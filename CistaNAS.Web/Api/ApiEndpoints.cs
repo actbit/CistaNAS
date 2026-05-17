@@ -22,6 +22,15 @@ public static class ApiEndpoints
         .AllowAnonymous()
         .WithName("Login");
 
+        api.MapPost("/auth/change-password", (ChangePasswordRequest req, HttpContext ctx, AuthService auth) =>
+        {
+            string? username = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+            bool ok = auth.ChangePassword(username, req.OldPassword, req.NewPassword);
+            return ok ? Results.Ok() : Results.BadRequest(new { error = "パスワードが正しくありません。" });
+        })
+        .WithName("ChangePassword");
+
         // ---- ボリューム ----
         var volumes = api.MapGroup("/volumes")
             .RequireAuthorization();
@@ -58,9 +67,39 @@ public static class ApiEndpoints
         })
         .WithName("LockVolume");
 
-        volumes.MapGet("/", (VolumeService vs) =>
-            Results.Ok(vs.ListAll()))
+        volumes.MapGet("/", (VolumeService vs, HttpContext ctx) =>
+        {
+            string? username = ctx.User.Identity?.Name;
+            var list = username is not null ? vs.ListForUser(username) : vs.ListAll();
+            return Results.Ok(list);
+        })
         .WithName("ListVolumes");
+
+        volumes.MapPost("/{name}/grant", (string name, GrantAccessRequest req, HttpContext ctx, VolumeService vs) =>
+        {
+            try
+            {
+                string? granter = ctx.User.Identity?.Name;
+                if (string.IsNullOrEmpty(granter)) return Results.Unauthorized();
+                vs.GrantAccess(name, granter, req.GranterPassword, req.TargetUsername, req.TargetPassword);
+                return Results.Ok();
+            }
+            catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .WithName("GrantAccess");
+
+        volumes.MapPost("/{name}/revoke", (string name, RevokeAccessRequest req, HttpContext ctx, VolumeService vs) =>
+        {
+            try
+            {
+                string? revoker = ctx.User.Identity?.Name;
+                if (string.IsNullOrEmpty(revoker)) return Results.Unauthorized();
+                vs.RevokeAccess(name, revoker, req.TargetUsername);
+                return Results.Ok();
+            }
+            catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .WithName("RevokeAccess");
 
         // ---- ファイル ----
         var files = api.MapGroup("/files/{volumeName}")

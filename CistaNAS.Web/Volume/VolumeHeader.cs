@@ -2,35 +2,40 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using CistaNAS.Web.Crypto;
+using CistaNAS.Web.Models;
 
 namespace CistaNAS.Web.Volume;
 
 /// <summary>
 /// ボリュームヘッダ（volume.json）。低レベルな Volume 層の実装。
-/// マスター鍵は「ユーザー名＋パスワード」のハッシュ由来 KEK で AES-256-GCM ラップする。
-/// 誤認証情報は GCM 認証失敗で検出。
+/// マスター鍵をユーザーごとに AES-256-GCM ラップして保存。
+/// 共有ボリュームでは複数ユーザーのエントリが存在する。
 /// </summary>
 public sealed class VolumeHeader
 {
     public const string FileName = "volume.json";
-    private const int CurrentFormatVersion = 2;
     private const int GcmTagSize = 16;
     private const int GcmNonceSize = 12;
     private const int KekSize = 32;
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    public int FormatVersion { get; set; } = CurrentFormatVersion;
     public string Name { get; set; } = "";
     public DateTimeOffset CreatedAt { get; set; }
     public bool Encrypted { get; set; } = true;
     public int SectorSize { get; set; }
 
-    /// <summary>ボリュームを所有するユーザー。KEK 導出に使うユーザー名を記録。</summary>
+    /// <summary>ボリュームの作成者（削除不可）。</summary>
     public string OwnerUser { get; set; } = "";
 
-    public KdfParams Kdf { get; set; } = new();
-    public WrappedKey WrappedMasterKey { get; set; } = new();
+    /// <summary>ユーザーごとのラップ済み鍵。キー = ユーザー名。</summary>
+    public Dictionary<string, UserWrappedKey> UserKeys { get; set; } = new(StringComparer.Ordinal);
+
+    public sealed class UserWrappedKey
+    {
+        public KdfParams Kdf { get; set; } = new();
+        public WrappedKey WrappedMasterKey { get; set; } = new();
+    }
 
     public sealed class KdfParams
     {
@@ -48,20 +53,37 @@ public sealed class VolumeHeader
     }
 
     /// <summary>
-    /// ユーザー名＋パスワードから KEK を導出する。
-    /// KEK = PBKDF2-SHA256(password, SHA256(username) || salt, iterations, 32)
-    /// ユーザー名がソルトの一部になることで、同じパスワードでもユーザーが違えば別の KEK になる。
+    /// KEK 導出: PBKDF2-SHA256(password, SHA256(username) || salt, iterations, 32)
+    /// ユーザー名がソルトの一部 → 同じパスワードでもユーザー違いで別 KEK。
     /// </summary>
     private static byte[] DeriveKek(string username, string password, byte[] salt, int iterations)
     {
-        // ユーザー名をハッシュしてソルトの前に結合
         byte[] userHash = SHA256.HashData(Encoding.UTF8.GetBytes(username));
         byte[] combinedSalt = new byte[userHash.Length + salt.Length];
         Buffer.BlockCopy(userHash, 0, combinedSalt, 0, userHash.Length);
         Buffer.BlockCopy(salt, 0, combinedSalt, userHash.Length, salt.Length);
-
         return Rfc2898DeriveBytes.Pbkdf2(password, combinedSalt, iterations, HashAlgorithmName.SHA256, KekSize);
     }
+
+    private static (byte[] Nonce, byte[] Ciphertext, byte[] Tag) WrapKey(byte[] masterKey, byte[] kek)
+    {
+        byte[] nonce = RandomNumberGenerator.GetBytes(GcmNonceSize);
+        byte[] ct = new byte[masterKey.Length];
+        byte[] tag = new byte[GcmTagSize];
+        using (var gcm = new AesGcm(kek, GcmTagSize))
+            gcm.Encrypt(nonce, masterKey, ct, tag);
+        return (nonce, ct, tag);
+    }
+
+    private static byte[] UnwrapKey(WrappedKey wk, byte[] kek)
+    {
+        byte[] master = new byte[wk.Ciphertext.Length];
+        using var gcm = new AesGcm(kek, GcmTagSize);
+        gcm.Decrypt(wk.Nonce, wk.Ciphertext, wk.Tag, master);
+        return master;
+    }
+
+    // ---- 公開 API ----
 
     /// <summary>新しいボリュームの header＋マスター鍵を生成する。</summary>
     public static (VolumeHeader Header, byte[]? MasterKey) Create(
@@ -69,31 +91,20 @@ public sealed class VolumeHeader
     {
         if (!encrypted)
         {
-            var plainHeader = new VolumeHeader
+            return (new VolumeHeader
             {
                 Name = name,
                 CreatedAt = DateTimeOffset.UtcNow,
                 Encrypted = false,
                 SectorSize = sectorSize,
                 OwnerUser = username ?? "",
-            };
-            return (plainHeader, null);
+            }, null);
         }
 
         ArgumentException.ThrowIfNullOrEmpty(username);
         ArgumentException.ThrowIfNullOrEmpty(password);
 
         byte[] master = KeyDerivation.NewMasterKey();
-        byte[] salt = KeyDerivation.NewSalt();
-        byte[] kek = DeriveKek(username, password, salt, kdfIterations);
-
-        byte[] nonce = RandomNumberGenerator.GetBytes(GcmNonceSize);
-        byte[] ct = new byte[master.Length];
-        byte[] tag = new byte[GcmTagSize];
-        using (var gcm = new AesGcm(kek, GcmTagSize))
-            gcm.Encrypt(nonce, master, ct, tag);
-        CryptographicOperations.ZeroMemory(kek);
-
         var header = new VolumeHeader
         {
             Name = name,
@@ -101,27 +112,95 @@ public sealed class VolumeHeader
             Encrypted = true,
             SectorSize = sectorSize,
             OwnerUser = username,
-            Kdf = new KdfParams { Iterations = kdfIterations, Salt = salt },
-            WrappedMasterKey = new WrappedKey { Nonce = nonce, Ciphertext = ct, Tag = tag },
         };
+        header.AddUserWrap(username, password, master, kdfIterations);
         return (header, master);
     }
 
-    /// <summary>
-    /// ユーザー名＋パスワードからマスター鍵を復元する。
-    /// 未暗号化ボリュームなら null。誤認証情報でも null。
-    /// </summary>
+    /// <summary>追加ユーザーのためにマスター鍵をラップして登録。</summary>
+    public void AddUserWrap(string username, string password, byte[] masterKey, int kdfIterations)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(username);
+        ArgumentException.ThrowIfNullOrEmpty(password);
+
+        byte[] salt = KeyDerivation.NewSalt();
+        byte[] kek = DeriveKek(username, password, salt, kdfIterations);
+        try
+        {
+            var (nonce, ct, tag) = WrapKey(masterKey, kek);
+            UserKeys[username] = new UserWrappedKey
+            {
+                Kdf = new KdfParams { Iterations = kdfIterations, Salt = salt },
+                WrappedMasterKey = new WrappedKey { Nonce = nonce, Ciphertext = ct, Tag = tag },
+            };
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(kek);
+        }
+    }
+
+    /// <summary>指定ユーザーのエントリを新しいパスワードで再ラップ。</summary>
+    public void RewrapUser(string username, string oldPassword, string newPassword, int kdfIterations)
+    {
+        if (!UserKeys.TryGetValue(username, out var entry))
+            throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
+
+        byte[] oldKek = DeriveKek(username, oldPassword, entry.Kdf.Salt, entry.Kdf.Iterations);
+        try
+        {
+            byte[] masterKey = UnwrapKey(entry.WrappedMasterKey, oldKek);
+            try
+            {
+                // 新しいソルトで再ラップ
+                byte[] newSalt = KeyDerivation.NewSalt();
+                byte[] newKek = DeriveKek(username, newPassword, newSalt, kdfIterations);
+                try
+                {
+                    var (nonce, ct, tag) = WrapKey(masterKey, newKek);
+                    UserKeys[username] = new UserWrappedKey
+                    {
+                        Kdf = new KdfParams { Iterations = kdfIterations, Salt = newSalt },
+                        WrappedMasterKey = new WrappedKey { Nonce = nonce, Ciphertext = ct, Tag = tag },
+                    };
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(newKek);
+                }
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(masterKey);
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(oldKek);
+        }
+    }
+
+    /// <summary>ユーザーのアクセス権を削除。オーナーは削除不可。</summary>
+    public bool RemoveUserWrap(string username)
+    {
+        if (username == OwnerUser)
+            throw new VolumeException("オーナーは削除できません。");
+        return UserKeys.Remove(username);
+    }
+
+    /// <summary>ユーザーがアクセス権を持つか。</summary>
+    public bool HasUserAccess(string username) => UserKeys.ContainsKey(username);
+
+    /// <summary>指定ユーザーでマスター鍵をアンラップ。失敗時 null。</summary>
     public byte[]? UnwrapMasterKey(string username, string password)
     {
         if (!Encrypted) return null;
+        if (!UserKeys.TryGetValue(username, out var entry)) return null;
 
-        byte[] kek = DeriveKek(username, password, Kdf.Salt, Kdf.Iterations);
+        byte[] kek = DeriveKek(username, password, entry.Kdf.Salt, entry.Kdf.Iterations);
         try
         {
-            byte[] master = new byte[WrappedMasterKey.Ciphertext.Length];
-            using var gcm = new AesGcm(kek, GcmTagSize);
-            gcm.Decrypt(WrappedMasterKey.Nonce, WrappedMasterKey.Ciphertext, WrappedMasterKey.Tag, master);
-            return master;
+            return UnwrapKey(entry.WrappedMasterKey, kek);
         }
         catch (AuthenticationTagMismatchException)
         {

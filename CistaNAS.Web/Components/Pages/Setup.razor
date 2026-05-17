@@ -1,0 +1,101 @@
+@page "/setup"
+@using CistaNAS.Web.Services
+@inject UserStore UserStore
+@inject VolumeService VolumeSvc
+@inject NavigationManager Nav
+
+<PageTitle>初回セットアップ - CistaNAS</PageTitle>
+
+@if (UserStore.HasAnyUsers)
+{
+    <NavigateToLogin />
+}
+else
+{
+    <div class="container" style="max-width:500px; margin-top:80px">
+        <div class="card">
+            <div class="card-header"><h3 class="mb-0">CistaNAS 初回セットアップ</h3></div>
+            <div class="card-body">
+                <p>管理者アカウントを作成してください。</p>
+
+                @if (_error is not null)
+                {
+                    <div class="alert alert-danger">@_error</div>
+                }
+
+                <EditForm Model="_model" OnValidSubmit="HandleSetup" FormName="SetupForm">
+                    <div class="mb-3">
+                        <label class="form-label">ユーザー名</label>
+                        <InputText @bind-Value="_model.Username" class="form-control" />
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">パスワード</label>
+                        <InputText type="password" @bind-Value="_model.Password" class="form-control" />
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">パスワード（確認）</label>
+                        <InputText type="password" @bind-Value="_model.ConfirmPassword" class="form-control" />
+                    </div>
+                    <hr />
+                    <div class="mb-3 form-check">
+                        <InputCheckbox @bind-Value="_model.CreateVolume" class="form-check-input" id="chkCreateVol" />
+                        <label class="form-check-label" for="chkCreateVol">最初のボリュームも作成する</label>
+                    </div>
+                    @if (_model.CreateVolume)
+                    {
+                        <div class="mb-3">
+                            <label class="form-label">ボリューム名</label>
+                            <InputText @bind-Value="_model.VolumeName" class="form-control" />
+                        </div>
+                    }
+                    <button type="submit" class="btn btn-primary w-100">セットアップ完了</button>
+                </EditForm>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private SetupModel _model = new();
+    private string? _error;
+
+    private sealed class SetupModel
+    {
+        public string Username { get; set; } = "admin";
+        public string Password { get; set; } = "";
+        public string ConfirmPassword { get; set; } = "";
+        public bool CreateVolume { get; set; } = true;
+        public string VolumeName { get; set; } = "data";
+    }
+
+    private void HandleSetup()
+    {
+        if (_model.Password != _model.ConfirmPassword)
+        {
+            _error = "パスワードが一致しません。";
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(_model.Username) || string.IsNullOrWhiteSpace(_model.Password))
+        {
+            _error = "ユーザー名とパスワードは必須です。";
+            return;
+        }
+
+        try
+        {
+            UserStore.CreateInitialAdmin(_model.Username, _model.Password);
+
+            if (_model.CreateVolume && !string.IsNullOrWhiteSpace(_model.VolumeName))
+            {
+                VolumeSvc.Create(_model.VolumeName, _model.Username, _model.Password, encrypted: true);
+                VolumeSvc.Lock(_model.VolumeName);
+            }
+
+            Nav.NavigateTo("/login", forceLoad: false);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+    }
+}

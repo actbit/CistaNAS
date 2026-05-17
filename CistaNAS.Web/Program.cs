@@ -98,16 +98,16 @@ dav.MapMethods("", ["OPTIONS"], (WebDavHandler h, HttpContext ctx) => h.OptionsA
 dav.MapMethods("{*path}", ["PROPFIND"],
     (string volumeName, string path, HttpContext ctx, WebDavHandler h) =>
         h.PropFindAsync(volumeName, path, ctx.Request.Headers["Depth"].FirstOrDefault(), ctx));
-dav.MapGet("{*path}", (string volumeName, string path, WebDavHandler h) =>
-    h.Get(volumeName, path));
+dav.MapGet("{*path}", (string volumeName, string path, HttpContext ctx, WebDavHandler h) =>
+    h.Get(volumeName, path, ctx));
 dav.MapMethods("{*path}", ["PUT"],
     (string volumeName, string path, HttpContext ctx, WebDavHandler h) =>
         h.Put(volumeName, path, ctx.Request));
-dav.MapDelete("{*path}", (string volumeName, string path, WebDavHandler h) =>
-    h.Delete(volumeName, path));
+dav.MapDelete("{*path}", (string volumeName, string path, HttpContext ctx, WebDavHandler h) =>
+    h.Delete(volumeName, path, ctx));
 dav.MapMethods("{*path}", ["MKCOL"],
-    (string volumeName, string path, WebDavHandler h) =>
-        h.MkCol(volumeName, path));
+    (string volumeName, string path, HttpContext ctx, WebDavHandler h) =>
+        h.MkCol(volumeName, path, ctx));
 
 app.MapDefaultEndpoints();
 

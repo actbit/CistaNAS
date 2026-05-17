@@ -16,7 +16,6 @@ else
 {
     <h1>ボリューム管理</h1>
 
-    <!-- 新規作成 -->
     <div class="card mb-4">
         <div class="card-header">ボリューム作成</div>
         <div class="card-body">
@@ -27,13 +26,12 @@ else
                 </div>
                 <div class="mb-3 form-check">
                     <InputCheckbox @bind-Value="_createModel.Encrypted" class="form-check-input" id="chkEncrypted" />
-                    <label class="form-check-label" for="chkEncrypted">暗号化する（マスター鍵をログイン認証情報で保護）</label>
+                    <label class="form-check-label" for="chkEncrypted">暗号化する</label>
                 </div>
                 @if (_createModel.Encrypted)
                 {
                     <div class="alert alert-info">
                         ユーザー <strong>@CurrentUsername</strong> の認証情報でマスター鍵を暗号化します。
-                        マウント時は同じユーザーでログインしている必要があります。
                     </div>
                     <div class="mb-3">
                         <label class="form-label">パスワード（確認用）</label>
@@ -51,7 +49,6 @@ else
         </div>
     </div>
 
-    <!-- ボリューム一覧 -->
     <h2>ボリューム一覧</h2>
     @if (_volumes.Count == 0)
     {
@@ -64,6 +61,8 @@ else
                 <tr>
                     <th>名前</th>
                     <th>暗号化</th>
+                    <th>所有ユーザー</th>
+                    <th>共有</th>
                     <th>状態</th>
                     <th>作成日</th>
                     <th>操作</th>
@@ -76,6 +75,7 @@ else
                         <td>@v.Name</td>
                         <td>@(v.Encrypted ? "あり" : "なし")</td>
                         <td>@v.OwnerUser</td>
+                        <td>@(v.AuthorizedUsers.Count > 1 ? $"{v.AuthorizedUsers.Count} ユーザー" : "-")</td>
                         <td>
                             @if (v.IsMounted)
                             {
@@ -91,11 +91,15 @@ else
                             @if (v.IsMounted)
                             {
                                 <button class="btn btn-sm btn-outline-danger me-1" @onclick="() => HandleLock(v.Name)">ロック</button>
-                                <a href="/files/@v.Name" class="btn btn-sm btn-outline-primary">ファイル</a>
+                                <a href="/files/@v.Name" class="btn btn-sm btn-outline-primary me-1">ファイル</a>
                             }
                             else
                             {
-                                <button class="btn btn-sm btn-outline-primary" @onclick="() => ShowMountDialog(v.Name, v.Encrypted)">マウント</button>
+                                <button class="btn btn-sm btn-outline-primary me-1" @onclick="() => ShowMountDialog(v.Name, v.Encrypted)">マウント</button>
+                            }
+                            @if (v.OwnerUser == CurrentUsername && v.Encrypted)
+                            {
+                                <button class="btn btn-sm btn-outline-secondary" @onclick="() => ShowShareDialog(v.Name)">共有</button>
                             }
                         </td>
                     </tr>
@@ -104,7 +108,6 @@ else
         </table>
     }
 
-    <!-- マウントダイアログ -->
     @if (_mountTarget is not null)
     {
         <div class="modal d-block" tabindex="-1" style="background-color:rgba(0,0,0,0.5)">
@@ -124,7 +127,7 @@ else
                         }
                         else
                         {
-                            <p>非暗号化ボリュームです。パスワードは不要です。</p>
+                            <p>非暗号化ボリュームです。</p>
                         }
                         @if (_mountError is not null)
                         {
@@ -134,6 +137,54 @@ else
                     <div class="modal-footer">
                         <button type="button" class="btn btn-secondary" @onclick="CloseMountDialog">キャンセル</button>
                         <button type="button" class="btn btn-primary" @onclick="HandleMount">マウント</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
+
+    @if (_shareTarget is not null)
+    {
+        <div class="modal d-block" tabindex="-1" style="background-color:rgba(0,0,0,0.5)">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">共有: @_shareTarget</h5>
+                        <button type="button" class="btn-close" @onclick="CloseShareDialog"></button>
+                    </div>
+                    <div class="modal-body">
+                        <h6>アクセス権のあるユーザー</h6>
+                        <ul class="list-group mb-3">
+                            @foreach (var u in _shareUsers)
+                            {
+                                <li class="list-group-item d-flex justify-content-between align-items-center">
+                                    @u
+                                    @if (u != CurrentUsername)
+                                    {
+                                        <button class="btn btn-sm btn-outline-danger" @onclick="() => HandleRevoke(_shareTarget, u)">削除</button>
+                                    }
+                                    else
+                                    {
+                                        <span class="badge bg-primary">オーナー</span>
+                                    }
+                                </li>
+                            }
+                        </ul>
+                        <hr />
+                        <h6>ユーザーを追加</h6>
+                        <div class="mb-2">
+                            <input class="form-control mb-2" placeholder="ユーザー名" @bind="_grantUsername" />
+                            <input type="password" class="form-control mb-2" placeholder="対象ユーザーのパスワード" @bind="_grantPassword" />
+                            <input type="password" class="form-control mb-2" placeholder="自分のパスワード（確認）" @bind="_grantGranterPassword" />
+                        </div>
+                        @if (_shareError is not null)
+                        {
+                            <div class="alert alert-danger">@_shareError</div>
+                        }
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" @onclick="CloseShareDialog">閉じる</button>
+                        <button type="button" class="btn btn-primary" @onclick="HandleGrant">追加</button>
                     </div>
                 </div>
             </div>
@@ -152,6 +203,13 @@ else
     private string _mountPassword = "";
     private string? _mountError;
 
+    private string? _shareTarget;
+    private IReadOnlyList<string> _shareUsers = [];
+    private string _grantUsername = "";
+    private string _grantPassword = "";
+    private string _grantGranterPassword = "";
+    private string? _shareError;
+
     private sealed class CreateModel
     {
         public string Name { get; set; } = "";
@@ -161,71 +219,75 @@ else
 
     private string CurrentUsername => AuthState.User?.Identity?.Name ?? "";
 
-    protected override void OnInitialized()
-    {
-        RefreshList();
-    }
+    protected override void OnInitialized() => RefreshList();
+    private void RefreshList() => _volumes = VolumeSvc.ListForUser(CurrentUsername).ToList();
 
-    private void RefreshList()
+    private void HandleCreate()
     {
-        _volumes = VolumeSvc.ListAll().ToList();
-    }
-
-    private async Task HandleCreate()
-    {
-        _isCreating = true;
-        _createError = null;
+        _isCreating = true; _createError = null;
         try
         {
             VolumeSvc.Create(_createModel.Name, CurrentUsername, _createModel.Password, _createModel.Encrypted);
             _createModel = new() { Encrypted = true };
             RefreshList();
         }
-        catch (VolumeException ex)
-        {
-            _createError = ex.Message;
-        }
+        catch (VolumeException ex) { _createError = ex.Message; }
         _isCreating = false;
     }
 
     private void ShowMountDialog(string name, bool encrypted)
     {
-        _mountTarget = name;
-        _mountNeedsPassword = encrypted;
-        _mountPassword = "";
-        _mountError = null;
+        _mountTarget = name; _mountNeedsPassword = encrypted;
+        _mountPassword = ""; _mountError = null;
     }
-
-    private void CloseMountDialog()
-    {
-        _mountTarget = null;
-        _mountError = null;
-    }
+    private void CloseMountDialog() { _mountTarget = null; _mountError = null; }
 
     private void HandleMount()
     {
         try
         {
             VolumeSvc.Mount(_mountTarget!, CurrentUsername, _mountNeedsPassword ? _mountPassword : null);
-            CloseMountDialog();
-            RefreshList();
+            CloseMountDialog(); RefreshList();
         }
-        catch (VolumeException ex)
-        {
-            _mountError = ex.Message;
-        }
+        catch (VolumeException ex) { _mountError = ex.Message; }
     }
 
     private void HandleLock(string name)
     {
+        try { VolumeSvc.Lock(name); RefreshList(); } catch { }
+    }
+
+    private void ShowShareDialog(string name)
+    {
+        var vol = _volumes.FirstOrDefault(v => v.Name == name);
+        if (vol is null) return;
+        _shareTarget = name; _shareUsers = vol.AuthorizedUsers;
+        _grantUsername = ""; _grantPassword = ""; _grantGranterPassword = ""; _shareError = null;
+    }
+    private void CloseShareDialog() { _shareTarget = null; _shareError = null; }
+
+    private void HandleGrant()
+    {
         try
         {
-            VolumeSvc.Lock(name);
+            VolumeSvc.GrantAccess(_shareTarget!, CurrentUsername, _grantGranterPassword, _grantUsername, _grantPassword);
             RefreshList();
+            var vol = _volumes.FirstOrDefault(v => v.Name == _shareTarget);
+            if (vol is not null) _shareUsers = vol.AuthorizedUsers;
+            _grantUsername = ""; _grantPassword = ""; _grantGranterPassword = ""; _shareError = null;
         }
-        catch (VolumeException ex)
+        catch (VolumeException ex) { _shareError = ex.Message; }
+    }
+
+    private void HandleRevoke(string volumeName, string targetUser)
+    {
+        try
         {
-            // UI 上は既にマウントされていないので何もしない
+            VolumeSvc.RevokeAccess(volumeName, CurrentUsername, targetUser);
+            RefreshList();
+            var vol = _volumes.FirstOrDefault(v => v.Name == _shareTarget);
+            if (vol is not null) _shareUsers = vol.AuthorizedUsers;
         }
+        catch (VolumeException ex) { _shareError = ex.Message; }
     }
 }

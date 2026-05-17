@@ -1,5 +1,7 @@
 @using CistaNAS.Web.Components.Auth
+@using CistaNAS.Web.Services
 @inject AuthenticationStateService AuthState
+@inject UserStore UserStore
 
 <div class="top-row ps-3 navbar navbar-dark">
     <div class="container-fluid">
@@ -20,11 +22,24 @@
                 <span class="bi bi-house-door-fill" aria-hidden="true"></span> Home
             </NavLink>
         </div>
-        @if (AuthState.IsLoggedIn)
+        @if (!UserStore.HasAnyUsers)
+        {
+            <div class="nav-item px-3">
+                <NavLink class="nav-link" href="setup">
+                    <span class="bi bi-gear-fill" aria-hidden="true"></span> 初期設定
+                </NavLink>
+            </div>
+        }
+        else if (AuthState.IsLoggedIn)
         {
             <div class="nav-item px-3">
                 <NavLink class="nav-link" href="volumes">
                     <span class="bi bi-hdd-fill" aria-hidden="true"></span> ボリューム
+                </NavLink>
+            </div>
+            <div class="nav-item px-3">
+                <NavLink class="nav-link" href="settings">
+                    <span class="bi bi-gear-fill" aria-hidden="true"></span> 設定
                 </NavLink>
             </div>
         }

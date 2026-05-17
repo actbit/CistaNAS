@@ -1,0 +1,97 @@
+@page "/settings"
+@using CistaNAS.Web.Components.Auth
+@using CistaNAS.Web.Services
+@inject AuthenticationStateService AuthState
+@inject AuthService Auth
+@inject NavigationManager Nav
+
+<PageTitle>設定 - CistaNAS</PageTitle>
+
+@if (!AuthState.IsLoggedIn)
+{
+    <NavigateToLogin />
+}
+else
+{
+    <h1>設定</h1>
+
+    <div class="card" style="max-width:500px">
+        <div class="card-header">パスワード変更</div>
+        <div class="card-body">
+            @if (_success)
+            {
+                <div class="alert alert-success">パスワードを変更しました。再度ログインしてください。</div>
+                <button class="btn btn-primary" @onclick="HandleLogout">ログイン画面へ</button>
+            }
+            else
+            {
+                @if (_error is not null)
+                {
+                    <div class="alert alert-danger">@_error</div>
+                }
+                <EditForm Model="_model" OnValidSubmit="HandleChangePassword" FormName="ChangePasswordForm">
+                    <div class="mb-3">
+                        <label class="form-label">現在のパスワード</label>
+                        <InputText type="password" @bind-Value="_model.OldPassword" class="form-control" />
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">新しいパスワード</label>
+                        <InputText type="password" @bind-Value="_model.NewPassword" class="form-control" />
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">新しいパスワード（確認）</label>
+                        <InputText type="password" @bind-Value="_model.ConfirmPassword" class="form-control" />
+                    </div>
+                    <button type="submit" class="btn btn-primary" disabled="@_isLoading">
+                        @(_isLoading ? "変更中..." : "変更")
+                    </button>
+                </EditForm>
+            }
+        </div>
+    </div>
+}
+
+@code {
+    private ChangeModel _model = new();
+    private bool _isLoading;
+    private bool _success;
+    private string? _error;
+
+    private sealed class ChangeModel
+    {
+        public string OldPassword { get; set; } = "";
+        public string NewPassword { get; set; } = "";
+        public string ConfirmPassword { get; set; } = "";
+    }
+
+    private void HandleChangePassword()
+    {
+        if (_model.NewPassword != _model.ConfirmPassword)
+        {
+            _error = "パスワードが一致しません。";
+            return;
+        }
+
+        _isLoading = true;
+        _error = null;
+
+        string username = AuthState.User?.Identity?.Name ?? "";
+        bool ok = Auth.ChangePassword(username, _model.OldPassword, _model.NewPassword);
+
+        if (ok)
+        {
+            _success = true;
+        }
+        else
+        {
+            _error = "現在のパスワードが正しくありません。";
+        }
+        _isLoading = false;
+    }
+
+    private void HandleLogout()
+    {
+        AuthState.Logout();
+        Nav.NavigateTo("/login", forceLoad: false);
+    }
+}

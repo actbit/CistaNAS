@@ -82,4 +82,10 @@ public sealed class AuthService(
 
         return result.IsValid ? new ClaimsPrincipal(result.ClaimsIdentity) : null;
     }
+
+    /// <summary>パスワードを変更し、全ボリュームの KEK を再ラップ。</summary>
+    public bool ChangePassword(string username, string oldPassword, string newPassword)
+    {
+        return users.ChangePassword(username, oldPassword, newPassword);
+    }
 }

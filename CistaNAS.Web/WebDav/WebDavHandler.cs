@@ -20,6 +20,16 @@ public sealed class WebDavHandler
         _fileService = fileService;
     }
 
+    private static string? GetUsername(HttpContext ctx) => ctx.User.Identity?.Name;
+
+    private bool CheckAccess(string volumeName, HttpContext ctx)
+    {
+        if (!_volumeService.IsMounted(volumeName)) return false;
+        string? username = GetUsername(ctx);
+        if (username is null) return false;
+        return _volumeService.HasAccess(volumeName, username);
+    }
+
     // ---- OPTIONS ----
 
     public Task OptionsAsync(HttpContext ctx)
@@ -34,7 +44,7 @@ public sealed class WebDavHandler
 
     public Task PropFindAsync(string volumeName, string path, string? depthHeader, HttpContext ctx)
     {
-        if (!_volumeService.IsMounted(volumeName))
+        if (!CheckAccess(volumeName, ctx))
         {
             ctx.Response.StatusCode = 400;
             return ctx.Response.WriteAsJsonAsync(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
@@ -100,9 +110,9 @@ public sealed class WebDavHandler
 
     // ---- GET ----
 
-    public IResult Get(string volumeName, string path)
+    public IResult Get(string volumeName, string path, HttpContext ctx)
     {
-        if (!_volumeService.IsMounted(volumeName))
+        if (!CheckAccess(volumeName, ctx))
             return Results.BadRequest(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
 
         string name = NormalizePath(path);
@@ -124,7 +134,7 @@ public sealed class WebDavHandler
 
     public async Task<IResult> Put(string volumeName, string path, HttpRequest request)
     {
-        if (!_volumeService.IsMounted(volumeName))
+        if (!CheckAccess(volumeName, request.HttpContext))
             return Results.BadRequest(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
 
         string name = NormalizePath(path);
@@ -145,9 +155,9 @@ public sealed class WebDavHandler
 
     // ---- DELETE ----
 
-    public IResult Delete(string volumeName, string path)
+    public IResult Delete(string volumeName, string path, HttpContext ctx)
     {
-        if (!_volumeService.IsMounted(volumeName))
+        if (!CheckAccess(volumeName, ctx))
             return Results.BadRequest(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
 
         string name = NormalizePath(path);
@@ -167,9 +177,9 @@ public sealed class WebDavHandler
 
     // ---- MKCOL ----
 
-    public IResult MkCol(string volumeName, string path)
+    public IResult MkCol(string volumeName, string path, HttpContext ctx)
     {
-        if (!_volumeService.IsMounted(volumeName))
+        if (!CheckAccess(volumeName, ctx))
             return Results.BadRequest(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
 
         return Results.Created();

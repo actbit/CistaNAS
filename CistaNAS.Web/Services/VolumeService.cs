@@ -9,9 +9,7 @@ using Microsoft.Extensions.Options;
 namespace CistaNAS.Web.Services;
 
 /// <summary>
-/// ボリュームの作成・マウント・ロックを管理する Singleton Service。
-/// マウント状態（Stream）をプロセス内に保持し、Blazor と /api/v1 で共有する。
-/// 暗号化ボリュームの KEK は「ユーザー名＋パスワード」のハッシュから導出。
+/// ボリュームの作成・マウント・ロック・共有を管理する Singleton Service。
 /// </summary>
 public sealed class VolumeService
 {
@@ -30,11 +28,7 @@ public sealed class VolumeService
     public VolumeInfo Create(string name, string? username, string? password, bool encrypted = true)
     {
         ValidateName(name);
-        if (encrypted)
-        {
-            ArgumentException.ThrowIfNullOrEmpty(username);
-            ArgumentException.ThrowIfNullOrEmpty(password);
-        }
+        if (encrypted) { ArgumentException.ThrowIfNullOrEmpty(username); ArgumentException.ThrowIfNullOrEmpty(password); }
 
         string dir = VolumeDir(name);
         if (Directory.Exists(dir))
@@ -44,12 +38,10 @@ public sealed class VolumeService
 
         Directory.CreateDirectory(dir);
         header.Save(Path.Combine(dir, VolumeHeader.FileName));
-
         File.Create(GetDataPath(name)).Dispose();
-
         MountInternal(name, header, masterKey);
 
-        return new VolumeInfo(name, true, encrypted, header.OwnerUser, header.CreatedAt);
+        return ToInfo(name, header, true);
     }
 
     public VolumeInfo Mount(string name, string username, string? password)
@@ -57,12 +49,7 @@ public sealed class VolumeService
         if (_mounted.ContainsKey(name))
             throw new VolumeException($"ボリューム '{name}' は既にマウントされています。");
 
-        string headerPath = Path.Combine(VolumeDir(name), VolumeHeader.FileName);
-        if (!File.Exists(headerPath))
-            throw new VolumeException($"ボリューム '{name}' が見つかりません。");
-
-        var header = VolumeHeader.Load(headerPath);
-
+        var header = LoadHeaderOrThrow(name);
         byte[]? masterKey = null;
         if (header.Encrypted)
         {
@@ -73,24 +60,34 @@ public sealed class VolumeService
         }
 
         MountInternal(name, header, masterKey);
-        return new VolumeInfo(name, true, header.Encrypted, header.OwnerUser, header.CreatedAt);
+        return ToInfo(name, header, true);
     }
 
     public void Lock(string name)
     {
         if (!_mounted.TryRemove(name, out var mv))
             throw new VolumeException($"ボリューム '{name}' はマウントされていません。");
-
         mv.Stream.Dispose();
-        if (mv.MasterKey is not null)
-            CryptographicOperations.ZeroMemory(mv.MasterKey);
+        if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
     }
 
-    public IReadOnlyList<VolumeInfo> ListMounted()
+    /// <summary>指定ユーザーがアクセスできるボリューム一覧を返す。</summary>
+    public IReadOnlyList<VolumeInfo> ListForUser(string username)
     {
-        var result = new List<VolumeInfo>(_mounted.Count);
-        foreach ((string name, var mv) in _mounted)
-            result.Add(new VolumeInfo(name, true, mv.Encrypted, mv.OwnerUser, mv.CreatedAt));
+        var result = new List<VolumeInfo>();
+        if (!Directory.Exists(_dataRoot)) return result;
+
+        foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
+        {
+            string name = Path.GetFileName(dir);
+            var header = LoadHeaderIfExists(name);
+            if (header is null) continue;
+
+            bool hasAccess = !header.Encrypted || header.HasUserAccess(username);
+            if (!hasAccess) continue;
+
+            result.Add(ToInfo(name, header, _mounted.ContainsKey(name)));
+        }
         return result;
     }
 
@@ -102,11 +99,9 @@ public sealed class VolumeService
         foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
         {
             string name = Path.GetFileName(dir);
-            string headerPath = Path.Combine(dir, VolumeHeader.FileName);
-            if (!File.Exists(headerPath)) continue;
-
-            var header = VolumeHeader.Load(headerPath);
-            result.Add(new VolumeInfo(name, _mounted.ContainsKey(name), header.Encrypted, header.OwnerUser, header.CreatedAt));
+            var header = LoadHeaderIfExists(name);
+            if (header is null) continue;
+            result.Add(ToInfo(name, header, _mounted.ContainsKey(name)));
         }
         return result;
     }
@@ -120,26 +115,114 @@ public sealed class VolumeService
 
     public bool IsMounted(string name) => _mounted.ContainsKey(name);
 
+    /// <summary>ボリュームが指定ユーザーのアクセス権を持つか。</summary>
+    public bool HasAccess(string volumeName, string username)
+    {
+        var header = LoadHeaderIfExists(volumeName);
+        if (header is null) return false;
+        return !header.Encrypted || header.HasUserAccess(username);
+    }
+
+    // ---- 共有 ----
+
+    /// <summary>ボリュームに別ユーザーのアクセス権を付与。</summary>
+    public void GrantAccess(string volumeName, string granterUsername, string granterPassword,
+        string targetUsername, string targetPassword)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(granterUsername);
+        ArgumentException.ThrowIfNullOrEmpty(granterPassword);
+        ArgumentException.ThrowIfNullOrEmpty(targetUsername);
+        ArgumentException.ThrowIfNullOrEmpty(targetPassword);
+
+        var header = LoadHeaderOrThrow(volumeName);
+        if (!header.HasUserAccess(granterUsername))
+            throw new VolumeException($"ユーザー '{granterUsername}' はこのボリュームにアクセス権がありません。");
+
+        byte[]? masterKey = header.UnwrapMasterKey(granterUsername, granterPassword)
+            ?? throw new VolumeException("付与者の認証情報が正しくありません。");
+
+        try
+        {
+            header.AddUserWrap(targetUsername, targetPassword, masterKey, _volOpts.KdfIterations);
+            header.Save(GetHeaderPath(volumeName));
+            RefreshMountedHeader(volumeName, header);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(masterKey);
+        }
+    }
+
+    /// <summary>ボリュームからユーザーのアクセス権を剥奪。</summary>
+    public void RevokeAccess(string volumeName, string revokerUsername, string targetUsername)
+    {
+        var header = LoadHeaderOrThrow(volumeName);
+        if (header.OwnerUser != revokerUsername)
+            throw new VolumeException("オーナーのみがアクセス権を剥奪できます。");
+        if (targetUsername == header.OwnerUser)
+            throw new VolumeException("オーナーのアクセス権は剥奪できません。");
+
+        header.RemoveUserWrap(targetUsername);
+        header.Save(GetHeaderPath(volumeName));
+        RefreshMountedHeader(volumeName, header);
+    }
+
+    /// <summary>ユーザーのパスワード変更時に全ボリュームの鍵を再ラップ。</summary>
+    public void RewrapAllForUser(string username, string oldPassword, string newPassword)
+    {
+        if (!Directory.Exists(_dataRoot)) return;
+
+        foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
+        {
+            string name = Path.GetFileName(dir);
+            var header = LoadHeaderIfExists(name);
+            if (header is null || !header.HasUserAccess(username)) continue;
+
+            header.RewrapUser(username, oldPassword, newPassword, _volOpts.KdfIterations);
+            header.Save(GetHeaderPath(name));
+            RefreshMountedHeader(name, header);
+        }
+    }
+
+    // ---- 内部 ----
+
     private void MountInternal(string name, VolumeHeader header, byte[]? masterKey)
     {
-        string dataPath = GetDataPath(name);
-        var fs = new FileStream(dataPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
-
-        Stream stream;
-        if (header.Encrypted && masterKey is not null)
-        {
-            stream = new AesXtsStream(fs, masterKey, header.SectorSize, fs.Length, writable: true);
-        }
-        else
-        {
-            stream = fs;
-        }
-
+        var fs = new FileStream(GetDataPath(name), FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        Stream stream = (header.Encrypted && masterKey is not null)
+            ? new AesXtsStream(fs, masterKey, header.SectorSize, fs.Length, writable: true)
+            : fs;
         _mounted[name] = new MountedVolume(header, masterKey, stream);
     }
 
+    private VolumeHeader LoadHeaderOrThrow(string name)
+    {
+        string path = GetHeaderPath(name);
+        if (!File.Exists(path))
+            throw new VolumeException($"ボリューム '{name}' が見つかりません。");
+        return VolumeHeader.Load(path);
+    }
+
+    private VolumeHeader? LoadHeaderIfExists(string name)
+    {
+        string path = GetHeaderPath(name);
+        if (!File.Exists(path)) return null;
+        return VolumeHeader.Load(path);
+    }
+
+    private void RefreshMountedHeader(string name, VolumeHeader updated)
+    {
+        if (_mounted.TryGetValue(name, out var mv))
+            mv.UpdateHeader(updated);
+    }
+
+    private static VolumeInfo ToInfo(string name, VolumeHeader h, bool mounted) => new(
+        name, mounted, h.Encrypted, h.OwnerUser, h.CreatedAt,
+        h.UserKeys.Keys.ToList());
+
     private string VolumeDir(string name) => Path.Combine(_dataRoot, name);
     private string GetDataPath(string name) => Path.Combine(VolumeDir(name), "volume.dat");
+    private string GetHeaderPath(string name) => Path.Combine(VolumeDir(name), VolumeHeader.FileName);
 
     private static void ValidateName(string name)
     {
@@ -152,11 +235,9 @@ public sealed class VolumeService
 
     private sealed class MountedVolume(VolumeHeader header, byte[]? masterKey, Stream stream)
     {
-        public VolumeHeader Header { get; } = header;
+        public VolumeHeader Header { get; private set; } = header;
         public byte[]? MasterKey { get; } = masterKey;
         public Stream Stream { get; } = stream;
-        public bool Encrypted { get; } = header.Encrypted;
-        public string OwnerUser { get; } = header.OwnerUser;
-        public DateTimeOffset CreatedAt { get; } = header.CreatedAt;
+        public void UpdateHeader(VolumeHeader h) => Header = h;
     }
 }
