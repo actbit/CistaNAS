@@ -1,0 +1,58 @@
+@page "/login"
+@using CistaNAS.Web.Components.Auth
+@inject AuthenticationStateService AuthState
+@inject NavigationManager Nav
+
+<PageTitle>ログイン - CistaNAS</PageTitle>
+
+<h1>ログイン</h1>
+
+@if (ErrorMessage is not null)
+{
+    <div class="alert alert-danger">@ErrorMessage</div>
+}
+
+<EditForm Model="_model" OnValidSubmit="HandleLogin" FormName="LoginForm">
+    <DataAnnotationsValidator />
+    <div class="mb-3">
+        <label class="form-label" for="username">ユーザ名</label>
+        <InputText @bind-Value="_model.Username" class="form-control" id="username" />
+    </div>
+    <div class="mb-3">
+        <label class="form-label" for="password">パスワード</label>
+        <InputText type="password" @bind-Value="_model.Password" class="form-control" id="password" />
+    </div>
+    <button type="submit" class="btn btn-primary" disabled="@IsLoading">
+        @(IsLoading ? "ログイン中..." : "ログイン")
+    </button>
+</EditForm>
+
+@code {
+    private LoginModel _model = new();
+    private bool IsLoading;
+    private string? ErrorMessage;
+
+    private sealed class LoginModel
+    {
+        public string Username { get; set; } = "";
+        public string Password { get; set; } = "";
+    }
+
+    private async Task HandleLogin()
+    {
+        IsLoading = true;
+        ErrorMessage = null;
+
+        bool ok = await AuthState.LoginAsync(_model.Username, _model.Password);
+        if (ok)
+        {
+            Nav.NavigateTo("/volumes", forceLoad: false);
+        }
+        else
+        {
+            ErrorMessage = "ユーザ名またはパスワードが正しくありません。";
+        }
+
+        IsLoading = false;
+    }
+}

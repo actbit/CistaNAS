@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="CistaNAS.ApiService/CistaNAS.ApiService.csproj" />
+  <Project Path="CistaNAS.AppHost/CistaNAS.AppHost.csproj" />
+  <Project Path="CistaNAS.ServiceDefaults/CistaNAS.ServiceDefaults.csproj" />
+  <Project Path="CistaNAS.Tests/CistaNAS.Tests.csproj" />
+  <Project Path="CistaNAS.Web/CistaNAS.Web.csproj" />
+</Solution>

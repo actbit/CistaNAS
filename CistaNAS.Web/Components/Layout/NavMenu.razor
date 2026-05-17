@@ -1,0 +1,47 @@
+@using CistaNAS.Web.Components.Auth
+@inject AuthenticationStateService AuthState
+
+<div class="top-row ps-3 navbar navbar-dark">
+    <div class="container-fluid">
+        <a class="navbar-brand" href="">CistaNAS</a>
+        @if (AuthState.IsLoggedIn)
+        {
+            <button class="btn btn-outline-light btn-sm" @onclick="HandleLogout">ログアウト</button>
+        }
+    </div>
+</div>
+
+<input type="checkbox" title="Navigation menu" class="navbar-toggler" />
+
+<div class="nav-scrollable" onclick="document.querySelector('.navbar-toggler').click()">
+    <nav class="nav flex-column">
+        <div class="nav-item px-3">
+            <NavLink class="nav-link" href="" Match="NavLinkMatch.All">
+                <span class="bi bi-house-door-fill" aria-hidden="true"></span> Home
+            </NavLink>
+        </div>
+        @if (AuthState.IsLoggedIn)
+        {
+            <div class="nav-item px-3">
+                <NavLink class="nav-link" href="volumes">
+                    <span class="bi bi-hdd-fill" aria-hidden="true"></span> ボリューム
+                </NavLink>
+            </div>
+        }
+        else
+        {
+            <div class="nav-item px-3">
+                <NavLink class="nav-link" href="login">
+                    <span class="bi bi-box-arrow-in-right" aria-hidden="true"></span> ログイン
+                </NavLink>
+            </div>
+        }
+    </nav>
+</div>
+
+@code {
+    private void HandleLogout()
+    {
+        AuthState.Logout();
+    }
+}

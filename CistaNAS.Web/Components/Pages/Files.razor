@@ -1,0 +1,145 @@
+@page "/files/{VolumeName}"
+@using CistaNAS.Web.Components.Auth
+@using CistaNAS.Web.Models
+@using CistaNAS.Web.Services
+@inject AuthenticationStateService AuthState
+@inject VolumeService VolumeSvc
+@inject FileService FileSvc
+@inject NavigationManager Nav
+
+<PageTitle>ファイル: @VolumeName - CistaNAS</PageTitle>
+
+@if (!AuthState.IsLoggedIn)
+{
+    <NavigateToLogin />
+}
+else if (!VolumeSvc.IsMounted(VolumeName))
+{
+    <div class="alert alert-warning">
+        ボリューム「@VolumeName」はマウントされていません。
+        <a href="/volumes">ボリューム管理に戻る</a>
+    </div>
+}
+else
+{
+    <h1>ファイル: @VolumeName</h1>
+    <a href="/volumes" class="btn btn-outline-secondary mb-3">ボリューム一覧に戻る</a>
+
+    <!-- アップロード -->
+    <div class="card mb-4">
+        <div class="card-header">ファイルアップロード</div>
+        <div class="card-body">
+            <InputFile OnChange="HandleUpload" accept="*/*" />
+            @if (_uploadError is not null)
+            {
+                <div class="alert alert-danger mt-2">@_uploadError</div>
+            }
+        </div>
+    </div>
+
+    <!-- ファイル一覧 -->
+    @if (_files.Count == 0)
+    {
+        <p>ファイルがありません。</p>
+    }
+    else
+    {
+        <table class="table table-striped">
+            <thead>
+                <tr>
+                    <th>ファイル名</th>
+                    <th>サイズ</th>
+                    <th>更新日時</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var f in _files)
+                {
+                    <tr>
+                        <td>@f.Name</td>
+                        <td>@FormatSize(f.Length)</td>
+                        <td>@f.ModifiedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")</td>
+                        <td>
+                            <button class="btn btn-sm btn-outline-primary me-1" @onclick="() => HandleDownload(f.Name)">ダウンロード</button>
+                            <button class="btn btn-sm btn-outline-danger" @onclick="() => HandleDelete(f.Name)">削除</button>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+}
+
+@code {
+    [Parameter] public string VolumeName { get; set; } = "";
+
+    private List<FileMetadata> _files = [];
+    private string? _uploadError;
+
+    protected override void OnInitialized()
+    {
+        RefreshList();
+    }
+
+    private void RefreshList()
+    {
+        try
+        {
+            _files = FileSvc.List(VolumeName).Files.ToList();
+        }
+        catch
+        {
+            _files = [];
+        }
+    }
+
+    private async Task HandleUpload(InputFileChangeEventArgs e)
+    {
+        _uploadError = null;
+        try
+        {
+            foreach (var file in e.GetMultipleFiles(10))
+            {
+                await using var stream = file.OpenReadStream(maxAllowedSize: 10L * 1024 * 1024 * 1024); // 10 GB
+                await FileSvc.UploadAsync(VolumeName, file.Name, stream, file.Size);
+            }
+            RefreshList();
+        }
+        catch (Exception ex)
+        {
+            _uploadError = $"アップロードエラー: {ex.Message}";
+        }
+    }
+
+    private void HandleDownload(string fileName)
+    {
+        // Blazor Server では JS 経由でダウンロードをトリガーする方法が一般的だが、
+        // ここでは /api/v1/files/{volume}/{name} の API エンドポイント経由で
+        // ブラウザにダウンロードさせる。トークンはクエリパラメータで渡す。
+        var token = AuthState.Token;
+        var url = $"/api/v1/files/{Uri.EscapeDataString(VolumeName)}/{Uri.EscapeDataString(fileName)}?token={Uri.EscapeDataString(token ?? "")}";
+        Nav.NavigateTo(url, forceLoad: true);
+    }
+
+    private void HandleDelete(string fileName)
+    {
+        try
+        {
+            FileSvc.Delete(VolumeName, fileName);
+            RefreshList();
+        }
+        catch (FileServiceException ex)
+        {
+            _uploadError = ex.Message;
+        }
+    }
+
+    private static string FormatSize(long bytes) => bytes switch
+    {
+        < 1024 => $"{bytes} B",
+        < 1024 * 1024 => $"{bytes / 1024.0:F1} KB",
+        < 1024 * 1024 * 1024 => $"{bytes / (1024.0 * 1024):F1} MB",
+        _ => $"{bytes / (1024.0 * 1024 * 1024):F2} GB",
+    };
+}

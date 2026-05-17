@@ -1,0 +1,231 @@
+@page "/volumes"
+@using CistaNAS.Web.Components.Auth
+@using CistaNAS.Web.Models
+@using CistaNAS.Web.Services
+@inject AuthenticationStateService AuthState
+@inject VolumeService VolumeSvc
+@inject NavigationManager Nav
+
+<PageTitle>ボリューム - CistaNAS</PageTitle>
+
+@if (!AuthState.IsLoggedIn)
+{
+    <NavigateToLogin />
+}
+else
+{
+    <h1>ボリューム管理</h1>
+
+    <!-- 新規作成 -->
+    <div class="card mb-4">
+        <div class="card-header">ボリューム作成</div>
+        <div class="card-body">
+            <EditForm Model="_createModel" OnValidSubmit="HandleCreate" FormName="CreateVolumeForm">
+                <div class="mb-3">
+                    <label class="form-label">名前</label>
+                    <InputText @bind-Value="_createModel.Name" class="form-control" />
+                </div>
+                <div class="mb-3 form-check">
+                    <InputCheckbox @bind-Value="_createModel.Encrypted" class="form-check-input" id="chkEncrypted" />
+                    <label class="form-check-label" for="chkEncrypted">暗号化する（マスター鍵をログイン認証情報で保護）</label>
+                </div>
+                @if (_createModel.Encrypted)
+                {
+                    <div class="alert alert-info">
+                        ユーザー <strong>@CurrentUsername</strong> の認証情報でマスター鍵を暗号化します。
+                        マウント時は同じユーザーでログインしている必要があります。
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">パスワード（確認用）</label>
+                        <InputText type="password" @bind-Value="_createModel.Password" class="form-control" />
+                    </div>
+                }
+                <button type="submit" class="btn btn-success" disabled="@_isCreating">
+                    @(_isCreating ? "作成中..." : "作成")
+                </button>
+            </EditForm>
+            @if (_createError is not null)
+            {
+                <div class="alert alert-danger mt-2">@_createError</div>
+            }
+        </div>
+    </div>
+
+    <!-- ボリューム一覧 -->
+    <h2>ボリューム一覧</h2>
+    @if (_volumes.Count == 0)
+    {
+        <p>ボリュームがありません。</p>
+    }
+    else
+    {
+        <table class="table table-striped">
+            <thead>
+                <tr>
+                    <th>名前</th>
+                    <th>暗号化</th>
+                    <th>状態</th>
+                    <th>作成日</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var v in _volumes)
+                {
+                    <tr>
+                        <td>@v.Name</td>
+                        <td>@(v.Encrypted ? "あり" : "なし")</td>
+                        <td>@v.OwnerUser</td>
+                        <td>
+                            @if (v.IsMounted)
+                            {
+                                <span class="badge bg-success">マウント済み</span>
+                            }
+                            else
+                            {
+                                <span class="badge bg-secondary">未マウント</span>
+                            }
+                        </td>
+                        <td>@v.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</td>
+                        <td>
+                            @if (v.IsMounted)
+                            {
+                                <button class="btn btn-sm btn-outline-danger me-1" @onclick="() => HandleLock(v.Name)">ロック</button>
+                                <a href="/files/@v.Name" class="btn btn-sm btn-outline-primary">ファイル</a>
+                            }
+                            else
+                            {
+                                <button class="btn btn-sm btn-outline-primary" @onclick="() => ShowMountDialog(v.Name, v.Encrypted)">マウント</button>
+                            }
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+
+    <!-- マウントダイアログ -->
+    @if (_mountTarget is not null)
+    {
+        <div class="modal d-block" tabindex="-1" style="background-color:rgba(0,0,0,0.5)">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">マウント: @_mountTarget</h5>
+                        <button type="button" class="btn-close" @onclick="CloseMountDialog"></button>
+                    </div>
+                    <div class="modal-body">
+                        @if (_mountNeedsPassword)
+                        {
+                            <div class="mb-3">
+                                <label class="form-label">パスワード</label>
+                                <input type="password" class="form-control" @bind="_mountPassword" />
+                            </div>
+                        }
+                        else
+                        {
+                            <p>非暗号化ボリュームです。パスワードは不要です。</p>
+                        }
+                        @if (_mountError is not null)
+                        {
+                            <div class="alert alert-danger">@_mountError</div>
+                        }
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" @onclick="CloseMountDialog">キャンセル</button>
+                        <button type="button" class="btn btn-primary" @onclick="HandleMount">マウント</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+@code {
+    private List<VolumeInfo> _volumes = [];
+    private CreateModel _createModel = new() { Encrypted = true };
+    private bool _isCreating;
+    private string? _createError;
+
+    private string? _mountTarget;
+    private bool _mountNeedsPassword;
+    private string _mountPassword = "";
+    private string? _mountError;
+
+    private sealed class CreateModel
+    {
+        public string Name { get; set; } = "";
+        public string Password { get; set; } = "";
+        public bool Encrypted { get; set; } = true;
+    }
+
+    private string CurrentUsername => AuthState.User?.Identity?.Name ?? "";
+
+    protected override void OnInitialized()
+    {
+        RefreshList();
+    }
+
+    private void RefreshList()
+    {
+        _volumes = VolumeSvc.ListAll().ToList();
+    }
+
+    private async Task HandleCreate()
+    {
+        _isCreating = true;
+        _createError = null;
+        try
+        {
+            VolumeSvc.Create(_createModel.Name, CurrentUsername, _createModel.Password, _createModel.Encrypted);
+            _createModel = new() { Encrypted = true };
+            RefreshList();
+        }
+        catch (VolumeException ex)
+        {
+            _createError = ex.Message;
+        }
+        _isCreating = false;
+    }
+
+    private void ShowMountDialog(string name, bool encrypted)
+    {
+        _mountTarget = name;
+        _mountNeedsPassword = encrypted;
+        _mountPassword = "";
+        _mountError = null;
+    }
+
+    private void CloseMountDialog()
+    {
+        _mountTarget = null;
+        _mountError = null;
+    }
+
+    private void HandleMount()
+    {
+        try
+        {
+            VolumeSvc.Mount(_mountTarget!, CurrentUsername, _mountNeedsPassword ? _mountPassword : null);
+            CloseMountDialog();
+            RefreshList();
+        }
+        catch (VolumeException ex)
+        {
+            _mountError = ex.Message;
+        }
+    }
+
+    private void HandleLock(string name)
+    {
+        try
+        {
+            VolumeSvc.Lock(name);
+            RefreshList();
+        }
+        catch (VolumeException ex)
+        {
+            // UI 上は既にマウントされていないので何もしない
+        }
+    }
+}
