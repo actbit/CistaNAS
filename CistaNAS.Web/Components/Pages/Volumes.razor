@@ -2,8 +2,10 @@
 @using CistaNAS.Web.Components.Auth
 @using CistaNAS.Web.Models
 @using CistaNAS.Web.Services
+@using CistaNAS.Web.Volume
 @inject AuthenticationStateService AuthState
 @inject VolumeService VolumeSvc
+@inject E2eeInterop E2ee
 @inject NavigationManager Nav
 
 <PageTitle>ボリューム - CistaNAS</PageTitle>
@@ -30,12 +32,44 @@ else
                 </div>
                 @if (_createModel.Encrypted)
                 {
-                    <div class="alert alert-info">
-                        ユーザー <strong>@CurrentUsername</strong> の認証情報でマスター鍵を暗号化します。
+                    <div class="mb-3">
+                        <label class="form-label">暗号化方式</label>
+                        <div class="form-check">
+                            <input type="radio" class="form-check-input" name="encMode" id="encServer"
+                                   checked="@(_createModel.EncryptionMode == "server")"
+                                   @onchange="@(() => _createModel.EncryptionMode = "server")" />
+                            <label class="form-check-label" for="encServer">
+                                サーバー暗号化（AES-XTS）
+                            </label>
+                        </div>
+                        <div class="form-check">
+                            <input type="radio" class="form-check-input" name="encMode" id="encE2ee"
+                                   checked="@(_createModel.EncryptionMode == "e2ee")"
+                                   @onchange="@(() => _createModel.EncryptionMode = "e2ee")" />
+                            <label class="form-check-label" for="encE2ee">
+                                E2EE（エンドツーエンド暗号化）
+                            </label>
+                        </div>
                     </div>
+                }
+                @if (_createModel.Encrypted)
+                {
                     <div class="mb-3">
                         <label class="form-label">パスワード（確認用）</label>
                         <InputText type="password" @bind-Value="_createModel.Password" class="form-control" />
+                    </div>
+                }
+                @if (_createModel.Encrypted && _createModel.EncryptionMode == "e2ee")
+                {
+                    <div class="alert alert-info">
+                        <strong>E2EE ボリューム</strong>: マスターキーはブラウザ内で生成され、サーバーには送信されません。
+                        パスワードを紛失するとデータを復旧できません。
+                    </div>
+                }
+                else if (_createModel.Encrypted)
+                {
+                    <div class="alert alert-info">
+                        ユーザー <strong>@CurrentUsername</strong> の認証情報でマスター鍵を暗号化します。
                     </div>
                 }
                 <button type="submit" class="btn btn-success" disabled="@_isCreating">
@@ -73,7 +107,20 @@ else
                 {
                     <tr>
                         <td>@v.Name</td>
-                        <td>@(v.Encrypted ? "あり" : "なし")</td>
+                        <td>
+                            @if (v.EncryptionMode == "e2ee")
+                            {
+                                <span class="badge bg-info">E2EE</span>
+                            }
+                            else if (v.Encrypted)
+                            {
+                                <span class="badge bg-primary">サーバー</span>
+                            }
+                            else
+                            {
+                                <span class="badge bg-secondary">なし</span>
+                            }
+                        </td>
                         <td>@v.OwnerUser</td>
                         <td>@(v.AuthorizedUsers.Count > 1 ? $"{v.AuthorizedUsers.Count} ユーザー" : "-")</td>
                         <td>
@@ -95,7 +142,7 @@ else
                             }
                             else
                             {
-                                <button class="btn btn-sm btn-outline-primary me-1" @onclick="() => ShowMountDialog(v.Name, v.Encrypted)">マウント</button>
+                                <button class="btn btn-sm btn-outline-primary me-1" @onclick="() => ShowMountDialog(v.Name, v.Encrypted, v.EncryptionMode)">マウント</button>
                             }
                             @if (v.OwnerUser == CurrentUsername && v.Encrypted)
                             {
@@ -118,7 +165,17 @@ else
                         <button type="button" class="btn-close" @onclick="CloseMountDialog"></button>
                     </div>
                     <div class="modal-body">
-                        @if (_mountNeedsPassword)
+                        @if (_mountIsE2ee)
+                        {
+                            <div class="alert alert-warning">
+                                E2EE ボリュームです。パスワードを入力するとブラウザ内でマスターキーが導出されます。
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">パスワード</label>
+                                <input type="password" class="form-control" @bind="_mountPassword" />
+                            </div>
+                        }
+                        else if (_mountNeedsPassword)
                         {
                             <div class="mb-3">
                                 <label class="form-label">パスワード</label>
@@ -136,7 +193,9 @@ else
                     </div>
                     <div class="modal-footer">
                         <button type="button" class="btn btn-secondary" @onclick="CloseMountDialog">キャンセル</button>
-                        <button type="button" class="btn btn-primary" @onclick="HandleMount">マウント</button>
+                        <button type="button" class="btn btn-primary" disabled="@_isMounting" @onclick="HandleMount">
+                            @(_isMounting ? "マウント中..." : "マウント")
+                        </button>
                     </div>
                 </div>
             </div>
@@ -200,6 +259,8 @@ else
 
     private string? _mountTarget;
     private bool _mountNeedsPassword;
+    private bool _mountIsE2ee;
+    private bool _isMounting;
     private string _mountPassword = "";
     private string? _mountError;
 
@@ -215,6 +276,7 @@ else
         public string Name { get; set; } = "";
         public string Password { get; set; } = "";
         public bool Encrypted { get; set; } = true;
+        public string EncryptionMode { get; set; } = "server";
     }
 
     private string CurrentUsername => AuthState.User?.Identity?.Name ?? "";
@@ -222,34 +284,79 @@ else
     protected override void OnInitialized() => RefreshList();
     private void RefreshList() => _volumes = VolumeSvc.ListForUser(CurrentUsername).ToList();
 
-    private void HandleCreate()
+    private async Task HandleCreate()
     {
         _isCreating = true; _createError = null;
         try
         {
-            VolumeSvc.Create(_createModel.Name, CurrentUsername, _createModel.Password, _createModel.Encrypted);
+            if (_createModel.Encrypted && _createModel.EncryptionMode == "e2ee")
+            {
+                await HandleCreateE2ee();
+            }
+            else
+            {
+                VolumeSvc.Create(_createModel.Name, CurrentUsername, _createModel.Password, _createModel.Encrypted);
+            }
             _createModel = new() { Encrypted = true };
             RefreshList();
         }
-        catch (VolumeException ex) { _createError = ex.Message; }
+        catch (Exception ex) { _createError = ex.Message; }
         _isCreating = false;
     }
 
-    private void ShowMountDialog(string name, bool encrypted)
+    private async Task HandleCreateE2ee()
     {
-        _mountTarget = name; _mountNeedsPassword = encrypted;
-        _mountPassword = ""; _mountError = null;
+        // クライアント側で KEK 導出 → マスターキー生成 → ラップ
+        byte[] salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
+        string saltB64 = Convert.ToBase64String(salt);
+        string kekHandle = await E2ee.DeriveKek(_createModel.Password, saltB64, 310_000);
+        string mkHandle = await E2ee.GenerateMasterKey();
+        var (nonceB64, ctB64, tagB64) = await E2ee.WrapMasterKey(mkHandle, kekHandle);
+        await E2ee.ClearKey(kekHandle);
+        await E2ee.ClearKey(mkHandle);
+
+        var wrappedKey = new VolumeHeader.UserWrappedKey
+        {
+            Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = 310_000, Salt = salt },
+            WrappedMasterKey = new()
+            {
+                Algorithm = "aes-256-gcm",
+                Nonce = Convert.FromBase64String(nonceB64),
+                Ciphertext = Convert.FromBase64String(ctB64),
+                Tag = Convert.FromBase64String(tagB64),
+            },
+        };
+
+        VolumeSvc.CreateE2ee(_createModel.Name, CurrentUsername, wrappedKey);
+    }
+
+    private void ShowMountDialog(string name, bool encrypted, string encryptionMode)
+    {
+        _mountTarget = name;
+        _mountNeedsPassword = encrypted;
+        _mountIsE2ee = encryptionMode == "e2ee";
+        _mountPassword = ""; _mountError = null; _isMounting = false;
     }
     private void CloseMountDialog() { _mountTarget = null; _mountError = null; }
 
-    private void HandleMount()
+    private async Task HandleMount()
     {
+        _isMounting = true; _mountError = null;
         try
         {
-            VolumeSvc.Mount(_mountTarget!, CurrentUsername, _mountNeedsPassword ? _mountPassword : null);
+            if (_mountIsE2ee)
+            {
+                // E2EE: サーバー側でマウント（アクセス権チェックのみ）
+                VolumeSvc.MountE2ee(_mountTarget!, CurrentUsername);
+            }
+            else
+            {
+                VolumeSvc.Mount(_mountTarget!, CurrentUsername, _mountNeedsPassword ? _mountPassword : null);
+            }
             CloseMountDialog(); RefreshList();
         }
         catch (VolumeException ex) { _mountError = ex.Message; }
+        _isMounting = false;
     }
 
     private void HandleLock(string name)

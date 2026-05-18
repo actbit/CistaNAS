@@ -62,6 +62,7 @@ builder.Services.AddScoped<WebDavHandler>();
 
 // ---- E2EE ----
 builder.Services.AddScoped<E2eeFileService>();
+builder.Services.AddScoped<E2eeInterop>();
 
 // ---- Blazor (Interactive Server rendering) ----
 builder.Services.AddRazorComponents()

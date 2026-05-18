@@ -272,7 +272,7 @@ public sealed class VolumeService
 
     private static VolumeInfo ToInfo(string name, VolumeHeader h, bool mounted) => new(
         name, mounted, h.Encrypted, h.OwnerUser, h.CreatedAt,
-        h.UserKeys.Keys.ToList());
+        h.UserKeys.Keys.ToList(), h.EncryptionMode);
 
     private string VolumeDir(string name) => Path.Combine(_dataRoot, name);
     private string GetDataPath(string name) => Path.Combine(VolumeDir(name), "volume.dat");
