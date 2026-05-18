@@ -13,11 +13,13 @@ public sealed class WebDavHandler
 {
     private readonly VolumeService _volumeService;
     private readonly FileService _fileService;
+    private readonly E2eeFileService _e2eeFileService;
 
-    public WebDavHandler(VolumeService volumeService, FileService fileService)
+    public WebDavHandler(VolumeService volumeService, FileService fileService, E2eeFileService e2eeFileService)
     {
         _volumeService = volumeService;
         _fileService = fileService;
+        _e2eeFileService = e2eeFileService;
     }
 
     private static string? GetUsername(HttpContext ctx) => ctx.User.Identity?.Name;
@@ -28,6 +30,16 @@ public sealed class WebDavHandler
         string? username = GetUsername(ctx);
         if (username is null) return false;
         return _volumeService.HasAccess(volumeName, username);
+    }
+
+    private bool IsE2ee(string volumeName)
+    {
+        try
+        {
+            var (_, header) = _volumeService.GetMounted(volumeName);
+            return header.IsE2ee;
+        }
+        catch { return false; }
     }
 
     // ---- OPTIONS ----
@@ -49,6 +61,10 @@ public sealed class WebDavHandler
             ctx.Response.StatusCode = 400;
             return ctx.Response.WriteAsJsonAsync(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
         }
+
+        // E2EE ボリュームの場合は opaque なファイル一覧を返す
+        if (IsE2ee(volumeName))
+            return PropFindE2ee(volumeName, path, ctx);
 
         int depth = WebDavXml.ParseDepth(depthHeader);
         var files = _fileService.List(volumeName).Files;
@@ -241,5 +257,37 @@ public sealed class WebDavHandler
             }
         }
         return result;
+    }
+
+    // ---- E2EE 対応 ----
+
+    private Task PropFindE2ee(string volumeName, string path, HttpContext ctx)
+    {
+        var e2eeFiles = _e2eeFileService.ListFiles(volumeName).Files;
+        var resources = new List<WebDavResource>();
+
+        resources.Add(new WebDavResource
+        {
+            Path = NormalizePath(path),
+            IsCollection = true,
+            LastModified = DateTimeOffset.UtcNow,
+        });
+
+        foreach (var f in e2eeFiles)
+        {
+            resources.Add(new WebDavResource
+            {
+                Path = f.EncryptedName,
+                IsCollection = false,
+                Size = f.EncryptedLength,
+                LastModified = f.ModifiedAt,
+            });
+        }
+
+        string baseUrl = $"/dav/{Uri.EscapeDataString(volumeName)}";
+        string xml = WebDavXml.BuildMultiStatus(resources, baseUrl);
+        ctx.Response.StatusCode = 207;
+        ctx.Response.ContentType = "application/xml; charset=utf-8";
+        return ctx.Response.WriteAsync(xml);
     }
 }

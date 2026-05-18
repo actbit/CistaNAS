@@ -44,6 +44,27 @@ public sealed class VolumeService
         return ToInfo(name, header, true);
     }
 
+    /// <summary>E2EE ボリュームを作成（クライアントから wrappedMasterKey を受け取る）。</summary>
+    public VolumeInfo CreateE2ee(string name, string username, VolumeHeader.UserWrappedKey wrappedKey, int chunkSize = 1048576)
+    {
+        ValidateName(name);
+        ArgumentException.ThrowIfNullOrEmpty(username);
+
+        string dir = VolumeDir(name);
+        if (Directory.Exists(dir))
+            throw new VolumeException($"ボリューム '{name}' は既に存在します。");
+
+        var header = VolumeHeader.CreateE2ee(name, username, wrappedKey, chunkSize);
+
+        Directory.CreateDirectory(dir);
+        header.Save(Path.Combine(dir, VolumeHeader.FileName));
+        File.Create(GetDataPath(name)).Dispose();
+        // E2EE: サーバーはマスターキーを持たない。raw FileStream でマウント。
+        MountInternal(name, header, masterKey: null);
+
+        return ToInfo(name, header, true);
+    }
+
     public VolumeInfo Mount(string name, string username, string? password)
     {
         if (_mounted.ContainsKey(name))
@@ -61,6 +82,37 @@ public sealed class VolumeService
 
         MountInternal(name, header, masterKey);
         return ToInfo(name, header, true);
+    }
+
+    /// <summary>E2EE ボリュームをマウント（アクセス権チェックのみ、鍵アンラップなし）。</summary>
+    public VolumeInfo MountE2ee(string name, string username)
+    {
+        if (_mounted.ContainsKey(name))
+            throw new VolumeException($"ボリューム '{name}' は既にマウントされています。");
+
+        var header = LoadHeaderOrThrow(name);
+        if (!header.IsE2ee)
+            throw new VolumeException($"ボリューム '{name}' は E2EE ボリュームではありません。");
+        if (!header.HasUserAccess(username))
+            throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
+
+        // E2EE: マスターキーなしで raw FileStream マウント
+        MountInternal(name, header, masterKey: null);
+        return ToInfo(name, header, true);
+    }
+
+    /// <summary>E2EE ボリュームに wrapped key を追加（クライアント側で再ラップ済み）。</summary>
+    public void AddE2eeWrappedKey(string volumeName, string granterUsername, string targetUsername, VolumeHeader.UserWrappedKey wrappedKey)
+    {
+        var header = LoadHeaderOrThrow(volumeName);
+        if (!header.IsE2ee)
+            throw new VolumeException($"ボリューム '{volumeName}' は E2EE ボリュームではありません。");
+        if (header.OwnerUser != granterUsername)
+            throw new VolumeException("オーナーのみがアクセス権を付与できます。");
+        if (!header.HasUserAccess(targetUsername))
+            header.AddWrappedKey(targetUsername, wrappedKey);
+        header.Save(GetHeaderPath(volumeName));
+        RefreshMountedHeader(volumeName, header);
     }
 
     public void Lock(string name)
@@ -188,7 +240,9 @@ public sealed class VolumeService
 
     private void MountInternal(string name, VolumeHeader header, byte[]? masterKey)
     {
-        var fs = new FileStream(GetDataPath(name), FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        // E2EE はサーバー側で暗号化しないため、FileStream を排他保持しない
+        var share = header.IsE2ee ? FileShare.ReadWrite : FileShare.None;
+        var fs = new FileStream(GetDataPath(name), FileMode.Open, FileAccess.ReadWrite, share);
         Stream stream = (header.Encrypted && masterKey is not null)
             ? new AesXtsStream(fs, masterKey, header.SectorSize, fs.Length, writable: true)
             : fs;

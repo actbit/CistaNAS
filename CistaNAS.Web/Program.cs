@@ -60,6 +60,9 @@ builder.Services.AddCistaNasServices();
 // ---- WebDAV ----
 builder.Services.AddScoped<WebDavHandler>();
 
+// ---- E2EE ----
+builder.Services.AddScoped<E2eeFileService>();
+
 // ---- Blazor (Interactive Server rendering) ----
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();

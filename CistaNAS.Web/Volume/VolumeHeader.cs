@@ -25,6 +25,12 @@ public sealed class VolumeHeader
     public bool Encrypted { get; set; } = true;
     public int SectorSize { get; set; }
 
+    /// <summary>"server" (サーバー側 AES-XTS) or "e2ee" (クライアント側暗号化)。</summary>
+    public string EncryptionMode { get; set; } = "server";
+
+    /// <summary>E2EE チャンクサイズ（バイト）。EncryptionMode が "e2ee" の場合のみ使用。</summary>
+    public int ChunkSize { get; set; } = 1048576;
+
     /// <summary>ボリュームの作成者（削除不可）。</summary>
     public string OwnerUser { get; set; } = "";
 
@@ -51,6 +57,33 @@ public sealed class VolumeHeader
         public byte[] Ciphertext { get; set; } = [];
         public byte[] Tag { get; set; } = [];
     }
+
+    /// <summary>
+    /// E2EE ボリュームを作成。マスターキーはクライアントで生成・ラップ済み。
+    /// </summary>
+    public static VolumeHeader CreateE2ee(
+        string name, string username, UserWrappedKey wrappedKey, int chunkSize)
+    {
+        return new VolumeHeader
+        {
+            Name = name,
+            CreatedAt = DateTimeOffset.UtcNow,
+            Encrypted = true,
+            EncryptionMode = "e2ee",
+            ChunkSize = chunkSize,
+            SectorSize = 0,
+            OwnerUser = username,
+            UserKeys = { [username] = wrappedKey },
+        };
+    }
+
+    /// <summary>E2EE ボリュームにユーザーの wrapped key を追加（クライアント側で再ラップ済み）。</summary>
+    public void AddWrappedKey(string username, UserWrappedKey wrappedKey)
+    {
+        UserKeys[username] = wrappedKey;
+    }
+
+    public bool IsE2ee => EncryptionMode == "e2ee";
 
     /// <summary>
     /// KEK 導出: PBKDF2-SHA256(password, SHA256(username) || salt, iterations, 32)

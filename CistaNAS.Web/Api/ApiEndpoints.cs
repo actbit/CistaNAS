@@ -158,6 +158,9 @@ public static class ApiEndpoints
         })
         .WithName("DeleteFile");
 
+        // ---- E2EE ----
+        api.MapE2eeApi();
+
         return api;
     }
 }

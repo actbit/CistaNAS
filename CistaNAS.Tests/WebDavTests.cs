@@ -27,7 +27,8 @@ public class WebDavTests : IDisposable
         var io = Options.Create(opt);
         _volumeService = new VolumeService(io);
         _fileService = new FileService(_volumeService, new JournalService(io), io);
-        _handler = new WebDavHandler(_volumeService, _fileService);
+        var e2eeFs = new E2eeFileService(_volumeService, io);
+        _handler = new WebDavHandler(_volumeService, _fileService, e2eeFs);
     }
 
     private DefaultHttpContext NewContext(string username = "testuser")
