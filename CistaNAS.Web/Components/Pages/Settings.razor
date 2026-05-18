@@ -1,8 +1,11 @@
 @page "/settings"
 @using CistaNAS.Web.Components.Auth
+@using CistaNAS.Web.Configuration
+@using CistaNAS.Web.Models
 @using CistaNAS.Web.Services
 @inject AuthenticationStateService AuthState
 @inject AuthService Auth
+@inject UserStore Users
 @inject NavigationManager Nav
 
 <PageTitle>設定 - CistaNAS</PageTitle>
@@ -15,47 +18,168 @@ else
 {
     <h1>設定</h1>
 
-    <div class="card" style="max-width:500px">
+    <!-- パスワード変更 -->
+    <div class="card mb-4" style="max-width:500px">
         <div class="card-header">パスワード変更</div>
         <div class="card-body">
-            @if (_success)
+            @if (_passwordSuccess)
             {
                 <div class="alert alert-success">パスワードを変更しました。再度ログインしてください。</div>
                 <button class="btn btn-primary" @onclick="HandleLogout">ログイン画面へ</button>
             }
             else
             {
-                @if (_error is not null)
+                @if (_passwordError is not null)
                 {
-                    <div class="alert alert-danger">@_error</div>
+                    <div class="alert alert-danger">@_passwordError</div>
                 }
-                <EditForm Model="_model" OnValidSubmit="HandleChangePassword" FormName="ChangePasswordForm">
+                <EditForm Model="_pwModel" OnValidSubmit="HandleChangePassword" FormName="ChangePasswordForm">
                     <div class="mb-3">
                         <label class="form-label">現在のパスワード</label>
-                        <InputText type="password" @bind-Value="_model.OldPassword" class="form-control" />
+                        <InputText type="password" @bind-Value="_pwModel.OldPassword" class="form-control" />
                     </div>
                     <div class="mb-3">
                         <label class="form-label">新しいパスワード</label>
-                        <InputText type="password" @bind-Value="_model.NewPassword" class="form-control" />
+                        <InputText type="password" @bind-Value="_pwModel.NewPassword" class="form-control" />
                     </div>
                     <div class="mb-3">
                         <label class="form-label">新しいパスワード（確認）</label>
-                        <InputText type="password" @bind-Value="_model.ConfirmPassword" class="form-control" />
+                        <InputText type="password" @bind-Value="_pwModel.ConfirmPassword" class="form-control" />
                     </div>
-                    <button type="submit" class="btn btn-primary" disabled="@_isLoading">
-                        @(_isLoading ? "変更中..." : "変更")
+                    <button type="submit" class="btn btn-primary" disabled="@_pwLoading">
+                        @(_pwLoading ? "変更中..." : "変更")
                     </button>
                 </EditForm>
             }
         </div>
     </div>
+
+    <!-- ユーザー管理 -->
+    <div class="card mb-4">
+        <div class="card-header">ユーザー管理</div>
+        <div class="card-body">
+            <table class="table table-sm table-striped">
+                <thead>
+                    <tr>
+                        <th>ユーザー名</th>
+                        <th>ロール</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var u in _users)
+                    {
+                        <tr>
+                            <td>@u.Username</td>
+                            <td><span class="badge bg-primary">@u.Role</span></td>
+                            <td>
+                                @if (u.Username != CurrentUsername)
+                                {
+                                    <button class="btn btn-sm btn-outline-danger"
+                                            @onclick="() => HandleDeleteUser(u.Username)">
+                                        削除
+                                    </button>
+                                }
+                                else
+                                {
+                                    <span class="text-muted">自分</span>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+
+            <hr />
+            <h6>ユーザー追加</h6>
+            @if (_userError is not null)
+            {
+                <div class="alert alert-danger">@_userError</div>
+            }
+            @if (_userSuccess)
+            {
+                <div class="alert alert-success">ユーザーを追加しました。</div>
+            }
+            <div class="row g-2 align-items-end" style="max-width:500px">
+                <div class="col">
+                    <label class="form-label">ユーザー名</label>
+                    <input class="form-control" @bind="_newUsername" />
+                </div>
+                <div class="col">
+                    <label class="form-label">パスワード</label>
+                    <input type="password" class="form-control" @bind="_newPassword" />
+                </div>
+                <div class="col-auto">
+                    <button class="btn btn-success" @onclick="HandleAddUser">追加</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 暗号化設定 -->
+    <div class="card mb-4">
+        <div class="card-header">暗号化設定</div>
+        <div class="card-body">
+            <div class="row g-3" style="max-width:500px">
+                <div class="col-12">
+                    <label class="form-label">デフォルト暗号化モード（新規ボリューム作成時）</label>
+                    <select class="form-select" @bind="_encSettings.DefaultEncryptionMode">
+                        <option value="server">サーバー暗号化（AES-XTS）</option>
+                        <option value="e2ee">E2EE（エンドツーエンド暗号化）</option>
+                        <option value="none">暗号化なし</option>
+                    </select>
+                    <div class="form-text">
+                        新規ボリューム作成時の初期値。ボリュームごとに個別に変更可能。
+                    </div>
+                </div>
+                <div class="col-12">
+                    <label class="form-label">E2EE チャンクサイズ</label>
+                    <select class="form-select" @bind="_encSettings.E2eeChunkSize">
+                        <option value="262144">256 KB</option>
+                        <option value="524288">512 KB</option>
+                        <option value="1048576">1 MB（推奨）</option>
+                        <option value="4194304">4 MB</option>
+                    </select>
+                    <div class="form-text">
+                        E2EE ボリュームのチャンク分割サイズ。小さいほどストリーミングに有利、大きいほどオーバーヘッドが少ない。
+                    </div>
+                </div>
+                <div class="col-12">
+                    <label class="form-label">PBKDF2 反復回数（ボリューム鍵導出）</label>
+                    <input type="number" class="form-control" @bind="_encSettings.KdfIterations" min="10000" step="10000" />
+                    <div class="form-text">
+                        現在の設定: @_encSettings.KdfIterations.ToString("N0")。高いほど安全だが遅い。
+                    </div>
+                </div>
+                <div class="col-12">
+                    <label class="form-label">セクタサイズ（AES-XTS）</label>
+                    <select class="form-select" @bind="_encSettings.SectorSize">
+                        <option value="512">512 B</option>
+                        <option value="4096">4 KB（推奨）</option>
+                    </select>
+                </div>
+            </div>
+            @if (_encSaveSuccess)
+            {
+                <div class="alert alert-success mt-3">設定を保存しました。</div>
+            }
+            @if (_encError is not null)
+            {
+                <div class="alert alert-danger mt-3">@_encError</div>
+            }
+            <button class="btn btn-primary mt-3" @onclick="HandleSaveEncryption">保存</button>
+        </div>
+    </div>
 }
 
 @code {
-    private ChangeModel _model = new();
-    private bool _isLoading;
-    private bool _success;
-    private string? _error;
+    private string CurrentUsername => AuthState.User?.Identity?.Name ?? "";
+
+    // パスワード変更
+    private ChangeModel _pwModel = new();
+    private bool _pwLoading;
+    private bool _passwordSuccess;
+    private string? _passwordError;
 
     private sealed class ChangeModel
     {
@@ -64,29 +188,54 @@ else
         public string ConfirmPassword { get; set; } = "";
     }
 
+    // ユーザー管理
+    private IReadOnlyList<UserAccount> _users = [];
+    private string _newUsername = "";
+    private string _newPassword = "";
+    private string? _userError;
+    private bool _userSuccess;
+
+    // 暗号化設定
+    private EncSettingsModel _encSettings = new();
+    private bool _encSaveSuccess;
+    private string? _encError;
+
+    private sealed class EncSettingsModel
+    {
+        public string DefaultEncryptionMode { get; set; } = "server";
+        public int E2eeChunkSize { get; set; } = 1048576;
+        public int KdfIterations { get; set; } = 310_000;
+        public int SectorSize { get; set; } = 4096;
+    }
+
+    protected override void OnInitialized()
+    {
+        RefreshUsers();
+        LoadEncryptionSettings();
+    }
+
+    private void RefreshUsers()
+    {
+        _users = Users.ListUsers();
+    }
+
+    // ---- パスワード変更 ----
+
     private void HandleChangePassword()
     {
-        if (_model.NewPassword != _model.ConfirmPassword)
+        if (_pwModel.NewPassword != _pwModel.ConfirmPassword)
         {
-            _error = "パスワードが一致しません。";
+            _passwordError = "パスワードが一致しません。";
             return;
         }
 
-        _isLoading = true;
-        _error = null;
+        _pwLoading = true;
+        _passwordError = null;
 
-        string username = AuthState.User?.Identity?.Name ?? "";
-        bool ok = Auth.ChangePassword(username, _model.OldPassword, _model.NewPassword);
-
-        if (ok)
-        {
-            _success = true;
-        }
-        else
-        {
-            _error = "現在のパスワードが正しくありません。";
-        }
-        _isLoading = false;
+        bool ok = Auth.ChangePassword(CurrentUsername, _pwModel.OldPassword, _pwModel.NewPassword);
+        if (ok) _passwordSuccess = true;
+        else _passwordError = "現在のパスワードが正しくありません。";
+        _pwLoading = false;
     }
 
     private void HandleLogout()
@@ -94,4 +243,114 @@ else
         AuthState.Logout();
         Nav.NavigateTo("/login", forceLoad: false);
     }
+
+    // ---- ユーザー管理 ----
+
+    private void HandleAddUser()
+    {
+        _userError = null; _userSuccess = false;
+        try
+        {
+            Users.CreateUser(_newUsername.Trim(), _newPassword, role: "admin");
+            _newUsername = ""; _newPassword = "";
+            _userSuccess = true;
+            RefreshUsers();
+        }
+        catch (Exception ex) { _userError = ex.Message; }
+    }
+
+    private void HandleDeleteUser(string username)
+    {
+        _userError = null;
+        try
+        {
+            Users.DeleteUser(username);
+            RefreshUsers();
+        }
+        catch (Exception ex) { _userError = ex.Message; }
+    }
+
+    // ---- 暗号化設定 ----
+
+    private void LoadEncryptionSettings()
+    {
+        // appsettings.json から直接読み込み（DI 経由だと読み取り専用のため）
+        try
+        {
+            string path = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+            if (!File.Exists(path)) return;
+            using var fs = File.OpenRead(path);
+            var doc = System.Text.Json.JsonDocument.Parse(fs);
+            var nas = doc.RootElement.GetProperty("CistaNas");
+
+            if (nas.TryGetProperty("Volume", out var vol))
+            {
+                if (vol.TryGetProperty("DefaultEncryptionMode", out var mode))
+                    _encSettings.DefaultEncryptionMode = mode.GetString() ?? "server";
+                if (vol.TryGetProperty("E2eeChunkSize", out var cs))
+                    _encSettings.E2eeChunkSize = cs.GetInt32();
+                if (vol.TryGetProperty("KdfIterations", out var ki))
+                    _encSettings.KdfIterations = ki.GetInt32();
+                if (vol.TryGetProperty("SectorSize", out var ss))
+                    _encSettings.SectorSize = ss.GetInt32();
+            }
+        }
+        catch { }
+    }
+
+    private void HandleSaveEncryption()
+    {
+        _encSaveSuccess = false; _encError = null;
+        try
+        {
+            string path = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+            System.Text.Json.JsonElement root;
+            if (File.Exists(path))
+            {
+                using (var fs = File.OpenRead(path))
+                    root = System.Text.Json.JsonDocument.Parse(fs).RootElement.Clone();
+            }
+            else
+            {
+                root = System.Text.Json.JsonDocument.Parse("{}").RootElement.Clone();
+            }
+
+            // JSON を構築して保存
+            var dict = new Dictionary<string, object>();
+            foreach (var prop in root.EnumerateObject())
+                dict[prop.Name] = DeserializeElement(prop.Value);
+
+            if (!dict.ContainsKey("CistaNas"))
+                dict["CistaNas"] = new Dictionary<string, object>();
+
+            var nasDict = (Dictionary<string, object>)dict["CistaNas"];
+            if (!nasDict.ContainsKey("Volume"))
+                nasDict["Volume"] = new Dictionary<string, object>();
+
+            var volDict = (Dictionary<string, object>)nasDict["Volume"];
+            volDict["DefaultEncryptionMode"] = _encSettings.DefaultEncryptionMode;
+            volDict["E2eeChunkSize"] = _encSettings.E2eeChunkSize;
+            volDict["KdfIterations"] = _encSettings.KdfIterations;
+            volDict["SectorSize"] = _encSettings.SectorSize;
+
+            var options = new System.Text.Json.JsonSerializerOptions { WriteIndented = true };
+            string json = System.Text.Json.JsonSerializer.Serialize(dict, options);
+            File.WriteAllText(path, json);
+
+            _encSaveSuccess = true;
+        }
+        catch (Exception ex) { _encError = $"保存エラー: {ex.Message}"; }
+    }
+
+    private static object DeserializeElement(System.Text.Json.JsonElement el) => el.ValueKind switch
+    {
+        System.Text.Json.JsonValueKind.Object => el.EnumerateObject()
+            .ToDictionary(p => p.Name, p => DeserializeElement(p.Value)),
+        System.Text.Json.JsonValueKind.Array => el.EnumerateArray().Select(DeserializeElement).ToList(),
+        System.Text.Json.JsonValueKind.String => el.GetString()!,
+        System.Text.Json.JsonValueKind.Number => el.TryGetInt32(out var i) ? i : el.GetDouble(),
+        System.Text.Json.JsonValueKind.True => true,
+        System.Text.Json.JsonValueKind.False => false,
+        _ => "",
+    };
 }

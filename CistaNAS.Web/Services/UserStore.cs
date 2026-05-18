@@ -46,6 +46,64 @@ public sealed class UserStore
         }
     }
 
+    public IReadOnlyList<UserAccount> ListUsers()
+    {
+        lock (_gate) { return _users.ToList(); }
+    }
+
+    public void CreateUser(string username, string password, string role = "user")
+    {
+        lock (_gate)
+        {
+            if (_users.Any(u => string.Equals(u.Username, username, StringComparison.Ordinal)))
+                throw new InvalidOperationException($"ユーザー '{username}' は既に存在します。");
+            ArgumentException.ThrowIfNullOrEmpty(username);
+            ArgumentException.ThrowIfNullOrEmpty(password);
+
+            _users.Add(new UserAccount
+            {
+                Username = username,
+                PasswordHash = PasswordHasher.Hash(password, _pbkdf2Iterations),
+                Role = role,
+            });
+            Save();
+        }
+    }
+
+    public void DeleteUser(string username)
+    {
+        lock (_gate)
+        {
+            var user = _users.FirstOrDefault(u => string.Equals(u.Username, username, StringComparison.Ordinal));
+            if (user is null)
+                throw new InvalidOperationException($"ユーザー '{username}' が見つかりません。");
+
+            _users.Remove(user);
+            Save();
+        }
+    }
+
+    public void UpdateRole(string username, string newRole)
+    {
+        lock (_gate)
+        {
+            var user = _users.FirstOrDefault(u => string.Equals(u.Username, username, StringComparison.Ordinal));
+            if (user is null)
+                throw new InvalidOperationException($"ユーザー '{username}' が見つかりません。");
+
+            user.Role = newRole;
+            Save();
+        }
+    }
+
+    public bool IsAdmin(string username)
+    {
+        lock (_gate)
+        {
+            return _users.FirstOrDefault(u => string.Equals(u.Username, username, StringComparison.Ordinal))?.Role == "admin";
+        }
+    }
+
     /// <summary>セットアップウィザードから初期管理者を作成。</summary>
     public void CreateInitialAdmin(string username, string password)
     {

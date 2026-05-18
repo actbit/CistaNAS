@@ -47,4 +47,10 @@ public sealed class VolumeOptions
 
     /// <summary>ボリュームパスワードからマスター鍵を導出する際の PBKDF2 反復回数。</summary>
     public int KdfIterations { get; set; } = 310_000;
+
+    /// <summary>新規ボリューム作成時のデフォルト暗号化モード。"server" | "e2ee" | "none"。</summary>
+    public string DefaultEncryptionMode { get; set; } = "server";
+
+    /// <summary>E2EE ボリュームのデフォルトチャンクサイズ（バイト）。</summary>
+    public int E2eeChunkSize { get; set; } = 1048576;
 }
