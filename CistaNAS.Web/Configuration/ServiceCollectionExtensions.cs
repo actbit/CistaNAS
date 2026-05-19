@@ -18,6 +18,7 @@ public static class ServiceCollectionExtensions
 
         // グループ
         services.AddSingleton<GroupStore>();       // groups.json
+        services.AddSingleton<InvitationService>(); // 招待URL（in-memory）
 
         // ボリューム（Task #4）
         services.AddSingleton<VolumeService>();    // Singleton: マウント状態保持
