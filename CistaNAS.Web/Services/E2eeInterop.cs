@@ -101,4 +101,89 @@ public sealed class E2eeInterop(IJSRuntime js)
         var mod = await GetModule();
         return await mod.InvokeAsync<string>("generateFileSalt");
     }
+
+    // ---- ECDH key pair management ----
+
+    public async Task<(string PublicKeyHandle, string PrivateKeyHandle)> GenerateKeyPair()
+    {
+        var mod = await GetModule();
+        var result = await mod.InvokeAsync<JsonElement>("generateKeyPair");
+        return (result.GetProperty("publicKeyHandle").GetString()!,
+                result.GetProperty("privateKeyHandle").GetString()!);
+    }
+
+    public async Task<string> ExportPublicKey(string publicKeyHandle)
+    {
+        var mod = await GetModule();
+        return await mod.InvokeAsync<string>("exportPublicKey", publicKeyHandle);
+    }
+
+    public async Task<(string Nonce, string Wrapped)> EncryptPrivateKey(
+        string privateKeyHandle, string password, string saltBase64, int iterations)
+    {
+        var mod = await GetModule();
+        var result = await mod.InvokeAsync<JsonElement>(
+            "encryptPrivateKey", privateKeyHandle, password, saltBase64, iterations);
+        return (result.GetProperty("nonce").GetString()!,
+                result.GetProperty("wrapped").GetString()!);
+    }
+
+    public async Task<string> DecryptPrivateKey(
+        string wrappedBase64, string nonceBase64, string password, string saltBase64, int iterations)
+    {
+        var mod = await GetModule();
+        return await mod.InvokeAsync<string>(
+            "decryptPrivateKey", wrappedBase64, nonceBase64, password, saltBase64, iterations);
+    }
+
+    // ---- ECIES wrap/unwrap ----
+
+    public async Task<(string EphemeralPublicKey, string Nonce, string Ciphertext, string Tag)>
+        EcdhWrap(string masterKeyHandle, string recipientPublicKeyBase64)
+    {
+        var mod = await GetModule();
+        var result = await mod.InvokeAsync<JsonElement>("ecdhWrap", masterKeyHandle, recipientPublicKeyBase64);
+        return (
+            result.GetProperty("ephemeralPublicKey").GetString()!,
+            result.GetProperty("nonce").GetString()!,
+            result.GetProperty("ciphertext").GetString()!,
+            result.GetProperty("tag").GetString()!
+        );
+    }
+
+    public async Task<string> EcdhUnwrap(
+        string nonceBase64, string ciphertextBase64, string tagBase64,
+        string ephemeralPublicKeyBase64, string privateKeyHandle)
+    {
+        var mod = await GetModule();
+        return await mod.InvokeAsync<string>(
+            "ecdhUnwrap", nonceBase64, ciphertextBase64, tagBase64,
+            ephemeralPublicKeyBase64, privateKeyHandle);
+    }
+
+    // ---- Invitation key exchange ----
+
+    public async Task<string> DeriveInvitationKey(string secretBase64)
+    {
+        var mod = await GetModule();
+        return await mod.InvokeAsync<string>("deriveInvitationKey", secretBase64);
+    }
+
+    public async Task<(string Nonce, string Ciphertext)> EncryptForInvitation(
+        string dataBase64, string invitationKeyHandle)
+    {
+        var mod = await GetModule();
+        var result = await mod.InvokeAsync<JsonElement>(
+            "encryptForInvitation", dataBase64, invitationKeyHandle);
+        return (result.GetProperty("nonce").GetString()!,
+                result.GetProperty("ciphertext").GetString()!);
+    }
+
+    public async Task<string> DecryptFromInvitation(
+        string ciphertextBase64, string nonceBase64, string invitationKeyHandle)
+    {
+        var mod = await GetModule();
+        return await mod.InvokeAsync<string>(
+            "decryptFromInvitation", ciphertextBase64, nonceBase64, invitationKeyHandle);
+    }
 }
