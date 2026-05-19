@@ -16,6 +16,7 @@ public static class E2eeEndpoints
 
         e2ee.MapPost("/create-volume", CreateVolume);
         e2ee.MapPost("/{volumeName}/mount", Mount);
+        e2ee.MapGet("/{volumeName}/wrapped-key/{username}", GetWrappedKey);
         e2ee.MapPost("/{volumeName}/create-file", CreateFile);
         e2ee.MapPost("/{volumeName}/upload-chunk/{fileId}/{chunkIndex}", UploadChunk);
         e2ee.MapGet("/{volumeName}/download-chunk/{fileId}/{chunkIndex}", DownloadChunk);
@@ -68,6 +69,41 @@ public static class E2eeEndpoints
         {
             var info = volumeService.MountE2ee(volumeName, username);
             return Results.Ok(info);
+        }
+        catch (VolumeException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
+
+    private static IResult GetWrappedKey(string volumeName, string username, VolumeService vs)
+    {
+        try
+        {
+            var header = vs.GetVolumeHeader(volumeName);
+            if (!header.UserKeys.TryGetValue(username, out var key))
+                return Results.NotFound(new { error = "このユーザーの wrapped key が見つかりません。" });
+
+            return Results.Ok(new
+            {
+                wrapType = key.WrapType,
+                kdf = new
+                {
+                    algorithm = key.Kdf.Algorithm,
+                    iterations = key.Kdf.Iterations,
+                    salt = Convert.ToBase64String(key.Kdf.Salt),
+                },
+                wrappedMasterKey = new
+                {
+                    algorithm = key.WrappedMasterKey.Algorithm,
+                    nonce = Convert.ToBase64String(key.WrappedMasterKey.Nonce),
+                    ciphertext = Convert.ToBase64String(key.WrappedMasterKey.Ciphertext),
+                    tag = Convert.ToBase64String(key.WrappedMasterKey.Tag),
+                },
+                ephemeralPublicKey = key.EphemeralPublicKey is not null
+                    ? Convert.ToBase64String(key.EphemeralPublicKey) : null,
+                chunkSize = header.ChunkSize,
+            });
         }
         catch (VolumeException ex)
         {

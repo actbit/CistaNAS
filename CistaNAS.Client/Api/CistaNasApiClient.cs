@@ -65,6 +65,27 @@ public sealed class CistaNasApiClient
         res.EnsureSuccessStatusCode();
     }
 
+    public async Task<WrappedKeyInfo> GetWrappedKeyAsync(string volumeName, string username)
+    {
+        var res = await _http.GetAsync($"/api/v1/e2ee/{volumeName}/wrapped-key/{username}");
+        res.EnsureSuccessStatusCode();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+
+        var kdf = json.GetProperty("kdf");
+        var wk = json.GetProperty("wrappedMasterKey");
+
+        return new WrappedKeyInfo
+        {
+            KdfAlgorithm = kdf.GetProperty("algorithm").GetString()!,
+            KdfIterations = kdf.GetProperty("iterations").GetInt32(),
+            KdfSalt = Convert.FromBase64String(kdf.GetProperty("salt").GetString()!),
+            WrappedNonce = Convert.FromBase64String(wk.GetProperty("nonce").GetString()!),
+            WrappedCiphertext = Convert.FromBase64String(wk.GetProperty("ciphertext").GetString()!),
+            WrappedTag = Convert.FromBase64String(wk.GetProperty("tag").GetString()!),
+            ChunkSize = json.TryGetProperty("chunkSize", out var cs) ? cs.GetInt32() : 1048576,
+        };
+    }
+
     public async Task<string> CreateFileAsync(string volumeName, string encryptedName, long encryptedLength, int chunkCount)
     {
         var req = new { encryptedName, encryptedLength, chunkCount };
@@ -166,4 +187,15 @@ public class VolumeListItem
     public string EncryptionMode { get; set; } = "server";
     public bool IsMounted { get; set; }
     public string OwnerUser { get; set; } = "";
+}
+
+public class WrappedKeyInfo
+{
+    public required string KdfAlgorithm { get; set; }
+    public required int KdfIterations { get; set; }
+    public required byte[] KdfSalt { get; set; }
+    public required byte[] WrappedNonce { get; set; }
+    public required byte[] WrappedCiphertext { get; set; }
+    public required byte[] WrappedTag { get; set; }
+    public int ChunkSize { get; set; } = 1048576;
 }

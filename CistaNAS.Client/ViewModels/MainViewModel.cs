@@ -99,7 +99,7 @@ public partial class MainViewModel : ObservableObject
         try
         {
             await _api.MountAsync(SelectedVolume.Name);
-            await _mountService.MountAsync(SelectedVolume.Name, SelectedDriveLetter, _api, VolumePassword);
+            await _mountService.MountAsync(SelectedVolume.Name, SelectedDriveLetter, _api, Username, VolumePassword);
             StatusMessage = $"{SelectedVolume.Name} を {SelectedDriveLetter} にマウントしました。";
             ShowMountDialog = false;
             await RefreshVolumesAsync();

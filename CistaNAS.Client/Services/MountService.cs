@@ -10,16 +10,22 @@ public sealed class MountService
 {
     private readonly ConcurrentDictionary<string, MountedVolume> _mounted = new(StringComparer.Ordinal);
 
-    public async Task MountAsync(string volumeName, string driveLetter, CistaNasApiClient api, string password)
+    public async Task MountAsync(string volumeName, string driveLetter, CistaNasApiClient api,
+        string username, string password)
     {
         if (_mounted.ContainsKey(volumeName))
             throw new InvalidOperationException($"ボリューム '{volumeName}' は既にマウントされています。");
 
-        byte[] salt = new byte[16]; // TODO: サーバーから取得
-        byte[] kek = E2eeCrypto.DeriveKek("", password, salt, 310_000);
-        byte[] masterKey = E2eeCrypto.GenerateMasterKey(); // TODO: サーバーから wrapped key を取得してアンラップ
+        // サーバーから wrapped key 情報を取得
+        var wkInfo = await api.GetWrappedKeyAsync(volumeName, username);
 
-        var fs = new CistaNasFileSystem(api, masterKey, volumeName);
+        // KEK を導出してマスターキーをアンラップ
+        byte[] kek = E2eeCrypto.DeriveKek(username, password, wkInfo.KdfSalt, wkInfo.KdfIterations);
+        byte[] masterKey = E2eeCrypto.UnwrapMasterKey(
+            wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag, kek);
+        CryptographicOperations.ZeroMemory(kek);
+
+        var fs = new CistaNasFileSystem(api, masterKey, volumeName, wkInfo.ChunkSize);
 
         var cts = new CancellationTokenSource();
         var task = Task.Run(() =>
@@ -46,7 +52,6 @@ public sealed class MountService
             }
         }, cts.Token);
 
-        // マウントが完了するまで少し待つ
         await Task.Delay(1000);
 
         if (!_mounted.ContainsKey(volumeName))
