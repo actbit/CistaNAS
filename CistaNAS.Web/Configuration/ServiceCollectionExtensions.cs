@@ -16,6 +16,9 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<UserStore>();        // users.json：共有状態
         services.AddScoped<AuthService>();         // 状態なし
 
+        // グループ
+        services.AddSingleton<GroupStore>();       // groups.json
+
         // ボリューム（Task #4）
         services.AddSingleton<VolumeService>();    // Singleton: マウント状態保持
 

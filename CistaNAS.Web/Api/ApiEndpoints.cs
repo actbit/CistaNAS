@@ -161,6 +161,91 @@ public static class ApiEndpoints
         // ---- E2EE ----
         api.MapE2eeApi();
 
+        // ---- グループ ----
+        var groups = api.MapGroup("/groups")
+            .RequireAuthorization();
+
+        groups.MapGet("/", (GroupStore gs) =>
+            Results.Ok(gs.ListGroups()))
+            .WithName("ListGroups");
+
+        groups.MapPost("/", (CreateGroupRequest req, HttpContext ctx, GroupStore gs) =>
+        {
+            string username = ctx.User.Identity?.Name ?? "";
+            try
+            {
+                gs.CreateGroup(req.GroupName, username);
+                return Results.Created($"/api/v1/groups/{req.GroupName}", null);
+            }
+            catch (Exception ex) { return Results.Conflict(new { error = ex.Message }); }
+        })
+        .WithName("CreateGroup");
+
+        groups.MapDelete("/{groupName}", (string groupName, HttpContext ctx, GroupStore gs) =>
+        {
+            string username = ctx.User.Identity?.Name ?? "";
+            try
+            {
+                gs.DeleteGroup(groupName, username);
+                return Results.NoContent();
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .WithName("DeleteGroup");
+
+        groups.MapPost("/{groupName}/members", (string groupName, AddGroupMemberRequest req,
+            HttpContext ctx, GroupStore gs) =>
+        {
+            string username = ctx.User.Identity?.Name ?? "";
+            try
+            {
+                gs.AddMember(groupName, username, req.Username);
+                return Results.Ok();
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .WithName("AddGroupMember");
+
+        groups.MapDelete("/{groupName}/members/{username}", (string groupName, string username,
+            HttpContext ctx, GroupStore gs) =>
+        {
+            string requester = ctx.User.Identity?.Name ?? "";
+            try
+            {
+                gs.RemoveMember(groupName, requester, username);
+                return Results.NoContent();
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .WithName("RemoveGroupMember");
+
+        // ---- ボリューム グループアクセス ----
+        volumes.MapPost("/{name}/grant-group", (string name, GrantGroupAccessRequest req,
+            HttpContext ctx, VolumeService vs) =>
+        {
+            try
+            {
+                string granter = ctx.User.Identity?.Name ?? "";
+                vs.GrantGroupAccess(name, granter, req.GroupName);
+                return Results.Ok();
+            }
+            catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .WithName("GrantGroupAccess");
+
+        volumes.MapPost("/{name}/revoke-group", (string name, GrantGroupAccessRequest req,
+            HttpContext ctx, VolumeService vs) =>
+        {
+            try
+            {
+                string revoker = ctx.User.Identity?.Name ?? "";
+                vs.RevokeGroupAccess(name, revoker, req.GroupName);
+                return Results.Ok();
+            }
+            catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .WithName("RevokeGroupAccess");
+
         return api;
     }
 }

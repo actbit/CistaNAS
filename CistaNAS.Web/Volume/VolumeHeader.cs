@@ -37,6 +37,9 @@ public sealed class VolumeHeader
     /// <summary>ユーザーごとのラップ済み鍵。キー = ユーザー名。</summary>
     public Dictionary<string, UserWrappedKey> UserKeys { get; set; } = new(StringComparer.Ordinal);
 
+    /// <summary>アクセスを許可されたグループ名（サーバー暗号化ボリュームのみ）。</summary>
+    public HashSet<string> AuthorizedGroups { get; set; } = new(StringComparer.Ordinal);
+
     public sealed class UserWrappedKey
     {
         public KdfParams Kdf { get; set; } = new();

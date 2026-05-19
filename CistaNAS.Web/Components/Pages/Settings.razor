@@ -6,6 +6,7 @@
 @inject AuthenticationStateService AuthState
 @inject AuthService Auth
 @inject UserStore Users
+@inject GroupStore Groups
 @inject NavigationManager Nav
 
 <PageTitle>設定 - CistaNAS</PageTitle>
@@ -116,6 +117,89 @@ else
         </div>
     </div>
 
+    <!-- グループ管理 -->
+    <div class="card mb-4">
+        <div class="card-header">グループ管理</div>
+        <div class="card-body">
+            @if (_groups.Count == 0)
+            {
+                <p>グループがありません。</p>
+            }
+            else
+            {
+                <table class="table table-sm table-striped">
+                    <thead>
+                        <tr><th>グループ名</th><th>オーナー</th><th>メンバー</th><th>操作</th></tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var g in _groups)
+                        {
+                            <tr>
+                                <td><a href="#" @onclick="() => _selectedGroup = Groups.Find(g.GroupName)">@g.GroupName</a></td>
+                                <td>@g.OwnerUser</td>
+                                <td>@string.Join(", ", g.Members)</td>
+                                <td>
+                                    @if (g.OwnerUser == CurrentUsername)
+                                    {
+                                        <button class="btn btn-sm btn-outline-danger me-1"
+                                                @onclick="() => HandleDeleteGroup(g.GroupName)">削除</button>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+
+            <hr />
+            <h6>グループ作成</h6>
+            @if (_groupError is not null)
+            {
+                <div class="alert alert-danger">@_groupError</div>
+            }
+            <div class="row g-2 align-items-end" style="max-width:400px">
+                <div class="col">
+                    <label class="form-label">グループ名</label>
+                    <input class="form-control" @bind="_newGroupName" />
+                </div>
+                <div class="col-auto">
+                    <button class="btn btn-success" @onclick="HandleCreateGroup">作成</button>
+                </div>
+            </div>
+
+            @if (_selectedGroup is not null)
+            {
+                <hr />
+                <h6>メンバー管理: @_selectedGroup.GroupName</h6>
+                <ul class="list-group mb-2">
+                    @foreach (var m in _selectedGroup.Members)
+                    {
+                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                            @m
+                            @if (m != _selectedGroup.OwnerUser)
+                            {
+                                <button class="btn btn-sm btn-outline-danger"
+                                        @onclick="() => HandleRemoveMember(_selectedGroup.GroupName, m)">削除</button>
+                            }
+                            else
+                            {
+                                <span class="badge bg-primary">オーナー</span>
+                            }
+                        </li>
+                    }
+                </ul>
+                <div class="row g-2 align-items-end" style="max-width:400px">
+                    <div class="col">
+                        <input class="form-control" placeholder="ユーザー名" @bind="_addMemberName" />
+                    </div>
+                    <div class="col-auto">
+                        <button class="btn btn-primary" @onclick="HandleAddMember">追加</button>
+                    </div>
+                </div>
+            }
+        </div>
+    </div>
+
     <!-- 暗号化設定 -->
     <div class="card mb-4">
         <div class="card-header">暗号化設定</div>
@@ -195,6 +279,13 @@ else
     private string? _userError;
     private bool _userSuccess;
 
+    // グループ管理
+    private IReadOnlyList<GroupAccount> _groups = [];
+    private string _newGroupName = "";
+    private string? _groupError;
+    private GroupAccount? _selectedGroup;
+    private string _addMemberName = "";
+
     // 暗号化設定
     private EncSettingsModel _encSettings = new();
     private bool _encSaveSuccess;
@@ -211,12 +302,18 @@ else
     protected override void OnInitialized()
     {
         RefreshUsers();
+        RefreshGroups();
         LoadEncryptionSettings();
     }
 
     private void RefreshUsers()
     {
         _users = Users.ListUsers();
+    }
+
+    private void RefreshGroups()
+    {
+        _groups = Groups.ListGroups();
     }
 
     // ---- パスワード変更 ----
@@ -266,8 +363,61 @@ else
         {
             Users.DeleteUser(username);
             RefreshUsers();
+            RefreshGroups();
         }
         catch (Exception ex) { _userError = ex.Message; }
+    }
+
+    // ---- グループ管理 ----
+
+    private void HandleCreateGroup()
+    {
+        _groupError = null;
+        try
+        {
+            Groups.CreateGroup(_newGroupName.Trim(), CurrentUsername);
+            _newGroupName = "";
+            RefreshGroups();
+        }
+        catch (Exception ex) { _groupError = ex.Message; }
+    }
+
+    private void HandleDeleteGroup(string groupName)
+    {
+        _groupError = null;
+        try
+        {
+            Groups.DeleteGroup(groupName, CurrentUsername);
+            if (_selectedGroup?.GroupName == groupName) _selectedGroup = null;
+            RefreshGroups();
+        }
+        catch (Exception ex) { _groupError = ex.Message; }
+    }
+
+    private void HandleAddMember()
+    {
+        _groupError = null;
+        if (_selectedGroup is null) return;
+        try
+        {
+            Groups.AddMember(_selectedGroup.GroupName, CurrentUsername, _addMemberName.Trim());
+            _addMemberName = "";
+            RefreshGroups();
+            _selectedGroup = Groups.Find(_selectedGroup.GroupName);
+        }
+        catch (Exception ex) { _groupError = ex.Message; }
+    }
+
+    private void HandleRemoveMember(string groupName, string username)
+    {
+        _groupError = null;
+        try
+        {
+            Groups.RemoveMember(groupName, CurrentUsername, username);
+            RefreshGroups();
+            _selectedGroup = Groups.Find(groupName);
+        }
+        catch (Exception ex) { _groupError = ex.Message; }
     }
 
     // ---- 暗号化設定 ----

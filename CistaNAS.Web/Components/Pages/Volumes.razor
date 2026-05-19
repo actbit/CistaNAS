@@ -5,6 +5,7 @@
 @using CistaNAS.Web.Volume
 @inject AuthenticationStateService AuthState
 @inject VolumeService VolumeSvc
+@inject GroupStore GroupSvc
 @inject E2eeInterop E2ee
 @inject NavigationManager Nav
 
@@ -106,7 +107,13 @@ else
                 @foreach (var v in _volumes)
                 {
                     <tr>
-                        <td>@v.Name</td>
+                        <td>
+                            @v.Name
+                            @if (v.IsHome)
+                            {
+                                <span class="badge bg-info ms-1">Home</span>
+                            }
+                        </td>
                         <td>
                             @if (v.EncryptionMode == "e2ee")
                             {
@@ -144,7 +151,7 @@ else
                             {
                                 <button class="btn btn-sm btn-outline-primary me-1" @onclick="() => ShowMountDialog(v.Name, v.Encrypted, v.EncryptionMode)">マウント</button>
                             }
-                            @if (v.OwnerUser == CurrentUsername && v.Encrypted)
+                            @if (v.OwnerUser == CurrentUsername && v.Encrypted && !v.IsHome)
                             {
                                 <button class="btn btn-sm btn-outline-secondary" @onclick="() => ShowShareDialog(v.Name)">共有</button>
                             }
@@ -240,10 +247,51 @@ else
                         {
                             <div class="alert alert-danger">@_shareError</div>
                         }
+
+                        @if (!_shareIsE2ee)
+                        {
+                            <hr />
+                            <h6>グループアクセス</h6>
+                            @if (_shareGroups.Count > 0)
+                            {
+                                <ul class="list-group mb-2">
+                                    @foreach (var gn in _shareGroups)
+                                    {
+                                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                                            @gn
+                                            <button class="btn btn-sm btn-outline-danger"
+                                                    @onclick="() => HandleRevokeGroup(_shareTarget!, gn)">削除</button>
+                                        </li>
+                                    }
+                                </ul>
+                            }
+                            else
+                            {
+                                <p class="text-muted small">グループに共有されていません。</p>
+                            }
+                            <div class="row g-2 align-items-end">
+                                <div class="col">
+                                    <select class="form-select form-select-sm" @bind="_grantGroupName">
+                                        <option value="">グループを選択</option>
+                                        @foreach (var g in _availableGroups)
+                                        {
+                                            <option value="@g.GroupName">@g.GroupName</option>
+                                        }
+                                    </select>
+                                </div>
+                                <div class="col-auto">
+                                    <button class="btn btn-sm btn-outline-primary" @onclick="HandleGrantGroup">追加</button>
+                                </div>
+                            </div>
+                        }
+                        else
+                        {
+                            <div class="alert alert-info mt-2">E2EE ボリュームはグループ共有に対応していません。</div>
+                        }
                     </div>
                     <div class="modal-footer">
                         <button type="button" class="btn btn-secondary" @onclick="CloseShareDialog">閉じる</button>
-                        <button type="button" class="btn btn-primary" @onclick="HandleGrant">追加</button>
+                        <button type="button" class="btn btn-primary" @onclick="HandleGrant">ユーザー追加</button>
                     </div>
                 </div>
             </div>
@@ -266,6 +314,10 @@ else
 
     private string? _shareTarget;
     private IReadOnlyList<string> _shareUsers = [];
+    private bool _shareIsE2ee;
+    private IReadOnlyList<string> _shareGroups = [];
+    private IReadOnlyList<GroupAccount> _availableGroups = [];
+    private string _grantGroupName = "";
     private string _grantUsername = "";
     private string _grantPassword = "";
     private string _grantGranterPassword = "";
@@ -369,6 +421,10 @@ else
         var vol = _volumes.FirstOrDefault(v => v.Name == name);
         if (vol is null) return;
         _shareTarget = name; _shareUsers = vol.AuthorizedUsers;
+        _shareIsE2ee = vol.EncryptionMode == "e2ee";
+        _shareGroups = vol.AuthorizedGroups;
+        _availableGroups = GroupSvc.ListGroups();
+        _grantGroupName = "";
         _grantUsername = ""; _grantPassword = ""; _grantGranterPassword = ""; _shareError = null;
     }
     private void CloseShareDialog() { _shareTarget = null; _shareError = null; }
@@ -394,6 +450,32 @@ else
             RefreshList();
             var vol = _volumes.FirstOrDefault(v => v.Name == _shareTarget);
             if (vol is not null) _shareUsers = vol.AuthorizedUsers;
+        }
+        catch (VolumeException ex) { _shareError = ex.Message; }
+    }
+
+    private void HandleGrantGroup()
+    {
+        if (string.IsNullOrEmpty(_grantGroupName)) return;
+        try
+        {
+            VolumeSvc.GrantGroupAccess(_shareTarget!, CurrentUsername, _grantGroupName);
+            RefreshList();
+            var vol = _volumes.FirstOrDefault(v => v.Name == _shareTarget);
+            if (vol is not null) _shareGroups = vol.AuthorizedGroups;
+            _grantGroupName = ""; _shareError = null;
+        }
+        catch (VolumeException ex) { _shareError = ex.Message; }
+    }
+
+    private void HandleRevokeGroup(string volumeName, string groupName)
+    {
+        try
+        {
+            VolumeSvc.RevokeGroupAccess(volumeName, CurrentUsername, groupName);
+            RefreshList();
+            var vol = _volumes.FirstOrDefault(v => v.Name == _shareTarget);
+            if (vol is not null) _shareGroups = vol.AuthorizedGroups;
         }
         catch (VolumeException ex) { _shareError = ex.Message; }
     }

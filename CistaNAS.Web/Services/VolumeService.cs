@@ -15,19 +15,27 @@ public sealed class VolumeService
 {
     private readonly string _dataRoot;
     private readonly VolumeOptions _volOpts;
+    private readonly GroupStore _groupStore;
 
     private readonly ConcurrentDictionary<string, MountedVolume> _mounted = new();
 
-    public VolumeService(IOptions<CistaNasOptions> options)
+    public VolumeService(IOptions<CistaNasOptions> options, GroupStore groupStore)
     {
         _dataRoot = options.Value.DataRoot;
         _volOpts = options.Value.Volume;
+        _groupStore = groupStore;
         Directory.CreateDirectory(_dataRoot);
     }
 
     public VolumeInfo Create(string name, string? username, string? password, bool encrypted = true)
     {
         ValidateName(name);
+        return CreateInternal(name, username, password, encrypted);
+    }
+
+    /// <summary>ホームボリューム等、内部用途の作成（home__ プレフィックスを許可）。</summary>
+    public VolumeInfo CreateInternal(string name, string? username, string? password, bool encrypted = true)
+    {
         if (encrypted) { ArgumentException.ThrowIfNullOrEmpty(username); ArgumentException.ThrowIfNullOrEmpty(password); }
 
         string dir = VolumeDir(name);
@@ -129,14 +137,16 @@ public sealed class VolumeService
         var result = new List<VolumeInfo>();
         if (!Directory.Exists(_dataRoot)) return result;
 
+        var userGroups = _groupStore.GetGroupsForUser(username)
+            .Select(g => g.GroupName).ToHashSet(StringComparer.Ordinal);
+
         foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
         {
             string name = Path.GetFileName(dir);
             var header = LoadHeaderIfExists(name);
             if (header is null) continue;
 
-            bool hasAccess = !header.Encrypted || header.HasUserAccess(username);
-            if (!hasAccess) continue;
+            if (!HasAccessInternal(header, username, userGroups)) continue;
 
             result.Add(ToInfo(name, header, _mounted.ContainsKey(name)));
         }
@@ -172,7 +182,18 @@ public sealed class VolumeService
     {
         var header = LoadHeaderIfExists(volumeName);
         if (header is null) return false;
-        return !header.Encrypted || header.HasUserAccess(username);
+        var userGroups = _groupStore.GetGroupsForUser(username)
+            .Select(g => g.GroupName).ToHashSet(StringComparer.Ordinal);
+        return HasAccessInternal(header, username, userGroups);
+    }
+
+    private static bool HasAccessInternal(VolumeHeader header, string username, HashSet<string> userGroups)
+    {
+        // 非暗号化ボリューム: UserKeys が空なら誰でもアクセス可、そうでなければユーザーまたはグループ
+        if (!header.Encrypted && header.UserKeys.Count == 0) return true;
+        if (header.HasUserAccess(username)) return true;
+        if (header.AuthorizedGroups.Overlaps(userGroups)) return true;
+        return false;
     }
 
     // ---- 共有 ----
@@ -236,6 +257,66 @@ public sealed class VolumeService
         }
     }
 
+    // ---- グループアクセス ----
+
+    public void GrantGroupAccess(string volumeName, string granterUsername, string groupName)
+    {
+        var header = LoadHeaderOrThrow(volumeName);
+        if (header.OwnerUser != granterUsername)
+            throw new VolumeException("オーナーのみがグループアクセスを付与できます。");
+        if (header.IsE2ee)
+            throw new VolumeException("E2EE ボリュームはグループ共有に対応していません。");
+        if (_groupStore.Find(groupName) is null)
+            throw new VolumeException($"グループ '{groupName}' が見つかりません。");
+
+        header.AuthorizedGroups.Add(groupName);
+        header.Save(GetHeaderPath(volumeName));
+        RefreshMountedHeader(volumeName, header);
+    }
+
+    public void RevokeGroupAccess(string volumeName, string revokerUsername, string groupName)
+    {
+        var header = LoadHeaderOrThrow(volumeName);
+        if (header.OwnerUser != revokerUsername)
+            throw new VolumeException("オーナーのみがグループアクセスを剥奪できます。");
+        if (!header.AuthorizedGroups.Remove(groupName))
+            throw new VolumeException($"グループ '{groupName}' はこのボリュームにアクセス権がありません。");
+
+        header.Save(GetHeaderPath(volumeName));
+        RefreshMountedHeader(volumeName, header);
+    }
+
+    public void RemoveGroupFromAllVolumes(string groupName)
+    {
+        if (!Directory.Exists(_dataRoot)) return;
+        foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
+        {
+            string name = Path.GetFileName(dir);
+            var header = LoadHeaderIfExists(name);
+            if (header is null) continue;
+            if (header.AuthorizedGroups.Remove(groupName))
+            {
+                header.Save(GetHeaderPath(name));
+                RefreshMountedHeader(name, header);
+            }
+        }
+    }
+
+    // ---- ボリューム削除 ----
+
+    public void DeleteVolume(string name)
+    {
+        if (_mounted.TryRemove(name, out var mv))
+        {
+            mv.Stream.Dispose();
+            if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
+        }
+
+        string dir = VolumeDir(name);
+        if (Directory.Exists(dir))
+            Directory.Delete(dir, recursive: true);
+    }
+
     // ---- 内部 ----
 
     private void MountInternal(string name, VolumeHeader header, byte[]? masterKey)
@@ -272,7 +353,9 @@ public sealed class VolumeService
 
     private static VolumeInfo ToInfo(string name, VolumeHeader h, bool mounted) => new(
         name, mounted, h.Encrypted, h.OwnerUser, h.CreatedAt,
-        h.UserKeys.Keys.ToList(), h.EncryptionMode);
+        h.UserKeys.Keys.ToList(), h.EncryptionMode,
+        h.AuthorizedGroups.ToList(),
+        name.StartsWith("home__", StringComparison.Ordinal));
 
     private string VolumeDir(string name) => Path.Combine(_dataRoot, name);
     private string GetDataPath(string name) => Path.Combine(VolumeDir(name), "volume.dat");
@@ -281,6 +364,8 @@ public sealed class VolumeService
     private static void ValidateName(string name)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
+        if (name.StartsWith("home__", StringComparison.Ordinal))
+            throw new VolumeException("'home__' で始まる名前は予約されています。");
         if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
             throw new VolumeException("ボリューム名に使用できない文字が含まれています。");
         if (name.Length > 64)

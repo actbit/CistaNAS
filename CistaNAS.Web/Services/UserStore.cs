@@ -68,6 +68,15 @@ public sealed class UserStore
             });
             Save();
         }
+
+        // ホームボリューム自動作成（ロック外で実行）
+        try
+        {
+            var volumeService = _services.GetRequiredService<VolumeService>();
+            string homeName = $"home__{username}";
+            volumeService.CreateInternal(homeName, username, password: null, encrypted: false);
+        }
+        catch { /* 既に存在する等は無視 */ }
     }
 
     public void DeleteUser(string username)
@@ -81,6 +90,21 @@ public sealed class UserStore
             _users.Remove(user);
             Save();
         }
+
+        // グループから除去 + ホームボリューム削除
+        try
+        {
+            var groupStore = _services.GetRequiredService<GroupStore>();
+            groupStore.RemoveUserFromAllGroups(username);
+        }
+        catch { }
+
+        try
+        {
+            var volumeService = _services.GetRequiredService<VolumeService>();
+            volumeService.DeleteVolume($"home__{username}");
+        }
+        catch { }
     }
 
     public void UpdateRole(string username, string newRole)

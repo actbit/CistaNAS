@@ -4,6 +4,7 @@ using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
 using CistaNAS.Web.Volume;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
@@ -24,7 +25,8 @@ public class E2eeFileTests : IDisposable
             Volume = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
         };
         var io = Options.Create(opt);
-        _volumeService = new VolumeService(io);
+        var gs = new GroupStore(io, new ServiceCollection().BuildServiceProvider());
+        _volumeService = new VolumeService(io, gs);
         _e2eeFs = new E2eeFileService(_volumeService, io);
         _masterKey = RandomNumberGenerator.GetBytes(32);
     }

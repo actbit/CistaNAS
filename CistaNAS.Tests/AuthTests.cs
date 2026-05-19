@@ -18,7 +18,8 @@ public class AuthTests : IDisposable
             Volume = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
         };
         var io = Options.Create(opt);
-        var vs = new VolumeService(io);
+        var gs = new GroupStore(io, new FakeServiceProvider());
+        var vs = new VolumeService(io, gs);
         var store = new UserStore(io, NullLogger<UserStore>.Instance, new FakeServiceProvider(vs));
         var key = new JwtSigningKey(System.Security.Cryptography.RandomNumberGenerator.GetBytes(48));
         return (new AuthService(store, key, io), store, opt, vs);

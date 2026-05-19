@@ -10,7 +10,9 @@ public sealed record ChangePasswordRequest(string OldPassword, string NewPasswor
 public sealed record VolumeInfo(
     string Name, bool IsMounted, bool Encrypted, string OwnerUser,
     DateTimeOffset CreatedAt, IReadOnlyList<string> AuthorizedUsers,
-    string EncryptionMode = "server");
+    string EncryptionMode = "server",
+    IReadOnlyList<string> AuthorizedGroups = null!,
+    bool IsHome = false);
 
 /// <summary>ボリューム操作の業務エラー。</summary>
 public sealed class VolumeException(string message) : Exception(message);

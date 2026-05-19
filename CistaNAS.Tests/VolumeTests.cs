@@ -1,6 +1,7 @@
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
@@ -16,7 +17,9 @@ public class VolumeTests : IDisposable
         _dataRoot = Path.Combine(Path.GetTempPath(), "cista-vol-" + Guid.NewGuid().ToString("N"));
         _volOpts = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 };
         var opt = new CistaNasOptions { DataRoot = _dataRoot, Volume = _volOpts };
-        _vs = new VolumeService(Options.Create(opt));
+        var io = Options.Create(opt);
+        var gs = new GroupStore(io, new ServiceCollection().BuildServiceProvider());
+        _vs = new VolumeService(io, gs);
     }
 
     [Fact]
