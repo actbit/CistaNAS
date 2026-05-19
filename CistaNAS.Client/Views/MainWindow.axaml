@@ -1,0 +1,63 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:CistaNAS.Client.ViewModels"
+        x:Class="CistaNAS.Client.Views.MainWindow"
+        x:DataType="vm:MainViewModel"
+        Title="CistaNAS Client"
+        Width="520" Height="480"
+        WindowStartupLocation="CenterScreen">
+
+    <Grid Margin="16" RowDefinitions="Auto,*,Auto">
+
+        <!-- ログインパネル -->
+        <StackPanel Grid.Row="0" IsVisible="{Binding !IsLoggedIn}" Spacing="8">
+            <TextBlock Text="CistaNAS Client" FontSize="24" FontWeight="Bold" Margin="0,0,0,8"/>
+            <TextBox Text="{Binding ServerUrl}" PlaceholderText="サーバー URL" />
+            <TextBox Text="{Binding Username}" PlaceholderText="ユーザー名" />
+            <TextBox Text="{Binding Password}" PlaceholderText="パスワード" PasswordChar="*" />
+            <Button Content="ログイン" Command="{Binding LoginCommand}"
+                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                    IsEnabled="{Binding !IsBusy}" />
+        </StackPanel>
+
+        <!-- ボリューム一覧パネル -->
+        <Grid Grid.Row="1" IsVisible="{Binding IsLoggedIn}" RowDefinitions="Auto,*,Auto" Margin="0,8,0,0">
+            <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="8" Margin="0,0,0,8">
+                <TextBlock Text="ボリューム一覧" FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                <Button Content="更新" Command="{Binding RefreshVolumesCommand}" />
+            </StackPanel>
+
+            <ListBox Grid.Row="1" ItemsSource="{Binding Volumes}"
+                     SelectedItem="{Binding SelectedVolume}"
+                     DoubleTapped="VolumeList_DoubleTapped">
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <StackPanel Margin="0,4">
+                            <TextBlock Text="{Binding Name}" FontWeight="SemiBold"/>
+                            <StackPanel Orientation="Horizontal" Spacing="12">
+                                <TextBlock Text="{Binding EncryptionText}" FontSize="12" Foreground="Gray"/>
+                                <TextBlock Text="{Binding StatusText}" FontSize="12" Foreground="Gray"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+
+            <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" Margin="0,8,0,0">
+                <Button Content="マウント" Command="{Binding ShowMountCommand}"
+                        IsEnabled="{Binding SelectedVolume, Converter={x:Static ObjectConverters.IsNotNull}}"
+                        />
+                <Button Content="アンマウント" Command="{Binding UnmountCommand}"
+                        IsEnabled="{Binding SelectedVolume.IsMounted}"
+                        />
+            </StackPanel>
+        </Grid>
+
+        <!-- ステータスバー -->
+        <Border Grid.Row="2" Background="{DynamicResource SystemControlBackgroundAltHighBrush}"
+                Padding="8,4" CornerRadius="4" Margin="0,8,0,0">
+            <TextBlock Text="{Binding StatusMessage}" FontSize="12" />
+        </Border>
+
+    </Grid>
+</Window>

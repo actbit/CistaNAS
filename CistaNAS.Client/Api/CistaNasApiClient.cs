@@ -124,6 +124,29 @@ public sealed class CistaNasApiClient
         }
         return result;
     }
+
+    public async Task<List<VolumeListItem>> ListVolumesAsync()
+    {
+        var res = await _http.GetAsync("/api/v1/volumes");
+        res.EnsureSuccessStatusCode();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var result = new List<VolumeListItem>();
+        if (json.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var v in json.EnumerateArray())
+            {
+                result.Add(new VolumeListItem
+                {
+                    Name = v.GetProperty("name").GetString()!,
+                    Encrypted = v.TryGetProperty("encrypted", out var enc) && enc.GetBoolean(),
+                    EncryptionMode = v.TryGetProperty("encryptionMode", out var mode) ? mode.GetString() ?? "server" : "server",
+                    IsMounted = v.TryGetProperty("isMounted", out var mnt) && mnt.GetBoolean(),
+                    OwnerUser = v.TryGetProperty("ownerUser", out var owner) ? owner.GetString() ?? "" : "",
+                });
+            }
+        }
+        return result;
+    }
 }
 
 public class E2eeFileEntry
@@ -134,4 +157,13 @@ public class E2eeFileEntry
     public int ChunkCount { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset ModifiedAt { get; set; }
+}
+
+public class VolumeListItem
+{
+    public required string Name { get; set; }
+    public bool Encrypted { get; set; }
+    public string EncryptionMode { get; set; } = "server";
+    public bool IsMounted { get; set; }
+    public string OwnerUser { get; set; } = "";
 }
