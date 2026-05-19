@@ -12,6 +12,16 @@ public static class ApiEndpoints
     public static IEndpointRouteBuilder MapCistaNasApi(this WebApplication app, IEndpointRouteBuilder api)
     {
         // ---- 認証 ----
+        api.MapPost("/auth/setup", (SetupRequest req, UserStore users) =>
+        {
+            if (users.HasAnyUsers)
+                return Results.Conflict(new { error = "初期セットアップは既に完了しています。" });
+            users.CreateInitialAdmin(req.Username, req.Password);
+            return Results.Ok(new { message = "初期管理者を作成しました。" });
+        })
+        .AllowAnonymous()
+        .WithName("Setup");
+
         api.MapPost("/auth/login", (LoginRequest req, AuthService auth) =>
         {
             var res = auth.Authenticate(req.Username, req.Password);
