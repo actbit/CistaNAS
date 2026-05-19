@@ -42,8 +42,10 @@ public sealed class VolumeHeader
 
     public sealed class UserWrappedKey
     {
+        public string WrapType { get; set; } = "password"; // "password" or "ecdh"
         public KdfParams Kdf { get; set; } = new();
         public WrappedKey WrappedMasterKey { get; set; } = new();
+        public byte[]? EphemeralPublicKey { get; set; } // ECDH only: raw 65B uncompressed point
     }
 
     public sealed class KdfParams

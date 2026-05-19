@@ -128,6 +128,27 @@ public sealed class UserStore
         }
     }
 
+    public string? GetPublicKey(string username)
+    {
+        lock (_gate)
+        {
+            return _users.FirstOrDefault(u =>
+                string.Equals(u.Username, username, StringComparison.Ordinal))?.PublicKey;
+        }
+    }
+
+    public void UpdatePublicKey(string username, string publicKeyBase64)
+    {
+        lock (_gate)
+        {
+            var user = _users.FirstOrDefault(u =>
+                string.Equals(u.Username, username, StringComparison.Ordinal))
+                ?? throw new InvalidOperationException($"ユーザー '{username}' が見つかりません。");
+            user.PublicKey = publicKeyBase64;
+            Save();
+        }
+    }
+
     /// <summary>セットアップウィザードから初期管理者を作成。</summary>
     public void CreateInitialAdmin(string username, string password)
     {

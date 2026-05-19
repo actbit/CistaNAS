@@ -12,4 +12,7 @@ public sealed class UserAccount
     public required string Username { get; set; }
     public required string PasswordHash { get; set; }
     public string Role { get; set; } = "admin";
+
+    /// <summary>Base64(raw 65B) エンコードされた ECDH P-256 公開鍵。null は未生成。</summary>
+    public string? PublicKey { get; set; }
 }

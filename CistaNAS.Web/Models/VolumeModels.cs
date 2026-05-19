@@ -12,7 +12,8 @@ public sealed record VolumeInfo(
     DateTimeOffset CreatedAt, IReadOnlyList<string> AuthorizedUsers,
     string EncryptionMode = "server",
     IReadOnlyList<string> AuthorizedGroups = null!,
-    bool IsHome = false);
+    bool IsHome = false,
+    Dictionary<string, string>? UserWrapTypes = null);
 
 /// <summary>ボリューム操作の業務エラー。</summary>
 public sealed class VolumeException(string message) : Exception(message);

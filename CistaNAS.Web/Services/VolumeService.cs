@@ -351,11 +351,17 @@ public sealed class VolumeService
             mv.UpdateHeader(updated);
     }
 
-    private static VolumeInfo ToInfo(string name, VolumeHeader h, bool mounted) => new(
-        name, mounted, h.Encrypted, h.OwnerUser, h.CreatedAt,
-        h.UserKeys.Keys.ToList(), h.EncryptionMode,
-        h.AuthorizedGroups.ToList(),
-        name.StartsWith("home__", StringComparison.Ordinal));
+    private static VolumeInfo ToInfo(string name, VolumeHeader h, bool mounted)
+    {
+        var wrapTypes = h.UserKeys.Count > 0
+            ? h.UserKeys.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.WrapType, StringComparer.Ordinal)
+            : null;
+        return new(name, mounted, h.Encrypted, h.OwnerUser, h.CreatedAt,
+            h.UserKeys.Keys.ToList(), h.EncryptionMode,
+            h.AuthorizedGroups.ToList(),
+            name.StartsWith("home__", StringComparison.Ordinal),
+            wrapTypes);
+    }
 
     private string VolumeDir(string name) => Path.Combine(_dataRoot, name);
     private string GetDataPath(string name) => Path.Combine(VolumeDir(name), "volume.dat");
@@ -366,6 +372,8 @@ public sealed class VolumeService
         ArgumentException.ThrowIfNullOrEmpty(name);
         if (name.StartsWith("home__", StringComparison.Ordinal))
             throw new VolumeException("'home__' で始まる名前は予約されています。");
+        if (name.StartsWith("group__", StringComparison.Ordinal))
+            throw new VolumeException("'group__' で始まる名前は予約されています。グループボリュームは別途作成してください。");
         if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
             throw new VolumeException("ボリューム名に使用できない文字が含まれています。");
         if (name.Length > 64)
