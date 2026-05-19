@@ -1,0 +1,96 @@
+@page "/invite/{invitationId}"
+@using CistaNAS.Web.Components.Auth
+@using CistaNAS.Web.Services
+@inject AuthenticationStateService AuthState
+@inject InvitationService InvSvc
+@inject UserStore Users
+@inject NavigationManager Nav
+
+<PageTitle>招待 - CistaNAS</PageTitle>
+
+@if (!AuthState.IsLoggedIn)
+{
+    <NavigateToLogin />
+}
+else
+{
+    <h1>招待の受諾</h1>
+
+    @if (_invite is null)
+    {
+        <div class="alert alert-warning">招待が見つかりません。URL が正しいか確認してください。</div>
+    }
+    else if (_accepted)
+    {
+        <div class="alert alert-success">
+            招待を受諾しました。オーナーがメンバー追加を行うとマウントできるようになります。
+        </div>
+        <a href="/volumes" class="btn btn-primary">ボリューム一覧へ</a>
+    }
+    else
+    {
+        <div class="card" style="max-width:500px">
+            <div class="card-body">
+                <p><strong>@_invite.InviterUsername</strong> からの招待</p>
+                <p class="text-muted small">作成日時: @_invite.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</p>
+
+                @if (_hasPublicKey)
+                {
+                    <div class="alert alert-success small">公開鍵登録済み。ECDH 共有が可能です。</div>
+                }
+                else
+                {
+                    <div class="alert alert-warning small">
+                        公開鍵が未登録です。先に<a href="/settings">設定</a>で鍵ペアを生成してください。
+                    </div>
+                }
+
+                @if (_error is not null)
+                {
+                    <div class="alert alert-danger">@_error</div>
+                }
+
+                <button class="btn btn-primary" disabled="@(_loading || !_hasPublicKey)"
+                        @onclick="HandleAccept">
+                    @(_loading ? "処理中..." : "招待を受諾する")
+                </button>
+            </div>
+        </div>
+    }
+}
+
+@code {
+    [Parameter] public string InvitationId { get; set; } = "";
+
+    private InvitationRecord? _invite;
+    private bool _loading;
+    private bool _accepted;
+    private string? _error;
+    private bool _hasPublicKey;
+
+    private string CurrentUsername => AuthState.User?.Identity?.Name ?? "";
+
+    protected override void OnInitialized()
+    {
+        _invite = InvSvc.Find(InvitationId);
+        _hasPublicKey = Users.GetPublicKey(CurrentUsername) is not null;
+    }
+
+    private void HandleAccept()
+    {
+        _loading = true; _error = null;
+        try
+        {
+            if (!_hasPublicKey)
+            {
+                _error = "公開鍵が登録されていません。";
+                return;
+            }
+
+            InvSvc.SetAcceptedData(InvitationId, Users.GetPublicKey(CurrentUsername)!, "");
+            _accepted = true;
+        }
+        catch (Exception ex) { _error = ex.Message; }
+        finally { _loading = false; }
+    }
+}
