@@ -16,14 +16,16 @@ public sealed class VolumeService
     private readonly string _dataRoot;
     private readonly VolumeOptions _volOpts;
     private readonly GroupStore _groupStore;
+    private readonly UserStore _userStore;
 
     private readonly ConcurrentDictionary<string, MountedVolume> _mounted = new();
 
-    public VolumeService(IOptions<CistaNasOptions> options, GroupStore groupStore)
+    public VolumeService(IOptions<CistaNasOptions> options, GroupStore groupStore, UserStore userStore)
     {
         _dataRoot = options.Value.DataRoot;
         _volOpts = options.Value.Volume;
         _groupStore = groupStore;
+        _userStore = userStore;
         Directory.CreateDirectory(_dataRoot);
     }
 
@@ -300,6 +302,89 @@ public sealed class VolumeService
                 RefreshMountedHeader(name, header);
             }
         }
+    }
+
+    // ---- グループ E2EE ボリューム ----
+
+    /// <summary>グループ専用E2EEボリュームを作成（group__ プレフィックス付き）。</summary>
+    public VolumeInfo CreateGroupE2ee(string groupName, string ownerUsername,
+        VolumeHeader.UserWrappedKey ownerWrappedKey, int chunkSize = 1048576)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(groupName);
+        ArgumentException.ThrowIfNullOrEmpty(ownerUsername);
+
+        string volName = $"group__{groupName}";
+        string dir = VolumeDir(volName);
+        if (Directory.Exists(dir))
+            throw new VolumeException($"グループボリューム '{volName}' は既に存在します。");
+
+        var header = VolumeHeader.CreateE2ee(volName, ownerUsername, ownerWrappedKey, chunkSize);
+        Directory.CreateDirectory(dir);
+        header.Save(Path.Combine(dir, VolumeHeader.FileName));
+        File.Create(GetDataPath(volName)).Dispose();
+        MountInternal(volName, header, masterKey: null);
+
+        return ToInfo(volName, header, true);
+    }
+
+    /// <summary>グループのE2EEボリューム一覧を取得（グループオーナー用）。</summary>
+    public IReadOnlyList<VolumeInfo> GetGroupE2eeVolumes(string groupName)
+    {
+        var result = new List<VolumeInfo>();
+        string prefix = $"group__{groupName}";
+        if (!Directory.Exists(_dataRoot)) return result;
+
+        foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
+        {
+            string name = Path.GetFileName(dir);
+            if (name != prefix) continue;
+            var header = LoadHeaderIfExists(name);
+            if (header is null || !header.IsE2ee) continue;
+            result.Add(ToInfo(name, header, _mounted.ContainsKey(name)));
+        }
+        return result;
+    }
+
+    /// <summary>グループメンバーの公開鍵一覧を取得（ECDH共有用）。</summary>
+    public IReadOnlyList<(string Username, string? PublicKey)> GetGroupMembersWithPublicKeys(
+        string volumeName, string requesterUsername)
+    {
+        var header = LoadHeaderOrThrow(volumeName);
+        if (header.OwnerUser != requesterUsername)
+            throw new VolumeException("オーナーのみがメンバー情報を取得できます。");
+        if (!header.IsE2ee)
+            throw new VolumeException("E2EE ボリュームではありません。");
+
+        // group__ プレフィックスからグループ名を抽出
+        string groupName = volumeName.StartsWith("group__", StringComparison.Ordinal)
+            ? volumeName[7..] : "";
+        if (string.IsNullOrEmpty(groupName))
+            throw new VolumeException("グループボリュームではありません。");
+
+        var group = _groupStore.Find(groupName)
+            ?? throw new VolumeException($"グループ '{groupName}' が見つかりません。");
+
+        return group.Members
+            .Where(m => !header.HasUserAccess(m))
+            .Select(m => (m, _userStore.GetPublicKey(m)))
+            .ToList();
+    }
+
+    /// <summary>E2EEボリュームにECDHラップ済み鍵を一括追加。</summary>
+    public void AddE2eeWrappedKeysBatch(string volumeName, string requesterUsername,
+        Dictionary<string, VolumeHeader.UserWrappedKey> wrappedKeys)
+    {
+        var header = LoadHeaderOrThrow(volumeName);
+        if (header.OwnerUser != requesterUsername)
+            throw new VolumeException("オーナーのみが鍵を追加できます。");
+
+        foreach (var (username, wrappedKey) in wrappedKeys)
+        {
+            if (!header.HasUserAccess(username))
+                header.AddWrappedKey(username, wrappedKey);
+        }
+        header.Save(GetHeaderPath(volumeName));
+        RefreshMountedHeader(volumeName, header);
     }
 
     // ---- ボリューム削除 ----
