@@ -1,7 +1,0 @@
-[
-  {
-    "Username": "admin",
-    "PasswordHash": "pbkdf2-sha256$210000$iHsDLJHKGrmxUdGNWc/cuQ==$SvmJrPwoaJ5uZzR1gjLYuZiepWFhZsJXAaOjtG1QMvU=",
-    "Role": "admin"
-  }
-]

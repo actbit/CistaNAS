@@ -13,6 +13,7 @@ namespace CistaNAS.Tests;
 public class AspireFixture : IAsyncLifetime
 {
     private DistributedApplication? _app;
+    private string _tempDataRoot = "";
 
     public HttpClient Http { get; private set; } = null!;
     public CistaNasApiClient Api { get; private set; } = null!;
@@ -23,7 +24,18 @@ public class AspireFixture : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
+        // テスト専用の一時ディレクトリを作成
+        _tempDataRoot = Path.Combine(Path.GetTempPath(), $"cista-test-{Guid.NewGuid():N}");
+
         var builder = await DistributedApplicationTestingBuilder.CreateAsync<Projects.CistaNAS_AppHost>();
+
+        // webfrontend の DataRoot を一時ディレクトリに上書き
+        var proj = builder.Resources
+            .OfType<Aspire.Hosting.ApplicationModel.ProjectResource>()
+            .First(r => r.Name == "webfrontend");
+        builder.CreateResourceBuilder(proj)
+            .WithEnvironment("CistaNas__DataRoot", _tempDataRoot);
+
         _app = await builder.BuildAsync();
         await _app.StartAsync();
 
@@ -58,6 +70,13 @@ public class AspireFixture : IAsyncLifetime
     {
         Http.Dispose();
         if (_app is not null) await _app.DisposeAsync();
+
+        // テスト用データを一括削除
+        if (Directory.Exists(_tempDataRoot))
+        {
+            try { Directory.Delete(_tempDataRoot, true); }
+            catch { /* ベストエフォート */ }
+        }
     }
 }
 
