@@ -6,7 +6,10 @@
 @inject AuthenticationStateService AuthState
 @inject VolumeService VolumeSvc
 @inject GroupStore GroupSvc
+@inject UserStore UserSvc
+@inject InvitationService InvSvc
 @inject E2eeInterop E2ee
+@inject IJSRuntime JS
 @inject NavigationManager Nav
 
 <PageTitle>ボリューム - CistaNAS</PageTitle>
@@ -51,6 +54,14 @@ else
                                 E2EE（エンドツーエンド暗号化）
                             </label>
                         </div>
+                        <div class="form-check">
+                            <input type="radio" class="form-check-input" name="encMode" id="encGroupE2ee"
+                                   checked="@(_createModel.EncryptionMode == "group-e2ee")"
+                                   @onchange="@(() => _createModel.EncryptionMode = "group-e2ee")" />
+                            <label class="form-check-label" for="encGroupE2ee">
+                                グループ E2EE（ECDH 共有対応）
+                            </label>
+                        </div>
                     </div>
                 }
                 @if (_createModel.Encrypted)
@@ -65,6 +76,13 @@ else
                     <div class="alert alert-info">
                         <strong>E2EE ボリューム</strong>: マスターキーはブラウザ内で生成され、サーバーには送信されません。
                         パスワードを紛失するとデータを復旧できません。
+                    </div>
+                }
+                else if (_createModel.Encrypted && _createModel.EncryptionMode == "group-e2ee")
+                {
+                    <div class="alert alert-info">
+                        <strong>グループ E2EE ボリューム</strong>: ECDH 鍵交換でメンバー間共有が可能な E2EE ボリューム。
+                        マスターキーはパスワードでラップし、メンバー追加時に公開鍵で ECIES ラップします。
                     </div>
                 }
                 else if (_createModel.Encrypted)
@@ -286,7 +304,23 @@ else
                         }
                         else
                         {
-                            <div class="alert alert-info mt-2">E2EE ボリュームはグループ共有に対応していません。</div>
+                            <hr />
+                            <h6>ECDH メンバー追加</h6>
+                            <p class="form-text small">
+                                相手ユーザーが公開鍵を登録している場合、ECDH でマスターキーを共有します。
+                            </p>
+                            <div class="row g-2 align-items-end">
+                                <div class="col">
+                                    <input class="form-control form-control-sm" placeholder="ユーザー名" @bind="_grantUsername" />
+                                </div>
+                                <div class="col-auto">
+                                    <button class="btn btn-sm btn-outline-primary" @onclick="HandleEcdhGrant">ECDH 共有</button>
+                                </div>
+                            </div>
+                            @if (_shareError is not null)
+                            {
+                                <div class="alert alert-danger mt-2 small">@_shareError</div>
+                            }
                         }
                     </div>
                     <div class="modal-footer">
@@ -345,6 +379,10 @@ else
             {
                 await HandleCreateE2ee();
             }
+            else if (_createModel.Encrypted && _createModel.EncryptionMode == "group-e2ee")
+            {
+                await HandleCreateGroupE2ee();
+            }
             else
             {
                 VolumeSvc.Create(_createModel.Name, CurrentUsername, _createModel.Password, _createModel.Encrypted);
@@ -380,6 +418,33 @@ else
         };
 
         VolumeSvc.CreateE2ee(_createModel.Name, CurrentUsername, wrappedKey);
+    }
+
+    private async Task HandleCreateGroupE2ee()
+    {
+        // パスワードラップでオーナー鍵を作成
+        byte[] salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
+        string saltB64 = Convert.ToBase64String(salt);
+        string kekHandle = await E2ee.DeriveKek(_createModel.Password, saltB64, 310_000);
+        string mkHandle = await E2ee.GenerateMasterKey();
+        var (nonceB64, ctB64, tagB64) = await E2ee.WrapMasterKey(mkHandle, kekHandle);
+        await E2ee.ClearKey(kekHandle);
+        await E2ee.ClearKey(mkHandle);
+
+        var ownerWrappedKey = new VolumeHeader.UserWrappedKey
+        {
+            WrapType = "password",
+            Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = 310_000, Salt = salt },
+            WrappedMasterKey = new()
+            {
+                Algorithm = "aes-256-gcm",
+                Nonce = Convert.FromBase64String(nonceB64),
+                Ciphertext = Convert.FromBase64String(ctB64),
+                Tag = Convert.FromBase64String(tagB64),
+            },
+        };
+
+        VolumeSvc.CreateGroupE2ee(_createModel.Name, CurrentUsername, ownerWrappedKey);
     }
 
     private void ShowMountDialog(string name, bool encrypted, string encryptionMode)
@@ -421,7 +486,7 @@ else
         var vol = _volumes.FirstOrDefault(v => v.Name == name);
         if (vol is null) return;
         _shareTarget = name; _shareUsers = vol.AuthorizedUsers;
-        _shareIsE2ee = vol.EncryptionMode == "e2ee";
+        _shareIsE2ee = vol.EncryptionMode == "e2ee" && vol.Name.StartsWith("group__");
         _shareGroups = vol.AuthorizedGroups;
         _availableGroups = GroupSvc.ListGroups();
         _grantGroupName = "";
@@ -478,5 +543,71 @@ else
             if (vol is not null) _shareGroups = vol.AuthorizedGroups;
         }
         catch (VolumeException ex) { _shareError = ex.Message; }
+    }
+
+    private async Task HandleEcdhGrant()
+    {
+        _shareError = null;
+        if (string.IsNullOrWhiteSpace(_grantUsername)) { _shareError = "ユーザー名を入力してください。"; return; }
+        try
+        {
+            // 相手の公開鍵を取得
+            string? recipientPubKey = UserSvc.GetPublicKey(_grantUsername.Trim());
+            if (recipientPubKey is null)
+            {
+                _shareError = "相手ユーザーの公開鍵が登録されていません。先に設定ページで鍵ペアを生成してください。";
+                return;
+            }
+
+            // 自分のパスワードでマスターキーをアンラップするため、パスワード入力が必要
+            if (string.IsNullOrWhiteSpace(_grantGranterPassword))
+            {
+                _shareError = "自分のパスワードを入力してください（マスターキー復号用）。";
+                return;
+            }
+
+            // ボリュームヘッダから自分の wrapped key を取得してアンラップ
+            var vol = VolumeSvc.GetVolumeInfo(_shareTarget!);
+            if (vol?.UserWrapTypes is null || !vol.UserWrapTypes.TryGetValue(CurrentUsername, out var wrapType))
+            {
+                _shareError = "自分の wrapped key が見つかりません。";
+                return;
+            }
+
+            // KEK 導出 → マスターキー アンラップ
+            var header = VolumeSvc.GetVolumeHeader(_shareTarget!);
+            var myKey = header.UserKeys[CurrentUsername];
+            string kekHandle = await E2ee.DeriveKek(_grantGranterPassword,
+                Convert.ToBase64String(myKey.Kdf.Salt), myKey.Kdf.Iterations);
+            string mkHandle = await E2ee.UnwrapMasterKey(
+                Convert.ToBase64String(myKey.WrappedMasterKey.Nonce),
+                Convert.ToBase64String(myKey.WrappedMasterKey.Ciphertext),
+                Convert.ToBase64String(myKey.WrappedMasterKey.Tag), kekHandle);
+            await E2ee.ClearKey(kekHandle);
+
+            // 相手の公開鍵で ECIES ラップ
+            var (ephPubKey, nonce, ct, tag) = await E2ee.EcdhWrap(mkHandle, recipientPubKey);
+            await E2ee.ClearKey(mkHandle);
+
+            var ecdhWrappedKey = new VolumeHeader.UserWrappedKey
+            {
+                WrapType = "ecdh",
+                EphemeralPublicKey = Convert.FromBase64String(ephPubKey),
+                WrappedMasterKey = new()
+                {
+                    Algorithm = "aes-256-gcm",
+                    Nonce = Convert.FromBase64String(nonce),
+                    Ciphertext = Convert.FromBase64String(ct),
+                    Tag = Convert.FromBase64String(tag),
+                },
+            };
+
+            VolumeSvc.AddE2eeWrappedKey(_shareTarget!, CurrentUsername, _grantUsername.Trim(), ecdhWrappedKey);
+            RefreshList();
+            vol = _volumes.FirstOrDefault(v => v.Name == _shareTarget);
+            if (vol is not null) _shareUsers = vol.AuthorizedUsers;
+            _grantUsername = ""; _grantGranterPassword = ""; _shareError = null;
+        }
+        catch (Exception ex) { _shareError = ex.Message; }
     }
 }

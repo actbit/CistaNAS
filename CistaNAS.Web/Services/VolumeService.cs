@@ -133,6 +133,17 @@ public sealed class VolumeService
         if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
     }
 
+    /// <summary>ボリューム情報を返す。存在しない場合は null。</summary>
+    public VolumeInfo? GetVolumeInfo(string name)
+    {
+        var header = LoadHeaderIfExists(name);
+        if (header is null) return null;
+        return ToInfo(name, header, _mounted.ContainsKey(name));
+    }
+
+    /// <summary>ボリュームヘッダを返す。存在しない場合は例外。</summary>
+    public VolumeHeader GetVolumeHeader(string name) => LoadHeaderOrThrow(name);
+
     /// <summary>指定ユーザーがアクセスできるボリューム一覧を返す。</summary>
     public IReadOnlyList<VolumeInfo> ListForUser(string username)
     {
