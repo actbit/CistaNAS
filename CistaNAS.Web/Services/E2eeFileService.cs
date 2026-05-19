@@ -191,13 +191,14 @@ public sealed class E2eeFileService
 /// <summary>部分読み取り用 Stream ラッパー。</summary>
 file sealed class SubStream(Stream baseStream, long length) : Stream
 {
+    private readonly long _length = length;
     private long _remaining = length;
 
     public override bool CanRead => true;
     public override bool CanSeek => false;
     public override bool CanWrite => false;
-    public override long Length => length;
-    public override long Position { get => length - _remaining; set => throw new NotSupportedException(); }
+    public override long Length => _length;
+    public override long Position { get => _length - _remaining; set => throw new NotSupportedException(); }
 
     public override int Read(byte[] buffer, int offset, int count)
     {

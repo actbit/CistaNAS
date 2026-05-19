@@ -69,12 +69,12 @@ public class E2eeFileTests : IDisposable
 
         var (stream0, len0) = _e2eeFs.DownloadChunk(vol, entry.FileId, 0);
         byte[] dl0 = new byte[len0];
-        using (stream0) await stream0.ReadAsync(dl0);
+        using (stream0) await stream0.ReadExactlyAsync(dl0);
         Assert.Equal(encChunk0, dl0);
 
         var (stream1, len1) = _e2eeFs.DownloadChunk(vol, entry.FileId, 1);
         byte[] dl1 = new byte[len1];
-        using (stream1) await stream1.ReadAsync(dl1);
+        using (stream1) await stream1.ReadExactlyAsync(dl1);
         Assert.Equal(encChunk1, dl1);
 
         byte[] dec0 = E2eeCrypto.DecryptChunk(dl0, fileKey, 0, out var salt0);
