@@ -6,6 +6,7 @@ using CistaNAS.Web.Services;
 using CistaNAS.Web.WebDav;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
@@ -27,7 +28,9 @@ public class WebDavTests : IDisposable
         };
         var io = Options.Create(opt);
         var gs = new GroupStore(io, new ServiceCollection().BuildServiceProvider());
-        _volumeService = new VolumeService(io, gs);
+        var sp = new ServiceCollection().AddLogging().BuildServiceProvider();
+        var us = new UserStore(io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
+        _volumeService = new VolumeService(io, gs, us);
         _fileService = new FileService(_volumeService, new JournalService(io), io);
         var e2eeFs = new E2eeFileService(_volumeService, io);
         _handler = new WebDavHandler(_volumeService, _fileService, e2eeFs);

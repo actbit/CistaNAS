@@ -18,9 +18,11 @@ public class AuthTests : IDisposable
             Volume = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
         };
         var io = Options.Create(opt);
-        var gs = new GroupStore(io, new FakeServiceProvider());
-        var vs = new VolumeService(io, gs);
-        var store = new UserStore(io, NullLogger<UserStore>.Instance, new FakeServiceProvider(vs));
+        var fakeSp = new FakeServiceProvider();
+        var gs = new GroupStore(io, fakeSp);
+        var store = new UserStore(io, NullLogger<UserStore>.Instance, fakeSp);
+        var vs = new VolumeService(io, gs, store);
+        fakeSp.SetVolumeService(vs);
         var key = new JwtSigningKey(System.Security.Cryptography.RandomNumberGenerator.GetBytes(48));
         return (new AuthService(store, key, io), store, opt, vs);
     }
@@ -118,12 +120,14 @@ public class AuthTests : IDisposable
     /// <summary>UserStore が IServiceProvider 経由で VolumeService を解決するためのスタブ。</summary>
     private sealed class FakeServiceProvider : IServiceProvider
     {
-        private readonly VolumeService? _volumeService;
+        private VolumeService? _volumeService;
 
         public FakeServiceProvider(VolumeService? volumeService = null)
         {
             _volumeService = volumeService;
         }
+
+        public void SetVolumeService(VolumeService vs) => _volumeService = vs;
 
         public object? GetService(Type serviceType) =>
             serviceType == typeof(VolumeService) ? _volumeService : null;

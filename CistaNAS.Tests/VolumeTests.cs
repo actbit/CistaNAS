@@ -2,6 +2,7 @@ using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
@@ -19,7 +20,9 @@ public class VolumeTests : IDisposable
         var opt = new CistaNasOptions { DataRoot = _dataRoot, Volume = _volOpts };
         var io = Options.Create(opt);
         var gs = new GroupStore(io, new ServiceCollection().BuildServiceProvider());
-        _vs = new VolumeService(io, gs);
+        var sp = new ServiceCollection().AddLogging().BuildServiceProvider();
+        var us = new UserStore(io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
+        _vs = new VolumeService(io, gs, us);
     }
 
     [Fact]

@@ -22,8 +22,10 @@ public class GroupTests : IDisposable
         };
         var io = Options.Create(opt);
         var sp = new ServiceCollection()
+            .AddLogging()
             .AddSingleton(_ => io)
             .AddSingleton<GroupStore>()
+            .AddSingleton<UserStore>()
             .AddSingleton<VolumeService>()
             .BuildServiceProvider();
 
