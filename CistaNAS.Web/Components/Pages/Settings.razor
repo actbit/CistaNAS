@@ -7,6 +7,8 @@
 @inject AuthService Auth
 @inject UserStore Users
 @inject GroupStore Groups
+@inject E2eeInterop E2ee
+@inject IJSRuntime JS
 @inject NavigationManager Nav
 
 <PageTitle>設定 - CistaNAS</PageTitle>
@@ -254,6 +256,44 @@ else
             <button class="btn btn-primary mt-3" @onclick="HandleSaveEncryption">保存</button>
         </div>
     </div>
+
+    <!-- E2EE 鍵ペア管理 -->
+    <div class="card mb-4">
+        <div class="card-header">E2EE 鍵ペア管理</div>
+        <div class="card-body">
+            <p class="form-text">
+                E2EE グループ共有で使用する ECDH 鍵ペアを管理します。
+                秘密鍵はパスワードで暗号化してブラウザに保存します。
+            </p>
+            @if (_keyHasPublicKey)
+            {
+                <div class="alert alert-success">
+                    公開鍵登録済み。E2EE グループ共有を利用できます。
+                </div>
+            }
+            else
+            {
+                <div class="alert alert-warning">
+                    公開鍵が未登録です。鍵ペアを生成してください。
+                </div>
+            }
+            @if (_keyError is not null)
+            {
+                <div class="alert alert-danger">@_keyError</div>
+            }
+            @if (_keySuccess is not null)
+            {
+                <div class="alert alert-success">@_keySuccess</div>
+            }
+            <div class="mb-3">
+                <label class="form-label">パスワード（秘密鍵の暗号化用）</label>
+                <input type="password" class="form-control" style="max-width:300px" @bind="_keyPassword" />
+            </div>
+            <button class="btn btn-primary" disabled="@_keyLoading" @onclick="HandleGenerateKeyPair">
+                @(_keyLoading ? "生成中..." : "鍵ペアを生成・登録")
+            </button>
+        </div>
+    </div>
 }
 
 @code {
@@ -291,6 +331,13 @@ else
     private bool _encSaveSuccess;
     private string? _encError;
 
+    // E2EE 鍵ペア管理
+    private bool _keyHasPublicKey;
+    private bool _keyLoading;
+    private string _keyPassword = "";
+    private string? _keyError;
+    private string? _keySuccess;
+
     private sealed class EncSettingsModel
     {
         public string DefaultEncryptionMode { get; set; } = "server";
@@ -304,6 +351,7 @@ else
         RefreshUsers();
         RefreshGroups();
         LoadEncryptionSettings();
+        _keyHasPublicKey = Users.GetPublicKey(CurrentUsername) is not null;
     }
 
     private void RefreshUsers()
@@ -503,4 +551,52 @@ else
         System.Text.Json.JsonValueKind.False => false,
         _ => "",
     };
+
+    // ---- E2EE 鍵ペア管理 ----
+
+    private async Task HandleGenerateKeyPair()
+    {
+        _keyLoading = true; _keyError = null; _keySuccess = null;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_keyPassword))
+            {
+                _keyError = "パスワードを入力してください。";
+                return;
+            }
+
+            // ECDH 鍵ペア生成
+            var (pubHandle, privHandle) = await E2ee.GenerateKeyPair();
+
+            // 公開鍵をエクスポート
+            string pubKeyB64 = await E2ee.ExportPublicKey(pubHandle);
+
+            // 秘密鍵をパスワードで暗号化
+            byte[] salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
+            string saltB64 = Convert.ToBase64String(salt);
+            var (nonceB64, wrappedB64) = await E2ee.EncryptPrivateKey(privHandle, _keyPassword, saltB64, 310_000);
+
+            // サーバーに公開鍵を登録
+            Users.UpdatePublicKey(CurrentUsername, pubKeyB64);
+
+            // 暗号化済み秘密鍵を localStorage に保存
+            string key = $"e2ee_privkey_{CurrentUsername}";
+            string json = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                wrapped = wrappedB64,
+                nonce = nonceB64,
+                salt = saltB64,
+                iterations = 310000
+            });
+            await JS.InvokeVoidAsync("localStorage.setItem", key, json);
+
+            await E2ee.ClearKey(pubHandle);
+            await E2ee.ClearKey(privHandle);
+
+            _keyHasPublicKey = true;
+            _keySuccess = "鍵ペアを生成し、公開鍵を登録しました。";
+        }
+        catch (Exception ex) { _keyError = $"エラー: {ex.Message}"; }
+        finally { _keyLoading = false; }
+    }
 }
