@@ -54,3 +54,12 @@ public sealed class E2eeCatalog
 {
     public Dictionary<string, E2eeFileEntry> Files { get; set; } = new(StringComparer.Ordinal);
 }
+
+// ---- ECDH 鍵交換・招待関連 DTO ----
+
+public sealed record SetPublicKeyRequest(string PublicKey);
+public sealed record CreateGroupE2eeVolumeRequest(string GroupName, VolumeHeader.UserWrappedKey OwnerWrappedKey, int ChunkSize = 1048576);
+public sealed record AddE2eeWrappedKeysBatchRequest(Dictionary<string, VolumeHeader.UserWrappedKey> WrappedKeys);
+public sealed record CreateInvitationRequest(string TargetUsername);
+public sealed record AcceptInvitationRequest(string InvitationId, string EncryptedPublicKey, string Nonce);
+public sealed record InvitationResponse(string InvitationId, string InviterUsername, DateTimeOffset CreatedAt);

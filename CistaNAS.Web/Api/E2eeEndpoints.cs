@@ -3,6 +3,7 @@ using CistaNAS.Web.Services;
 using CistaNAS.Web.Volume;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace CistaNAS.Web.Api;
 
@@ -22,6 +23,20 @@ public static class E2eeEndpoints
         e2ee.MapDelete("/{volumeName}/files/{fileId}", DeleteFile);
         e2ee.MapGet("/{volumeName}/files", ListFiles);
         e2ee.MapPost("/{volumeName}/add-wrapped-key", AddWrappedKey);
+
+        // ---- ECDH public key management ----
+        e2ee.MapGet("/public-key/{username}", GetPublicKey);
+        e2ee.MapPut("/my-public-key", SetMyPublicKey);
+
+        // ---- Group E2EE volume ----
+        e2ee.MapPost("/create-group-volume", CreateGroupVolume);
+        e2ee.MapGet("/{volumeName}/group-members", GetGroupMembers);
+        e2ee.MapPost("/{volumeName}/add-wrapped-keys-batch", AddWrappedKeysBatch);
+
+        // ---- Invitation ----
+        e2ee.MapPost("/invitations", CreateInvitation);
+        e2ee.MapGet("/invitations/{invitationId}", GetInvitation);
+        e2ee.MapPost("/invitations/{invitationId}/accept", AcceptInvitation);
 
         return e2ee;
     }
@@ -155,5 +170,99 @@ public static class E2eeEndpoints
         {
             return Results.BadRequest(new { error = ex.Message });
         }
+    }
+
+    // ---- ECDH public key ----
+
+    private static IResult GetPublicKey(string username, UserStore userStore)
+    {
+        var pubKey = userStore.GetPublicKey(username);
+        return pubKey is not null
+            ? Results.Ok(new { publicKey = pubKey })
+            : Results.NotFound(new { error = "公開鍵が登録されていません。" });
+    }
+
+    private static IResult SetMyPublicKey(SetPublicKeyRequest req, HttpContext ctx, UserStore userStore)
+    {
+        string username = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+        try
+        {
+            userStore.UpdatePublicKey(username, req.PublicKey);
+            return Results.Ok();
+        }
+        catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+    }
+
+    // ---- Group E2EE volume ----
+
+    private static IResult CreateGroupVolume(CreateGroupE2eeVolumeRequest req,
+        VolumeService vs, HttpContext ctx)
+    {
+        string username = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+        try
+        {
+            var info = vs.CreateGroupE2ee(req.GroupName, username, req.OwnerWrappedKey, req.ChunkSize);
+            return Results.Created($"/api/v1/e2ee/{info.Name}/mount", info);
+        }
+        catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
+    }
+
+    private static IResult GetGroupMembers(string volumeName, VolumeService vs, HttpContext ctx)
+    {
+        string username = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+        try
+        {
+            var members = vs.GetGroupMembersWithPublicKeys(volumeName, username);
+            return Results.Ok(members.Select(m => new { m.Username, m.PublicKey }));
+        }
+        catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
+    }
+
+    private static IResult AddWrappedKeysBatch(string volumeName, AddE2eeWrappedKeysBatchRequest req,
+        VolumeService vs, HttpContext ctx)
+    {
+        string username = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+        try
+        {
+            vs.AddE2eeWrappedKeysBatch(volumeName, username, req.WrappedKeys);
+            return Results.Ok();
+        }
+        catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
+    }
+
+    // ---- Invitation ----
+
+    private static IResult CreateInvitation(CreateInvitationRequest req, HttpContext ctx,
+        InvitationService invSvc)
+    {
+        string username = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+        var record = invSvc.Create(username, req.TargetUsername);
+        return Results.Ok(new { record.InvitationId });
+    }
+
+    private static IResult GetInvitation(string invitationId, InvitationService invSvc)
+    {
+        var record = invSvc.Find(invitationId);
+        return record is null
+            ? Results.NotFound(new { error = "招待が見つかりません。" })
+            : Results.Ok(new { record.InvitationId, record.InviterUsername, record.CreatedAt });
+    }
+
+    private static IResult AcceptInvitation(string invitationId, AcceptInvitationRequest req,
+        InvitationService invSvc)
+    {
+        var record = invSvc.Find(invitationId);
+        if (record is null) return Results.NotFound(new { error = "招待が見つかりません。" });
+        try
+        {
+            invSvc.SetAcceptedData(invitationId, req.EncryptedPublicKey, req.Nonce);
+            return Results.Ok();
+        }
+        catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
     }
 }
