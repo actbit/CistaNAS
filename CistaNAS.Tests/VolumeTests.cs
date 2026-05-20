@@ -1,6 +1,9 @@
+using System.Security.Cryptography;
+using CistaNAS.Client.Crypto;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
+using CistaNAS.Web.Volume;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -170,5 +173,112 @@ public class VolumeTests : IDisposable
             try { _vs.Lock(v.Name); } catch { }
         }
         if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true);
+    }
+
+    // ---- 追加テスト ----
+
+    [Fact]
+    public void Create_GroupPrefix_Throws()
+    {
+        Assert.Throws<VolumeException>(() =>
+            _vs.Create("group__test", "alice", "pw", encrypted: true));
+    }
+
+    [Fact]
+    public void Create_InvalidChars_Throws()
+    {
+        Assert.Throws<VolumeException>(() =>
+            _vs.Create("bad|name", "alice", "pw", encrypted: true));
+    }
+
+    [Fact]
+    public void Create_TooLong_Throws()
+    {
+        string longName = new('a', 65);
+        Assert.Throws<VolumeException>(() =>
+            _vs.Create(longName, "alice", "pw", encrypted: true));
+    }
+
+    [Fact]
+    public void DoubleMount_Throws()
+    {
+        _vs.Create("dm", "alice", "pw", encrypted: true);
+        Assert.Throws<VolumeException>(() => _vs.Mount("dm", "alice", "pw"));
+    }
+
+    [Fact]
+    public void Lock_NotMounted_Throws()
+    {
+        Assert.Throws<VolumeException>(() => _vs.Lock("nonexistent"));
+    }
+
+    [Fact]
+    public void DeleteVolume_RemovesDirectory()
+    {
+        _vs.Create("to-delete", "alice", "pw", encrypted: true);
+        Assert.True(Directory.Exists(Path.Combine(_dataRoot, "to-delete")));
+
+        _vs.DeleteVolume("to-delete");
+        Assert.False(Directory.Exists(Path.Combine(_dataRoot, "to-delete")));
+        Assert.False(_vs.IsMounted("to-delete"));
+    }
+
+    [Fact]
+    public void MountE2ee_Success()
+    {
+        byte[] masterKey = RandomNumberGenerator.GetBytes(32);
+        byte[] salt = RandomNumberGenerator.GetBytes(16);
+        byte[] kek = E2eeCrypto.DeriveKek("alice", "pw", salt, 1000);
+        var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
+
+        _vs.CreateE2ee("e2ee-mount", "alice", new VolumeHeader.UserWrappedKey
+        {
+            Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = 1000, Salt = salt },
+            WrappedMasterKey = new() { Algorithm = "aes-256-gcm", Nonce = nonce, Ciphertext = ct, Tag = tag },
+        });
+
+        _vs.Lock("e2ee-mount");
+        var info = _vs.MountE2ee("e2ee-mount", "alice");
+        Assert.True(info.IsMounted);
+    }
+
+    [Fact]
+    public void MountE2ee_WrongUser_Throws()
+    {
+        byte[] masterKey = RandomNumberGenerator.GetBytes(32);
+        byte[] salt = RandomNumberGenerator.GetBytes(16);
+        byte[] kek = E2eeCrypto.DeriveKek("alice", "pw", salt, 1000);
+        var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
+
+        _vs.CreateE2ee("e2ee-mount2", "alice", new VolumeHeader.UserWrappedKey
+        {
+            Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = 1000, Salt = salt },
+            WrappedMasterKey = new() { Algorithm = "aes-256-gcm", Nonce = nonce, Ciphertext = ct, Tag = tag },
+        });
+
+        _vs.Lock("e2ee-mount2");
+        Assert.Throws<VolumeException>(() => _vs.MountE2ee("e2ee-mount2", "bob"));
+    }
+
+    [Fact]
+    public void GrantGroupAccess_E2eeVolume_Throws()
+    {
+        byte[] masterKey = RandomNumberGenerator.GetBytes(32);
+        byte[] salt = RandomNumberGenerator.GetBytes(16);
+        byte[] kek = E2eeCrypto.DeriveKek("alice", "pw", salt, 1000);
+        var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
+
+        var gs = new GroupStore(Options.Create(new CistaNasOptions { DataRoot = _dataRoot }),
+            new ServiceCollection().BuildServiceProvider());
+        gs.CreateGroup("testg", "alice");
+
+        _vs.CreateE2ee("e2ee-group", "alice", new VolumeHeader.UserWrappedKey
+        {
+            Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = 1000, Salt = salt },
+            WrappedMasterKey = new() { Algorithm = "aes-256-gcm", Nonce = nonce, Ciphertext = ct, Tag = tag },
+        });
+
+        Assert.Throws<VolumeException>(() =>
+            _vs.GrantGroupAccess("e2ee-group", "alice", "testg"));
     }
 }
