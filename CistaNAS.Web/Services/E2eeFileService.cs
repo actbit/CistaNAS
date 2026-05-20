@@ -18,6 +18,7 @@ public sealed class E2eeFileService
     private readonly VolumeService _volumeService;
     private readonly string _dataRoot;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _fileGates = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _volumeGates = new(StringComparer.Ordinal);
 
     public E2eeFileService(VolumeService volumeService, IOptions<CistaNasOptions> options)
     {
@@ -38,26 +39,39 @@ public sealed class E2eeFileService
     public E2eeFileEntry CreateFile(string volumeName, E2eeCreateFileRequest request)
     {
         var header = GetE2eeHeader(volumeName);
-        var catalog = LoadCatalog(volumeName);
 
-        string fileId = Guid.NewGuid().ToString("N");
-        string dataPath = GetDataPath(volumeName);
-        long offset = new FileInfo(dataPath).Length;
-
-        var entry = new E2eeFileEntry
+        var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        volGate.Wait();
+        try
         {
-            FileId = fileId,
-            EncryptedName = request.EncryptedName,
-            Offset = offset,
-            EncryptedLength = request.EncryptedLength,
-            ChunkCount = request.ChunkCount,
-            CreatedAt = DateTimeOffset.UtcNow,
-            ModifiedAt = DateTimeOffset.UtcNow,
-        };
+            var catalog = LoadCatalog(volumeName);
 
-        catalog.Files[fileId] = entry;
-        SaveCatalog(volumeName, catalog);
-        return entry;
+            string fileId = Guid.NewGuid().ToString("N");
+            string dataPath = GetDataPath(volumeName);
+            long offset = new FileInfo(dataPath).Length;
+
+            var entry = new E2eeFileEntry
+            {
+                FileId = fileId,
+                EncryptedName = request.EncryptedName,
+                Offset = offset,
+                EncryptedLength = request.EncryptedLength,
+                ChunkCount = request.ChunkCount,
+                CreatedAt = DateTimeOffset.UtcNow,
+                ModifiedAt = DateTimeOffset.UtcNow,
+            };
+
+            catalog.Files[fileId] = entry;
+            SaveCatalog(volumeName, catalog);
+
+            // ファイル gate も登録（UploadChunkAsync で使用）
+            _fileGates.TryAdd(fileId, new SemaphoreSlim(1, 1));
+            return entry;
+        }
+        finally
+        {
+            volGate.Release();
+        }
     }
 
     /// <summary>チャンクをアップロードして volume.dat に書き込む。</summary>
@@ -154,8 +168,7 @@ public sealed class E2eeFileService
         entry.ModifiedAt = DateTimeOffset.UtcNow;
         SaveCatalog(volumeName, catalog);
 
-        if (_fileGates.TryRemove(fileId, out var gate))
-            gate.Dispose();
+        // ゲートは残しておき、Cleanup に任せる（進行中の UploadChunkAsync を保護）
     }
 
     /// <summary>ファイル一覧を返す。</summary>
@@ -163,6 +176,17 @@ public sealed class E2eeFileService
     {
         GetE2eeHeader(volumeName);
         var catalog = LoadCatalog(volumeName);
+
+        // カタログに存在しないファイルIDのゲートを掃除
+        foreach (var kvp in _fileGates)
+        {
+            if (!catalog.Files.ContainsKey(kvp.Key))
+            {
+                if (_fileGates.TryRemove(kvp.Key, out var gate))
+                    gate.Dispose();
+            }
+        }
+
         return new E2eeListFilesResponse(catalog.Files.Values.OrderBy(f => f.CreatedAt).ToList());
     }
 

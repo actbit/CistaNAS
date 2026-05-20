@@ -65,21 +65,6 @@ public sealed class FileService
         var catalog = LoadCatalog(volumeName);
         catalog.Files.TryGetValue(fileName, out var existing);
 
-        long offset;
-        lock (stream)
-        {
-            if (existing is not null && existing.Length >= contentLength)
-            {
-                offset = existing.Offset;
-            }
-            else
-            {
-                offset = stream.Length;
-            }
-
-            stream.Seek(offset, SeekOrigin.Begin);
-        }
-
         // ユーザー入力の読み取りは lock 外で行い（非同期 I/O）、書き込みだけ lock 内で実行
         byte[] buffer = new byte[81920];
         long remaining = contentLength;
@@ -93,8 +78,19 @@ public sealed class FileService
             remaining -= read;
         }
 
+        // オフセット決定 + 書き込みを単一 lock でアトミックに実行
+        long offset;
         lock (stream)
         {
+            if (existing is not null && existing.Length >= contentLength)
+            {
+                offset = existing.Offset;
+            }
+            else
+            {
+                offset = stream.Length;
+            }
+
             stream.Seek(offset, SeekOrigin.Begin);
             ms.WriteTo(stream);
             stream.Flush();
