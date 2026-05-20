@@ -427,10 +427,18 @@ public sealed class VolumeService
 
     public void DeleteVolume(string name)
     {
-        if (_mounted.TryRemove(name, out var mv))
+        _mountGate.Wait();
+        try
         {
-            mv.Stream.Dispose();
-            if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
+            if (_mounted.TryRemove(name, out var mv))
+            {
+                mv.Stream.Dispose();
+                if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
+            }
+        }
+        finally
+        {
+            _mountGate.Release();
         }
 
         string dir = VolumeDir(name);

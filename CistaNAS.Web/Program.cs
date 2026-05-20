@@ -118,11 +118,11 @@ builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
     {
-        // Same-Origin が基本。外部 API クライアントが必要な場合は設定で追加
-        policy.SetIsOriginAllowed(_ => true)
-              .AllowAnyHeader()
+        policy.AllowAnyHeader()
               .AllowAnyMethod()
-              .AllowCredentials();
+              .SetIsOriginAllowed(origin =>
+                  string.Equals(origin, "null", StringComparison.OrdinalIgnoreCase) || // Blazor SSR same-origin
+                  true); // 制限する場合は特定ドメインに絞る
     });
 });
 

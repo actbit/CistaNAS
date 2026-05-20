@@ -7,6 +7,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="CistaNAS.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\CistaNAS.ServiceDefaults\CistaNAS.ServiceDefaults.csproj" />
   </ItemGroup>
 

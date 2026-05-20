@@ -4,7 +4,7 @@ using StreamingTokenService = CistaNAS.Web.Services.StreamingTokenService;
 
 namespace CistaNAS.Web.Api;
 
-file static class PathSanitizer
+internal static class PathSanitizer
 {
     /// <summary>
     /// ユーザー入力のファイルパスをサニタイズし、ディレクトリトラバーサルを防止する。
@@ -217,9 +217,9 @@ public static class ApiEndpoints
         api.MapGet("/stream/{volumeName}/{*filePath}", (
             string volumeName, string filePath, string? token,
             StreamingTokenService sts, VolumeService vs, FileService fs,
-            HttpContext ctx, long? fromByte, long? toByte) =>
+            HttpContext ctx) =>
         {
-            // トークン検証
+            // トークン検証 — ユーザー・ボリューム・ファイル名すべて照合
             if (string.IsNullOrEmpty(token)) return Results.Unauthorized();
             var validated = sts.Validate(token);
             if (validated is null) return Results.Unauthorized();
@@ -229,6 +229,7 @@ public static class ApiEndpoints
             try
             {
                 string fileName = PathSanitizer.SanitizeFileName(filePath);
+                if (!string.Equals(file, fileName, StringComparison.Ordinal)) return Results.Forbid();
                 var dl = fs.Download(volumeName, fileName);
                 return Results.Stream(dl.Stream, "application/octet-stream", dl.FileName,
                     enableRangeProcessing: true);

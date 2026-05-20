@@ -289,7 +289,16 @@ else
             {
                 var (chunkStream, chunkLen) = E2eeFileSvc.DownloadChunk(VolumeName, entry.FileId, i);
                 byte[] encData = new byte[chunkLen];
-                using (chunkStream) await chunkStream.ReadAsync(encData);
+                using (chunkStream)
+                {
+                    int read = 0;
+                    while (read < chunkLen)
+                    {
+                        int n = await chunkStream.ReadAsync(encData, read, (int)chunkLen - read);
+                        if (n == 0) break;
+                        read += n;
+                    }
+                }
 
                 if (i == 0 && fileSaltB64 is null)
                 {
@@ -473,7 +482,16 @@ else
             {
                 var (chunkStream, chunkLen) = E2eeFileSvc.DownloadChunk(VolumeName, entry.FileId, i);
                 byte[] encData = new byte[chunkLen];
-                using (chunkStream) await chunkStream.ReadAsync(encData);
+                using (chunkStream)
+                {
+                    int read = 0;
+                    while (read < chunkLen)
+                    {
+                        int n = await chunkStream.ReadAsync(encData, read, (int)chunkLen - read);
+                        if (n == 0) break;
+                        read += n;
+                    }
+                }
 
                 if (i == 0 && fileSaltB64 is null)
                 {
@@ -512,11 +530,20 @@ else
 
     // ---- 通常ボリューム ----
 
-    private void HandleDownload(string fileName)
+    private async Task HandleDownload(string fileName)
     {
-        var token = AuthState.Token;
-        var url = $"/api/v1/files/{Uri.EscapeDataString(VolumeName)}/{Uri.EscapeDataString(fileName)}?token={Uri.EscapeDataString(token ?? "")}";
-        Nav.NavigateTo(url, forceLoad: true);
+        try
+        {
+            var baseUri = Nav.BaseUri.TrimEnd('/');
+            var jwt = AuthState.Token ?? "";
+            var streamUrl = await JS.InvokeAsync<string>(
+                "cistaMedia.getStreamUrl", baseUri, VolumeName, fileName, jwt);
+            Nav.NavigateTo(streamUrl, forceLoad: true);
+        }
+        catch (Exception ex)
+        {
+            _uploadError = $"ダウンロードエラー: {ex.Message}";
+        }
     }
 
     private void HandleDelete(string fileName)

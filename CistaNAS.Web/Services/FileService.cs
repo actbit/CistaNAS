@@ -117,11 +117,23 @@ public sealed class FileService
             throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
 
         var (stream, _) = _volumeService.GetMounted(volumeName);
-        stream.Seek(meta.Offset, SeekOrigin.Begin);
+        // ロックして安全にシーク→読み取りを行うため、データを独立メモリにコピーして返す
+        byte[] data;
+        lock (stream)
+        {
+            stream.Seek(meta.Offset, SeekOrigin.Begin);
+            data = new byte[meta.Length];
+            int totalRead = 0;
+            while (totalRead < data.Length)
+            {
+                int n = stream.Read(data, totalRead, data.Length - totalRead);
+                if (n == 0) break;
+                totalRead += n;
+            }
+        }
 
-        // 読み取り用に部分ストリームをラップ
-        var subStream = new SubStream(stream, meta.Length);
-        return new FileDownloadResponse(subStream, meta.Name, meta.Length);
+        var ms = new MemoryStream(data, 0, data.Length, writable: false);
+        return new FileDownloadResponse(ms, meta.Name, meta.Length);
     }
 
     /// <summary>ファイルを削除。</summary>
@@ -185,31 +197,4 @@ public sealed class FileService
 
     private string GetCatalogPath(string volumeName)
         => Path.Combine(_dataRoot, volumeName, "catalog.json");
-}
-
-/// <summary>暗号化ストリームの部分読み取り用ラッパー。</summary>
-file sealed class SubStream(Stream baseStream, long length) : Stream
-{
-    private readonly long _length = length;
-    private long _remaining = length;
-
-    public override bool CanRead => true;
-    public override bool CanSeek => false;
-    public override bool CanWrite => false;
-    public override long Length => _length;
-    public override long Position { get => _length - _remaining; set => throw new NotSupportedException(); }
-
-    public override int Read(byte[] buffer, int offset, int count)
-    {
-        if (_remaining <= 0) return 0;
-        int toRead = (int)Math.Min(count, _remaining);
-        int read = baseStream.Read(buffer, offset, toRead);
-        _remaining -= read;
-        return read;
-    }
-
-    public override void Flush() { }
-    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-    public override void SetLength(long value) => throw new NotSupportedException();
-    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 }
