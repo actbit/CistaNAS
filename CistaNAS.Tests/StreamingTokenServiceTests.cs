@@ -19,7 +19,7 @@ public class StreamingTokenServiceTests
     }
 
     [Fact]
-    public void Validate_TokenIsSingleUse()
+    public void Validate_TokenIsReusableForRangeRequests()
     {
         var svc = new StreamingTokenService();
         string token = svc.Issue("alice", "vol1", "file.txt");
@@ -28,7 +28,7 @@ public class StreamingTokenServiceTests
         var second = svc.Validate(token);
 
         Assert.NotNull(first);
-        Assert.Null(second);
+        Assert.NotNull(second);
     }
 
     [Fact]
