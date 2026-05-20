@@ -1,4 +1,5 @@
 @using CistaNAS.Web.Helpers
+@implements IAsyncDisposable
 
 <div class="modal-overlay" @onclick="Close">
     <div class="modal-content media-modal" @onclick:stopPropagation>
@@ -117,7 +118,22 @@
 
     private async Task Close()
     {
+        await RevokeBlobUrlAsync();
         _streamUrl = null;
         await OnClose.InvokeAsync();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await RevokeBlobUrlAsync();
+    }
+
+    private async Task RevokeBlobUrlAsync()
+    {
+        if (_streamUrl is not null && _streamUrl.StartsWith("blob:", StringComparison.Ordinal))
+        {
+            try { await JS.InvokeVoidAsync("cistaMedia.revokeBlobUrl", _streamUrl); }
+            catch { /* 破棄時の例外は無視 */ }
+        }
     }
 }

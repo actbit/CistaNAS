@@ -212,6 +212,7 @@ public sealed class WebDavHandler
         foreach (var part in parts)
         {
             if (part == ".." || part == ".") continue;
+            if (part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) continue;
             safeParts.Add(part);
         }
         return string.Join('/', safeParts);

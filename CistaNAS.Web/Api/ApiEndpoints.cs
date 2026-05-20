@@ -20,7 +20,8 @@ internal static class PathSanitizer
         foreach (var part in parts)
         {
             if (part == ".." || part == ".") continue;
-            if (part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) continue;
+            if (part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                throw new FileServiceException("ファイル名に使用できない文字が含まれています。");
             safeParts.Add(part);
         }
 

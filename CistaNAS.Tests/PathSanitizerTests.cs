@@ -64,4 +64,10 @@ public class PathSanitizerTests
     {
         Assert.Equal("photo.jpg", PathSanitizer.SanitizeFileName("photo.jpg"));
     }
+
+    [Fact]
+    public void InvalidFileNameChars_Throws()
+    {
+        Assert.Throws<FileServiceException>(() => PathSanitizer.SanitizeFileName("bad|name.txt"));
+    }
 }

@@ -1,4 +1,5 @@
 @page "/files/{VolumeName}"
+@implements IAsyncDisposable
 @using CistaNAS.Web.Components.Auth
 @using CistaNAS.Web.Models
 @using CistaNAS.Web.Services
@@ -572,5 +573,14 @@ else
         public E2eeFileEntry Entry { get; set; } = null!;
         public string PlainName { get; set; } = "";
         public bool Downloading { get; set; }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_previewStreamUrl is not null && _previewStreamUrl.StartsWith("blob:", StringComparison.Ordinal))
+        {
+            try { await JS.InvokeVoidAsync("cistaMedia.revokeBlobUrl", _previewStreamUrl); }
+            catch { /* 破棄時の例外は無視 */ }
+        }
     }
 }

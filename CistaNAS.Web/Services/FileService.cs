@@ -66,30 +66,39 @@ public sealed class FileService
         catalog.Files.TryGetValue(fileName, out var existing);
 
         long offset;
-        if (existing is not null && existing.Length >= contentLength)
+        lock (stream)
         {
-            // 既存スペースに収まる → 上書き
-            offset = existing.Offset;
-        }
-        else
-        {
-            // 末尾に追記
-            offset = stream.Length;
+            if (existing is not null && existing.Length >= contentLength)
+            {
+                offset = existing.Offset;
+            }
+            else
+            {
+                offset = stream.Length;
+            }
+
+            stream.Seek(offset, SeekOrigin.Begin);
         }
 
-        stream.Seek(offset, SeekOrigin.Begin);
-        // セクタ境界まで content をコピー
+        // ユーザー入力の読み取りは lock 外で行い（非同期 I/O）、書き込みだけ lock 内で実行
         byte[] buffer = new byte[81920];
         long remaining = contentLength;
+        using var ms = new MemoryStream((int)contentLength);
         while (remaining > 0)
         {
             int toRead = (int)Math.Min(buffer.Length, remaining);
             int read = await content.ReadAsync(buffer.AsMemory(0, toRead), ct);
             if (read == 0) break;
-            stream.Write(buffer, 0, read);
+            ms.Write(buffer, 0, read);
             remaining -= read;
         }
-        stream.Flush();
+
+        lock (stream)
+        {
+            stream.Seek(offset, SeekOrigin.Begin);
+            ms.WriteTo(stream);
+            stream.Flush();
+        }
 
         // カタログ更新
         var meta = new FileMetadata

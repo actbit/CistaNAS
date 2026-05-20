@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
@@ -16,6 +17,7 @@ public sealed class E2eeFileService
 
     private readonly VolumeService _volumeService;
     private readonly string _dataRoot;
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _fileGates = new(StringComparer.Ordinal);
 
     public E2eeFileService(VolumeService volumeService, IOptions<CistaNasOptions> options)
     {
@@ -62,37 +64,47 @@ public sealed class E2eeFileService
     public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, Stream data, long dataLength, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
-        var catalog = LoadCatalog(volumeName);
 
-        if (!catalog.Files.TryGetValue(fileId, out var entry))
-            throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
-
-        // チャンクはシーケンシャルに書き込む — 前のチャンクまでの累積サイズがオフセット
-        long chunkOffset = entry.Offset + entry.ChunkSizes.Sum(s => (long)s);
-
-        string dataPath = GetDataPath(volumeName);
-        using var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
-        fs.Seek(chunkOffset, SeekOrigin.Begin);
-
-        long written = 0;
-        byte[] buffer = new byte[81920];
-        long remaining = dataLength;
-        while (remaining > 0)
+        var gate = _fileGates.GetOrAdd(fileId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
         {
-            int toRead = (int)Math.Min(buffer.Length, remaining);
-            int read = await data.ReadAsync(buffer.AsMemory(0, toRead), ct);
-            if (read == 0) break;
-            fs.Write(buffer, 0, read);
-            written += read;
-            remaining -= read;
-        }
-        fs.Flush();
+            var catalog = LoadCatalog(volumeName);
 
-        // チャンクサイズを記録
-        while (entry.ChunkSizes.Count <= chunkIndex)
-            entry.ChunkSizes.Add(0);
-        entry.ChunkSizes[chunkIndex] = (int)written;
-        SaveCatalog(volumeName, catalog);
+            if (!catalog.Files.TryGetValue(fileId, out var entry))
+                throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+
+            // チャンクはシーケンシャルに書き込む — 前のチャンクまでの累積サイズがオフセット
+            long chunkOffset = entry.Offset + entry.ChunkSizes.Sum(s => (long)s);
+
+            string dataPath = GetDataPath(volumeName);
+            using var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+            fs.Seek(chunkOffset, SeekOrigin.Begin);
+
+            long written = 0;
+            byte[] buffer = new byte[81920];
+            long remaining = dataLength;
+            while (remaining > 0)
+            {
+                int toRead = (int)Math.Min(buffer.Length, remaining);
+                int read = await data.ReadAsync(buffer.AsMemory(0, toRead), ct);
+                if (read == 0) break;
+                fs.Write(buffer, 0, read);
+                written += read;
+                remaining -= read;
+            }
+            fs.Flush();
+
+            // チャンクサイズを記録
+            while (entry.ChunkSizes.Count <= chunkIndex)
+                entry.ChunkSizes.Add(0);
+            entry.ChunkSizes[chunkIndex] = (int)written;
+            SaveCatalog(volumeName, catalog);
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     /// <summary>チャンクをダウンロード。</summary>
@@ -141,6 +153,9 @@ public sealed class E2eeFileService
         entry.EncryptedLength = request.ActualEncryptedLength;
         entry.ModifiedAt = DateTimeOffset.UtcNow;
         SaveCatalog(volumeName, catalog);
+
+        if (_fileGates.TryRemove(fileId, out var gate))
+            gate.Dispose();
     }
 
     /// <summary>ファイル一覧を返す。</summary>
