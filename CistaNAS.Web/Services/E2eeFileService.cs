@@ -17,8 +17,8 @@ public sealed class E2eeFileService
 
     private readonly VolumeService _volumeService;
     private readonly string _dataRoot;
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _fileGates = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _volumeGates = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> _fileGates = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> _volumeGates = new(StringComparer.Ordinal);
 
     public E2eeFileService(VolumeService volumeService, IOptions<CistaNasOptions> options)
     {

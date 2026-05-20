@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Crypto;
@@ -23,6 +24,7 @@ namespace CistaNAS.Web.Services;
 public sealed class FileService
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private static readonly ConcurrentDictionary<string, object> _catalogLocks = new(StringComparer.Ordinal);
 
     private readonly VolumeService _volumeService;
     private readonly JournalService _journalService;
@@ -62,9 +64,6 @@ public sealed class FileService
         });
 
         // 既存ファイルがあれば上書き（同じオフセットに収まれば再利用、否则追記）
-        var catalog = LoadCatalog(volumeName);
-        catalog.Files.TryGetValue(fileName, out var existing);
-
         // ユーザー入力の読み取りは lock 外で行い（非同期 I/O）、書き込みだけ lock 内で実行
         byte[] buffer = new byte[81920];
         long remaining = contentLength;
@@ -78,35 +77,42 @@ public sealed class FileService
             remaining -= read;
         }
 
-        // オフセット決定 + 書き込みを単一 lock でアトミックに実行
+        // カタログ読み込み + ストリーム書き込み + カタログ保存をボリュームロックで保護
         long offset;
-        lock (stream)
+        FileMetadata meta;
+        object catLock = _catalogLocks.GetOrAdd(volumeName, _ => new object());
+        lock (catLock)
         {
-            if (existing is not null && existing.Length >= contentLength)
+            var catalog = LoadCatalog(volumeName);
+            catalog.Files.TryGetValue(fileName, out var existing);
+
+            lock (stream)
             {
-                offset = existing.Offset;
-            }
-            else
-            {
-                offset = stream.Length;
+                if (existing is not null && existing.Length >= contentLength)
+                {
+                    offset = existing.Offset;
+                }
+                else
+                {
+                    offset = stream.Length;
+                }
+
+                stream.Seek(offset, SeekOrigin.Begin);
+                ms.WriteTo(stream);
+                stream.Flush();
             }
 
-            stream.Seek(offset, SeekOrigin.Begin);
-            ms.WriteTo(stream);
-            stream.Flush();
+            meta = new FileMetadata
+            {
+                Name = fileName,
+                Offset = offset,
+                Length = contentLength - remaining,
+                CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
+                ModifiedAt = DateTimeOffset.UtcNow,
+            };
+            catalog.Files[fileName] = meta;
+            SaveCatalog(volumeName, catalog);
         }
-
-        // カタログ更新
-        var meta = new FileMetadata
-        {
-            Name = fileName,
-            Offset = offset,
-            Length = contentLength - remaining, // 実際に書いた分
-            CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
-            ModifiedAt = DateTimeOffset.UtcNow,
-        };
-        catalog.Files[fileName] = meta;
-        SaveCatalog(volumeName, catalog);
 
         // ジャーナル: コミット
         _journalService.Commit(volumeName);
@@ -117,28 +123,32 @@ public sealed class FileService
     /// <summary>ファイルをダウンロード。</summary>
     public FileDownloadResponse Download(string volumeName, string fileName)
     {
-        var catalog = LoadCatalog(volumeName);
-        if (!catalog.Files.TryGetValue(fileName, out var meta))
-            throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
-
         var (stream, _) = _volumeService.GetMounted(volumeName);
-        // ロックして安全にシーク→読み取りを行うため、データを独立メモリにコピーして返す
-        byte[] data;
-        lock (stream)
-        {
-            stream.Seek(meta.Offset, SeekOrigin.Begin);
-            data = new byte[meta.Length];
-            int totalRead = 0;
-            while (totalRead < data.Length)
-            {
-                int n = stream.Read(data, totalRead, data.Length - totalRead);
-                if (n == 0) break;
-                totalRead += n;
-            }
-        }
 
-        var ms = new MemoryStream(data, 0, data.Length, writable: false);
-        return new FileDownloadResponse(ms, meta.Name, meta.Length);
+        object catLock = _catalogLocks.GetOrAdd(volumeName, _ => new object());
+        lock (catLock)
+        {
+            var catalog = LoadCatalog(volumeName);
+            if (!catalog.Files.TryGetValue(fileName, out var meta))
+                throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
+
+            byte[] data;
+            lock (stream)
+            {
+                stream.Seek(meta.Offset, SeekOrigin.Begin);
+                data = new byte[meta.Length];
+                int totalRead = 0;
+                while (totalRead < data.Length)
+                {
+                    int n = stream.Read(data, totalRead, data.Length - totalRead);
+                    if (n == 0) break;
+                    totalRead += n;
+                }
+            }
+
+            var ms = new MemoryStream(data, 0, data.Length, writable: false);
+            return new FileDownloadResponse(ms, meta.Name, meta.Length);
+        }
     }
 
     /// <summary>ファイルを削除。</summary>
@@ -150,11 +160,15 @@ public sealed class FileService
             Path = fileName,
         });
 
-        var catalog = LoadCatalog(volumeName);
-        if (!catalog.Files.Remove(fileName))
-            throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
+        object catLock = _catalogLocks.GetOrAdd(volumeName, _ => new object());
+        lock (catLock)
+        {
+            var catalog = LoadCatalog(volumeName);
+            if (!catalog.Files.Remove(fileName))
+                throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
 
-        SaveCatalog(volumeName, catalog);
+            SaveCatalog(volumeName, catalog);
+        }
         _journalService.Commit(volumeName);
     }
 
