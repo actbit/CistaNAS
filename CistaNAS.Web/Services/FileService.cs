@@ -60,14 +60,14 @@ public sealed class FileService
         {
             Operation = JournalOp.WriteFile,
             Path = fileName,
-            Length = (int)contentLength,
+            Length = checked((int)Math.Min(contentLength, int.MaxValue)),
         });
 
         // 既存ファイルがあれば上書き（同じオフセットに収まれば再利用、否则追記）
         // ユーザー入力の読み取りは lock 外で行い（非同期 I/O）、書き込みだけ lock 内で実行
         byte[] buffer = new byte[81920];
         long remaining = contentLength;
-        using var ms = new MemoryStream((int)contentLength);
+        using var ms = new MemoryStream(Math.Min((int)Math.Min(contentLength, int.MaxValue), int.MaxValue));
         while (remaining > 0)
         {
             int toRead = (int)Math.Min(buffer.Length, remaining);

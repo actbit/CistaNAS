@@ -33,7 +33,15 @@ public sealed class VolumeService
     public VolumeInfo Create(string name, string? username, string? password, bool encrypted = true)
     {
         ValidateName(name);
-        return CreateInternal(name, username, password, encrypted);
+        _mountGate.Wait();
+        try
+        {
+            return CreateInternal(name, username, password, encrypted);
+        }
+        finally
+        {
+            _mountGate.Release();
+        }
     }
 
     /// <summary>ホームボリューム等、内部用途の作成（home__ プレフィックスを許可）。</summary>
@@ -61,19 +69,26 @@ public sealed class VolumeService
         ValidateName(name);
         ArgumentException.ThrowIfNullOrEmpty(username);
 
-        string dir = VolumeDir(name);
-        if (Directory.Exists(dir))
-            throw new VolumeException($"ボリューム '{name}' は既に存在します。");
+        _mountGate.Wait();
+        try
+        {
+            string dir = VolumeDir(name);
+            if (Directory.Exists(dir))
+                throw new VolumeException($"ボリューム '{name}' は既に存在します。");
 
-        var header = VolumeHeader.CreateE2ee(name, username, wrappedKey, chunkSize);
+            var header = VolumeHeader.CreateE2ee(name, username, wrappedKey, chunkSize);
 
-        Directory.CreateDirectory(dir);
-        header.Save(Path.Combine(dir, VolumeHeader.FileName));
-        File.Create(GetDataPath(name)).Dispose();
-        // E2EE: サーバーはマスターキーを持たない。raw FileStream でマウント。
-        MountInternal(name, header, masterKey: null);
+            Directory.CreateDirectory(dir);
+            header.Save(Path.Combine(dir, VolumeHeader.FileName));
+            File.Create(GetDataPath(name)).Dispose();
+            MountInternal(name, header, masterKey: null);
 
-        return ToInfo(name, header, true);
+            return ToInfo(name, header, true);
+        }
+        finally
+        {
+            _mountGate.Release();
+        }
     }
 
     public VolumeInfo Mount(string name, string username, string? password)
@@ -131,15 +146,23 @@ public sealed class VolumeService
     /// <summary>E2EE ボリュームに wrapped key を追加（クライアント側で再ラップ済み）。</summary>
     public void AddE2eeWrappedKey(string volumeName, string granterUsername, string targetUsername, VolumeHeader.UserWrappedKey wrappedKey)
     {
-        var header = LoadHeaderOrThrow(volumeName);
-        if (!header.IsE2ee)
-            throw new VolumeException($"ボリューム '{volumeName}' は E2EE ボリュームではありません。");
-        if (header.OwnerUser != granterUsername)
-            throw new VolumeException("オーナーのみがアクセス権を付与できます。");
-        if (!header.HasUserAccess(targetUsername))
-            header.AddWrappedKey(targetUsername, wrappedKey);
-        header.Save(GetHeaderPath(volumeName));
-        RefreshMountedHeader(volumeName, header);
+        _mountGate.Wait();
+        try
+        {
+            var header = LoadHeaderOrThrow(volumeName);
+            if (!header.IsE2ee)
+                throw new VolumeException($"ボリューム '{volumeName}' は E2EE ボリュームではありません。");
+            if (header.OwnerUser != granterUsername)
+                throw new VolumeException("オーナーのみがアクセス権を付与できます。");
+            if (!header.HasUserAccess(targetUsername))
+                header.AddWrappedKey(targetUsername, wrappedKey);
+            header.Save(GetHeaderPath(volumeName));
+            RefreshMountedHeader(volumeName, header);
+        }
+        finally
+        {
+            _mountGate.Release();
+        }
     }
 
     public void Lock(string name)
@@ -245,37 +268,53 @@ public sealed class VolumeService
         ArgumentException.ThrowIfNullOrEmpty(targetUsername);
         ArgumentException.ThrowIfNullOrEmpty(targetPassword);
 
-        var header = LoadHeaderOrThrow(volumeName);
-        if (!header.HasUserAccess(granterUsername))
-            throw new VolumeException($"ユーザー '{granterUsername}' はこのボリュームにアクセス権がありません。");
-
-        byte[]? masterKey = header.UnwrapMasterKey(granterUsername, granterPassword)
-            ?? throw new VolumeException("付与者の認証情報が正しくありません。");
-
+        _mountGate.Wait();
         try
         {
-            header.AddUserWrap(targetUsername, targetPassword, masterKey, _volOpts.KdfIterations);
-            header.Save(GetHeaderPath(volumeName));
-            RefreshMountedHeader(volumeName, header);
+            var header = LoadHeaderOrThrow(volumeName);
+            if (!header.HasUserAccess(granterUsername))
+                throw new VolumeException($"ユーザー '{granterUsername}' はこのボリュームにアクセス権がありません。");
+
+            byte[]? masterKey = header.UnwrapMasterKey(granterUsername, granterPassword)
+                ?? throw new VolumeException("付与者の認証情報が正しくありません。");
+
+            try
+            {
+                header.AddUserWrap(targetUsername, targetPassword, masterKey, _volOpts.KdfIterations);
+                header.Save(GetHeaderPath(volumeName));
+                RefreshMountedHeader(volumeName, header);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(masterKey);
+            }
         }
         finally
         {
-            CryptographicOperations.ZeroMemory(masterKey);
+            _mountGate.Release();
         }
     }
 
     /// <summary>ボリュームからユーザーのアクセス権を剥奪。</summary>
     public void RevokeAccess(string volumeName, string revokerUsername, string targetUsername)
     {
-        var header = LoadHeaderOrThrow(volumeName);
-        if (header.OwnerUser != revokerUsername)
-            throw new VolumeException("オーナーのみがアクセス権を剥奪できます。");
-        if (targetUsername == header.OwnerUser)
-            throw new VolumeException("オーナーのアクセス権は剥奪できません。");
+        _mountGate.Wait();
+        try
+        {
+            var header = LoadHeaderOrThrow(volumeName);
+            if (header.OwnerUser != revokerUsername)
+                throw new VolumeException("オーナーのみがアクセス権を剥奪できます。");
+            if (targetUsername == header.OwnerUser)
+                throw new VolumeException("オーナーのアクセス権は剥奪できません。");
 
-        header.RemoveUserWrap(targetUsername);
-        header.Save(GetHeaderPath(volumeName));
-        RefreshMountedHeader(volumeName, header);
+            header.RemoveUserWrap(targetUsername);
+            header.Save(GetHeaderPath(volumeName));
+            RefreshMountedHeader(volumeName, header);
+        }
+        finally
+        {
+            _mountGate.Release();
+        }
     }
 
     /// <summary>ユーザーのパスワード変更時に全ボリュームの鍵を再ラップ。</summary>
@@ -283,15 +322,23 @@ public sealed class VolumeService
     {
         if (!Directory.Exists(_dataRoot)) return;
 
-        foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
+        _mountGate.Wait();
+        try
         {
-            string name = Path.GetFileName(dir);
-            var header = LoadHeaderIfExists(name);
-            if (header is null || !header.HasUserAccess(username)) continue;
+            foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
+            {
+                string name = Path.GetFileName(dir);
+                var header = LoadHeaderIfExists(name);
+                if (header is null || !header.HasUserAccess(username)) continue;
 
-            header.RewrapUser(username, oldPassword, newPassword, _volOpts.KdfIterations);
-            header.Save(GetHeaderPath(name));
-            RefreshMountedHeader(name, header);
+                header.RewrapUser(username, oldPassword, newPassword, _volOpts.KdfIterations);
+                header.Save(GetHeaderPath(name));
+                RefreshMountedHeader(name, header);
+            }
+        }
+        finally
+        {
+            _mountGate.Release();
         }
     }
 
@@ -299,7 +346,10 @@ public sealed class VolumeService
 
     public void GrantGroupAccess(string volumeName, string granterUsername, string groupName)
     {
-        var header = LoadHeaderOrThrow(volumeName);
+        _mountGate.Wait();
+        try
+        {
+            var header = LoadHeaderOrThrow(volumeName);
         if (header.OwnerUser != granterUsername)
             throw new VolumeException("オーナーのみがグループアクセスを付与できます。");
         if (header.IsE2ee)
@@ -307,36 +357,57 @@ public sealed class VolumeService
         if (_groupStore.Find(groupName) is null)
             throw new VolumeException($"グループ '{groupName}' が見つかりません。");
 
-        header.AuthorizedGroups.Add(groupName);
-        header.Save(GetHeaderPath(volumeName));
-        RefreshMountedHeader(volumeName, header);
+            header.AuthorizedGroups.Add(groupName);
+            header.Save(GetHeaderPath(volumeName));
+            RefreshMountedHeader(volumeName, header);
+        }
+        finally
+        {
+            _mountGate.Release();
+        }
     }
 
     public void RevokeGroupAccess(string volumeName, string revokerUsername, string groupName)
     {
-        var header = LoadHeaderOrThrow(volumeName);
-        if (header.OwnerUser != revokerUsername)
-            throw new VolumeException("オーナーのみがグループアクセスを剥奪できます。");
-        if (!header.AuthorizedGroups.Remove(groupName))
-            throw new VolumeException($"グループ '{groupName}' はこのボリュームにアクセス権がありません。");
+        _mountGate.Wait();
+        try
+        {
+            var header = LoadHeaderOrThrow(volumeName);
+            if (header.OwnerUser != revokerUsername)
+                throw new VolumeException("オーナーのみがグループアクセスを剥奪できます。");
+            if (!header.AuthorizedGroups.Remove(groupName))
+                throw new VolumeException($"グループ '{groupName}' はこのボリュームにアクセス権がありません。");
 
-        header.Save(GetHeaderPath(volumeName));
-        RefreshMountedHeader(volumeName, header);
+            header.Save(GetHeaderPath(volumeName));
+            RefreshMountedHeader(volumeName, header);
+        }
+        finally
+        {
+            _mountGate.Release();
+        }
     }
 
     public void RemoveGroupFromAllVolumes(string groupName)
     {
         if (!Directory.Exists(_dataRoot)) return;
-        foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
+        _mountGate.Wait();
+        try
         {
-            string name = Path.GetFileName(dir);
-            var header = LoadHeaderIfExists(name);
-            if (header is null) continue;
-            if (header.AuthorizedGroups.Remove(groupName))
+            foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
             {
-                header.Save(GetHeaderPath(name));
-                RefreshMountedHeader(name, header);
+                string name = Path.GetFileName(dir);
+                var header = LoadHeaderIfExists(name);
+                if (header is null) continue;
+                if (header.AuthorizedGroups.Remove(groupName))
+                {
+                    header.Save(GetHeaderPath(name));
+                    RefreshMountedHeader(name, header);
+                }
             }
+        }
+        finally
+        {
+            _mountGate.Release();
         }
     }
 
@@ -349,18 +420,26 @@ public sealed class VolumeService
         ArgumentException.ThrowIfNullOrEmpty(groupName);
         ArgumentException.ThrowIfNullOrEmpty(ownerUsername);
 
-        string volName = $"group__{groupName}";
-        string dir = VolumeDir(volName);
-        if (Directory.Exists(dir))
-            throw new VolumeException($"グループボリューム '{volName}' は既に存在します。");
+        _mountGate.Wait();
+        try
+        {
+            string volName = $"group__{groupName}";
+            string dir = VolumeDir(volName);
+            if (Directory.Exists(dir))
+                throw new VolumeException($"グループボリューム '{volName}' は既に存在します。");
 
-        var header = VolumeHeader.CreateE2ee(volName, ownerUsername, ownerWrappedKey, chunkSize);
-        Directory.CreateDirectory(dir);
-        header.Save(Path.Combine(dir, VolumeHeader.FileName));
-        File.Create(GetDataPath(volName)).Dispose();
-        MountInternal(volName, header, masterKey: null);
+            var header = VolumeHeader.CreateE2ee(volName, ownerUsername, ownerWrappedKey, chunkSize);
+            Directory.CreateDirectory(dir);
+            header.Save(Path.Combine(dir, VolumeHeader.FileName));
+            File.Create(GetDataPath(volName)).Dispose();
+            MountInternal(volName, header, masterKey: null);
 
-        return ToInfo(volName, header, true);
+            return ToInfo(volName, header, true);
+        }
+        finally
+        {
+            _mountGate.Release();
+        }
     }
 
     /// <summary>グループのE2EEボリューム一覧を取得（グループオーナー用）。</summary>
@@ -410,17 +489,25 @@ public sealed class VolumeService
     public void AddE2eeWrappedKeysBatch(string volumeName, string requesterUsername,
         Dictionary<string, VolumeHeader.UserWrappedKey> wrappedKeys)
     {
-        var header = LoadHeaderOrThrow(volumeName);
-        if (header.OwnerUser != requesterUsername)
-            throw new VolumeException("オーナーのみが鍵を追加できます。");
-
-        foreach (var (username, wrappedKey) in wrappedKeys)
+        _mountGate.Wait();
+        try
         {
-            if (!header.HasUserAccess(username))
-                header.AddWrappedKey(username, wrappedKey);
+            var header = LoadHeaderOrThrow(volumeName);
+            if (header.OwnerUser != requesterUsername)
+                throw new VolumeException("オーナーのみが鍵を追加できます。");
+
+            foreach (var (username, wrappedKey) in wrappedKeys)
+            {
+                if (!header.HasUserAccess(username))
+                    header.AddWrappedKey(username, wrappedKey);
+            }
+            header.Save(GetHeaderPath(volumeName));
+            RefreshMountedHeader(volumeName, header);
         }
-        header.Save(GetHeaderPath(volumeName));
-        RefreshMountedHeader(volumeName, header);
+        finally
+        {
+            _mountGate.Release();
+        }
     }
 
     // ---- ボリューム削除 ----

@@ -34,6 +34,13 @@ public sealed class JournalFile
     /// <summary>ジャーナルの追記。完了後に <see cref="Flush"/> を呼ぶこと。</summary>
     public static void Append(string journalPath, JournalEntry entry)
     {
+        using var lockStream = File.Open(
+            journalPath + ".lock",
+            FileMode.OpenOrCreate,
+            FileAccess.ReadWrite,
+            FileShare.None);
+        lockStream.Lock(0, 1);
+
         JournalFile journal;
         if (File.Exists(journalPath))
         {
@@ -57,6 +64,13 @@ public sealed class JournalFile
     public static List<JournalEntry> Drain(string journalPath)
     {
         if (!File.Exists(journalPath)) return [];
+
+        using var lockStream = File.Open(
+            journalPath + ".lock",
+            FileMode.OpenOrCreate,
+            FileAccess.ReadWrite,
+            FileShare.None);
+        lockStream.Lock(0, 1);
 
         List<JournalEntry> entries;
         using (var fs = File.OpenRead(journalPath))

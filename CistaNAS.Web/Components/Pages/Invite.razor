@@ -1,6 +1,7 @@
 @page "/invite/{invitationId}"
 @using CistaNAS.Web.Components.Auth
 @using CistaNAS.Web.Services
+@implements IDisposable
 @inject AuthenticationStateService AuthState
 @inject InvitationService InvSvc
 @inject UserStore Users
@@ -72,6 +73,7 @@ else
 
     protected override void OnInitialized()
     {
+        AuthState.Subscribe(OnAuthStateChanged);
         _invite = InvSvc.Find(InvitationId);
         _hasPublicKey = Users.GetPublicKey(CurrentUsername) is not null;
     }
@@ -93,4 +95,8 @@ else
         catch (Exception ex) { _error = ex.Message; }
         finally { _loading = false; }
     }
+
+    private void OnAuthStateChanged() => StateHasChanged();
+
+    public void Dispose() => AuthState.Unsubscribe(OnAuthStateChanged);
 }

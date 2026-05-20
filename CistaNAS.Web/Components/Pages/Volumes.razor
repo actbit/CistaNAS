@@ -3,6 +3,7 @@
 @using CistaNAS.Web.Models
 @using CistaNAS.Web.Services
 @using CistaNAS.Web.Volume
+@implements IDisposable
 @inject AuthenticationStateService AuthState
 @inject VolumeService VolumeSvc
 @inject GroupStore GroupSvc
@@ -367,7 +368,11 @@ else
 
     private string CurrentUsername => AuthState.User?.Identity?.Name ?? "";
 
-    protected override void OnInitialized() => RefreshList();
+    protected override void OnInitialized()
+    {
+        AuthState.Subscribe(OnAuthStateChanged);
+        RefreshList();
+    }
     private void RefreshList() => _volumes = VolumeSvc.ListForUser(CurrentUsername).ToList();
 
     private async Task HandleCreate()
@@ -610,4 +615,8 @@ else
         }
         catch (Exception ex) { _shareError = ex.Message; }
     }
+
+    private void OnAuthStateChanged() => StateHasChanged();
+
+    public void Dispose() => AuthState.Unsubscribe(OnAuthStateChanged);
 }

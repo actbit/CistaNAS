@@ -172,19 +172,24 @@ public sealed class UserStore
     /// </summary>
     public bool ChangePassword(string username, string oldPassword, string newPassword)
     {
+        // 1) ロック内で旧パスワード検証 + ユーザー存在確認
+        UserAccount? user;
         lock (_gate)
         {
-            var user = _users.FirstOrDefault(u => string.Equals(u.Username, username, StringComparison.Ordinal));
+            user = _users.FirstOrDefault(u => string.Equals(u.Username, username, StringComparison.Ordinal));
             if (user is null) return false;
 
             if (!PasswordHasher.Verify(oldPassword, user.PasswordHash))
                 return false;
+        }
 
-            // 先に全ボリュームの KEK を再ラップ
-            var volumeService = _services.GetRequiredService<VolumeService>();
-            volumeService.RewrapAllForUser(username, oldPassword, newPassword);
+        // 2) ロック外で重い KEK 再ラップを実行（他操作をブロックしない）
+        var volumeService = _services.GetRequiredService<VolumeService>();
+        volumeService.RewrapAllForUser(username, oldPassword, newPassword);
 
-            // 成功後にハッシュ更新
+        // 3) 再ラップ成功後にハッシュ更新
+        lock (_gate)
+        {
             user.PasswordHash = PasswordHasher.Hash(newPassword, _pbkdf2Iterations);
             Save();
             return true;

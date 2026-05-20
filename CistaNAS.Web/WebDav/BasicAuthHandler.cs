@@ -1,4 +1,5 @@
 using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
 using CistaNAS.Web.Services;
@@ -45,7 +46,11 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
 
             var loginResponse = _authService.Authenticate(username, password);
             if (loginResponse is null)
+            {
+                // ユーザーが存在しない場合もダミー計算を実行してタイミングを均一化
+                DummyHash();
                 return AuthenticateResult.Fail("Invalid credentials.");
+            }
 
             var principal = await _authService.ValidateTokenAsync(loginResponse.AccessToken);
             if (principal is null)
@@ -58,6 +63,11 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
         {
             return AuthenticateResult.Fail("Invalid Base64 in Basic Auth.");
         }
+    }
+
+    private static void DummyHash()
+    {
+        Rfc2898DeriveBytes.Pbkdf2("dummy"u8, RandomNumberGenerator.GetBytes(16), 1, HashAlgorithmName.SHA256, 32);
     }
 
     protected override Task HandleChallengeAsync(AuthenticationProperties properties)

@@ -30,7 +30,7 @@ public sealed class InvitationService
 
     public InvitationRecord? Find(string invitationId)
     {
-        _invitations.TryGetValue(invitationId, out var record);
+        _invitations.TryGetValue(invitationId.ToLowerInvariant(), out var record);
         return record;
     }
 

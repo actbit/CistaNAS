@@ -1,5 +1,6 @@
 @using CistaNAS.Web.Components.Auth
 @using CistaNAS.Web.Services
+@implements IDisposable
 @inject AuthenticationStateService AuthState
 @inject UserStore UserStore
 
@@ -55,8 +56,17 @@
 </div>
 
 @code {
+    protected override void OnInitialized()
+    {
+        AuthState.Subscribe(OnAuthStateChanged);
+    }
+
     private void HandleLogout()
     {
         AuthState.Logout();
     }
+
+    private void OnAuthStateChanged() => StateHasChanged();
+
+    public void Dispose() => AuthState.Unsubscribe(OnAuthStateChanged);
 }

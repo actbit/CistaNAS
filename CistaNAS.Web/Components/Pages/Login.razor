@@ -1,5 +1,6 @@
 @page "/login"
 @using CistaNAS.Web.Components.Auth
+@implements IDisposable
 @inject AuthenticationStateService AuthState
 @inject NavigationManager Nav
 
@@ -38,21 +39,39 @@
         public string Password { get; set; } = "";
     }
 
+    protected override void OnInitialized()
+    {
+        AuthState.Subscribe(OnAuthStateChanged);
+    }
+
     private async Task HandleLogin()
     {
         IsLoading = true;
         ErrorMessage = null;
 
-        bool ok = await AuthState.LoginAsync(_model.Username, _model.Password);
-        if (ok)
+        try
         {
-            Nav.NavigateTo("/volumes", forceLoad: false);
+            bool ok = await AuthState.LoginAsync(_model.Username, _model.Password);
+            if (ok)
+            {
+                Nav.NavigateTo("/volumes", forceLoad: false);
+            }
+            else
+            {
+                ErrorMessage = "ユーザ名またはパスワードが正しくありません。";
+            }
         }
-        else
+        catch
         {
-            ErrorMessage = "ユーザ名またはパスワードが正しくありません。";
+            ErrorMessage = "ログイン中にエラーが発生しました。";
         }
-
-        IsLoading = false;
+        finally
+        {
+            IsLoading = false;
+        }
     }
+
+    private void OnAuthStateChanged() => StateHasChanged();
+
+    public void Dispose() => AuthState.Unsubscribe(OnAuthStateChanged);
 }

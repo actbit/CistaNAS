@@ -1,5 +1,6 @@
 @page "/files/{VolumeName}"
 @implements IAsyncDisposable
+@implements IDisposable
 @using CistaNAS.Web.Components.Auth
 @using CistaNAS.Web.Models
 @using CistaNAS.Web.Services
@@ -205,6 +206,7 @@ else
 
     protected override void OnInitialized()
     {
+        AuthState.Subscribe(OnAuthStateChanged);
         _isE2ee = GetVolumeEncryptionMode() == "e2ee";
         if (!_isE2ee)
         {
@@ -589,4 +591,8 @@ else
     {
         await RevokePreviewBlobUrl();
     }
+
+    private void OnAuthStateChanged() => StateHasChanged();
+
+    public void Dispose() => AuthState.Unsubscribe(OnAuthStateChanged);
 }

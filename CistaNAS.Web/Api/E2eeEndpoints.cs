@@ -76,8 +76,18 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult GetWrappedKey(string volumeName, string username, VolumeService vs)
+    private static IResult GetWrappedKey(string volumeName, string username, VolumeService vs, HttpContext ctx)
     {
+        string caller = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(caller))
+            return Results.Unauthorized();
+
+        if (caller != username)
+            return Results.Forbid();
+
+        if (!vs.IsMounted(volumeName))
+            return Results.NotFound(new { error = "ボリュームがマウントされていません。" });
+
         try
         {
             var header = vs.GetVolumeHeader(volumeName);
@@ -281,19 +291,35 @@ public static class E2eeEndpoints
         return Results.Ok(new { record.InvitationId });
     }
 
-    private static IResult GetInvitation(string invitationId, InvitationService invSvc)
+    private static IResult GetInvitation(string invitationId, InvitationService invSvc, HttpContext ctx)
     {
+        string caller = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(caller))
+            return Results.Unauthorized();
+
         var record = invSvc.Find(invitationId);
-        return record is null
-            ? Results.NotFound(new { error = "招待が見つかりません。" })
-            : Results.Ok(new { record.InvitationId, record.InviterUsername, record.CreatedAt });
+        if (record is null)
+            return Results.NotFound(new { error = "招待が見つかりません。" });
+
+        if (record.InviterUsername != caller && !string.Equals(record.TargetUsername, caller, StringComparison.Ordinal))
+            return Results.Forbid();
+
+        return Results.Ok(new { record.InvitationId, record.InviterUsername, record.CreatedAt });
     }
 
     private static IResult AcceptInvitation(string invitationId, AcceptInvitationRequest req,
-        InvitationService invSvc)
+        InvitationService invSvc, HttpContext ctx)
     {
+        string caller = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(caller))
+            return Results.Unauthorized();
+
         var record = invSvc.Find(invitationId);
         if (record is null) return Results.NotFound(new { error = "招待が見つかりません。" });
+
+        if (!string.Equals(record.TargetUsername, caller, StringComparison.Ordinal))
+            return Results.Forbid();
+
         try
         {
             invSvc.SetAcceptedData(invitationId, req.EncryptedPublicKey, req.Nonce);

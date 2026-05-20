@@ -7,7 +7,7 @@ namespace CistaNAS.Web.Components.Auth;
 /// Blazor Interactive Server でのログイン状態管理。
 /// HttpContext が無い Blazor 回線内で認証クレームを保持する。
 /// </summary>
-public sealed class AuthenticationStateService
+public sealed class AuthenticationStateService : IDisposable
 {
     private readonly AuthService _authService;
 
@@ -41,4 +41,9 @@ public sealed class AuthenticationStateService
     }
 
     public string? Token { get; private set; }
+
+    public void Subscribe(Action handler) => StateChanged += handler;
+    public void Unsubscribe(Action handler) => StateChanged -= handler;
+
+    public void Dispose() => StateChanged = null;
 }

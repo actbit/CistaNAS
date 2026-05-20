@@ -1,4 +1,5 @@
 @page "/settings"
+@implements IDisposable
 @using CistaNAS.Web.Components.Auth
 @using CistaNAS.Web.Configuration
 @using CistaNAS.Web.Models
@@ -58,6 +59,8 @@ else
     </div>
 
     <!-- ユーザー管理 -->
+    @if (IsAdmin)
+    {
     <div class="card mb-4">
         <div class="card-header">ユーザー管理</div>
         <div class="card-body">
@@ -118,6 +121,7 @@ else
             </div>
         </div>
     </div>
+    }
 
     <!-- グループ管理 -->
     <div class="card mb-4">
@@ -298,6 +302,7 @@ else
 
 @code {
     private string CurrentUsername => AuthState.User?.Identity?.Name ?? "";
+    private bool IsAdmin => Users.IsAdmin(CurrentUsername);
 
     // パスワード変更
     private ChangeModel _pwModel = new();
@@ -348,6 +353,7 @@ else
 
     protected override void OnInitialized()
     {
+        AuthState.Subscribe(OnAuthStateChanged);
         RefreshUsers();
         RefreshGroups();
         LoadEncryptionSettings();
@@ -599,4 +605,8 @@ else
         catch (Exception ex) { _keyError = $"エラー: {ex.Message}"; }
         finally { _keyLoading = false; }
     }
+
+    private void OnAuthStateChanged() => StateHasChanged();
+
+    public void Dispose() => AuthState.Unsubscribe(OnAuthStateChanged);
 }
