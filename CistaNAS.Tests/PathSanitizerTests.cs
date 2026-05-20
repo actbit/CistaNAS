@@ -70,4 +70,34 @@ public class PathSanitizerTests
     {
         Assert.Throws<FileServiceException>(() => PathSanitizer.SanitizeFileName("bad|name.txt"));
     }
+
+    [Fact]
+    public void DoubleEncodedTraversal_NotFullyDecoded()
+    {
+        // Uri.UnescapeDataString は1段階しかデコードしない: %252e → %2e (not ..)
+        // よって %2e%2e は ".." ではなくそのまま残る — 安全
+        string result = PathSanitizer.SanitizeFileName("%252e%252e/secret");
+        Assert.DoesNotContain("..", result);
+    }
+
+    [Fact]
+    public void NullInput_Throws()
+    {
+        Assert.Throws<NullReferenceException>(() => PathSanitizer.SanitizeFileName(null!));
+    }
+
+    [Fact]
+    public void MultipleSlashes_Collapses()
+    {
+        Assert.Equal("a/b/c", PathSanitizer.SanitizeFileName("a///b///c"));
+    }
+
+    [Fact]
+    public void DeepTraversal_StripsDotsOnly()
+    {
+        // .. だけが取り除かれ、残りのセグメントは保持される
+        string result = PathSanitizer.SanitizeFileName("a/b/../../c/../d/../../safe.txt");
+        Assert.DoesNotContain("..", result);
+        Assert.EndsWith("safe.txt", result);
+    }
 }

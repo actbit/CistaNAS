@@ -1,3 +1,4 @@
+using System.Reflection;
 using CistaNAS.Web.Services;
 
 namespace CistaNAS.Tests;
@@ -53,5 +54,46 @@ public class StreamingTokenServiceTests
         var svc = new StreamingTokenService();
         string token = svc.Issue("u", "v", "f");
         Assert.Matches("^[0-9a-f]{64}$", token);
+    }
+
+    [Fact]
+    public async Task Validate_ExpiredToken_ReturnsNull()
+    {
+        var svc = CreateWithTtl(TimeSpan.FromMilliseconds(1));
+        string token = svc.Issue("alice", "vol1", "file.txt");
+
+        await Task.Delay(50);
+
+        Assert.Null(svc.Validate(token));
+    }
+
+    [Fact]
+    public void Validate_EmptyToken_ReturnsNull()
+    {
+        var svc = new StreamingTokenService();
+        Assert.Null(svc.Validate(""));
+    }
+
+    [Fact]
+    public async Task Issue_CleanupRemovesExpiredTokens()
+    {
+        var svc = CreateWithTtl(TimeSpan.FromMilliseconds(1));
+        string token = svc.Issue("alice", "vol1", "file.txt");
+
+        await Task.Delay(50);
+
+        // Issue を呼ぶと Cleanup がトリガーされ、期限切れトークンが除去される
+        svc.Issue("bob", "vol2", "other.txt");
+
+        Assert.Null(svc.Validate(token));
+    }
+
+    private static StreamingTokenService CreateWithTtl(TimeSpan ttl)
+    {
+        var svc = new StreamingTokenService();
+        var field = typeof(StreamingTokenService).GetField("_ttl",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        field!.SetValue(svc, ttl);
+        return svc;
     }
 }
