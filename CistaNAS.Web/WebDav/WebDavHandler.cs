@@ -163,10 +163,8 @@ public sealed class WebDavHandler
             await _fileService.UploadAsync(volumeName, name, request.Body, len, request.HttpContext.RequestAborted);
             return Results.Created();
         }
-        catch (Exception ex) when (ex is VolumeException or FileServiceException)
-        {
-            return Results.BadRequest(new { error = ex.Message });
-        }
+        catch (VolumeException) { return Results.BadRequest(); }
+        catch (FileServiceException) { return Results.BadRequest(); }
     }
 
     // ---- DELETE ----
@@ -206,7 +204,17 @@ public sealed class WebDavHandler
     private static string NormalizePath(string? path)
     {
         if (string.IsNullOrEmpty(path)) return "";
-        return path.Trim('/').Replace("%20", " ");
+        string decoded = Uri.UnescapeDataString(path.Trim('/'));
+        string normalized = decoded.Replace('\\', '/');
+
+        var parts = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var safeParts = new List<string>(parts.Length);
+        foreach (var part in parts)
+        {
+            if (part == ".." || part == ".") continue;
+            safeParts.Add(part);
+        }
+        return string.Join('/', safeParts);
     }
 
     private static List<WebDavResource> GetDirectChildren(

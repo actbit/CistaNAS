@@ -19,6 +19,7 @@ public sealed class VolumeService
     private readonly UserStore _userStore;
 
     private readonly ConcurrentDictionary<string, MountedVolume> _mounted = new();
+    private readonly SemaphoreSlim _mountGate = new(1, 1);
 
     public VolumeService(IOptions<CistaNasOptions> options, GroupStore groupStore, UserStore userStore)
     {
@@ -77,38 +78,54 @@ public sealed class VolumeService
 
     public VolumeInfo Mount(string name, string username, string? password)
     {
-        if (_mounted.ContainsKey(name))
-            throw new VolumeException($"ボリューム '{name}' は既にマウントされています。");
-
-        var header = LoadHeaderOrThrow(name);
-        byte[]? masterKey = null;
-        if (header.Encrypted)
+        _mountGate.Wait();
+        try
         {
-            ArgumentException.ThrowIfNullOrEmpty(username);
-            ArgumentException.ThrowIfNullOrEmpty(password);
-            masterKey = header.UnwrapMasterKey(username, password)
-                ?? throw new VolumeException("認証情報が正しくありません。");
-        }
+            if (_mounted.ContainsKey(name))
+                throw new VolumeException($"ボリューム '{name}' は既にマウントされています。");
 
-        MountInternal(name, header, masterKey);
-        return ToInfo(name, header, true);
+            var header = LoadHeaderOrThrow(name);
+            byte[]? masterKey = null;
+            if (header.Encrypted)
+            {
+                ArgumentException.ThrowIfNullOrEmpty(username);
+                ArgumentException.ThrowIfNullOrEmpty(password);
+                masterKey = header.UnwrapMasterKey(username, password)
+                    ?? throw new VolumeException("認証情報が正しくありません。");
+            }
+
+            MountInternal(name, header, masterKey);
+            return ToInfo(name, header, true);
+        }
+        finally
+        {
+            _mountGate.Release();
+        }
     }
 
     /// <summary>E2EE ボリュームをマウント（アクセス権チェックのみ、鍵アンラップなし）。</summary>
     public VolumeInfo MountE2ee(string name, string username)
     {
-        if (_mounted.ContainsKey(name))
-            throw new VolumeException($"ボリューム '{name}' は既にマウントされています。");
+        _mountGate.Wait();
+        try
+        {
+            if (_mounted.ContainsKey(name))
+                throw new VolumeException($"ボリューム '{name}' は既にマウントされています。");
 
-        var header = LoadHeaderOrThrow(name);
-        if (!header.IsE2ee)
-            throw new VolumeException($"ボリューム '{name}' は E2EE ボリュームではありません。");
-        if (!header.HasUserAccess(username))
-            throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
+            var header = LoadHeaderOrThrow(name);
+            if (!header.IsE2ee)
+                throw new VolumeException($"ボリューム '{name}' は E2EE ボリュームではありません。");
+            if (!header.HasUserAccess(username))
+                throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
 
-        // E2EE: マスターキーなしで raw FileStream マウント
-        MountInternal(name, header, masterKey: null);
-        return ToInfo(name, header, true);
+            // E2EE: マスターキーなしで raw FileStream マウント
+            MountInternal(name, header, masterKey: null);
+            return ToInfo(name, header, true);
+        }
+        finally
+        {
+            _mountGate.Release();
+        }
     }
 
     /// <summary>E2EE ボリュームに wrapped key を追加（クライアント側で再ラップ済み）。</summary>
@@ -127,10 +144,18 @@ public sealed class VolumeService
 
     public void Lock(string name)
     {
-        if (!_mounted.TryRemove(name, out var mv))
-            throw new VolumeException($"ボリューム '{name}' はマウントされていません。");
-        mv.Stream.Dispose();
-        if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
+        _mountGate.Wait();
+        try
+        {
+            if (!_mounted.TryRemove(name, out var mv))
+                throw new VolumeException($"ボリューム '{name}' はマウントされていません。");
+            mv.Stream.Dispose();
+            if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
+        }
+        finally
+        {
+            _mountGate.Release();
+        }
     }
 
     /// <summary>ボリューム情報を返す。存在しない場合は null。</summary>

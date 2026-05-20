@@ -227,7 +227,7 @@ public static class E2eeEndpoints
             userStore.UpdatePublicKey(username, req.PublicKey);
             return Results.Ok();
         }
-        catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
     }
 
     // ---- Group E2EE volume ----
@@ -299,6 +299,6 @@ public static class E2eeEndpoints
             invSvc.SetAcceptedData(invitationId, req.EncryptedPublicKey, req.Nonce);
             return Results.Ok();
         }
-        catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
     }
 }

@@ -103,24 +103,38 @@ public static class Extensions
             // Add a default liveness check to ensure app is responsive
             .AddCheck("self", () => HealthCheckResult.Healthy(), ["live"]);
 
+        // CistaNAS: データディレクトリの存在確認
+        var dataRoot = builder.Configuration["CistaNas:DataRoot"] ?? "data";
+        builder.Services.AddHealthChecks()
+            .AddCheck("data-root", () =>
+            {
+                try
+                {
+                    var dir = Path.IsPathRooted(dataRoot) ? dataRoot
+                        : Path.Combine(AppContext.BaseDirectory, dataRoot);
+                    if (!Directory.Exists(dir))
+                        return HealthCheckResult.Degraded($"データディレクトリが存在しません: {dir}");
+                    return HealthCheckResult.Healthy();
+                }
+                catch (Exception ex)
+                {
+                    return HealthCheckResult.Unhealthy(ex.Message);
+                }
+            });
+
         return builder;
     }
 
     public static WebApplication MapDefaultEndpoints(this WebApplication app)
     {
-        // Adding health checks endpoints to applications in non-development environments has security implications.
-        // See https://aka.ms/dotnet/aspire/healthchecks for details before enabling these endpoints in non-development environments.
-        if (app.Environment.IsDevelopment())
-        {
-            // All health checks must pass for app to be considered ready to accept traffic after starting
-            app.MapHealthChecks(HealthEndpointPath);
+        // All health checks must pass for app to be considered ready to accept traffic after starting
+        app.MapHealthChecks(HealthEndpointPath);
 
-            // Only health checks tagged with the "live" tag must pass for app to be considered alive
-            app.MapHealthChecks(AlivenessEndpointPath, new HealthCheckOptions
-            {
-                Predicate = r => r.Tags.Contains("live")
-            });
-        }
+        // Only health checks tagged with the "live" tag must pass for app to be considered alive
+        app.MapHealthChecks(AlivenessEndpointPath, new HealthCheckOptions
+        {
+            Predicate = r => r.Tags.Contains("live")
+        });
 
         return app;
     }

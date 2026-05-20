@@ -1,0 +1,123 @@
+@using CistaNAS.Web.Helpers
+
+<div class="modal-overlay" @onclick="Close">
+    <div class="modal-content media-modal" @onclick:stopPropagation>
+        <div class="media-header">
+            <span class="media-filename">@FileName</span>
+            <button class="btn-close" @onclick="Close"></button>
+        </div>
+        <div class="media-body">
+            @if (_loading)
+            {
+                <div class="media-loading">
+                    <div class="spinner-border" role="status">
+                        <span class="visually-hidden">読み込み中...</span>
+                    </div>
+                    <p class="mt-2">
+                        @if (_progressTotal > 0)
+                        {
+                            <text>チャンク読み込み中... @_progressLoaded / @_progressTotal</text>
+                        }
+                        else
+                        {
+                            <text>読み込み中...</text>
+                        }
+                    </p>
+                </div>
+            }
+            else if (_error is not null)
+            {
+                <div class="alert alert-danger m-3">@_error</div>
+            }
+            else
+            {
+                switch (Type)
+                {
+                    case MediaHelper.MediaType.Image:
+                        <img src="@_streamUrl" alt="@FileName" class="media-image" />
+                        break;
+                    case MediaHelper.MediaType.Video:
+                        <video src="@_streamUrl" controls autoplay class="media-video">
+                            ブラウザが動画再生に対応していません。
+                        </video>
+                        break;
+                    case MediaHelper.MediaType.Audio:
+                        <div class="media-audio-wrapper">
+                            <div class="media-audio-icon">&#9835;</div>
+                            <audio src="@_streamUrl" controls autoplay class="media-audio">
+                                ブラウザが音声再生に対応していません。
+                            </audio>
+                        </div>
+                        break;
+                    default:
+                        <p class="text-muted">対応していない形式です。</p>
+                        break;
+                }
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    [Parameter] public string FileName { get; set; } = "";
+    [Parameter] public MediaHelper.MediaType Type { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    /// <summary>
+    /// 直接セットするストリーミングURL（通常ボリューム用）。
+    /// video/audio/img の src にそのまま渡す。Range リクエスト対応。
+    /// </summary>
+    [Parameter] public string? StreamUrl { get; set; }
+
+    [Inject] public IJSRuntime JS { get; set; } = null!;
+
+    private string? _streamUrl;
+    private bool _loading;
+    private string? _error;
+    private int _progressLoaded;
+    private int _progressTotal;
+
+    protected override void OnParametersSet()
+    {
+        if (StreamUrl is not null && _streamUrl != StreamUrl)
+        {
+            _streamUrl = StreamUrl;
+            _loading = false;
+        }
+    }
+
+    /// <summary>E2EE ストリーミングのローディング状態を開始。</summary>
+    public void SetE2eeLoading(int totalChunks)
+    {
+        _loading = true;
+        _error = null;
+        _progressLoaded = 0;
+        _progressTotal = totalChunks;
+    }
+
+    /// <summary>E2EE Blob URL を設定。</summary>
+    public void SetE2eeBlobUrl(string blobUrl)
+    {
+        _streamUrl = blobUrl;
+        _loading = false;
+    }
+
+    /// <summary>進捗を更新。</summary>
+    public void UpdateProgress(int loaded)
+    {
+        _progressLoaded = loaded;
+    }
+
+    /// <summary>エラーを設定。</summary>
+    public void SetError(string message)
+    {
+        _error = message;
+        _loading = false;
+    }
+
+    private async Task Close()
+    {
+        _streamUrl = null;
+        await OnClose.InvokeAsync();
+    }
+}

@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading.RateLimiting;
 using CistaNAS.Web.Api;
 using CistaNAS.Web.Components;
 using CistaNAS.Web.Configuration;
@@ -9,6 +10,14 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// ---- Kestrel リクエストサイズ制限 ----
+builder.WebHost.ConfigureKestrel(kestrel =>
+{
+    kestrel.Limits.MaxRequestBodySize = 2L * 1024 * 1024 * 1024; // 2 GiB（NAS 用途）
+    kestrel.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(30);
+    kestrel.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(2);
+});
 
 // Aspire 共通設定（テレメトリ・ヘルスチェック・サービスディスカバリ）
 builder.AddServiceDefaults();
@@ -21,6 +30,13 @@ var cista = builder.Configuration.GetSection(CistaNasOptions.SectionName)
     .Get<CistaNasOptions>() ?? new CistaNasOptions();
 
 // ---- JWT 認証 / 認可 ----
+if (string.IsNullOrWhiteSpace(cista.Jwt.SigningKey))
+{
+    if (!builder.Environment.IsDevelopment())
+        throw new InvalidOperationException("本番環境では CistaNas:Jwt:SigningKey の設定が必須です。");
+    // 開発環境のみランダム生成を許可
+}
+
 var signingKeyBytes = !string.IsNullOrWhiteSpace(cista.Jwt.SigningKey)
     ? Encoding.UTF8.GetBytes(cista.Jwt.SigningKey)
     : RandomNumberGenerator.GetBytes(48);
@@ -54,6 +70,35 @@ builder.Services.AddAuthorization(options =>
 });
 builder.Services.AddCascadingAuthenticationState();
 
+// ---- レート制限 ----
+builder.Services.AddRateLimiter(options =>
+{
+    // 認証エンドポイント: 1 IP あたり 10req/min
+    options.AddPolicy("auth", httpContext =>
+        RateLimitPartition.GetSlidingWindowLimiter(
+            partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new SlidingWindowRateLimiterOptions
+            {
+                PermitLimit = 10,
+                Window = TimeSpan.FromMinutes(1),
+                SegmentsPerWindow = 2,
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = 0,
+            }));
+    // 一般 API: 1 IP あたり 100req/min
+    options.AddPolicy("api", httpContext =>
+        RateLimitPartition.GetSlidingWindowLimiter(
+            partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new SlidingWindowRateLimiterOptions
+            {
+                PermitLimit = 100,
+                Window = TimeSpan.FromMinutes(1),
+                SegmentsPerWindow = 4,
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = 0,
+            }));
+});
+
 // ---- Service 層 DI 登録 ----
 builder.Services.AddCistaNasServices();
 
@@ -67,6 +112,19 @@ builder.Services.AddScoped<E2eeInterop>();
 // ---- Blazor (Interactive Server rendering) ----
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
+
+// ---- CORS（外部クライアント向け） ----
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+    {
+        // Same-Origin が基本。外部 API クライアントが必要な場合は設定で追加
+        policy.SetIsOriginAllowed(_ => true)
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials();
+    });
+});
 
 var app = builder.Build();
 
@@ -82,6 +140,30 @@ else
 
 app.UseHttpsRedirection();
 
+// ---- セキュリティヘッダー ----
+app.Use(async (ctx, next) =>
+{
+    var headers = ctx.Response.Headers;
+    headers.XContentTypeOptions = "nosniff";
+    headers.XFrameOptions = "SAMEORIGIN";
+    headers["Referrer-Policy"] = "strict-origin-when-cross-origin";
+    headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()";
+    if (!ctx.Request.Headers.ContainsKey("Content-Security-Policy"))
+    {
+        headers["Content-Security-Policy"] =
+            "default-src 'self'; " +
+            "script-src 'self'; " +
+            "style-src 'self' 'unsafe-inline'; " +
+            "img-src 'self' data: blob:; " +
+            "media-src 'self' blob:; " +
+            "connect-src 'self'; " +
+            "frame-ancestors 'self';";
+    }
+    await next();
+});
+
+app.UseCors();
+app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseAntiforgery();

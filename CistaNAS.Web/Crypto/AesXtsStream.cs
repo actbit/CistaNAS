@@ -258,6 +258,9 @@ public sealed class AesXtsStream : Stream
             _dataEnc.Dispose();
             _dataDec.Dispose();
             _tweakEnc.Dispose();
+            // 暗号鍵のメモリゼロ化
+            CryptographicOperations.ZeroMemory(_dataAes.Key);
+            CryptographicOperations.ZeroMemory(_tweakAes.Key);
             _dataAes.Dispose();
             _tweakAes.Dispose();
             if (!_leaveOpen) _base.Dispose();

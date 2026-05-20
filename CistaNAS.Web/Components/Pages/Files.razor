@@ -3,6 +3,7 @@
 @using CistaNAS.Web.Models
 @using CistaNAS.Web.Services
 @using CistaNAS.Web.Volume
+@using CistaNAS.Web.Helpers
 @inject AuthenticationStateService AuthState
 @inject VolumeService VolumeSvc
 @inject FileService FileSvc
@@ -99,6 +100,14 @@ else
                             <td>@f.PlainName</td>
                             <td>@f.Entry.ChunkCount</td>
                             <td>
+                                @if (MediaHelper.IsMedia(f.PlainName))
+                                {
+                                    <button class="btn btn-sm btn-outline-success me-1"
+                                            disabled="@f.Downloading"
+                                            @onclick="() => HandleE2eePreview(f)">
+                                        @(f.Downloading ? "読み込み中..." : "プレビュー")
+                                    </button>
+                                }
                                 <button class="btn btn-sm btn-outline-primary me-1"
                                         disabled="@f.Downloading"
                                         @onclick="() => HandleE2eeDownload(f)">
@@ -140,6 +149,13 @@ else
                             <td>@FormatSize(f.Length)</td>
                             <td>@f.ModifiedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")</td>
                             <td>
+                                @if (MediaHelper.IsMedia(f.Name))
+                                {
+                                    <button class="btn btn-sm btn-outline-success me-1"
+                                            @onclick="() => HandlePreview(f.Name)">
+                                        プレビュー
+                                    </button>
+                                }
                                 <button class="btn btn-sm btn-outline-primary me-1" @onclick="() => HandleDownload(f.Name)">ダウンロード</button>
                                 <button class="btn btn-sm btn-outline-danger" @onclick="() => HandleDelete(f.Name)">削除</button>
                             </td>
@@ -149,6 +165,16 @@ else
             </table>
         }
     }
+}
+
+<!-- メディアプレビューモーダル -->
+@if (_previewVisible)
+{
+    <MediaPreview @ref="_previewRef"
+                  FileName="@_previewFileName"
+                  Type="_previewType"
+                  StreamUrl="@_previewStreamUrl"
+                  OnClose="ClosePreview" />
 }
 
 @code {
@@ -166,6 +192,13 @@ else
     private string? _e2eeError;
     private string? _masterKeyHandle;
     private List<E2eeFileViewItem> _e2eeFiles = [];
+
+    // メディアプレビュー
+    private bool _previewVisible;
+    private string _previewFileName = "";
+    private MediaHelper.MediaType _previewType;
+    private string? _previewStreamUrl;
+    private MediaPreview? _previewRef;
 
     private string CurrentUsername => AuthState.User?.Identity?.Name ?? "";
 
@@ -194,6 +227,110 @@ else
         catch { _files = []; }
     }
 
+    // ---- メディアプレビュー: 通常ボリューム ----
+
+    /// <summary>
+    /// 短命トークンを発行し、ストリーミングURLを生成して video/audio/img の src にセット。
+    /// Range リクエスト対応のネイティブストリーミング。
+    /// </summary>
+    private async Task HandlePreview(string fileName)
+    {
+        var mediaType = MediaHelper.GetMediaType(fileName);
+        if (mediaType == MediaHelper.MediaType.None) return;
+
+        _previewFileName = fileName;
+        _previewType = mediaType;
+        _previewStreamUrl = null;
+        _previewVisible = true;
+
+        try
+        {
+            var baseUri = Nav.BaseUri.TrimEnd('/');
+            var jwt = AuthState.Token ?? "";
+            _previewStreamUrl = await JS.InvokeAsync<string>(
+                "cistaMedia.getStreamUrl", baseUri, VolumeName, fileName, jwt);
+        }
+        catch (Exception ex)
+        {
+            _uploadError = $"プレビューエラー: {ex.Message}";
+            _previewVisible = false;
+        }
+    }
+
+    // ---- メディアプレビュー: E2EE ボリューム ----
+
+    /// <summary>
+    /// チャンクを順次復号し、MediaSource Extensions でプログレッシブ再生。
+    /// MSE非対応形式は Blob フォールバック。
+    /// </summary>
+    private async Task HandleE2eePreview(E2eeFileViewItem item)
+    {
+        var mediaType = MediaHelper.GetMediaType(item.PlainName);
+        if (mediaType == MediaHelper.MediaType.None) return;
+
+        item.Downloading = true;
+        _previewFileName = item.PlainName;
+        _previewType = mediaType;
+        _previewStreamUrl = null;
+        _previewVisible = true;
+
+        // ローディング表示
+        _previewRef?.SetE2eeLoading(item.Entry.ChunkCount);
+
+        try
+        {
+            var entry = item.Entry;
+            string? fileSaltB64 = null;
+
+            // チャンクを順次復号
+            var decryptedChunks = new List<string>();
+
+            for (int i = 0; i < entry.ChunkCount; i++)
+            {
+                var (chunkStream, chunkLen) = E2eeFileSvc.DownloadChunk(VolumeName, entry.FileId, i);
+                byte[] encData = new byte[chunkLen];
+                using (chunkStream) await chunkStream.ReadAsync(encData);
+
+                if (i == 0 && fileSaltB64 is null)
+                {
+                    byte[] salt = new byte[16];
+                    Buffer.BlockCopy(encData, 0, salt, 0, 16);
+                    fileSaltB64 = Convert.ToBase64String(salt);
+                }
+
+                string encB64 = Convert.ToBase64String(encData);
+                byte[] plainBytes = await E2ee.DecryptChunk(encB64, _masterKeyHandle!, i, fileSaltB64 ?? "");
+                decryptedChunks.Add(Convert.ToBase64String(plainBytes));
+
+                _previewRef?.UpdateProgress(i + 1);
+            }
+
+            // 全チャンク復号完了 → Blob URL 生成
+            var mimeType = MediaHelper.GetMimeType(item.PlainName) ?? "application/octet-stream";
+
+            // Blob URL を JS で生成
+            string blobUrl = await JS.InvokeAsync<string>("cistaCreateMediaBlobUrl", decryptedChunks, mimeType);
+            _previewStreamUrl = blobUrl;
+            _previewRef?.SetE2eeBlobUrl(blobUrl);
+        }
+        catch (Exception ex)
+        {
+            _uploadError = $"プレビューエラー: {ex.Message}";
+            _previewRef?.SetError(ex.Message);
+        }
+        item.Downloading = false;
+    }
+
+    private async Task ClosePreview()
+    {
+        if (_previewStreamUrl is not null)
+        {
+            await JS.InvokeVoidAsync("cistaMedia.revokeBlobUrl", _previewStreamUrl);
+        }
+        _previewVisible = false;
+        _previewStreamUrl = null;
+    }
+
     // ---- E2EE ロック解除 ----
 
     private async Task HandleE2eeUnlock()
@@ -201,7 +338,6 @@ else
         _e2eeUnlocking = true; _e2eeError = null;
         try
         {
-            // サーバーから KDF パラメータと wrapped key を取得
             var (_, header) = VolumeSvc.GetMounted(VolumeName);
             var userKey = header.UserKeys.GetValueOrDefault(CurrentUsername);
             if (userKey is null)
@@ -278,21 +414,19 @@ else
 
     private async Task HandleE2eeUpload(InputFileChangeEventArgs e)
     {
-        const int chunkSize = 1048576; // 1 MiB
+        const int chunkSize = 1048576;
 
         foreach (var file in e.GetMultipleFiles(10))
         {
             string encName = await E2ee.EncryptFilename(file.Name, _masterKeyHandle!);
             string fileSaltB64 = await E2ee.GenerateFileSalt();
 
-            // 全チャンクを読み込む
             await using var stream = file.OpenReadStream(maxAllowedSize: 10L * 1024 * 1024 * 1024);
             long totalSize = file.Size;
             int totalChunks = (int)((totalSize + chunkSize - 1) / chunkSize);
             if (totalChunks == 0) totalChunks = 1;
 
-            // エントリ作成（EncryptedLength は推定値）
-            long estimatedLength = 16 + (long)totalChunks * (chunkSize + 16); // salt + chunks + tags
+            long estimatedLength = 16 + (long)totalChunks * (chunkSize + 16);
             var entry = E2eeFileSvc.CreateFile(VolumeName, new E2eeCreateFileRequest(encName, estimatedLength, totalChunks));
 
             long bytesRemaining = totalSize;
@@ -317,7 +451,6 @@ else
                 bytesRemaining -= read;
             }
 
-            // 確定（実際のサイズを更新）
             long actualLength = 16 + (totalChunks > 1 ? ((long)(totalChunks - 1) * (chunkSize + 16)) : 0) + (int)(totalSize - (totalChunks > 1 ? (long)(totalChunks - 1) * chunkSize : 0)) + 16;
             E2eeFileSvc.FinalizeFile(VolumeName, entry.FileId, new E2eeFinalizeFileRequest(actualLength));
         }
@@ -333,7 +466,6 @@ else
         try
         {
             var entry = item.Entry;
-            // チャンクごとにダウンロード → 復号 → 結合
             using var ms = new MemoryStream();
             string? fileSaltB64 = null;
 
@@ -343,7 +475,6 @@ else
                 byte[] encData = new byte[chunkLen];
                 using (chunkStream) await chunkStream.ReadAsync(encData);
 
-                // 最初のチャンクから salt を抽出
                 if (i == 0 && fileSaltB64 is null)
                 {
                     byte[] salt = new byte[16];
@@ -357,8 +488,7 @@ else
             }
 
             var base64 = Convert.ToBase64String(ms.ToArray());
-            var mimeType = "application/octet-stream";
-            await JS.InvokeVoidAsync("cistaDownload", item.PlainName, base64, mimeType);
+            await JS.InvokeVoidAsync("cistaDownload", item.PlainName, base64, "application/octet-stream");
         }
         catch (Exception ex)
         {

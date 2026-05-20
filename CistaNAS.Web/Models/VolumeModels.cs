@@ -1,10 +1,29 @@
+using System.ComponentModel.DataAnnotations;
+
 namespace CistaNAS.Web.Models;
 
-public sealed record CreateVolumeRequest(string Name, string? Username, string? Password, bool Encrypted = true);
-public sealed record MountRequest(string Name, string Username, string? Password);
-public sealed record GrantAccessRequest(string TargetUsername, string TargetPassword, string GranterPassword);
-public sealed record RevokeAccessRequest(string TargetUsername);
-public sealed record ChangePasswordRequest(string OldPassword, string NewPassword);
+public sealed record CreateVolumeRequest(
+    [Required] [StringLength(64, MinimumLength = 1)] string Name,
+    [StringLength(128)] string? Username,
+    [StringLength(256)] string? Password,
+    bool Encrypted = true);
+
+public sealed record MountRequest(
+    [Required] [StringLength(64, MinimumLength = 1)] string Name,
+    [Required] [StringLength(128)] string Username,
+    [StringLength(256)] string? Password);
+
+public sealed record GrantAccessRequest(
+    [Required] [StringLength(128)] string TargetUsername,
+    [Required] [StringLength(256, MinimumLength = 1)] string TargetPassword,
+    [Required] [StringLength(256, MinimumLength = 1)] string GranterPassword);
+
+public sealed record RevokeAccessRequest(
+    [Required] [StringLength(128)] string TargetUsername);
+
+public sealed record ChangePasswordRequest(
+    [Required] [StringLength(256, MinimumLength = 1)] string OldPassword,
+    [Required] [StringLength(256, MinimumLength = 8)] string NewPassword);
 
 /// <summary>ボリューム一覧表示用。</summary>
 public sealed record VolumeInfo(

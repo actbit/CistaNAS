@@ -24,7 +24,7 @@ public class AuthTests : IDisposable
         var vs = new VolumeService(io, gs, store);
         fakeSp.SetVolumeService(vs);
         var key = new JwtSigningKey(System.Security.Cryptography.RandomNumberGenerator.GetBytes(48));
-        return (new AuthService(store, key, io), store, opt, vs);
+        return (new AuthService(store, key, io, NullLogger<AuthService>.Instance), store, opt, vs);
     }
 
     private (AuthService auth, UserStore store, CistaNasOptions opt) Build()

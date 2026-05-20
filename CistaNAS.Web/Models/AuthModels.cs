@@ -1,10 +1,16 @@
+using System.ComponentModel.DataAnnotations;
+
 namespace CistaNAS.Web.Models;
 
 /// <summary>ログイン要求（/api/v1/auth/login・Blazor ログイン共通）。</summary>
-public sealed record LoginRequest(string Username, string Password);
+public sealed record LoginRequest(
+    [Required] [StringLength(128, MinimumLength = 1)] string Username,
+    [Required] [StringLength(256, MinimumLength = 1)] string Password);
 
 /// <summary>初期セットアップ要求（/api/v1/auth/setup）。</summary>
-public sealed record SetupRequest(string Username, string Password);
+public sealed record SetupRequest(
+    [Required] [StringLength(128, MinimumLength = 1)] string Username,
+    [Required] [StringLength(256, MinimumLength = 8)] string Password);
 
 /// <summary>ログイン成功時に返す JWT。</summary>
 public sealed record LoginResponse(string AccessToken, string TokenType, DateTimeOffset ExpiresAt);

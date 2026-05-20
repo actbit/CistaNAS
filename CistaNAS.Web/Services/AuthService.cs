@@ -2,6 +2,7 @@ using System.Security.Claims;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Crypto;
 using CistaNAS.Web.Models;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.JsonWebTokens;
 using Microsoft.IdentityModel.Tokens;
@@ -15,7 +16,8 @@ namespace CistaNAS.Web.Services;
 public sealed class AuthService(
     UserStore users,
     JwtSigningKey signingKey,
-    IOptions<CistaNasOptions> options)
+    IOptions<CistaNasOptions> options,
+    ILogger<AuthService> logger)
 {
     /// <summary>
     /// 資格情報を検証し、成功時に JWT を発行する。失敗時は null。
@@ -27,8 +29,12 @@ public sealed class AuthService(
 
         var user = users.Find(username);
         if (user is null || !PasswordHasher.Verify(password, user.PasswordHash))
+        {
+            logger.LogWarning("ログイン失敗: ユーザー '{Username}'", username);
             return null;
+        }
 
+        logger.LogInformation("ログイン成功: ユーザー '{Username}'", username);
         return IssueToken(user);
     }
 

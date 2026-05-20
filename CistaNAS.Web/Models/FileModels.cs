@@ -1,3 +1,4 @@
+using System.ComponentModel.DataAnnotations;
 using CistaNAS.Web.Volume;
 
 namespace CistaNAS.Web.Models;
@@ -23,10 +24,10 @@ public sealed class FileServiceException(string message) : Exception(message);
 
 /// <summary>E2EE ボリューム作成リクエスト（クライアントからラップ済み鍵を受け取る）。</summary>
 public sealed record E2eeCreateVolumeRequest(
-    string VolumeName,
-    string Username,
-    VolumeHeader.UserWrappedKey WrappedMasterKey,
-    int ChunkSize = 1048576);
+    [Required] [StringLength(64, MinimumLength = 1)] string VolumeName,
+    [Required] [StringLength(128)] string Username,
+    [Required] VolumeHeader.UserWrappedKey WrappedMasterKey,
+    [Range(4096, 67108864)] int ChunkSize = 1048576);
 
 /// <summary>E2EE ファイルカタログエントリ。</summary>
 public sealed class E2eeFileEntry
@@ -41,13 +42,18 @@ public sealed class E2eeFileEntry
     public DateTimeOffset ModifiedAt { get; set; }
 }
 
-public sealed record E2eeCreateFileRequest(string EncryptedName, long EncryptedLength, int ChunkCount);
-public sealed record E2eeFinalizeFileRequest(long ActualEncryptedLength);
+public sealed record E2eeCreateFileRequest(
+    [Required] string EncryptedName,
+    [Range(0, long.MaxValue)] long EncryptedLength,
+    [Range(1, 100000)] int ChunkCount);
+public sealed record E2eeFinalizeFileRequest([Range(0, long.MaxValue)] long ActualEncryptedLength);
 public sealed record E2eeListFilesResponse(IReadOnlyList<E2eeFileEntry> Files);
 public sealed record E2eeMountResponse(int ChunkSize, string EncryptionMode);
 
 /// <summary>E2EE 共有時の鍵追加リクエスト。</summary>
-public sealed record E2eeAddWrappedKeyRequest(string Username, VolumeHeader.UserWrappedKey WrappedMasterKey);
+public sealed record E2eeAddWrappedKeyRequest(
+    [Required] [StringLength(128)] string Username,
+    [Required] VolumeHeader.UserWrappedKey WrappedMasterKey);
 
 /// <summary>E2EE カタログ（永続化用）。</summary>
 public sealed class E2eeCatalog
@@ -57,9 +63,21 @@ public sealed class E2eeCatalog
 
 // ---- ECDH 鍵交換・招待関連 DTO ----
 
-public sealed record SetPublicKeyRequest(string PublicKey);
-public sealed record CreateGroupE2eeVolumeRequest(string GroupName, VolumeHeader.UserWrappedKey OwnerWrappedKey, int ChunkSize = 1048576);
-public sealed record AddE2eeWrappedKeysBatchRequest(Dictionary<string, VolumeHeader.UserWrappedKey> WrappedKeys);
-public sealed record CreateInvitationRequest(string TargetUsername);
-public sealed record AcceptInvitationRequest(string InvitationId, string EncryptedPublicKey, string Nonce);
+public sealed record SetPublicKeyRequest([Required] string PublicKey);
+public sealed record CreateGroupE2eeVolumeRequest(
+    [Required] [StringLength(64, MinimumLength = 1)] string GroupName,
+    [Required] VolumeHeader.UserWrappedKey OwnerWrappedKey,
+    [Range(4096, 67108864)] int ChunkSize = 1048576);
+public sealed record AddE2eeWrappedKeysBatchRequest(
+    [Required] Dictionary<string, VolumeHeader.UserWrappedKey> WrappedKeys);
+public sealed record CreateInvitationRequest([Required] [StringLength(128)] string TargetUsername);
+public sealed record AcceptInvitationRequest(
+    [Required] string InvitationId,
+    [Required] string EncryptedPublicKey,
+    [Required] string Nonce);
 public sealed record InvitationResponse(string InvitationId, string InviterUsername, DateTimeOffset CreatedAt);
+
+/// <summary>メディアストリーミングトークン発行リクエスト。</summary>
+public sealed record StreamTokenRequest(
+    [Required] string VolumeName,
+    [Required] string FileName);

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using CistaNAS.Web.Volume;
 
 namespace CistaNAS.Web.Services;
@@ -14,7 +15,7 @@ public sealed class InvitationService
     public InvitationRecord Create(string inviterUsername, string targetUsername,
         VolumeHeader.UserWrappedKey? groupVolumeWrappedKey = null)
     {
-        string id = Guid.NewGuid().ToString("N");
+        string id = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
         var record = new InvitationRecord
         {
             InvitationId = id,

@@ -117,8 +117,16 @@ public sealed class E2eeFileService
 
         string dataPath = GetDataPath(volumeName);
         var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        fs.Seek(chunkOffset, SeekOrigin.Begin);
-        return (new SubStream(fs, chunkLength), chunkLength);
+        try
+        {
+            fs.Seek(chunkOffset, SeekOrigin.Begin);
+            return (new SubStream(fs, chunkLength), chunkLength);
+        }
+        catch
+        {
+            fs.Dispose();
+            throw;
+        }
     }
 
     /// <summary>アップロード完了を確定。</summary>

@@ -1,7 +1,36 @@
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
+using StreamingTokenService = CistaNAS.Web.Services.StreamingTokenService;
 
 namespace CistaNAS.Web.Api;
+
+file static class PathSanitizer
+{
+    /// <summary>
+    /// ユーザー入力のファイルパスをサニタイズし、ディレクトリトラバーサルを防止する。
+    /// </summary>
+    public static string SanitizeFileName(string raw)
+    {
+        string decoded = Uri.UnescapeDataString(raw.TrimStart('/'));
+        string normalized = decoded.Replace('\\', '/');
+
+        // ディレクトリトラバーサル要素を除去
+        var parts = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var safeParts = new List<string>(parts.Length);
+        foreach (var part in parts)
+        {
+            if (part == ".." || part == ".") continue;
+            if (part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) continue;
+            safeParts.Add(part);
+        }
+
+        string safe = string.Join('/', safeParts);
+        if (string.IsNullOrEmpty(safe))
+            throw new FileServiceException("ファイル名が無効です。");
+
+        return safe;
+    }
+}
 
 /// <summary>
 /// /api/v1 ルート定義（rclone・RCX 等の外部クライアント向け）。
@@ -20,6 +49,7 @@ public static class ApiEndpoints
             return Results.Ok(new { message = "初期管理者を作成しました。" });
         })
         .AllowAnonymous()
+        .RequireRateLimiting("auth")
         .WithName("Setup");
 
         api.MapPost("/auth/login", (LoginRequest req, AuthService auth) =>
@@ -30,6 +60,7 @@ public static class ApiEndpoints
                 : Results.Ok(res);
         })
         .AllowAnonymous()
+        .RequireRateLimiting("auth")
         .WithName("Login");
 
         api.MapPost("/auth/change-password", (ChangePasswordRequest req, HttpContext ctx, AuthService auth) =>
@@ -129,7 +160,7 @@ public static class ApiEndpoints
         {
             try
             {
-                string fileName = Uri.UnescapeDataString(filePath.TrimStart('/'));
+                string fileName = PathSanitizer.SanitizeFileName(filePath);
                 long len = ctx.Request.ContentLength ?? 0;
                 using var stream = ctx.Request.Body;
                 var meta = await fs.UploadAsync(volumeName, fileName, stream, len, ctx.RequestAborted);
@@ -144,7 +175,7 @@ public static class ApiEndpoints
         {
             try
             {
-                string fileName = Uri.UnescapeDataString(filePath.TrimStart('/'));
+                string fileName = PathSanitizer.SanitizeFileName(filePath);
                 var dl = fs.Download(volumeName, fileName);
                 return Results.Stream(dl.Stream, "application/octet-stream", dl.FileName,
                     enableRangeProcessing: false);
@@ -152,14 +183,13 @@ public static class ApiEndpoints
             catch (FileServiceException ex) { return Results.NotFound(new { error = ex.Message }); }
             catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
-        .WithName("DownloadFile")
-        .AllowAnonymous(); // Blazor UI のダウンロード用（トークンをクエリパラメータで検証）
+        .WithName("DownloadFile");
 
         files.MapDelete("/{*filePath}", (string volumeName, string filePath, FileService fs) =>
         {
             try
             {
-                string fileName = Uri.UnescapeDataString(filePath.TrimStart('/'));
+                string fileName = PathSanitizer.SanitizeFileName(filePath);
                 fs.Delete(volumeName, fileName);
                 return Results.NoContent();
             }
@@ -170,6 +200,44 @@ public static class ApiEndpoints
 
         // ---- E2EE ----
         api.MapE2eeApi();
+
+        // ---- メディアストリーミング ----
+        // ストリーミングトークン発行（認証必須）
+        api.MapPost("/stream/token", (StreamTokenRequest req, HttpContext ctx, StreamingTokenService sts) =>
+        {
+            string? username = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+            string token = sts.Issue(username, req.VolumeName, req.FileName);
+            return Results.Ok(new { token });
+        })
+        .RequireAuthorization()
+        .WithName("IssueStreamToken");
+
+        // ストリーミングエンドポイント（短命トークン認証、Range対応）
+        api.MapGet("/stream/{volumeName}/{*filePath}", (
+            string volumeName, string filePath, string? token,
+            StreamingTokenService sts, VolumeService vs, FileService fs,
+            HttpContext ctx, long? fromByte, long? toByte) =>
+        {
+            // トークン検証
+            if (string.IsNullOrEmpty(token)) return Results.Unauthorized();
+            var validated = sts.Validate(token);
+            if (validated is null) return Results.Unauthorized();
+            var (user, vol, file) = validated.Value;
+            if (!string.Equals(vol, volumeName, StringComparison.Ordinal)) return Results.Forbid();
+
+            try
+            {
+                string fileName = PathSanitizer.SanitizeFileName(filePath);
+                var dl = fs.Download(volumeName, fileName);
+                return Results.Stream(dl.Stream, "application/octet-stream", dl.FileName,
+                    enableRangeProcessing: true);
+            }
+            catch (FileServiceException) { return Results.NotFound(); }
+            catch (VolumeException) { return Results.BadRequest(); }
+        })
+        .AllowAnonymous()
+        .WithName("StreamFile");
 
         // ---- グループ ----
         var groups = api.MapGroup("/groups")
@@ -187,7 +255,7 @@ public static class ApiEndpoints
                 gs.CreateGroup(req.GroupName, username);
                 return Results.Created($"/api/v1/groups/{req.GroupName}", null);
             }
-            catch (Exception ex) { return Results.Conflict(new { error = ex.Message }); }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { error = ex.Message }); }
         })
         .WithName("CreateGroup");
 
@@ -199,7 +267,7 @@ public static class ApiEndpoints
                 gs.DeleteGroup(groupName, username);
                 return Results.NoContent();
             }
-            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
         .WithName("DeleteGroup");
 
@@ -212,7 +280,7 @@ public static class ApiEndpoints
                 gs.AddMember(groupName, username, req.Username);
                 return Results.Ok();
             }
-            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
         .WithName("AddGroupMember");
 
@@ -225,7 +293,7 @@ public static class ApiEndpoints
                 gs.RemoveMember(groupName, requester, username);
                 return Results.NoContent();
             }
-            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
         .WithName("RemoveGroupMember");
 

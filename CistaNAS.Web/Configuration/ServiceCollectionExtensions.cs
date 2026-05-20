@@ -30,6 +30,9 @@ public static class ServiceCollectionExtensions
         // Blazor 認証状態
         services.AddScoped<AuthenticationStateService>();
 
+        // メディアストリーミング
+        services.AddSingleton<StreamingTokenService>();
+
         return services;
     }
 }
