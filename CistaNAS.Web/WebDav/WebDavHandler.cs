@@ -58,10 +58,9 @@ public sealed class WebDavHandler
     {
         if (!CheckAccess(volumeName, ctx))
         {
-            ctx.Response.StatusCode = 400;
+            ctx.Response.StatusCode = 403;
             return ctx.Response.WriteAsJsonAsync(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
         }
-
         // E2EE ボリュームの場合は opaque なファイル一覧を返す
         if (IsE2ee(volumeName))
             return PropFindE2ee(volumeName, path, ctx);
@@ -129,7 +128,7 @@ public sealed class WebDavHandler
     public IResult Get(string volumeName, string path, HttpContext ctx)
     {
         if (!CheckAccess(volumeName, ctx))
-            return Results.BadRequest(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
+            return Results.Forbid();
 
         string name = NormalizePath(path);
         if (string.IsNullOrEmpty(name))
@@ -151,7 +150,7 @@ public sealed class WebDavHandler
     public async Task<IResult> Put(string volumeName, string path, HttpRequest request)
     {
         if (!CheckAccess(volumeName, request.HttpContext))
-            return Results.BadRequest(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
+            return Results.Forbid();
 
         string name = NormalizePath(path);
         if (string.IsNullOrEmpty(name))
@@ -172,7 +171,7 @@ public sealed class WebDavHandler
     public IResult Delete(string volumeName, string path, HttpContext ctx)
     {
         if (!CheckAccess(volumeName, ctx))
-            return Results.BadRequest(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
+            return Results.Forbid();
 
         string name = NormalizePath(path);
         if (string.IsNullOrEmpty(name))
@@ -194,7 +193,7 @@ public sealed class WebDavHandler
     public IResult MkCol(string volumeName, string path, HttpContext ctx)
     {
         if (!CheckAccess(volumeName, ctx))
-            return Results.BadRequest(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
+            return Results.Forbid();
 
         return Results.Created();
     }

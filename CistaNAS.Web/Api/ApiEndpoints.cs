@@ -203,11 +203,12 @@ public static class ApiEndpoints
         api.MapE2eeApi();
 
         // ---- メディアストリーミング ----
-        // ストリーミングトークン発行（認証必須）
-        api.MapPost("/stream/token", (StreamTokenRequest req, HttpContext ctx, StreamingTokenService sts) =>
+        // ストリーミングトークン発行（認証必須 + ボリュームアクセス権チェック）
+        api.MapPost("/stream/token", (StreamTokenRequest req, HttpContext ctx, StreamingTokenService sts, VolumeService vs) =>
         {
             string? username = ctx.User.Identity?.Name;
             if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+            if (!vs.HasAccess(req.VolumeName, username)) return Results.Forbid();
             string token = sts.Issue(username, req.VolumeName, req.FileName);
             return Results.Ok(new { token });
         })
@@ -226,6 +227,7 @@ public static class ApiEndpoints
             if (validated is null) return Results.Unauthorized();
             var (user, vol, file) = validated.Value;
             if (!string.Equals(vol, volumeName, StringComparison.Ordinal)) return Results.Forbid();
+            if (!vs.HasAccess(volumeName, user)) return Results.Forbid();
 
             try
             {

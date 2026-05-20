@@ -239,6 +239,8 @@ else
         var mediaType = MediaHelper.GetMediaType(fileName);
         if (mediaType == MediaHelper.MediaType.None) return;
 
+        await RevokePreviewBlobUrl();
+
         _previewFileName = fileName;
         _previewType = mediaType;
         _previewStreamUrl = null;
@@ -268,6 +270,8 @@ else
     {
         var mediaType = MediaHelper.GetMediaType(item.PlainName);
         if (mediaType == MediaHelper.MediaType.None) return;
+
+        await RevokePreviewBlobUrl();
 
         item.Downloading = true;
         _previewFileName = item.PlainName;
@@ -333,12 +337,18 @@ else
 
     private async Task ClosePreview()
     {
-        if (_previewStreamUrl is not null)
-        {
-            await JS.InvokeVoidAsync("cistaMedia.revokeBlobUrl", _previewStreamUrl);
-        }
+        await RevokePreviewBlobUrl();
         _previewVisible = false;
         _previewStreamUrl = null;
+    }
+
+    private async Task RevokePreviewBlobUrl()
+    {
+        if (_previewStreamUrl is not null && _previewStreamUrl.StartsWith("blob:", StringComparison.Ordinal))
+        {
+            try { await JS.InvokeVoidAsync("cistaMedia.revokeBlobUrl", _previewStreamUrl); }
+            catch { /* 既に revoke 済みの場合は無視 */ }
+        }
     }
 
     // ---- E2EE ロック解除 ----
@@ -461,7 +471,7 @@ else
                 bytesRemaining -= read;
             }
 
-            long actualLength = 16 + (totalChunks > 1 ? ((long)(totalChunks - 1) * (chunkSize + 16)) : 0) + (int)(totalSize - (totalChunks > 1 ? (long)(totalChunks - 1) * chunkSize : 0)) + 16;
+            long actualLength = 16 + (totalChunks > 1 ? ((long)(totalChunks - 1) * (chunkSize + 16)) : 0) + (totalSize - (totalChunks > 1 ? (long)(totalChunks - 1) * chunkSize : 0)) + 16;
             E2eeFileSvc.FinalizeFile(VolumeName, entry.FileId, new E2eeFinalizeFileRequest(actualLength));
         }
 
@@ -516,12 +526,12 @@ else
         item.Downloading = false;
     }
 
-    private void HandleE2eeDelete(string fileId)
+    private async Task HandleE2eeDelete(string fileId)
     {
         try
         {
             E2eeFileSvc.DeleteFile(VolumeName, fileId);
-            _ = RefreshE2eeList();
+            await RefreshE2eeList();
         }
         catch (FileServiceException ex)
         {
@@ -577,10 +587,6 @@ else
 
     public async ValueTask DisposeAsync()
     {
-        if (_previewStreamUrl is not null && _previewStreamUrl.StartsWith("blob:", StringComparison.Ordinal))
-        {
-            try { await JS.InvokeVoidAsync("cistaMedia.revokeBlobUrl", _previewStreamUrl); }
-            catch { /* 破棄時の例外は無視 */ }
-        }
+        await RevokePreviewBlobUrl();
     }
 }
