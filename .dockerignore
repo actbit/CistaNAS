@@ -1,0 +1,12 @@
+**/bin/
+**/obj/
+**/.vs/
+**/data/
+*.user
+*.suo
+.git/
+.github/
+deploy/
+CistaNAS.AppHost/
+CistaNAS.Client/
+CistaNAS.Tests/

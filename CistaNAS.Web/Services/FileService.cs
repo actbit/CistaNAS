@@ -4,6 +4,7 @@ using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Crypto;
 using CistaNAS.Web.Journal;
 using CistaNAS.Web.Models;
+using CistaNAS.Web.Storage;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Web.Services;
@@ -28,22 +29,22 @@ public sealed class FileService
 
     private readonly VolumeService _volumeService;
     private readonly JournalService _journalService;
-    private readonly string _dataRoot;
+    private readonly IStorageProvider _storage;
 
     public FileService(
         VolumeService volumeService,
         JournalService journalService,
-        IOptions<CistaNasOptions> options)
+        IStorageProvider storage)
     {
         _volumeService = volumeService;
         _journalService = journalService;
-        _dataRoot = options.Value.DataRoot;
+        _storage = storage;
     }
 
     /// <summary>ボリューム内の全ファイルを一覧。</summary>
-    public ListFilesResponse List(string volumeName)
+    public async Task<ListFilesResponse> ListAsync(string volumeName, CancellationToken ct = default)
     {
-        var catalog = LoadCatalog(volumeName);
+        var catalog = await LoadCatalogAsync(volumeName, ct);
         return new ListFilesResponse(catalog.Files.Values.OrderBy(f => f.Name).ToList());
     }
 
@@ -56,12 +57,12 @@ public sealed class FileService
         var (stream, _) = _volumeService.GetMounted(volumeName);
 
         // ジャーナル: 書き込み前
-        _journalService.Record(volumeName, new JournalEntry
+        await _journalService.RecordAsync(volumeName, new JournalEntry
         {
             Operation = JournalOp.WriteFile,
             Path = fileName,
             Length = checked((int)Math.Min(contentLength, int.MaxValue)),
-        });
+        }, ct);
 
         // 既存ファイルがあれば上書き（同じオフセットに収まれば再利用、否则追記）
         // ユーザー入力の読み取りは lock 外で行い（非同期 I/O）、書き込みだけ lock 内で実行
@@ -83,7 +84,7 @@ public sealed class FileService
         object catLock = _catalogLocks.GetOrAdd(volumeName, _ => new object());
         lock (catLock)
         {
-            var catalog = LoadCatalog(volumeName);
+            var catalog = LoadCatalogAsync(volumeName, ct).GetAwaiter().GetResult();
             catalog.Files.TryGetValue(fileName, out var existing);
 
             lock (stream)
@@ -111,11 +112,11 @@ public sealed class FileService
                 ModifiedAt = DateTimeOffset.UtcNow,
             };
             catalog.Files[fileName] = meta;
-            SaveCatalog(volumeName, catalog);
+            SaveCatalogAsync(volumeName, catalog, ct).GetAwaiter().GetResult();
         }
 
         // ジャーナル: コミット
-        _journalService.Commit(volumeName);
+        await _journalService.CommitAsync(volumeName, ct);
 
         return meta;
     }
@@ -128,7 +129,7 @@ public sealed class FileService
         object catLock = _catalogLocks.GetOrAdd(volumeName, _ => new object());
         lock (catLock)
         {
-            var catalog = LoadCatalog(volumeName);
+            var catalog = LoadCatalogSync(volumeName);
             if (!catalog.Files.TryGetValue(fileName, out var meta))
                 throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
 
@@ -152,42 +153,42 @@ public sealed class FileService
     }
 
     /// <summary>ファイルを削除。</summary>
-    public void Delete(string volumeName, string fileName)
+    public async Task DeleteAsync(string volumeName, string fileName, CancellationToken ct = default)
     {
-        _journalService.Record(volumeName, new JournalEntry
+        await _journalService.RecordAsync(volumeName, new JournalEntry
         {
             Operation = JournalOp.DeleteFile,
             Path = fileName,
-        });
+        }, ct);
 
         object catLock = _catalogLocks.GetOrAdd(volumeName, _ => new object());
         lock (catLock)
         {
-            var catalog = LoadCatalog(volumeName);
+            var catalog = LoadCatalogAsync(volumeName, ct).GetAwaiter().GetResult();
             if (!catalog.Files.Remove(fileName))
                 throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
 
-            SaveCatalog(volumeName, catalog);
+            SaveCatalogAsync(volumeName, catalog, ct).GetAwaiter().GetResult();
         }
-        _journalService.Commit(volumeName);
+        await _journalService.CommitAsync(volumeName, ct);
     }
 
     /// <summary>クラッシュ復旧：未コミットジャーナルからカタログを修復。</summary>
-    public void Recover(string volumeName)
+    public async Task RecoverAsync(string volumeName, CancellationToken ct = default)
     {
-        var pending = _journalService.Recover(volumeName);
+        var pending = await _journalService.RecoverAsync(volumeName, ct);
         if (pending.Count == 0) return;
 
         // 書き込み未完了エントリは無視（次回上書きで回復）
         // 削除済みエントリはカタログから取り除く
-        var catalog = LoadCatalog(volumeName);
+        var catalog = await LoadCatalogAsync(volumeName, ct);
         foreach (var entry in pending)
         {
             if (entry.Operation == JournalOp.DeleteFile)
                 catalog.Files.Remove(entry.Path);
         }
-        SaveCatalog(volumeName, catalog);
-        _journalService.Commit(volumeName);
+        await SaveCatalogAsync(volumeName, catalog, ct);
+        await _journalService.CommitAsync(volumeName, ct);
     }
 
     // ---- カタログ ----
@@ -197,23 +198,26 @@ public sealed class FileService
         public Dictionary<string, FileMetadata> Files { get; set; } = new(StringComparer.Ordinal);
     }
 
-    private FileCatalog LoadCatalog(string volumeName)
+    private async Task<FileCatalog> LoadCatalogAsync(string volumeName, CancellationToken ct)
     {
-        string path = GetCatalogPath(volumeName);
-        if (!File.Exists(path)) return new FileCatalog();
-        using var fs = File.OpenRead(path);
-        return JsonSerializer.Deserialize<FileCatalog>(fs, JsonOptions) ?? new FileCatalog();
+        byte[]? data = await _storage.ReadAsync($"{volumeName}/catalog.json", ct);
+        if (data is null) return new FileCatalog();
+        return JsonSerializer.Deserialize<FileCatalog>(data, JsonOptions) ?? new FileCatalog();
     }
 
-    private void SaveCatalog(string volumeName, FileCatalog catalog)
+    private async Task SaveCatalogAsync(string volumeName, FileCatalog catalog, CancellationToken ct)
     {
-        string path = GetCatalogPath(volumeName);
-        string tmp = path + ".tmp";
-        using (var fs = File.Create(tmp))
-            JsonSerializer.Serialize(fs, catalog, JsonOptions);
-        File.Move(tmp, path, overwrite: true);
+        using var ms = new MemoryStream();
+        JsonSerializer.Serialize(ms, catalog, JsonOptions);
+        ms.Position = 0;
+        await _storage.WriteAtomicAsync($"{volumeName}/catalog.json", ms, ct);
     }
 
-    private string GetCatalogPath(string volumeName)
-        => Path.Combine(_dataRoot, volumeName, "catalog.json");
+    // 同期版（Download で使用。後方互換のため残す）
+    private FileCatalog LoadCatalogSync(string volumeName)
+    {
+        byte[]? data = _storage.ReadAsync($"{volumeName}/catalog.json").GetAwaiter().GetResult();
+        if (data is null) return new FileCatalog();
+        return JsonSerializer.Deserialize<FileCatalog>(data, JsonOptions) ?? new FileCatalog();
+    }
 }

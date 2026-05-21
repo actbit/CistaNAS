@@ -3,6 +3,7 @@ using System.Xml;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
+using CistaNAS.Web.Storage;
 using CistaNAS.Web.WebDav;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
@@ -27,12 +28,14 @@ public class WebDavTests : IDisposable
             Volume = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
         };
         var io = Options.Create(opt);
-        var gs = new GroupStore(io, new ServiceCollection().BuildServiceProvider());
+        var storage = new LocalStorageProvider(_dataRoot);
+        var metaStore = new VolumeMetadataStore(storage);
+        var gs = new GroupStore(storage, io, new ServiceCollection().BuildServiceProvider());
         var sp = new ServiceCollection().AddLogging().BuildServiceProvider();
-        var us = new UserStore(io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
-        _volumeService = new VolumeService(io, gs, us);
-        _fileService = new FileService(_volumeService, new JournalService(io), io);
-        var e2eeFs = new E2eeFileService(_volumeService, io);
+        var us = new UserStore(storage, io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
+        _volumeService = new VolumeService(io, gs, us, metaStore);
+        _fileService = new FileService(_volumeService, new JournalService(storage), storage);
+        var e2eeFs = new E2eeFileService(_volumeService, storage, io);
         _handler = new WebDavHandler(_volumeService, _fileService, e2eeFs);
     }
 
@@ -74,7 +77,7 @@ public class WebDavTests : IDisposable
         var content = Encoding.UTF8.GetBytes("Hello WebDAV!");
         using var ms = new MemoryStream(content);
         await _fileService.UploadAsync("io-vol", "hello.txt", ms, content.Length);
-        var list = _fileService.List("io-vol");
+        var list = await _fileService.ListAsync("io-vol");
         Assert.Single(list.Files);
     }
 
@@ -113,8 +116,8 @@ public class WebDavTests : IDisposable
     {
         _volumeService.Create("del-vol", null, null, encrypted: false);
         await Upload("del-vol", "todelete.txt", "bye");
-        _fileService.Delete("del-vol", "todelete.txt");
-        Assert.Empty(_fileService.List("del-vol").Files);
+        await _fileService.DeleteAsync("del-vol", "todelete.txt");
+        Assert.Empty((await _fileService.ListAsync("del-vol")).Files);
     }
 
     [Fact]

@@ -1,5 +1,6 @@
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Services;
+using CistaNAS.Web.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
@@ -19,9 +20,11 @@ public class AuthTests : IDisposable
         };
         var io = Options.Create(opt);
         var fakeSp = new FakeServiceProvider();
-        var gs = new GroupStore(io, fakeSp);
-        var store = new UserStore(io, NullLogger<UserStore>.Instance, fakeSp);
-        var vs = new VolumeService(io, gs, store);
+        var storage = new LocalStorageProvider(_dataRoot);
+        var metaStore = new VolumeMetadataStore(storage);
+        var gs = new GroupStore(storage, io, fakeSp);
+        var store = new UserStore(storage, io, NullLogger<UserStore>.Instance, fakeSp);
+        var vs = new VolumeService(io, gs, store, metaStore);
         fakeSp.SetVolumeService(vs);
         var key = new JwtSigningKey(System.Security.Cryptography.RandomNumberGenerator.GetBytes(48));
         return (new AuthService(store, key, io, NullLogger<AuthService>.Instance), store, opt, vs);

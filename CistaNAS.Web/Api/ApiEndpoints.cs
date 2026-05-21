@@ -147,11 +147,11 @@ public static class ApiEndpoints
         var files = api.MapGroup("/files/{volumeName}")
             .RequireAuthorization();
 
-        files.MapGet("/", (string volumeName, FileService fs) =>
+        files.MapGet("/", async (string volumeName, FileService fs) =>
         {
             try
             {
-                return Results.Ok(fs.List(volumeName));
+                return Results.Ok(await fs.ListAsync(volumeName));
             }
             catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
@@ -186,12 +186,12 @@ public static class ApiEndpoints
         })
         .WithName("DownloadFile");
 
-        files.MapDelete("/{*filePath}", (string volumeName, string filePath, FileService fs) =>
+        files.MapDelete("/{*filePath}", async (string volumeName, string filePath, FileService fs) =>
         {
             try
             {
                 string fileName = PathSanitizer.SanitizeFileName(filePath);
-                fs.Delete(volumeName, fileName);
+                await fs.DeleteAsync(volumeName, fileName);
                 return Results.NoContent();
             }
             catch (FileServiceException ex) { return Results.NotFound(new { error = ex.Message }); }

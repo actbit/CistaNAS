@@ -1,0 +1,15 @@
+services:
+  cistanas:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - cista-data:/app/data
+    environment:
+      - CistaNas__DataRoot=/app/data
+      - CistaNas__Jwt__SigningKey=${JWT_SIGNING_KEY:-}
+      - CistaNas__Auth__DefaultAdminPassword=${ADMIN_PASSWORD:-}
+      - ASPNETCORE_ENVIRONMENT=Development
+
+volumes:
+  cista-data:

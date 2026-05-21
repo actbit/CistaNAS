@@ -54,19 +54,23 @@ public sealed class WebDavHandler
 
     // ---- PROPFIND ----
 
-    public Task PropFindAsync(string volumeName, string path, string? depthHeader, HttpContext ctx)
+    public async Task PropFindAsync(string volumeName, string path, string? depthHeader, HttpContext ctx)
     {
         if (!CheckAccess(volumeName, ctx))
         {
             ctx.Response.StatusCode = 403;
-            return ctx.Response.WriteAsJsonAsync(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
+            await ctx.Response.WriteAsJsonAsync(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
+            return;
         }
         // E2EE ボリュームの場合は opaque なファイル一覧を返す
         if (IsE2ee(volumeName))
-            return PropFindE2ee(volumeName, path, ctx);
+        {
+            await PropFindE2ee(volumeName, path, ctx);
+            return;
+        }
 
         int depth = WebDavXml.ParseDepth(depthHeader);
-        var files = _fileService.List(volumeName).Files;
+        var files = (await _fileService.ListAsync(volumeName)).Files;
         string prefix = NormalizePath(path);
         var resources = new List<WebDavResource>();
 
@@ -99,7 +103,7 @@ public sealed class WebDavHandler
                 else
                 {
                     ctx.Response.StatusCode = 404;
-                    return Task.CompletedTask;
+                    return;
                 }
             }
         }
@@ -120,7 +124,7 @@ public sealed class WebDavHandler
         string xml = WebDavXml.BuildMultiStatus(resources, baseUrl);
         ctx.Response.StatusCode = 207; // Multi-Status
         ctx.Response.ContentType = "application/xml; charset=utf-8";
-        return ctx.Response.WriteAsync(xml);
+        await ctx.Response.WriteAsync(xml);
     }
 
     // ---- GET ----
@@ -168,7 +172,7 @@ public sealed class WebDavHandler
 
     // ---- DELETE ----
 
-    public IResult Delete(string volumeName, string path, HttpContext ctx)
+    public async Task<IResult> Delete(string volumeName, string path, HttpContext ctx)
     {
         if (!CheckAccess(volumeName, ctx))
             return Results.Forbid();
@@ -179,7 +183,7 @@ public sealed class WebDavHandler
 
         try
         {
-            _fileService.Delete(volumeName, name);
+            await _fileService.DeleteAsync(volumeName, name);
             return Results.NoContent();
         }
         catch (FileServiceException)

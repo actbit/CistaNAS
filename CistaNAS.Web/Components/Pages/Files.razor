@@ -204,13 +204,13 @@ else
 
     private string CurrentUsername => AuthState.User?.Identity?.Name ?? "";
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
         AuthState.Subscribe(OnAuthStateChanged);
         _isE2ee = GetVolumeEncryptionMode() == "e2ee";
         if (!_isE2ee)
         {
-            RefreshList();
+            await RefreshList();
         }
     }
 
@@ -224,9 +224,9 @@ else
         catch { return "server"; }
     }
 
-    private void RefreshList()
+    private async Task RefreshList()
     {
-        try { _files = FileSvc.List(VolumeName).Files.ToList(); }
+        try { _files = (await FileSvc.ListAsync(VolumeName)).Files.ToList(); }
         catch { _files = []; }
     }
 
@@ -425,7 +425,7 @@ else
                     await using var stream = file.OpenReadStream(maxAllowedSize: 10L * 1024 * 1024 * 1024);
                     await FileSvc.UploadAsync(VolumeName, file.Name, stream, file.Size);
                 }
-                RefreshList();
+                await RefreshList();
             }
         }
         catch (Exception ex)
@@ -559,12 +559,12 @@ else
         }
     }
 
-    private void HandleDelete(string fileName)
+    private async Task HandleDelete(string fileName)
     {
         try
         {
-            FileSvc.Delete(VolumeName, fileName);
-            RefreshList();
+            await FileSvc.DeleteAsync(VolumeName, fileName);
+            await RefreshList();
         }
         catch (FileServiceException ex)
         {

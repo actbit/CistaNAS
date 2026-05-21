@@ -1,6 +1,8 @@
+using System.Text.Json;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Journal;
 using CistaNAS.Web.Models;
+using CistaNAS.Web.Storage;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Web.Services;
@@ -11,46 +13,74 @@ namespace CistaNAS.Web.Services;
 /// </summary>
 public sealed class JournalService
 {
-    private readonly string _dataRoot;
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = false };
 
-    public JournalService(IOptions<CistaNasOptions> options)
+    private readonly IStorageProvider _storage;
+
+    public JournalService(IStorageProvider storage)
     {
-        _dataRoot = options.Value.DataRoot;
+        _storage = storage;
     }
 
     /// <summary>ジャーナルにエントリを追記する。書き込み前（pre-commit）に呼ぶ。</summary>
-    public void Record(string volumeName, JournalEntry entry)
+    public async Task RecordAsync(string volumeName, JournalEntry entry, CancellationToken ct = default)
     {
-        string path = GetJournalPath(volumeName);
+        string journalPath = $"{volumeName}/volume{JournalFile.Suffix}";
+        string lockPath = $"{volumeName}/volume{JournalFile.Suffix}.lock";
         entry.Timestamp = DateTimeOffset.UtcNow;
-        JournalFile.Append(path, entry);
+
+        using (await _storage.AcquireLockAsync(lockPath, ct))
+        {
+            byte[]? existing = await _storage.ReadAsync(journalPath, ct);
+            var journal = existing is not null
+                ? JsonSerializer.Deserialize<JournalFile>(existing, JsonOptions) ?? new JournalFile()
+                : new JournalFile();
+            journal.Pending.Add(entry);
+
+            using var ms = new MemoryStream();
+            JsonSerializer.Serialize(ms, journal, JsonOptions);
+            ms.Position = 0;
+            await _storage.WriteAtomicAsync(journalPath, ms, ct);
+        }
     }
 
     /// <summary>書き込み完了後にジャーナルをクリアする（コミット）。</summary>
-    public void Commit(string volumeName)
+    public async Task CommitAsync(string volumeName, CancellationToken ct = default)
     {
-        string path = GetJournalPath(volumeName);
-        if (File.Exists(path)) JournalFile.Drain(path);
+        string journalPath = $"{volumeName}/volume{JournalFile.Suffix}";
+        string lockPath = $"{volumeName}/volume{JournalFile.Suffix}.lock";
+
+        if (!await _storage.ExistsAsync(journalPath, ct)) return;
+
+        using (await _storage.AcquireLockAsync(lockPath, ct))
+        {
+            var empty = new JournalFile { Pending = [] };
+            using var ms = new MemoryStream();
+            JsonSerializer.Serialize(ms, empty, JsonOptions);
+            ms.Position = 0;
+            await _storage.WriteAtomicAsync(journalPath, ms, ct);
+        }
     }
 
     /// <summary>
     /// 未コミットのジャーナルがあればエントリを返す（クラッシュ復旧用）。
-    /// 復旧後は <see cref="Commit"/> を呼ぶこと。
+    /// 復旧後は <see cref="CommitAsync"/> を呼ぶこと。
     /// </summary>
-    public IReadOnlyList<JournalEntry> Recover(string volumeName)
+    public async Task<IReadOnlyList<JournalEntry>> RecoverAsync(string volumeName, CancellationToken ct = default)
     {
-        string path = GetJournalPath(volumeName);
-        return JournalFile.Read(path);
+        string journalPath = $"{volumeName}/volume{JournalFile.Suffix}";
+        byte[]? data = await _storage.ReadAsync(journalPath, ct);
+        if (data is null) return [];
+        return JsonSerializer.Deserialize<JournalFile>(data, JsonOptions)?.Pending ?? [];
     }
 
     /// <summary>ジャーナルが存在するか（未コミットのエントリがあるか）。</summary>
-    public bool HasPending(string volumeName)
+    public async Task<bool> HasPendingAsync(string volumeName, CancellationToken ct = default)
     {
-        string path = GetJournalPath(volumeName);
-        if (!File.Exists(path)) return false;
-        return JournalFile.Read(path).Count > 0;
+        string journalPath = $"{volumeName}/volume{JournalFile.Suffix}";
+        if (!await _storage.ExistsAsync(journalPath, ct)) return false;
+        byte[]? data = await _storage.ReadAsync(journalPath, ct);
+        if (data is null) return false;
+        return (JsonSerializer.Deserialize<JournalFile>(data, JsonOptions)?.Pending.Count ?? 0) > 0;
     }
-
-    private string GetJournalPath(string volumeName)
-        => Path.Combine(_dataRoot, volumeName, "volume" + JournalFile.Suffix);
 }

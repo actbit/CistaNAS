@@ -4,6 +4,7 @@ using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Crypto;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
+using CistaNAS.Web.Storage;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Web.Services;
@@ -16,20 +17,19 @@ public sealed class UserStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    private readonly string _path;
+    private readonly IStorageProvider _storage;
     private readonly int _pbkdf2Iterations;
     private readonly IServiceProvider _services;
     private readonly object _gate = new();
     private List<UserAccount> _users;
 
-    public UserStore(IOptions<CistaNasOptions> options, ILogger<UserStore> logger, IServiceProvider services)
+    public UserStore(IStorageProvider storage, IOptions<CistaNasOptions> options, ILogger<UserStore> logger, IServiceProvider services)
     {
+        _storage = storage;
         _services = services;
         var o = options.Value;
         _pbkdf2Iterations = o.Auth.Pbkdf2Iterations;
-        Directory.CreateDirectory(o.DataRoot);
-        _path = Path.Combine(o.DataRoot, "users.json");
-        _users = Load();
+        _users = LoadAsync().GetAwaiter().GetResult();
     }
 
     /// <summary>ユーザーが1人でも存在するか（セットアップウィザードの表示判定）。</summary>
@@ -66,7 +66,7 @@ public sealed class UserStore
                 PasswordHash = PasswordHasher.Hash(password, _pbkdf2Iterations),
                 Role = role,
             });
-            Save();
+            SaveAsync().GetAwaiter().GetResult();
         }
 
         // ホームボリューム自動作成（ロック外で実行）
@@ -88,7 +88,7 @@ public sealed class UserStore
                 throw new InvalidOperationException($"ユーザー '{username}' が見つかりません。");
 
             _users.Remove(user);
-            Save();
+            SaveAsync().GetAwaiter().GetResult();
         }
 
         // グループから除去 + ホームボリューム削除
@@ -116,7 +116,7 @@ public sealed class UserStore
                 throw new InvalidOperationException($"ユーザー '{username}' が見つかりません。");
 
             user.Role = newRole;
-            Save();
+            SaveAsync().GetAwaiter().GetResult();
         }
     }
 
@@ -145,7 +145,7 @@ public sealed class UserStore
                 string.Equals(u.Username, username, StringComparison.Ordinal))
                 ?? throw new InvalidOperationException($"ユーザー '{username}' が見つかりません。");
             user.PublicKey = publicKeyBase64;
-            Save();
+            SaveAsync().GetAwaiter().GetResult();
         }
     }
 
@@ -163,7 +163,7 @@ public sealed class UserStore
                 PasswordHash = PasswordHasher.Hash(password, _pbkdf2Iterations),
                 Role = "admin",
             });
-            Save();
+            SaveAsync().GetAwaiter().GetResult();
         }
     }
 
@@ -191,27 +191,27 @@ public sealed class UserStore
         lock (_gate)
         {
             user.PasswordHash = PasswordHasher.Hash(newPassword, _pbkdf2Iterations);
-            Save();
+            SaveAsync().GetAwaiter().GetResult();
             return true;
         }
     }
 
-    private List<UserAccount> Load()
+    private async Task<List<UserAccount>> LoadAsync()
     {
-        if (!File.Exists(_path)) return [];
+        byte[]? data = await _storage.ReadAsync("users.json");
+        if (data is null) return [];
         try
         {
-            using var fs = File.OpenRead(_path);
-            return JsonSerializer.Deserialize<List<UserAccount>>(fs, JsonOptions) ?? [];
+            return JsonSerializer.Deserialize<List<UserAccount>>(data, JsonOptions) ?? [];
         }
         catch (JsonException) { return []; }
     }
 
-    private void Save()
+    private async Task SaveAsync()
     {
-        string tmp = _path + ".tmp";
-        using (var fs = File.Create(tmp))
-            JsonSerializer.Serialize(fs, _users, JsonOptions);
-        File.Move(tmp, _path, overwrite: true);
+        using var ms = new MemoryStream();
+        JsonSerializer.Serialize(ms, _users, JsonOptions);
+        ms.Position = 0;
+        await _storage.WriteAtomicAsync("users.json", ms);
     }
 }

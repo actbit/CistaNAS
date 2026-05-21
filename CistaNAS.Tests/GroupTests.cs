@@ -1,6 +1,7 @@
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
+using CistaNAS.Web.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 
@@ -21,11 +22,14 @@ public class GroupTests : IDisposable
             Volume = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
         };
         var io = Options.Create(opt);
+        var storage = new LocalStorageProvider(_dataRoot);
         var sp = new ServiceCollection()
             .AddLogging()
+            .AddSingleton<IStorageProvider>(storage)
             .AddSingleton(_ => io)
             .AddSingleton<GroupStore>()
             .AddSingleton<UserStore>()
+            .AddSingleton<VolumeMetadataStore>()
             .AddSingleton<VolumeService>()
             .BuildServiceProvider();
 

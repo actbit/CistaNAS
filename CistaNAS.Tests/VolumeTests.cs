@@ -3,6 +3,7 @@ using CistaNAS.Client.Crypto;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
+using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -22,10 +23,12 @@ public class VolumeTests : IDisposable
         _volOpts = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 };
         var opt = new CistaNasOptions { DataRoot = _dataRoot, Volume = _volOpts };
         var io = Options.Create(opt);
-        var gs = new GroupStore(io, new ServiceCollection().BuildServiceProvider());
+        var storage = new LocalStorageProvider(_dataRoot);
+        var metaStore = new VolumeMetadataStore(storage);
+        var gs = new GroupStore(storage, io, new ServiceCollection().BuildServiceProvider());
         var sp = new ServiceCollection().AddLogging().BuildServiceProvider();
-        var us = new UserStore(io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
-        _vs = new VolumeService(io, gs, us);
+        var us = new UserStore(storage, io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
+        _vs = new VolumeService(io, gs, us, metaStore);
     }
 
     [Fact]
@@ -268,7 +271,8 @@ public class VolumeTests : IDisposable
         byte[] kek = E2eeCrypto.DeriveKek("alice", "pw", salt, 1000);
         var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
 
-        var gs = new GroupStore(Options.Create(new CistaNasOptions { DataRoot = _dataRoot }),
+        var gs = new GroupStore(new LocalStorageProvider(_dataRoot),
+            Options.Create(new CistaNasOptions { DataRoot = _dataRoot }),
             new ServiceCollection().BuildServiceProvider());
         gs.CreateGroup("testg", "alice");
 

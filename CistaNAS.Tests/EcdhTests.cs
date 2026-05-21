@@ -4,6 +4,7 @@ using CistaNAS.Client.Crypto;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
+using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -26,10 +27,12 @@ public class EcdhTests : IDisposable
             Volume = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
         };
         var io = Options.Create(opt);
-        var gs = new GroupStore(io, new ServiceCollection().BuildServiceProvider());
+        var storage = new LocalStorageProvider(_dataRoot);
+        var metaStore = new VolumeMetadataStore(storage);
+        var gs = new GroupStore(storage, io, new ServiceCollection().BuildServiceProvider());
         var sp = new ServiceCollection().AddLogging().BuildServiceProvider();
-        _userStore = new UserStore(io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
-        _vs = new VolumeService(io, gs, _userStore);
+        _userStore = new UserStore(storage, io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
+        _vs = new VolumeService(io, gs, _userStore, metaStore);
     }
 
     // ---- VolumeHeader.UserWrappedKey シリアライズ ----

@@ -10,9 +10,35 @@ public sealed class CistaNasOptions
     /// <summary>暗号化ボリューム・ジャーナル・ユーザ情報の保存ルート。</summary>
     public string DataRoot { get; set; } = "data";
 
+    public StorageOptions Storage { get; set; } = new();
     public JwtOptions Jwt { get; set; } = new();
     public AuthOptions Auth { get; set; } = new();
     public VolumeOptions Volume { get; set; } = new();
+}
+
+/// <summary>メタデータ保存先のプロバイダ設定。</summary>
+public sealed class StorageOptions
+{
+    /// <summary>"local"（デフォルト）, "s3", "azureblob", "gcs"。</summary>
+    public string Provider { get; set; } = "local";
+
+    /// <summary>S3: バケット名。Azure: コンテナ名。GCS: バケット名。</summary>
+    public string? BucketOrContainer { get; set; }
+
+    /// <summary>S3: リージョン。Azure: 接続文字列。GCS: 未使用（ADC 使用）。</summary>
+    public string? RegionOrConnectionString { get; set; }
+
+    /// <summary>S3: エンドポイント上書き（MinIO, LocalStack 等）。</summary>
+    public string? EndpointOverride { get; set; }
+
+    /// <summary>バケット/コンテナ内のプレフィックス（例: "instance-1/"）。</summary>
+    public string? PathPrefix { get; set; }
+
+    /// <summary>
+    /// volume.dat のローカルパス。null の場合は DataRoot を使用。
+    /// クラウドデプロイでは永続ボリュームマウントパス（例: /app/data）を指定。
+    /// </summary>
+    public string? VolumeDataPath { get; set; }
 }
 
 public sealed class JwtOptions

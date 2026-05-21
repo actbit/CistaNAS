@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Crypto;
 using CistaNAS.Web.Models;
+using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.Options;
 
@@ -10,24 +11,28 @@ namespace CistaNAS.Web.Services;
 
 /// <summary>
 /// ボリュームの作成・マウント・ロック・共有を管理する Singleton Service。
+/// メタデータは VolumeMetadataStore（IStorageProvider）経由で保存し、
+/// volume.dat はローカルファイルシステムに配置。
 /// </summary>
 public sealed class VolumeService
 {
-    private readonly string _dataRoot;
+    private readonly string _volumeDataPath;
     private readonly VolumeOptions _volOpts;
     private readonly GroupStore _groupStore;
     private readonly UserStore _userStore;
+    private readonly VolumeMetadataStore _metaStore;
 
     private readonly ConcurrentDictionary<string, MountedVolume> _mounted = new();
     private readonly SemaphoreSlim _mountGate = new(1, 1);
 
-    public VolumeService(IOptions<CistaNasOptions> options, GroupStore groupStore, UserStore userStore)
+    public VolumeService(IOptions<CistaNasOptions> options, GroupStore groupStore, UserStore userStore, VolumeMetadataStore metaStore)
     {
-        _dataRoot = options.Value.DataRoot;
+        _volumeDataPath = options.Value.Storage.VolumeDataPath ?? options.Value.DataRoot;
         _volOpts = options.Value.Volume;
         _groupStore = groupStore;
         _userStore = userStore;
-        Directory.CreateDirectory(_dataRoot);
+        _metaStore = metaStore;
+        Directory.CreateDirectory(_volumeDataPath);
     }
 
     public VolumeInfo Create(string name, string? username, string? password, bool encrypted = true)
@@ -49,14 +54,13 @@ public sealed class VolumeService
     {
         if (encrypted) { ArgumentException.ThrowIfNullOrEmpty(username); ArgumentException.ThrowIfNullOrEmpty(password); }
 
-        string dir = VolumeDir(name);
-        if (Directory.Exists(dir))
+        if (_metaStore.ExistsAsync(name).GetAwaiter().GetResult())
             throw new VolumeException($"ボリューム '{name}' は既に存在します。");
 
         var (header, masterKey) = VolumeHeader.Create(name, username, password, _volOpts.SectorSize, _volOpts.KdfIterations, encrypted);
 
-        Directory.CreateDirectory(dir);
-        header.Save(Path.Combine(dir, VolumeHeader.FileName));
+        Directory.CreateDirectory(VolumeDir(name));
+        _metaStore.SaveAsync(name, header).GetAwaiter().GetResult();
         File.Create(GetDataPath(name)).Dispose();
         MountInternal(name, header, masterKey);
 
@@ -72,14 +76,13 @@ public sealed class VolumeService
         _mountGate.Wait();
         try
         {
-            string dir = VolumeDir(name);
-            if (Directory.Exists(dir))
+            if (_metaStore.ExistsAsync(name).GetAwaiter().GetResult())
                 throw new VolumeException($"ボリューム '{name}' は既に存在します。");
 
             var header = VolumeHeader.CreateE2ee(name, username, wrappedKey, chunkSize);
 
-            Directory.CreateDirectory(dir);
-            header.Save(Path.Combine(dir, VolumeHeader.FileName));
+            Directory.CreateDirectory(VolumeDir(name));
+            _metaStore.SaveAsync(name, header).GetAwaiter().GetResult();
             File.Create(GetDataPath(name)).Dispose();
             MountInternal(name, header, masterKey: null);
 
@@ -133,7 +136,6 @@ public sealed class VolumeService
             if (!header.HasUserAccess(username))
                 throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
 
-            // E2EE: マスターキーなしで raw FileStream マウント
             MountInternal(name, header, masterKey: null);
             return ToInfo(name, header, true);
         }
@@ -156,7 +158,7 @@ public sealed class VolumeService
                 throw new VolumeException("オーナーのみがアクセス権を付与できます。");
             if (!header.HasUserAccess(targetUsername))
                 header.AddWrappedKey(targetUsername, wrappedKey);
-            header.Save(GetHeaderPath(volumeName));
+            _metaStore.SaveAsync(volumeName, header).GetAwaiter().GetResult();
             RefreshMountedHeader(volumeName, header);
         }
         finally
@@ -196,14 +198,13 @@ public sealed class VolumeService
     public IReadOnlyList<VolumeInfo> ListForUser(string username)
     {
         var result = new List<VolumeInfo>();
-        if (!Directory.Exists(_dataRoot)) return result;
+        var volumeNames = _metaStore.ListVolumeNamesAsync().GetAwaiter().GetResult();
 
         var userGroups = _groupStore.GetGroupsForUser(username)
             .Select(g => g.GroupName).ToHashSet(StringComparer.Ordinal);
 
-        foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
+        foreach (var name in volumeNames)
         {
-            string name = Path.GetFileName(dir);
             var header = LoadHeaderIfExists(name);
             if (header is null) continue;
 
@@ -217,11 +218,10 @@ public sealed class VolumeService
     public IReadOnlyList<VolumeInfo> ListAll()
     {
         var result = new List<VolumeInfo>();
-        if (!Directory.Exists(_dataRoot)) return result;
+        var volumeNames = _metaStore.ListVolumeNamesAsync().GetAwaiter().GetResult();
 
-        foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
+        foreach (var name in volumeNames)
         {
-            string name = Path.GetFileName(dir);
             var header = LoadHeaderIfExists(name);
             if (header is null) continue;
             result.Add(ToInfo(name, header, _mounted.ContainsKey(name)));
@@ -281,7 +281,7 @@ public sealed class VolumeService
             try
             {
                 header.AddUserWrap(targetUsername, targetPassword, masterKey, _volOpts.KdfIterations);
-                header.Save(GetHeaderPath(volumeName));
+                _metaStore.SaveAsync(volumeName, header).GetAwaiter().GetResult();
                 RefreshMountedHeader(volumeName, header);
             }
             finally
@@ -308,7 +308,7 @@ public sealed class VolumeService
                 throw new VolumeException("オーナーのアクセス権は剥奪できません。");
 
             header.RemoveUserWrap(targetUsername);
-            header.Save(GetHeaderPath(volumeName));
+            _metaStore.SaveAsync(volumeName, header).GetAwaiter().GetResult();
             RefreshMountedHeader(volumeName, header);
         }
         finally
@@ -320,19 +320,18 @@ public sealed class VolumeService
     /// <summary>ユーザーのパスワード変更時に全ボリュームの鍵を再ラップ。</summary>
     public void RewrapAllForUser(string username, string oldPassword, string newPassword)
     {
-        if (!Directory.Exists(_dataRoot)) return;
+        var volumeNames = _metaStore.ListVolumeNamesAsync().GetAwaiter().GetResult();
 
         _mountGate.Wait();
         try
         {
-            foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
+            foreach (var name in volumeNames)
             {
-                string name = Path.GetFileName(dir);
                 var header = LoadHeaderIfExists(name);
                 if (header is null || !header.HasUserAccess(username)) continue;
 
                 header.RewrapUser(username, oldPassword, newPassword, _volOpts.KdfIterations);
-                header.Save(GetHeaderPath(name));
+                _metaStore.SaveAsync(name, header).GetAwaiter().GetResult();
                 RefreshMountedHeader(name, header);
             }
         }
@@ -358,7 +357,7 @@ public sealed class VolumeService
             throw new VolumeException($"グループ '{groupName}' が見つかりません。");
 
             header.AuthorizedGroups.Add(groupName);
-            header.Save(GetHeaderPath(volumeName));
+            _metaStore.SaveAsync(volumeName, header).GetAwaiter().GetResult();
             RefreshMountedHeader(volumeName, header);
         }
         finally
@@ -378,7 +377,7 @@ public sealed class VolumeService
             if (!header.AuthorizedGroups.Remove(groupName))
                 throw new VolumeException($"グループ '{groupName}' はこのボリュームにアクセス権がありません。");
 
-            header.Save(GetHeaderPath(volumeName));
+            _metaStore.SaveAsync(volumeName, header).GetAwaiter().GetResult();
             RefreshMountedHeader(volumeName, header);
         }
         finally
@@ -389,18 +388,18 @@ public sealed class VolumeService
 
     public void RemoveGroupFromAllVolumes(string groupName)
     {
-        if (!Directory.Exists(_dataRoot)) return;
+        var volumeNames = _metaStore.ListVolumeNamesAsync().GetAwaiter().GetResult();
+
         _mountGate.Wait();
         try
         {
-            foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
+            foreach (var name in volumeNames)
             {
-                string name = Path.GetFileName(dir);
                 var header = LoadHeaderIfExists(name);
                 if (header is null) continue;
                 if (header.AuthorizedGroups.Remove(groupName))
                 {
-                    header.Save(GetHeaderPath(name));
+                    _metaStore.SaveAsync(name, header).GetAwaiter().GetResult();
                     RefreshMountedHeader(name, header);
                 }
             }
@@ -424,13 +423,13 @@ public sealed class VolumeService
         try
         {
             string volName = $"group__{groupName}";
-            string dir = VolumeDir(volName);
-            if (Directory.Exists(dir))
+            if (_metaStore.ExistsAsync(volName).GetAwaiter().GetResult())
                 throw new VolumeException($"グループボリューム '{volName}' は既に存在します。");
 
             var header = VolumeHeader.CreateE2ee(volName, ownerUsername, ownerWrappedKey, chunkSize);
-            Directory.CreateDirectory(dir);
-            header.Save(Path.Combine(dir, VolumeHeader.FileName));
+
+            Directory.CreateDirectory(VolumeDir(volName));
+            _metaStore.SaveAsync(volName, header).GetAwaiter().GetResult();
             File.Create(GetDataPath(volName)).Dispose();
             MountInternal(volName, header, masterKey: null);
 
@@ -447,11 +446,10 @@ public sealed class VolumeService
     {
         var result = new List<VolumeInfo>();
         string prefix = $"group__{groupName}";
-        if (!Directory.Exists(_dataRoot)) return result;
+        var volumeNames = _metaStore.ListVolumeNamesAsync().GetAwaiter().GetResult();
 
-        foreach (var dir in Directory.EnumerateDirectories(_dataRoot))
+        foreach (var name in volumeNames)
         {
-            string name = Path.GetFileName(dir);
             if (name != prefix) continue;
             var header = LoadHeaderIfExists(name);
             if (header is null || !header.IsE2ee) continue;
@@ -501,7 +499,7 @@ public sealed class VolumeService
                 if (!header.HasUserAccess(username))
                     header.AddWrappedKey(username, wrappedKey);
             }
-            header.Save(GetHeaderPath(volumeName));
+            _metaStore.SaveAsync(volumeName, header).GetAwaiter().GetResult();
             RefreshMountedHeader(volumeName, header);
         }
         finally
@@ -528,9 +526,18 @@ public sealed class VolumeService
             _mountGate.Release();
         }
 
+        // メタデータをストレージプロバイダ経由で削除
+        try { _metaStore.DeleteAllAsync(name).GetAwaiter().GetResult(); } catch { }
+
+        // ローカルの volume.dat を削除
+        string dataPath = GetDataPath(name);
+        if (File.Exists(dataPath))
+            File.Delete(dataPath);
+
+        // 空になったローカルディレクトリを掃除
         string dir = VolumeDir(name);
-        if (Directory.Exists(dir))
-            Directory.Delete(dir, recursive: true);
+        if (Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any())
+            Directory.Delete(dir);
     }
 
     // ---- 内部 ----
@@ -548,18 +555,12 @@ public sealed class VolumeService
 
     private VolumeHeader LoadHeaderOrThrow(string name)
     {
-        string path = GetHeaderPath(name);
-        if (!File.Exists(path))
-            throw new VolumeException($"ボリューム '{name}' が見つかりません。");
-        return VolumeHeader.Load(path);
+        return _metaStore.LoadAsync(name).GetAwaiter().GetResult()
+            ?? throw new VolumeException($"ボリューム '{name}' が見つかりません。");
     }
 
     private VolumeHeader? LoadHeaderIfExists(string name)
-    {
-        string path = GetHeaderPath(name);
-        if (!File.Exists(path)) return null;
-        return VolumeHeader.Load(path);
-    }
+        => _metaStore.LoadAsync(name).GetAwaiter().GetResult();
 
     private void RefreshMountedHeader(string name, VolumeHeader updated)
     {
@@ -579,9 +580,8 @@ public sealed class VolumeService
             wrapTypes);
     }
 
-    private string VolumeDir(string name) => Path.Combine(_dataRoot, name);
+    private string VolumeDir(string name) => Path.Combine(_volumeDataPath, name);
     private string GetDataPath(string name) => Path.Combine(VolumeDir(name), "volume.dat");
-    private string GetHeaderPath(string name) => Path.Combine(VolumeDir(name), VolumeHeader.FileName);
 
     private static void ValidateName(string name)
     {

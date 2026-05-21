@@ -1,6 +1,7 @@
 using System.Text.Json;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
+using CistaNAS.Web.Storage;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Web.Services;
@@ -9,16 +10,16 @@ public sealed class GroupStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    private readonly string _path;
+    private readonly IStorageProvider _storage;
     private readonly IServiceProvider _services;
     private readonly object _gate = new();
     private List<GroupAccount> _groups;
 
-    public GroupStore(IOptions<CistaNasOptions> options, IServiceProvider services)
+    public GroupStore(IStorageProvider storage, IOptions<CistaNasOptions> options, IServiceProvider services)
     {
+        _storage = storage;
         _services = services;
-        _path = Path.Combine(options.Value.DataRoot, "groups.json");
-        _groups = Load();
+        _groups = LoadAsync().GetAwaiter().GetResult();
     }
 
     public IReadOnlyList<GroupAccount> ListGroups()
@@ -72,7 +73,7 @@ public sealed class GroupStore
                 Members = [ownerUser],
                 CreatedAt = DateTimeOffset.UtcNow,
             });
-            Save();
+            SaveAsync().GetAwaiter().GetResult();
         }
     }
 
@@ -88,7 +89,7 @@ public sealed class GroupStore
                 throw new InvalidOperationException("オーナーのみがグループを削除できます。");
 
             _groups.Remove(group);
-            Save();
+            SaveAsync().GetAwaiter().GetResult();
         }
 
         // ボリュームからグループ参照を除去（ロックの外で）
@@ -110,7 +111,7 @@ public sealed class GroupStore
                 throw new InvalidOperationException("オーナーのみがメンバーを追加できます。");
             if (!group.Members.Add(username))
                 throw new InvalidOperationException($"ユーザー '{username}' は既にメンバーです。");
-            Save();
+            SaveAsync().GetAwaiter().GetResult();
         }
     }
 
@@ -125,7 +126,7 @@ public sealed class GroupStore
                 throw new InvalidOperationException("オーナーは削除できません。");
             if (!group.Members.Remove(username))
                 throw new InvalidOperationException($"ユーザー '{username}' はメンバーではありません。");
-            Save();
+            SaveAsync().GetAwaiter().GetResult();
         }
     }
 
@@ -136,7 +137,7 @@ public sealed class GroupStore
             bool changed = false;
             foreach (var g in _groups)
                 changed |= g.Members.Remove(username);
-            if (changed) Save();
+            if (changed) SaveAsync().GetAwaiter().GetResult();
         }
     }
 
@@ -147,22 +148,22 @@ public sealed class GroupStore
             ?? throw new InvalidOperationException($"グループ '{groupName}' が見つかりません。");
     }
 
-    private List<GroupAccount> Load()
+    private async Task<List<GroupAccount>> LoadAsync()
     {
-        if (!File.Exists(_path)) return [];
+        byte[]? data = await _storage.ReadAsync("groups.json");
+        if (data is null) return [];
         try
         {
-            using var fs = File.OpenRead(_path);
-            return JsonSerializer.Deserialize<List<GroupAccount>>(fs, JsonOptions) ?? [];
+            return JsonSerializer.Deserialize<List<GroupAccount>>(data, JsonOptions) ?? [];
         }
         catch (JsonException) { return []; }
     }
 
-    private void Save()
+    private async Task SaveAsync()
     {
-        string tmp = _path + ".tmp";
-        using (var fs = File.Create(tmp))
-            JsonSerializer.Serialize(fs, _groups, JsonOptions);
-        File.Move(tmp, _path, overwrite: true);
+        using var ms = new MemoryStream();
+        JsonSerializer.Serialize(ms, _groups, JsonOptions);
+        ms.Position = 0;
+        await _storage.WriteAtomicAsync("groups.json", ms);
     }
 }

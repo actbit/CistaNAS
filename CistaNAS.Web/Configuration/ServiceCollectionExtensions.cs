@@ -1,5 +1,7 @@
 using CistaNAS.Web.Components.Auth;
 using CistaNAS.Web.Services;
+using CistaNAS.Web.Storage;
+using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Web.Configuration;
 
@@ -12,20 +14,37 @@ public static class ServiceCollectionExtensions
 {
     public static IServiceCollection AddCistaNasServices(this IServiceCollection services)
     {
-        // 認証（Task #3）
-        services.AddSingleton<UserStore>();        // users.json：共有状態
-        services.AddScoped<AuthService>();         // 状態なし
+        // ストレージプロバイダ
+        services.AddSingleton<IStorageProvider>(sp =>
+        {
+            var options = sp.GetRequiredService<IOptions<CistaNasOptions>>().Value;
+            var storage = options.Storage;
+            return storage.Provider.ToLowerInvariant() switch
+            {
+                "local" => new LocalStorageProvider(options.DataRoot),
+                "s3" => CreateS3Provider(storage),
+                "azureblob" => CreateAzureBlobProvider(storage),
+                "gcs" => CreateGcsProvider(storage),
+                _ => throw new InvalidOperationException(
+                    $"Unknown storage provider: {storage.Provider}. Supported: local, s3, azureblob, gcs")
+            };
+        });
+
+        // 認証
+        services.AddSingleton<UserStore>();
+        services.AddScoped<AuthService>();
 
         // グループ
-        services.AddSingleton<GroupStore>();       // groups.json
-        services.AddSingleton<InvitationService>(); // 招待URL（in-memory）
+        services.AddSingleton<GroupStore>();
+        services.AddSingleton<InvitationService>();
 
-        // ボリューム（Task #4）
-        services.AddSingleton<VolumeService>();    // Singleton: マウント状態保持
+        // ボリューム
+        services.AddSingleton<VolumeMetadataStore>();
+        services.AddSingleton<VolumeService>();
 
-        // ファイル・ジャーナル（Task #5, #6）
-        services.AddScoped<JournalService>();      // 状態なし
-        services.AddScoped<FileService>();         // 状態なし
+        // ファイル・ジャーナル
+        services.AddScoped<JournalService>();
+        services.AddScoped<FileService>();
 
         // Blazor 認証状態
         services.AddScoped<AuthenticationStateService>();
@@ -34,5 +53,35 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<StreamingTokenService>();
 
         return services;
+    }
+
+    private static IStorageProvider CreateS3Provider(StorageOptions s)
+    {
+        var asmName = typeof(LocalStorageProvider).Assembly.FullName;
+        var type = Type.GetType($"CistaNAS.Web.Storage.S3StorageProvider, {asmName}", throwOnError: false, ignoreCase: false);
+        if (type is null)
+            throw new InvalidOperationException(
+                "S3 provider requires AWSSDK.S3 NuGet package. Install: dotnet add package AWSSDK.S3");
+        return (IStorageProvider)Activator.CreateInstance(type, s.BucketOrContainer, s.RegionOrConnectionString, s.EndpointOverride, s.PathPrefix)!;
+    }
+
+    private static IStorageProvider CreateAzureBlobProvider(StorageOptions s)
+    {
+        var asmName = typeof(LocalStorageProvider).Assembly.FullName;
+        var type = Type.GetType($"CistaNAS.Web.Storage.AzureBlobStorageProvider, {asmName}", throwOnError: false, ignoreCase: false);
+        if (type is null)
+            throw new InvalidOperationException(
+                "Azure Blob provider requires Azure.Storage.Blobs NuGet package. Install: dotnet add package Azure.Storage.Blobs");
+        return (IStorageProvider)Activator.CreateInstance(type, s.RegionOrConnectionString, s.BucketOrContainer, s.PathPrefix)!;
+    }
+
+    private static IStorageProvider CreateGcsProvider(StorageOptions s)
+    {
+        var asmName = typeof(LocalStorageProvider).Assembly.FullName;
+        var type = Type.GetType($"CistaNAS.Web.Storage.GcsStorageProvider, {asmName}", throwOnError: false, ignoreCase: false);
+        if (type is null)
+            throw new InvalidOperationException(
+                "GCS provider requires Google.Cloud.Storage.V1 NuGet package. Install: dotnet add package Google.Cloud.Storage.V1");
+        return (IStorageProvider)Activator.CreateInstance(type, s.BucketOrContainer, s.PathPrefix)!;
     }
 }

@@ -3,6 +3,7 @@ using System.Text.Json;
 using CistaNAS.Client.Crypto;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Services;
+using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -29,10 +30,12 @@ public class ClientE2eeRoundtripTests : IDisposable
             Volume = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
         };
         var io = Options.Create(opt);
-        var gs = new GroupStore(io, new ServiceCollection().BuildServiceProvider());
+        var storage = new LocalStorageProvider(_dataRoot);
+        var metaStore = new VolumeMetadataStore(storage);
+        var gs = new GroupStore(storage, io, new ServiceCollection().BuildServiceProvider());
         var sp = new ServiceCollection().AddLogging().BuildServiceProvider();
-        var us = new UserStore(io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
-        _vs = new VolumeService(io, gs, us);
+        var us = new UserStore(storage, io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
+        _vs = new VolumeService(io, gs, us, metaStore);
     }
 
     [Fact]

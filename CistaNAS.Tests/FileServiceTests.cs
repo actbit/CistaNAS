@@ -2,6 +2,7 @@ using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Journal;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
+using CistaNAS.Web.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -23,12 +24,14 @@ public class FileServiceTests : IDisposable
             Volume = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
         };
         var io = Options.Create(opt);
-        var gs = new GroupStore(io, new ServiceCollection().BuildServiceProvider());
+        var storage = new LocalStorageProvider(_dataRoot);
+        var metaStore = new VolumeMetadataStore(storage);
+        var gs = new GroupStore(storage, io, new ServiceCollection().BuildServiceProvider());
         var sp = new ServiceCollection().AddLogging().BuildServiceProvider();
-        var us = new UserStore(io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
-        _vs = new VolumeService(io, gs, us);
-        var js = new JournalService(io);
-        _fs = new FileService(_vs, js, io);
+        var us = new UserStore(storage, io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
+        _vs = new VolumeService(io, gs, us, metaStore);
+        var js = new JournalService(storage);
+        _fs = new FileService(_vs, js, storage);
     }
 
     [Fact]
@@ -111,10 +114,10 @@ public class FileServiceTests : IDisposable
     }
 
     [Fact]
-    public void Delete_NotFound_Throws()
+    public async Task Delete_NotFound_Throws()
     {
         string vol = MountVol("del-404");
-        Assert.Throws<FileServiceException>(() => _fs.Delete(vol, "nope.txt"));
+        await Assert.ThrowsAsync<FileServiceException>(() => _fs.DeleteAsync(vol, "nope.txt"));
     }
 
     [Fact]
@@ -128,20 +131,20 @@ public class FileServiceTests : IDisposable
         using (var ms = new MemoryStream(data))
             await _fs.UploadAsync(vol, "b.txt", ms, data.Length);
 
-        var list = _fs.List(vol);
+        var list = await _fs.ListAsync(vol);
         Assert.Equal(2, list.Files.Count);
 
-        _fs.Delete(vol, "a.txt");
-        list = _fs.List(vol);
+        await _fs.DeleteAsync(vol, "a.txt");
+        list = await _fs.ListAsync(vol);
         Assert.Single(list.Files);
         Assert.Equal("b.txt", list.Files[0].Name);
     }
 
     [Fact]
-    public void List_EmptyVolume_ReturnsEmpty()
+    public async Task List_EmptyVolume_ReturnsEmpty()
     {
         string vol = MountVol("empty-list");
-        var list = _fs.List(vol);
+        var list = await _fs.ListAsync(vol);
         Assert.Empty(list.Files);
     }
 

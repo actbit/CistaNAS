@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
+using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.Options;
 
@@ -10,20 +11,24 @@ namespace CistaNAS.Web.Services;
 /// <summary>
 /// E2EE ボリュームのファイル管理。opaque blob として volume.dat に格納し、
 /// catalog-e2ee.json に FileId ベースのメタデータを保持する。
+/// メタデータは IStorageProvider 経由で保存し、volume.dat はローカルファイルシステムに配置。
 /// </summary>
 public sealed class E2eeFileService
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     private readonly VolumeService _volumeService;
-    private readonly string _dataRoot;
+    private readonly IStorageProvider _storage;
+    private readonly string _volumeDataPath;
+
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _fileGates = new(StringComparer.Ordinal);
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _volumeGates = new(StringComparer.Ordinal);
 
-    public E2eeFileService(VolumeService volumeService, IOptions<CistaNasOptions> options)
+    public E2eeFileService(VolumeService volumeService, IStorageProvider storage, IOptions<CistaNasOptions> options)
     {
         _volumeService = volumeService;
-        _dataRoot = options.Value.DataRoot;
+        _storage = storage;
+        _volumeDataPath = options.Value.Storage.VolumeDataPath ?? options.Value.DataRoot;
     }
 
     /// <summary>E2EE ボリュームのヘッダを取得。E2EE でなければ例外。</summary>
@@ -64,7 +69,6 @@ public sealed class E2eeFileService
             catalog.Files[fileId] = entry;
             SaveCatalog(volumeName, catalog);
 
-            // ファイル gate も登録（UploadChunkAsync で使用）
             _fileGates.TryAdd(fileId, new SemaphoreSlim(1, 1));
             return entry;
         }
@@ -88,7 +92,6 @@ public sealed class E2eeFileService
             if (!catalog.Files.TryGetValue(fileId, out var entry))
                 throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
 
-            // チャンクはシーケンシャルに書き込む — 前のチャンクまでの累積サイズがオフセット
             long chunkOffset = entry.Offset + entry.ChunkSizes.Sum(s => (long)s);
 
             string dataPath = GetDataPath(volumeName);
@@ -109,7 +112,6 @@ public sealed class E2eeFileService
             }
             fs.Flush();
 
-            // チャンクサイズを記録
             while (entry.ChunkSizes.Count <= chunkIndex)
                 entry.ChunkSizes.Add(0);
             entry.ChunkSizes[chunkIndex] = (int)written;
@@ -167,8 +169,6 @@ public sealed class E2eeFileService
         entry.EncryptedLength = request.ActualEncryptedLength;
         entry.ModifiedAt = DateTimeOffset.UtcNow;
         SaveCatalog(volumeName, catalog);
-
-        // ゲートは残しておき、Cleanup に任せる（進行中の UploadChunkAsync を保護）
     }
 
     /// <summary>ファイル一覧を返す。</summary>
@@ -177,7 +177,6 @@ public sealed class E2eeFileService
         GetE2eeHeader(volumeName);
         var catalog = LoadCatalog(volumeName);
 
-        // カタログに存在しないファイルIDのゲートを掃除
         foreach (var kvp in _fileGates)
         {
             if (!catalog.Files.ContainsKey(kvp.Key))
@@ -213,26 +212,21 @@ public sealed class E2eeFileService
 
     private E2eeCatalog LoadCatalog(string volumeName)
     {
-        string path = GetCatalogPath(volumeName);
-        if (!File.Exists(path)) return new E2eeCatalog();
-        using var fs = File.OpenRead(path);
-        return JsonSerializer.Deserialize<E2eeCatalog>(fs, JsonOptions) ?? new E2eeCatalog();
+        byte[]? data = _storage.ReadAsync($"{volumeName}/catalog-e2ee.json").GetAwaiter().GetResult();
+        if (data is null) return new E2eeCatalog();
+        return JsonSerializer.Deserialize<E2eeCatalog>(data, JsonOptions) ?? new E2eeCatalog();
     }
 
     private void SaveCatalog(string volumeName, E2eeCatalog catalog)
     {
-        string path = GetCatalogPath(volumeName);
-        string tmp = path + ".tmp";
-        using (var fs = File.Create(tmp))
-            JsonSerializer.Serialize(fs, catalog, JsonOptions);
-        File.Move(tmp, path, overwrite: true);
+        using var ms = new MemoryStream();
+        JsonSerializer.Serialize(ms, catalog, JsonOptions);
+        ms.Position = 0;
+        _storage.WriteAtomicAsync($"{volumeName}/catalog-e2ee.json", ms).GetAwaiter().GetResult();
     }
 
-    private string GetCatalogPath(string volumeName)
-        => Path.Combine(_dataRoot, volumeName, "catalog-e2ee.json");
-
     private string GetDataPath(string volumeName)
-        => Path.Combine(_dataRoot, volumeName, "volume.dat");
+        => Path.Combine(_volumeDataPath, volumeName, "volume.dat");
 }
 
 /// <summary>部分読み取り用 Stream ラッパー。</summary>
