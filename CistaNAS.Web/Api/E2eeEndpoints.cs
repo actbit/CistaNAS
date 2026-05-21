@@ -121,8 +121,11 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult CreateFile(string volumeName, E2eeCreateFileRequest req, E2eeFileService e2eeFs)
+    private static IResult CreateFile(string volumeName, E2eeCreateFileRequest req, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
     {
+        var accessCheck = CheckVolumeAccess(volumeName, ctx, vs);
+        if (accessCheck != null) return accessCheck;
+
         try
         {
             var entry = e2eeFs.CreateFile(volumeName, req);
@@ -135,8 +138,11 @@ public static class E2eeEndpoints
     }
 
     private static async Task<IResult> UploadChunk(string volumeName, string fileId, int chunkIndex,
-        HttpRequest request, E2eeFileService e2eeFs)
+        HttpRequest request, VolumeService vs, E2eeFileService e2eeFs)
     {
+        var accessCheck = CheckVolumeAccess(volumeName, request.HttpContext, vs);
+        if (accessCheck != null) return accessCheck;
+
         long len = request.ContentLength ?? 0;
         try
         {
@@ -149,8 +155,11 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult DownloadChunk(string volumeName, string fileId, int chunkIndex, E2eeFileService e2eeFs)
+    private static IResult DownloadChunk(string volumeName, string fileId, int chunkIndex, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
     {
+        var accessCheck = CheckVolumeAccess(volumeName, ctx, vs);
+        if (accessCheck != null) return accessCheck;
+
         try
         {
             var (stream, length) = e2eeFs.DownloadChunk(volumeName, fileId, chunkIndex);
@@ -162,8 +171,11 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult FinalizeFile(string volumeName, string fileId, E2eeFinalizeFileRequest req, E2eeFileService e2eeFs)
+    private static IResult FinalizeFile(string volumeName, string fileId, E2eeFinalizeFileRequest req, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
     {
+        var accessCheck = CheckVolumeAccess(volumeName, ctx, vs);
+        if (accessCheck != null) return accessCheck;
+
         try
         {
             e2eeFs.FinalizeFile(volumeName, fileId, req);
@@ -175,8 +187,11 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult DeleteFile(string volumeName, string fileId, E2eeFileService e2eeFs)
+    private static IResult DeleteFile(string volumeName, string fileId, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
     {
+        var accessCheck = CheckVolumeAccess(volumeName, ctx, vs);
+        if (accessCheck != null) return accessCheck;
+
         try
         {
             e2eeFs.DeleteFile(volumeName, fileId);
@@ -188,8 +203,11 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult ListFiles(string volumeName, E2eeFileService e2eeFs)
+    private static IResult ListFiles(string volumeName, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
     {
+        var accessCheck = CheckVolumeAccess(volumeName, ctx, vs);
+        if (accessCheck != null) return accessCheck;
+
         try
         {
             return Results.Ok(e2eeFs.ListFiles(volumeName));
@@ -326,5 +344,14 @@ public static class E2eeEndpoints
             return Results.Ok();
         }
         catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
+    }
+
+    private static IResult? CheckVolumeAccess(string volumeName, HttpContext ctx, VolumeService vs)
+    {
+        string username = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+        if (!vs.HasAccess(volumeName, username))
+            return Results.Forbid();
+        return null;
     }
 }

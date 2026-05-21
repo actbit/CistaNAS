@@ -422,6 +422,9 @@ public sealed class VolumeService
         _mountGate.Wait();
         try
         {
+            if (_groupStore.Find(groupName) is null)
+                throw new VolumeException($"グループ '{groupName}' が見つかりません。");
+
             string volName = $"group__{groupName}";
             if (_metaStore.ExistsAsync(volName).GetAwaiter().GetResult())
                 throw new VolumeException($"グループボリューム '{volName}' は既に存在します。");

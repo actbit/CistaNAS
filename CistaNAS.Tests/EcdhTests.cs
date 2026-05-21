@@ -17,6 +17,7 @@ public class EcdhTests : IDisposable
     private readonly string _dataRoot;
     private readonly VolumeService _vs;
     private readonly UserStore _userStore;
+    private readonly GroupStore _groupStore;
 
     public EcdhTests()
     {
@@ -29,10 +30,10 @@ public class EcdhTests : IDisposable
         var io = Options.Create(opt);
         var storage = new LocalStorageProvider(_dataRoot);
         var metaStore = new VolumeMetadataStore(storage);
-        var gs = new GroupStore(storage, io, new ServiceCollection().BuildServiceProvider());
+        _groupStore = new GroupStore(storage, io, new ServiceCollection().BuildServiceProvider());
         var sp = new ServiceCollection().AddLogging().BuildServiceProvider();
         _userStore = new UserStore(storage, io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
-        _vs = new VolumeService(io, gs, _userStore, metaStore);
+        _vs = new VolumeService(io, _groupStore, _userStore, metaStore);
     }
 
     // ---- VolumeHeader.UserWrappedKey シリアライズ ----
@@ -75,6 +76,7 @@ public class EcdhTests : IDisposable
     [Fact]
     public void CreateGroupE2ee_Succeeds()
     {
+        _groupStore.CreateGroup("team-a", "alice");
         var wrappedKey = CreatePasswordWrappedKey("alice", "pw", out _);
         var info = _vs.CreateGroupE2ee("team-a", "alice", wrappedKey);
 
@@ -87,6 +89,7 @@ public class EcdhTests : IDisposable
     [Fact]
     public void CreateGroupE2ee_Duplicate_Throws()
     {
+        _groupStore.CreateGroup("dup-vol", "alice");
         var wk = CreatePasswordWrappedKey("alice", "pw", out _);
         _vs.CreateGroupE2ee("dup-vol", "alice", wk);
         Assert.Throws<VolumeException>(() => _vs.CreateGroupE2ee("dup-vol", "alice", wk));
@@ -97,6 +100,7 @@ public class EcdhTests : IDisposable
     [Fact]
     public void AddE2eeWrappedKey_Ecdh_IncreasesAuthorizedUsers()
     {
+        _groupStore.CreateGroup("share-vol", "alice");
         var wk = CreatePasswordWrappedKey("alice", "pw", out _);
         var info = _vs.CreateGroupE2ee("share-vol", "alice", wk);
 
@@ -113,6 +117,7 @@ public class EcdhTests : IDisposable
     [Fact]
     public void UserWrapTypes_Reflects_WrapTypes()
     {
+        _groupStore.CreateGroup("wrap-vol", "alice");
         var wk = CreatePasswordWrappedKey("alice", "pw", out _);
         var info = _vs.CreateGroupE2ee("wrap-vol", "alice", wk);
 
@@ -155,6 +160,7 @@ public class EcdhTests : IDisposable
     [Fact]
     public void RevokeAccess_EcdhUser_RemovesFromList()
     {
+        _groupStore.CreateGroup("revoke-vol", "alice");
         var wk = CreatePasswordWrappedKey("alice", "pw", out _);
         var info = _vs.CreateGroupE2ee("revoke-vol", "alice", wk);
 
