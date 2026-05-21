@@ -1,13 +1,10 @@
 using System.Security.Cryptography;
 using System.Text.Json;
 using CistaNAS.Client.Crypto;
-using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
-using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
@@ -15,25 +12,13 @@ namespace CistaNAS.Tests;
 public class EcdhTests : IDisposable
 {
     private readonly string _dataRoot;
+    private readonly IServiceProvider _sp;
     private readonly VolumeService _vs;
-    private readonly UserStore _userStore;
-    private readonly GroupStore _groupStore;
 
     public EcdhTests()
     {
-        _dataRoot = Path.Combine(Path.GetTempPath(), "cista-ecdh-" + Guid.NewGuid().ToString("N"));
-        var opt = new CistaNasOptions
-        {
-            DataRoot = _dataRoot,
-            Volume = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
-        };
-        var io = Options.Create(opt);
-        var storage = new LocalStorageProvider(_dataRoot);
-        var metaStore = new VolumeMetadataStore(storage);
-        _groupStore = new GroupStore(storage, io, new ServiceCollection().BuildServiceProvider());
-        var sp = new ServiceCollection().AddLogging().BuildServiceProvider();
-        _userStore = new UserStore(storage, io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
-        _vs = new VolumeService(io, _groupStore, _userStore, metaStore);
+        (_sp, _dataRoot) = TestHelper.BuildTestServices();
+        _vs = _sp.GetRequiredService<VolumeService>();
     }
 
     // ---- VolumeHeader.UserWrappedKey シリアライズ ----
@@ -74,9 +59,11 @@ public class EcdhTests : IDisposable
     // ---- CreateGroupE2ee ----
 
     [Fact]
-    public void CreateGroupE2ee_Succeeds()
+    public async Task CreateGroupE2ee_Succeeds()
     {
-        _groupStore.CreateGroup("team-a", "alice");
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("team-a", "alice");
         var wrappedKey = CreatePasswordWrappedKey("alice", "pw", out _);
         var info = _vs.CreateGroupE2ee("team-a", "alice", wrappedKey);
 
@@ -87,9 +74,11 @@ public class EcdhTests : IDisposable
     }
 
     [Fact]
-    public void CreateGroupE2ee_Duplicate_Throws()
+    public async Task CreateGroupE2ee_Duplicate_Throws()
     {
-        _groupStore.CreateGroup("dup-vol", "alice");
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("dup-vol", "alice");
         var wk = CreatePasswordWrappedKey("alice", "pw", out _);
         _vs.CreateGroupE2ee("dup-vol", "alice", wk);
         Assert.Throws<VolumeException>(() => _vs.CreateGroupE2ee("dup-vol", "alice", wk));
@@ -98,9 +87,11 @@ public class EcdhTests : IDisposable
     // ---- AddE2eeWrappedKey (ECDH) ----
 
     [Fact]
-    public void AddE2eeWrappedKey_Ecdh_IncreasesAuthorizedUsers()
+    public async Task AddE2eeWrappedKey_Ecdh_IncreasesAuthorizedUsers()
     {
-        _groupStore.CreateGroup("share-vol", "alice");
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("share-vol", "alice");
         var wk = CreatePasswordWrappedKey("alice", "pw", out _);
         var info = _vs.CreateGroupE2ee("share-vol", "alice", wk);
 
@@ -115,9 +106,11 @@ public class EcdhTests : IDisposable
     // ---- UserWrapTypes ----
 
     [Fact]
-    public void UserWrapTypes_Reflects_WrapTypes()
+    public async Task UserWrapTypes_Reflects_WrapTypes()
     {
-        _groupStore.CreateGroup("wrap-vol", "alice");
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("wrap-vol", "alice");
         var wk = CreatePasswordWrappedKey("alice", "pw", out _);
         var info = _vs.CreateGroupE2ee("wrap-vol", "alice", wk);
 
@@ -158,9 +151,11 @@ public class EcdhTests : IDisposable
     // ---- RevokeAccess removes wrapped key ----
 
     [Fact]
-    public void RevokeAccess_EcdhUser_RemovesFromList()
+    public async Task RevokeAccess_EcdhUser_RemovesFromList()
     {
-        _groupStore.CreateGroup("revoke-vol", "alice");
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("revoke-vol", "alice");
         var wk = CreatePasswordWrappedKey("alice", "pw", out _);
         var info = _vs.CreateGroupE2ee("revoke-vol", "alice", wk);
 
@@ -259,6 +254,6 @@ public class EcdhTests : IDisposable
         {
             try { _vs.Lock(v.Name); } catch { }
         }
-        if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true);
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch { }
     }
 }

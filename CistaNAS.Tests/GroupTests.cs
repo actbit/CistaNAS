@@ -1,140 +1,142 @@
-using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
-using CistaNAS.Web.Storage;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
 
 public class GroupTests : IDisposable
 {
     private readonly string _dataRoot;
-    private readonly GroupStore _gs;
+    private readonly IServiceProvider _sp;
     private readonly VolumeService _vs;
 
     public GroupTests()
     {
-        _dataRoot = Path.Combine(Path.GetTempPath(), "cista-group-" + Guid.NewGuid().ToString("N"));
-        var opt = new CistaNasOptions
-        {
-            DataRoot = _dataRoot,
-            Volume = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
-        };
-        var io = Options.Create(opt);
-        var storage = new LocalStorageProvider(_dataRoot);
-        var sp = new ServiceCollection()
-            .AddLogging()
-            .AddSingleton<IStorageProvider>(storage)
-            .AddSingleton(_ => io)
-            .AddSingleton<GroupStore>()
-            .AddSingleton<UserStore>()
-            .AddSingleton<VolumeMetadataStore>()
-            .AddSingleton<VolumeService>()
-            .BuildServiceProvider();
-
-        _gs = sp.GetRequiredService<GroupStore>();
-        _vs = sp.GetRequiredService<VolumeService>();
+        (_sp, _dataRoot) = TestHelper.BuildTestServices();
+        _vs = _sp.GetRequiredService<VolumeService>();
     }
 
-    // ---- GroupStore CRUD ----
+    // ---- GroupService CRUD ----
 
     [Fact]
-    public void CreateGroup_AddsOwnerAsMember()
+    public async Task CreateGroup_AddsOwnerAsMember()
     {
-        _gs.CreateGroup("team-a", "alice");
-        var g = _gs.Find("team-a");
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("team-a", "alice");
+        var g = await gs.FindAsync("team-a");
         Assert.NotNull(g);
         Assert.Equal("alice", g.OwnerUser);
-        Assert.Contains("alice", g.Members);
+        Assert.Contains(g.Members, m => m.Username == "alice");
     }
 
     [Fact]
-    public void CreateGroup_Duplicate_Throws()
+    public async Task CreateGroup_Duplicate_Throws()
     {
-        _gs.CreateGroup("team-b", "alice");
-        Assert.Throws<InvalidOperationException>(() => _gs.CreateGroup("team-b", "bob"));
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("team-b", "alice");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => gs.CreateGroupAsync("team-b", "bob"));
     }
 
     [Fact]
-    public void DeleteGroup_OwnerCanDelete()
+    public async Task DeleteGroup_OwnerCanDelete()
     {
-        _gs.CreateGroup("team-c", "alice");
-        _gs.DeleteGroup("team-c", "alice");
-        Assert.Null(_gs.Find("team-c"));
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("team-c", "alice");
+        await gs.DeleteGroupAsync("team-c", "alice");
+        Assert.Null(await gs.FindAsync("team-c"));
     }
 
     [Fact]
-    public void DeleteGroup_NonOwner_Throws()
+    public async Task DeleteGroup_NonOwner_Throws()
     {
-        _gs.CreateGroup("team-d", "alice");
-        Assert.Throws<InvalidOperationException>(() => _gs.DeleteGroup("team-d", "bob"));
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("team-d", "alice");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => gs.DeleteGroupAsync("team-d", "bob"));
     }
 
     [Fact]
-    public void AddMember_OwnerCanAdd()
+    public async Task AddMember_OwnerCanAdd()
     {
-        _gs.CreateGroup("team-e", "alice");
-        _gs.AddMember("team-e", "alice", "bob");
-        Assert.True(_gs.IsMember("team-e", "bob"));
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("team-e", "alice");
+        await gs.AddMemberAsync("team-e", "alice", "bob");
+        Assert.True(await gs.IsMemberAsync("team-e", "bob"));
     }
 
     [Fact]
-    public void AddMember_Duplicate_Throws()
+    public async Task AddMember_Duplicate_Throws()
     {
-        _gs.CreateGroup("team-f", "alice");
-        _gs.AddMember("team-f", "alice", "bob");
-        Assert.Throws<InvalidOperationException>(() => _gs.AddMember("team-f", "alice", "bob"));
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("team-f", "alice");
+        await gs.AddMemberAsync("team-f", "alice", "bob");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => gs.AddMemberAsync("team-f", "alice", "bob"));
     }
 
     [Fact]
-    public void RemoveMember_OwnerCanRemove()
+    public async Task RemoveMember_OwnerCanRemove()
     {
-        _gs.CreateGroup("team-g", "alice");
-        _gs.AddMember("team-g", "alice", "bob");
-        _gs.RemoveMember("team-g", "alice", "bob");
-        Assert.False(_gs.IsMember("team-g", "bob"));
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("team-g", "alice");
+        await gs.AddMemberAsync("team-g", "alice", "bob");
+        await gs.RemoveMemberAsync("team-g", "alice", "bob");
+        Assert.False(await gs.IsMemberAsync("team-g", "bob"));
     }
 
     [Fact]
-    public void RemoveMember_CannotRemoveOwner()
+    public async Task RemoveMember_CannotRemoveOwner()
     {
-        _gs.CreateGroup("team-h", "alice");
-        Assert.Throws<InvalidOperationException>(() => _gs.RemoveMember("team-h", "alice", "alice"));
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("team-h", "alice");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => gs.RemoveMemberAsync("team-h", "alice", "alice"));
     }
 
     [Fact]
-    public void GetGroupsForUser_ReturnsCorrectGroups()
+    public async Task GetGroupsForUser_ReturnsCorrectGroups()
     {
-        _gs.CreateGroup("ga", "alice");
-        _gs.CreateGroup("gb", "bob");
-        _gs.AddMember("gb", "bob", "alice");
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("ga", "alice");
+        await gs.CreateGroupAsync("gb", "bob");
+        await gs.AddMemberAsync("gb", "bob", "alice");
 
-        var aliceGroups = _gs.GetGroupsForUser("alice");
+        var aliceGroups = await gs.GetGroupsForUserAsync("alice");
         Assert.Equal(2, aliceGroups.Count);
     }
 
     [Fact]
-    public void RemoveUserFromAllGroups()
+    public async Task RemoveUserFromAllGroups()
     {
-        _gs.CreateGroup("ra", "alice");
-        _gs.CreateGroup("rb", "bob");
-        _gs.AddMember("ra", "alice", "charlie");
-        _gs.AddMember("rb", "bob", "charlie");
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("ra", "alice");
+        await gs.CreateGroupAsync("rb", "bob");
+        await gs.AddMemberAsync("ra", "alice", "charlie");
+        await gs.AddMemberAsync("rb", "bob", "charlie");
 
-        _gs.RemoveUserFromAllGroups("charlie");
-        Assert.False(_gs.IsMember("ra", "charlie"));
-        Assert.False(_gs.IsMember("rb", "charlie"));
+        await gs.RemoveUserFromAllGroupsAsync("charlie");
+        Assert.False(await gs.IsMemberAsync("ra", "charlie"));
+        Assert.False(await gs.IsMemberAsync("rb", "charlie"));
     }
 
     // ---- Volume group access ----
 
     [Fact]
-    public void GrantGroupAccess_MemberCanSeeVolume()
+    public async Task GrantGroupAccess_MemberCanSeeVolume()
     {
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+
         _vs.Create("grp-vol1", "alice", "pw", encrypted: true);
-        _gs.CreateGroup("team1", "alice");
-        _gs.AddMember("team1", "alice", "bob");
+        await gs.CreateGroupAsync("team1", "alice");
+        await gs.AddMemberAsync("team1", "alice", "bob");
 
         _vs.GrantGroupAccess("grp-vol1", "alice", "team1");
 
@@ -144,11 +146,14 @@ public class GroupTests : IDisposable
     }
 
     [Fact]
-    public void RevokeGroupAccess_MemberCannotSeeVolume()
+    public async Task RevokeGroupAccess_MemberCannotSeeVolume()
     {
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+
         _vs.Create("grp-vol2", "alice", "pw", encrypted: true);
-        _gs.CreateGroup("team2", "alice");
-        _gs.AddMember("team2", "alice", "bob");
+        await gs.CreateGroupAsync("team2", "alice");
+        await gs.AddMemberAsync("team2", "alice", "bob");
 
         _vs.GrantGroupAccess("grp-vol2", "alice", "team2");
         _vs.RevokeGroupAccess("grp-vol2", "alice", "team2");
@@ -158,22 +163,28 @@ public class GroupTests : IDisposable
     }
 
     [Fact]
-    public void GrantGroupAccess_NonOwner_Throws()
+    public async Task GrantGroupAccess_NonOwner_Throws()
     {
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+
         _vs.Create("grp-vol3", "alice", "pw", encrypted: true);
-        _gs.CreateGroup("team3", "alice");
+        await gs.CreateGroupAsync("team3", "alice");
         Assert.Throws<VolumeException>(() => _vs.GrantGroupAccess("grp-vol3", "bob", "team3"));
     }
 
     [Fact]
-    public void DeleteGroup_RemovesVolumeAccess()
+    public async Task DeleteGroup_RemovesVolumeAccess()
     {
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+
         _vs.Create("grp-vol4", "alice", "pw", encrypted: true);
-        _gs.CreateGroup("team4", "alice");
-        _gs.AddMember("team4", "alice", "bob");
+        await gs.CreateGroupAsync("team4", "alice");
+        await gs.AddMemberAsync("team4", "alice", "bob");
         _vs.GrantGroupAccess("grp-vol4", "alice", "team4");
 
-        _gs.DeleteGroup("team4", "alice");
+        await gs.DeleteGroupAsync("team4", "alice");
 
         var bobList = _vs.ListForUser("bob");
         Assert.Empty(bobList);
@@ -210,6 +221,6 @@ public class GroupTests : IDisposable
         {
             try { _vs.Lock(v.Name); } catch { }
         }
-        if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true);
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch { }
     }
 }

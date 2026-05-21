@@ -1,12 +1,10 @@
 using System.Security.Cryptography;
 using CistaNAS.Client.Crypto;
-using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
@@ -14,21 +12,13 @@ namespace CistaNAS.Tests;
 public class VolumeTests : IDisposable
 {
     private readonly string _dataRoot;
+    private readonly IServiceProvider _sp;
     private readonly VolumeService _vs;
-    private readonly VolumeOptions _volOpts;
 
     public VolumeTests()
     {
-        _dataRoot = Path.Combine(Path.GetTempPath(), "cista-vol-" + Guid.NewGuid().ToString("N"));
-        _volOpts = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 };
-        var opt = new CistaNasOptions { DataRoot = _dataRoot, Volume = _volOpts };
-        var io = Options.Create(opt);
-        var storage = new LocalStorageProvider(_dataRoot);
-        var metaStore = new VolumeMetadataStore(storage);
-        var gs = new GroupStore(storage, io, new ServiceCollection().BuildServiceProvider());
-        var sp = new ServiceCollection().AddLogging().BuildServiceProvider();
-        var us = new UserStore(storage, io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
-        _vs = new VolumeService(io, gs, us, metaStore);
+        (_sp, _dataRoot) = TestHelper.BuildTestServices();
+        _vs = _sp.GetRequiredService<VolumeService>();
     }
 
     [Fact]
@@ -81,10 +71,8 @@ public class VolumeTests : IDisposable
         _vs.Create("shared", "alice", "alice-pw", encrypted: true);
         _vs.Lock("shared");
 
-        // alice が bob に共有
         _vs.GrantAccess("shared", "alice", "alice-pw", "bob", "bob-pw");
 
-        // bob がマウント
         var info = _vs.Mount("shared", "bob", "bob-pw");
         Assert.True(info.IsMounted);
         Assert.Contains("alice", info.AuthorizedUsers);
@@ -115,13 +103,10 @@ public class VolumeTests : IDisposable
         _vs.Create("rewrap", "alice", "old-pw", encrypted: true);
         _vs.Lock("rewrap");
 
-        // パスワード変更（再ラップ）
         _vs.RewrapAllForUser("alice", "old-pw", "new-pw");
 
-        // 古いパスワードでマウント失敗
         Assert.Throws<VolumeException>(() => _vs.Mount("rewrap", "alice", "old-pw"));
 
-        // 新しいパスワードでマウント成功
         var info = _vs.Mount("rewrap", "alice", "new-pw");
         Assert.True(info.IsMounted);
     }
@@ -133,10 +118,8 @@ public class VolumeTests : IDisposable
         _vs.GrantAccess("multi", "alice", "alice-pw", "bob", "bob-pw");
         _vs.Lock("multi");
 
-        // alice のパスワード変更
         _vs.RewrapAllForUser("alice", "alice-pw", "alice-new");
 
-        // bob は影響なし
         var info = _vs.Mount("multi", "bob", "bob-pw");
         Assert.True(info.IsMounted);
     }
@@ -168,17 +151,6 @@ public class VolumeTests : IDisposable
         _vs.Lock("lock-test");
         Assert.False(_vs.IsMounted("lock-test"));
     }
-
-    public void Dispose()
-    {
-        foreach (var v in _vs.ListAll())
-        {
-            try { _vs.Lock(v.Name); } catch { }
-        }
-        if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true);
-    }
-
-    // ---- 追加テスト ----
 
     [Fact]
     public void Create_GroupPrefix_Throws()
@@ -264,17 +236,16 @@ public class VolumeTests : IDisposable
     }
 
     [Fact]
-    public void GrantGroupAccess_E2eeVolume_Throws()
+    public async Task GrantGroupAccess_E2eeVolume_Throws()
     {
         byte[] masterKey = RandomNumberGenerator.GetBytes(32);
         byte[] salt = RandomNumberGenerator.GetBytes(16);
         byte[] kek = E2eeCrypto.DeriveKek("alice", "pw", salt, 1000);
         var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
 
-        var gs = new GroupStore(new LocalStorageProvider(_dataRoot),
-            Options.Create(new CistaNasOptions { DataRoot = _dataRoot }),
-            new ServiceCollection().BuildServiceProvider());
-        gs.CreateGroup("testg", "alice");
+        using var scope = _sp.CreateAsyncScope();
+        var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
+        await gs.CreateGroupAsync("testg", "alice");
 
         _vs.CreateE2ee("e2ee-group", "alice", new VolumeHeader.UserWrappedKey
         {
@@ -284,5 +255,14 @@ public class VolumeTests : IDisposable
 
         Assert.Throws<VolumeException>(() =>
             _vs.GrantGroupAccess("e2ee-group", "alice", "testg"));
+    }
+
+    public void Dispose()
+    {
+        foreach (var v in _vs.ListAll())
+        {
+            try { _vs.Lock(v.Name); } catch { }
+        }
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch { }
     }
 }

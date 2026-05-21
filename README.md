@@ -30,7 +30,7 @@
 
 ## ストレージプロバイダ
 
-メタデータ（ボリュームヘッダ、カタログ、ジャーナル、ユーザー情報）の保存先を切り替え可能。`volume.dat`（暗号化ボリュームデータ）は AES-XTS のランダムアクセス要件により常にローカルディスクに配置。
+メタデータ（ボリュームヘッダ、カタログ、ジャーナル）の保存先を切り替え可能。ユーザー・グループ情報は DB（SQLite / PostgreSQL）に保存。`volume.dat`（暗号化ボリュームデータ）は AES-XTS のランダムアクセス要件により常にローカルディスクに配置。
 
 | プロバイダ | 設定値 | メタデータ保存先 |
 |---|---|---|
@@ -52,9 +52,9 @@ Services
       StreamingTokenService  メディアストリーミング用短命トークン (Singleton)
       JournalService         ジャーナル記録・復旧 (Scoped)
       AuthService            認証・JWT 発行 (Scoped)
-      UserStore              ユーザー管理・パスワード検証 (Scoped)
-      GroupStore             グループ管理 (Singleton)
-      InvitationService      招待コード管理 (Scoped)
+      AccountService         ユーザー管理 (Scoped) — ASP.NET Core Identity ラップ
+      GroupService           グループ管理 (Scoped) — EF Core 使用
+      InvitationService      招待コード管理 (Singleton)
 Crypto / Volume / Journal
   └ 低レベル実装
       AesXtsStream           AES-XTS seekable ストリーム
@@ -101,6 +101,14 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
 {
   "CistaNas": {
     "DataRoot": "data",
+    "Database": {
+      "Provider": "sqlite",
+      "ConnectionString": null,
+      "BucketOrContainer": null,
+      "RegionOrConnectionString": null,
+      "EndpointOverride": null,
+      "BlobKey": "cista.db"
+    },
     "Storage": {
       "Provider": "local",
       "BucketOrContainer": null,
@@ -129,6 +137,12 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
 | 項目 | 説明 |
 |---|---|
 | `DataRoot` | ローカルモード時のデータ保存先 |
+| `Database:Provider` | `"sqlite"` / `"postgresql"` / `"s3"` / `"azureblob"` / `"gcs"` |
+| `Database:ConnectionString` | PostgreSQL: 接続文字列。SQLite: ファイルパス（null なら `DataRoot/cista.db`） |
+| `Database:BucketOrContainer` | S3/Blob/GCS: バケット/コンテナ名 |
+| `Database:RegionOrConnectionString` | S3: リージョン、Azure: 接続文字列 |
+| `Database:EndpointOverride` | S3: エンドポイント上書き（MinIO 用） |
+| `Database:BlobKey` | オブジェクトストレージ内の DB ファイルパス（デフォルト `cista.db`） |
 | `Storage:Provider` | `"local"` / `"s3"` / `"azureblob"` / `"gcs"` |
 | `Storage:BucketOrContainer` | S3: バケット名、Azure: コンテナ名、GCS: バケット名 |
 | `Storage:RegionOrConnectionString` | S3: リージョン、Azure: 接続文字列 |
@@ -282,6 +296,8 @@ docker compose --profile s3 -f docker-compose.yml -f docker-compose.s3.yml up
 
 | 変数 | 説明 |
 |---|---|
+| `CistaNas__Database__Provider` | DB プロバイダ（`sqlite` / `postgresql` / `s3` / `azureblob` / `gcs`） |
+| `CistaNas__Database__ConnectionString` | PostgreSQL: 接続文字列 |
 | `CistaNas__Storage__Provider` | ストレージプロバイダ（`local` / `s3` / `azureblob` / `gcs`） |
 | `CistaNas__Storage__BucketOrContainer` | バケット/コンテナ名 |
 | `CistaNas__Storage__RegionOrConnectionString` | S3: リージョン、Azure: 接続文字列 |

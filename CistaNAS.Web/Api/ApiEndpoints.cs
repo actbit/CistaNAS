@@ -42,20 +42,20 @@ public static class ApiEndpoints
     public static IEndpointRouteBuilder MapCistaNasApi(this WebApplication app, IEndpointRouteBuilder api)
     {
         // ---- 認証 ----
-        api.MapPost("/auth/setup", (SetupRequest req, UserStore users) =>
+        api.MapPost("/auth/setup", async (SetupRequest req, AccountService accountService) =>
         {
-            if (users.HasAnyUsers)
+            if (await accountService.HasAnyUsersAsync())
                 return Results.Conflict(new { error = "初期セットアップは既に完了しています。" });
-            users.CreateInitialAdmin(req.Username, req.Password);
+            await accountService.CreateInitialAdminAsync(req.Username, req.Password);
             return Results.Ok(new { message = "初期管理者を作成しました。" });
         })
         .AllowAnonymous()
         .RequireRateLimiting("auth")
         .WithName("Setup");
 
-        api.MapPost("/auth/login", (LoginRequest req, AuthService auth) =>
+        api.MapPost("/auth/login", async (LoginRequest req, AuthService auth) =>
         {
-            var res = auth.Authenticate(req.Username, req.Password);
+            var res = await auth.AuthenticateAsync(req.Username, req.Password);
             return res is null
                 ? Results.Unauthorized()
                 : Results.Ok(res);
@@ -64,11 +64,11 @@ public static class ApiEndpoints
         .RequireRateLimiting("auth")
         .WithName("Login");
 
-        api.MapPost("/auth/change-password", (ChangePasswordRequest req, HttpContext ctx, AuthService auth) =>
+        api.MapPost("/auth/change-password", async (ChangePasswordRequest req, HttpContext ctx, AuthService auth) =>
         {
             string? username = ctx.User.Identity?.Name;
             if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
-            bool ok = auth.ChangePassword(username, req.OldPassword, req.NewPassword);
+            bool ok = await auth.ChangePasswordAsync(username, req.OldPassword, req.NewPassword);
             return ok ? Results.Ok() : Results.BadRequest(new { error = "パスワードが正しくありません。" });
         })
         .WithName("ChangePassword");
@@ -247,54 +247,54 @@ public static class ApiEndpoints
         var groups = api.MapGroup("/groups")
             .RequireAuthorization();
 
-        groups.MapGet("/", (GroupStore gs) =>
-            Results.Ok(gs.ListGroups()))
+        groups.MapGet("/", async (GroupService gs) =>
+            Results.Ok(await gs.ListGroupsAsync()))
             .WithName("ListGroups");
 
-        groups.MapPost("/", (CreateGroupRequest req, HttpContext ctx, GroupStore gs) =>
+        groups.MapPost("/", async (CreateGroupRequest req, HttpContext ctx, GroupService gs) =>
         {
             string username = ctx.User.Identity?.Name ?? "";
             try
             {
-                gs.CreateGroup(req.GroupName, username);
+                await gs.CreateGroupAsync(req.GroupName, username);
                 return Results.Created($"/api/v1/groups/{req.GroupName}", null);
             }
             catch (InvalidOperationException ex) { return Results.Conflict(new { error = ex.Message }); }
         })
         .WithName("CreateGroup");
 
-        groups.MapDelete("/{groupName}", (string groupName, HttpContext ctx, GroupStore gs) =>
+        groups.MapDelete("/{groupName}", async (string groupName, HttpContext ctx, GroupService gs) =>
         {
             string username = ctx.User.Identity?.Name ?? "";
             try
             {
-                gs.DeleteGroup(groupName, username);
+                await gs.DeleteGroupAsync(groupName, username);
                 return Results.NoContent();
             }
             catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
         .WithName("DeleteGroup");
 
-        groups.MapPost("/{groupName}/members", (string groupName, AddGroupMemberRequest req,
-            HttpContext ctx, GroupStore gs) =>
+        groups.MapPost("/{groupName}/members", async (string groupName, AddGroupMemberRequest req,
+            HttpContext ctx, GroupService gs) =>
         {
             string username = ctx.User.Identity?.Name ?? "";
             try
             {
-                gs.AddMember(groupName, username, req.Username);
+                await gs.AddMemberAsync(groupName, username, req.Username);
                 return Results.Ok();
             }
             catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
         .WithName("AddGroupMember");
 
-        groups.MapDelete("/{groupName}/members/{username}", (string groupName, string username,
-            HttpContext ctx, GroupStore gs) =>
+        groups.MapDelete("/{groupName}/members/{username}", async (string groupName, string username,
+            HttpContext ctx, GroupService gs) =>
         {
             string requester = ctx.User.Identity?.Name ?? "";
             try
             {
-                gs.RemoveMember(groupName, requester, username);
+                await gs.RemoveMemberAsync(groupName, requester, username);
                 return Results.NoContent();
             }
             catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }

@@ -6,7 +6,6 @@ using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
@@ -14,34 +13,31 @@ namespace CistaNAS.Tests;
 public class E2eeFileTests : IDisposable
 {
     private readonly string _dataRoot;
+    private readonly IServiceProvider _sp;
     private readonly VolumeService _volumeService;
-    private readonly E2eeFileService _e2eeFs;
     private readonly byte[] _masterKey;
 
     public E2eeFileTests()
     {
-        _dataRoot = Path.Combine(Path.GetTempPath(), "cista-e2ee-" + Guid.NewGuid().ToString("N"));
-        var opt = new CistaNasOptions
-        {
-            DataRoot = _dataRoot,
-            Volume = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
-        };
-        var io = Options.Create(opt);
-        var storage = new LocalStorageProvider(_dataRoot);
-        var metaStore = new VolumeMetadataStore(storage);
-        var gs = new GroupStore(storage, io, new ServiceCollection().BuildServiceProvider());
-        var sp = new ServiceCollection().AddLogging().BuildServiceProvider();
-        var us = new UserStore(storage, io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
-        _volumeService = new VolumeService(io, gs, us, metaStore);
-        _e2eeFs = new E2eeFileService(_volumeService, storage, io);
+        (_sp, _dataRoot) = TestHelper.BuildTestServices();
+        _volumeService = _sp.GetRequiredService<VolumeService>();
         _masterKey = RandomNumberGenerator.GetBytes(32);
+    }
+
+    private E2eeFileService GetE2eeFileService()
+    {
+        using var scope = _sp.CreateAsyncScope();
+        var opt = _sp.GetRequiredService<IOptions<CistaNasOptions>>();
+        var storage = _sp.GetRequiredService<IStorageProvider>();
+        return new E2eeFileService(_volumeService, storage, opt);
     }
 
     [Fact]
     public void CreateFile_ReturnsEntryWithFileId()
     {
         string vol = MountE2ee("test-create");
-        var entry = _e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc-name-abc", 2048, 2));
+        var e2eeFs = GetE2eeFileService();
+        var entry = e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc-name-abc", 2048, 2));
 
         Assert.False(string.IsNullOrEmpty(entry.FileId));
         Assert.Equal("enc-name-abc", entry.EncryptedName);
@@ -55,7 +51,8 @@ public class E2eeFileTests : IDisposable
         string vol = MountE2ee("test-io");
         const int chunkSize = 4096;
 
-        var entry = _e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc-file", chunkSize * 2 + 16 * 2 + 16, 2));
+        var e2eeFs = GetE2eeFileService();
+        var entry = e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc-file", chunkSize * 2 + 16 * 2 + 16, 2));
 
         byte[] fileSalt = E2eeCrypto.GenerateFileSalt();
         byte[] fileKey = E2eeCrypto.DeriveFileKey(_masterKey, fileSalt);
@@ -66,16 +63,16 @@ public class E2eeFileTests : IDisposable
         byte[] encChunk1 = E2eeCrypto.EncryptChunk(plain1, fileKey, 1, fileSalt, isFirstChunk: false);
 
         using (var ms0 = new MemoryStream(encChunk0))
-            await _e2eeFs.UploadChunkAsync(vol, entry.FileId, 0, ms0, encChunk0.Length);
+            await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0, ms0, encChunk0.Length);
         using (var ms1 = new MemoryStream(encChunk1))
-            await _e2eeFs.UploadChunkAsync(vol, entry.FileId, 1, ms1, encChunk1.Length);
+            await e2eeFs.UploadChunkAsync(vol, entry.FileId, 1, ms1, encChunk1.Length);
 
-        var (stream0, len0) = _e2eeFs.DownloadChunk(vol, entry.FileId, 0);
+        var (stream0, len0) = e2eeFs.DownloadChunk(vol, entry.FileId, 0);
         byte[] dl0 = new byte[len0];
         using (stream0) await stream0.ReadExactlyAsync(dl0);
         Assert.Equal(encChunk0, dl0);
 
-        var (stream1, len1) = _e2eeFs.DownloadChunk(vol, entry.FileId, 1);
+        var (stream1, len1) = e2eeFs.DownloadChunk(vol, entry.FileId, 1);
         byte[] dl1 = new byte[len1];
         using (stream1) await stream1.ReadExactlyAsync(dl1);
         Assert.Equal(encChunk1, dl1);
@@ -92,10 +89,11 @@ public class E2eeFileTests : IDisposable
     public void ListFiles_ReturnsCreatedFiles()
     {
         string vol = MountE2ee("test-list");
-        _e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc-a", 100, 1));
-        _e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc-b", 200, 1));
+        var e2eeFs = GetE2eeFileService();
+        e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc-a", 100, 1));
+        e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc-b", 200, 1));
 
-        var result = _e2eeFs.ListFiles(vol);
+        var result = e2eeFs.ListFiles(vol);
         Assert.Equal(2, result.Files.Count);
         Assert.Contains(result.Files, f => f.EncryptedName == "enc-a");
         Assert.Contains(result.Files, f => f.EncryptedName == "enc-b");
@@ -105,22 +103,24 @@ public class E2eeFileTests : IDisposable
     public void DeleteFile_RemovesFromCatalog()
     {
         string vol = MountE2ee("test-delete");
-        var entry = _e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("to-delete", 100, 1));
+        var e2eeFs = GetE2eeFileService();
+        var entry = e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("to-delete", 100, 1));
 
-        Assert.Single(_e2eeFs.ListFiles(vol).Files);
-        _e2eeFs.DeleteFile(vol, entry.FileId);
-        Assert.Empty(_e2eeFs.ListFiles(vol).Files);
+        Assert.Single(e2eeFs.ListFiles(vol).Files);
+        e2eeFs.DeleteFile(vol, entry.FileId);
+        Assert.Empty(e2eeFs.ListFiles(vol).Files);
     }
 
     [Fact]
     public void FinalizeFile_UpdatesLength()
     {
         string vol = MountE2ee("test-finalize");
-        var entry = _e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc", 2048, 2));
+        var e2eeFs = GetE2eeFileService();
+        var entry = e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc", 2048, 2));
 
-        _e2eeFs.FinalizeFile(vol, entry.FileId, new E2eeFinalizeFileRequest(1500));
+        e2eeFs.FinalizeFile(vol, entry.FileId, new E2eeFinalizeFileRequest(1500));
 
-        var list = _e2eeFs.ListFiles(vol);
+        var list = e2eeFs.ListFiles(vol);
         Assert.Single(list.Files);
         Assert.Equal(1500, list.Files[0].EncryptedLength);
     }
@@ -129,8 +129,9 @@ public class E2eeFileTests : IDisposable
     public void DeleteFile_NonExistent_Throws()
     {
         string vol = MountE2ee("test-del-missing");
+        var e2eeFs = GetE2eeFileService();
         Assert.Throws<FileServiceException>(() =>
-            _e2eeFs.DeleteFile(vol, "nonexistent-id"));
+            e2eeFs.DeleteFile(vol, "nonexistent-id"));
     }
 
     private string MountE2ee(string name)
@@ -160,6 +161,6 @@ public class E2eeFileTests : IDisposable
         {
             try { _volumeService.Lock(v.Name); } catch { }
         }
-        if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true);
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch { }
     }
 }

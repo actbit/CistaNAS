@@ -1,8 +1,8 @@
 using System.Security.Claims;
 using CistaNAS.Web.Configuration;
-using CistaNAS.Web.Crypto;
+using CistaNAS.Web.Identity;
 using CistaNAS.Web.Models;
-using Microsoft.Extensions.Logging;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.JsonWebTokens;
 using Microsoft.IdentityModel.Tokens;
@@ -14,7 +14,8 @@ namespace CistaNAS.Web.Services;
 /// 状態を持たないため Scoped 登録。Controllers / Blazor / /api/v1 から呼ばれる。
 /// </summary>
 public sealed class AuthService(
-    UserStore users,
+    AccountService accountService,
+    UserManager<ApplicationUser> userManager,
     JwtSigningKey signingKey,
     IOptions<CistaNasOptions> options,
     ILogger<AuthService> logger)
@@ -22,27 +23,30 @@ public sealed class AuthService(
     /// <summary>
     /// 資格情報を検証し、成功時に JWT を発行する。失敗時は null。
     /// </summary>
-    public LoginResponse? Authenticate(string username, string password)
+    public async Task<LoginResponse?> AuthenticateAsync(string username, string password)
     {
         if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(password))
             return null;
 
-        var user = users.Find(username);
-        if (user is null || !PasswordHasher.Verify(password, user.PasswordHash))
+        var user = await accountService.FindAsync(username);
+        if (user is null || !await accountService.CheckPasswordAsync(user, password))
         {
             logger.LogWarning("ログイン失敗: ユーザー '{Username}'", username);
             return null;
         }
 
         logger.LogInformation("ログイン成功: ユーザー '{Username}'", username);
-        return IssueToken(user);
+        return await IssueTokenAsync(user);
     }
 
-    public LoginResponse IssueToken(UserAccount user)
+    public async Task<LoginResponse> IssueTokenAsync(ApplicationUser user)
     {
         var jwt = options.Value.Jwt;
         var now = DateTimeOffset.UtcNow;
         var expires = now.AddMinutes(jwt.AccessTokenMinutes);
+
+        var roles = await accountService.GetRolesAsync(user);
+        var role = roles.FirstOrDefault() ?? "user";
 
         var descriptor = new SecurityTokenDescriptor
         {
@@ -53,9 +57,9 @@ public sealed class AuthService(
             Expires = expires.UtcDateTime,
             Subject = new ClaimsIdentity(
             [
-                new Claim(JwtRegisteredClaimNames.Sub, user.Username),
-                new Claim(ClaimTypes.Name, user.Username),
-                new Claim(ClaimTypes.Role, user.Role),
+                new Claim(JwtRegisteredClaimNames.Sub, user.UserName ?? user.Id),
+                new Claim(ClaimTypes.Name, user.UserName ?? user.Id),
+                new Claim(ClaimTypes.Role, role),
             ]),
             SigningCredentials = new SigningCredentials(
                 new SymmetricSecurityKey(signingKey.Value),
@@ -90,8 +94,8 @@ public sealed class AuthService(
     }
 
     /// <summary>パスワードを変更し、全ボリュームの KEK を再ラップ。</summary>
-    public bool ChangePassword(string username, string oldPassword, string newPassword)
+    public async Task<bool> ChangePasswordAsync(string username, string oldPassword, string newPassword)
     {
-        return users.ChangePassword(username, oldPassword, newPassword);
+        return await accountService.ChangePasswordAsync(username, oldPassword, newPassword);
     }
 }

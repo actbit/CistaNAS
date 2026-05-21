@@ -11,9 +11,32 @@ public sealed class CistaNasOptions
     public string DataRoot { get; set; } = "data";
 
     public StorageOptions Storage { get; set; } = new();
+    public DatabaseOptions Database { get; set; } = new();
     public JwtOptions Jwt { get; set; } = new();
     public AuthOptions Auth { get; set; } = new();
     public VolumeOptions Volume { get; set; } = new();
+}
+
+/// <summary>ユーザー/グループDBのプロバイダ設定。</summary>
+public sealed class DatabaseOptions
+{
+    /// <summary>"sqlite" | "postgresql" | "s3" | "azureblob" | "gcs"。</summary>
+    public string Provider { get; set; } = "sqlite";
+
+    /// <summary>PostgreSQL: 接続文字列。SQLite: ファイルパス（null なら DataRoot/cista.db）。</summary>
+    public string? ConnectionString { get; set; }
+
+    /// <summary>s3/azureblob/gcs: バケット/コンテナ名。Storage.BucketOrContainer と同じ。</summary>
+    public string? BucketOrContainer { get; set; }
+
+    /// <summary>s3: リージョン。azureblob: 接続文字列。gcs: 未使用。</summary>
+    public string? RegionOrConnectionString { get; set; }
+
+    /// <summary>s3: エンドポイント上書き（MinIO 等）。</summary>
+    public string? EndpointOverride { get; set; }
+
+    /// <summary>オブジェクトストレージ内の DB ファイルパス（デフォルト "cista.db"）。</summary>
+    public string? BlobKey { get; set; }
 }
 
 /// <summary>メタデータ保存先のプロバイダ設定。</summary>

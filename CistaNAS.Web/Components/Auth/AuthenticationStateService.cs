@@ -24,7 +24,7 @@ public sealed class AuthenticationStateService : IDisposable
     /// <summary>ログイン成功時に呼ぶ。JWT を ClaimsPrincipal に変換して保持。</summary>
     public async Task<bool> LoginAsync(string username, string password)
     {
-        var res = _authService.Authenticate(username, password);
+        var res = await _authService.AuthenticateAsync(username, password);
         if (res is null) return false;
 
         User = await _authService.ValidateTokenAsync(res.AccessToken);

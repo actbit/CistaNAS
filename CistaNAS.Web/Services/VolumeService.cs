@@ -2,9 +2,11 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Crypto;
+using CistaNAS.Web.Identity;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Web.Services;
@@ -18,19 +20,17 @@ public sealed class VolumeService
 {
     private readonly string _volumeDataPath;
     private readonly VolumeOptions _volOpts;
-    private readonly GroupStore _groupStore;
-    private readonly UserStore _userStore;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly VolumeMetadataStore _metaStore;
 
     private readonly ConcurrentDictionary<string, MountedVolume> _mounted = new();
     private readonly SemaphoreSlim _mountGate = new(1, 1);
 
-    public VolumeService(IOptions<CistaNasOptions> options, GroupStore groupStore, UserStore userStore, VolumeMetadataStore metaStore)
+    public VolumeService(IOptions<CistaNasOptions> options, IServiceScopeFactory scopeFactory, VolumeMetadataStore metaStore)
     {
         _volumeDataPath = options.Value.Storage.VolumeDataPath ?? options.Value.DataRoot;
         _volOpts = options.Value.Volume;
-        _groupStore = groupStore;
-        _userStore = userStore;
+        _scopeFactory = scopeFactory;
         _metaStore = metaStore;
         Directory.CreateDirectory(_volumeDataPath);
     }
@@ -200,8 +200,7 @@ public sealed class VolumeService
         var result = new List<VolumeInfo>();
         var volumeNames = _metaStore.ListVolumeNamesAsync().GetAwaiter().GetResult();
 
-        var userGroups = _groupStore.GetGroupsForUser(username)
-            .Select(g => g.GroupName).ToHashSet(StringComparer.Ordinal);
+        var userGroups = GetGroupsForUser(username);
 
         foreach (var name in volumeNames)
         {
@@ -243,8 +242,7 @@ public sealed class VolumeService
     {
         var header = LoadHeaderIfExists(volumeName);
         if (header is null) return false;
-        var userGroups = _groupStore.GetGroupsForUser(username)
-            .Select(g => g.GroupName).ToHashSet(StringComparer.Ordinal);
+        var userGroups = GetGroupsForUser(username);
         return HasAccessInternal(header, username, userGroups);
     }
 
@@ -353,7 +351,7 @@ public sealed class VolumeService
             throw new VolumeException("オーナーのみがグループアクセスを付与できます。");
         if (header.IsE2ee)
             throw new VolumeException("E2EE ボリュームはグループ共有に対応していません。");
-        if (_groupStore.Find(groupName) is null)
+        if (FindGroup(groupName) is null)
             throw new VolumeException($"グループ '{groupName}' が見つかりません。");
 
             header.AuthorizedGroups.Add(groupName);
@@ -422,7 +420,7 @@ public sealed class VolumeService
         _mountGate.Wait();
         try
         {
-            if (_groupStore.Find(groupName) is null)
+            if (FindGroup(groupName) is null)
                 throw new VolumeException($"グループ '{groupName}' が見つかりません。");
 
             string volName = $"group__{groupName}";
@@ -477,12 +475,12 @@ public sealed class VolumeService
         if (string.IsNullOrEmpty(groupName))
             throw new VolumeException("グループボリュームではありません。");
 
-        var group = _groupStore.Find(groupName)
+        var group = FindGroup(groupName)
             ?? throw new VolumeException($"グループ '{groupName}' が見つかりません。");
 
         return group.Members
-            .Where(m => !header.HasUserAccess(m))
-            .Select(m => (m, _userStore.GetPublicKey(m)))
+            .Where(m => !header.HasUserAccess(m.Username))
+            .Select(m => (m.Username, GetPublicKey(m.Username)))
             .ToList();
     }
 
@@ -585,6 +583,28 @@ public sealed class VolumeService
 
     private string VolumeDir(string name) => Path.Combine(_volumeDataPath, name);
     private string GetDataPath(string name) => Path.Combine(VolumeDir(name), "volume.dat");
+
+    private HashSet<string> GetGroupsForUser(string username)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var groupService = scope.ServiceProvider.GetRequiredService<GroupService>();
+        return groupService.GetGroupsForUserAsync(username).GetAwaiter().GetResult()
+            .Select(g => g.GroupName).ToHashSet(StringComparer.Ordinal);
+    }
+
+    private GroupEntity? FindGroup(string groupName)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var groupService = scope.ServiceProvider.GetRequiredService<GroupService>();
+        return groupService.FindAsync(groupName).GetAwaiter().GetResult();
+    }
+
+    private string? GetPublicKey(string username)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var accountService = scope.ServiceProvider.GetRequiredService<AccountService>();
+        return accountService.GetPublicKeyAsync(username).GetAwaiter().GetResult();
+    }
 
     private static void ValidateName(string name)
     {

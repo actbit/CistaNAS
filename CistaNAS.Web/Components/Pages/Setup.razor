@@ -1,12 +1,12 @@
 @page "/setup"
 @using CistaNAS.Web.Services
-@inject UserStore UserStore
+@inject AccountService AccountSvc
 @inject VolumeService VolumeSvc
 @inject NavigationManager Nav
 
 <PageTitle>初回セットアップ - CistaNAS</PageTitle>
 
-@if (UserStore.HasAnyUsers)
+@if (_hasAnyUsers)
 {
     <NavigateToLogin />
 }
@@ -56,6 +56,7 @@ else
 }
 
 @code {
+    private bool _hasAnyUsers;
     private SetupModel _model = new();
     private string? _error;
 
@@ -68,7 +69,12 @@ else
         public string VolumeName { get; set; } = "data";
     }
 
-    private void HandleSetup()
+    protected override async Task OnInitializedAsync()
+    {
+        _hasAnyUsers = await AccountSvc.HasAnyUsersAsync();
+    }
+
+    private async Task HandleSetup()
     {
         if (_model.Password != _model.ConfirmPassword)
         {
@@ -83,7 +89,7 @@ else
 
         try
         {
-            UserStore.CreateInitialAdmin(_model.Username, _model.Password);
+            await AccountSvc.CreateInitialAdminAsync(_model.Username, _model.Password);
 
             if (_model.CreateVolume && !string.IsNullOrWhiteSpace(_model.VolumeName))
             {

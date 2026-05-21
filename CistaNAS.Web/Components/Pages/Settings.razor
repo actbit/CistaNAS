@@ -2,12 +2,13 @@
 @implements IDisposable
 @using CistaNAS.Web.Components.Auth
 @using CistaNAS.Web.Configuration
+@using CistaNAS.Web.Identity
 @using CistaNAS.Web.Models
 @using CistaNAS.Web.Services
 @inject AuthenticationStateService AuthState
 @inject AuthService Auth
-@inject UserStore Users
-@inject GroupStore Groups
+@inject AccountService AccountSvc
+@inject GroupService GroupSvc
 @inject E2eeInterop E2ee
 @inject IJSRuntime JS
 @inject NavigationManager Nav
@@ -73,16 +74,16 @@ else
                     </tr>
                 </thead>
                 <tbody>
-                    @foreach (var u in _users)
+                    @foreach (var (user, roles) in _users)
                     {
                         <tr>
-                            <td>@u.Username</td>
-                            <td><span class="badge bg-primary">@u.Role</span></td>
+                            <td>@user.UserName</td>
+                            <td><span class="badge bg-primary">@(roles.FirstOrDefault() ?? "user")</span></td>
                             <td>
-                                @if (u.Username != CurrentUsername)
+                                @if (user.UserName != CurrentUsername)
                                 {
                                     <button class="btn btn-sm btn-outline-danger"
-                                            @onclick="() => HandleDeleteUser(u.Username)">
+                                            @onclick="() => HandleDeleteUser(user.UserName!)">
                                         削除
                                     </button>
                                 }
@@ -141,7 +142,7 @@ else
                         @foreach (var g in _groups)
                         {
                             <tr>
-                                <td><a href="#" @onclick="() => _selectedGroup = Groups.Find(g.GroupName)">@g.GroupName</a></td>
+                                <td><a href="#" @onclick="() => SelectGroup(g.GroupName)">@g.GroupName</a></td>
                                 <td>@g.OwnerUser</td>
                                 <td>@string.Join(", ", g.Members)</td>
                                 <td>
@@ -181,11 +182,11 @@ else
                     @foreach (var m in _selectedGroup.Members)
                     {
                         <li class="list-group-item d-flex justify-content-between align-items-center">
-                            @m
-                            @if (m != _selectedGroup.OwnerUser)
+                            @m.Username
+                            @if (m.Username != _selectedGroup.OwnerUser)
                             {
                                 <button class="btn btn-sm btn-outline-danger"
-                                        @onclick="() => HandleRemoveMember(_selectedGroup.GroupName, m)">削除</button>
+                                        @onclick="() => HandleRemoveMember(_selectedGroup.GroupName, m.Username)">削除</button>
                             }
                             else
                             {
@@ -302,7 +303,7 @@ else
 
 @code {
     private string CurrentUsername => AuthState.User?.Identity?.Name ?? "";
-    private bool IsAdmin => Users.IsAdmin(CurrentUsername);
+    private bool IsAdmin { get; set; }
 
     // パスワード変更
     private ChangeModel _pwModel = new();
@@ -318,17 +319,17 @@ else
     }
 
     // ユーザー管理
-    private IReadOnlyList<UserAccount> _users = [];
+    private IReadOnlyList<(ApplicationUser User, IList<string> Roles)> _users = [];
     private string _newUsername = "";
     private string _newPassword = "";
     private string? _userError;
     private bool _userSuccess;
 
     // グループ管理
-    private IReadOnlyList<GroupAccount> _groups = [];
+    private IReadOnlyList<GroupEntity> _groups = [];
     private string _newGroupName = "";
     private string? _groupError;
-    private GroupAccount? _selectedGroup;
+    private GroupEntity? _selectedGroup;
     private string _addMemberName = "";
 
     // 暗号化設定
@@ -351,28 +352,29 @@ else
         public int SectorSize { get; set; } = 4096;
     }
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
         AuthState.Subscribe(OnAuthStateChanged);
-        RefreshUsers();
-        RefreshGroups();
+        await RefreshUsers();
+        await RefreshGroups();
         LoadEncryptionSettings();
-        _keyHasPublicKey = Users.GetPublicKey(CurrentUsername) is not null;
+        IsAdmin = await AccountSvc.IsAdminAsync(CurrentUsername);
+        _keyHasPublicKey = await AccountSvc.GetPublicKeyAsync(CurrentUsername) is not null;
     }
 
-    private void RefreshUsers()
+    private async Task RefreshUsers()
     {
-        _users = Users.ListUsers();
+        _users = await AccountSvc.ListWithRolesAsync();
     }
 
-    private void RefreshGroups()
+    private async Task RefreshGroups()
     {
-        _groups = Groups.ListGroups();
+        _groups = await GroupSvc.ListGroupsAsync();
     }
 
     // ---- パスワード変更 ----
 
-    private void HandleChangePassword()
+    private async Task HandleChangePassword()
     {
         if (_pwModel.NewPassword != _pwModel.ConfirmPassword)
         {
@@ -383,7 +385,7 @@ else
         _pwLoading = true;
         _passwordError = null;
 
-        bool ok = Auth.ChangePassword(CurrentUsername, _pwModel.OldPassword, _pwModel.NewPassword);
+        bool ok = await Auth.ChangePasswordAsync(CurrentUsername, _pwModel.OldPassword, _pwModel.NewPassword);
         if (ok) _passwordSuccess = true;
         else _passwordError = "現在のパスワードが正しくありません。";
         _pwLoading = false;
@@ -397,79 +399,84 @@ else
 
     // ---- ユーザー管理 ----
 
-    private void HandleAddUser()
+    private async Task HandleAddUser()
     {
         _userError = null; _userSuccess = false;
         try
         {
-            Users.CreateUser(_newUsername.Trim(), _newPassword, role: "admin");
+            await AccountSvc.CreateUserAsync(_newUsername.Trim(), _newPassword, role: "admin");
             _newUsername = ""; _newPassword = "";
             _userSuccess = true;
-            RefreshUsers();
+            await RefreshUsers();
         }
         catch (Exception ex) { _userError = ex.Message; }
     }
 
-    private void HandleDeleteUser(string username)
+    private async Task HandleDeleteUser(string username)
     {
         _userError = null;
         try
         {
-            Users.DeleteUser(username);
-            RefreshUsers();
-            RefreshGroups();
+            await AccountSvc.DeleteUserAsync(username);
+            await RefreshUsers();
+            await RefreshGroups();
         }
         catch (Exception ex) { _userError = ex.Message; }
     }
 
     // ---- グループ管理 ----
 
-    private void HandleCreateGroup()
+    private async Task HandleCreateGroup()
     {
         _groupError = null;
         try
         {
-            Groups.CreateGroup(_newGroupName.Trim(), CurrentUsername);
+            await GroupSvc.CreateGroupAsync(_newGroupName.Trim(), CurrentUsername);
             _newGroupName = "";
-            RefreshGroups();
+            await RefreshGroups();
         }
         catch (Exception ex) { _groupError = ex.Message; }
     }
 
-    private void HandleDeleteGroup(string groupName)
+    private async Task HandleDeleteGroup(string groupName)
     {
         _groupError = null;
         try
         {
-            Groups.DeleteGroup(groupName, CurrentUsername);
+            await GroupSvc.DeleteGroupAsync(groupName, CurrentUsername);
             if (_selectedGroup?.GroupName == groupName) _selectedGroup = null;
-            RefreshGroups();
+            await RefreshGroups();
         }
         catch (Exception ex) { _groupError = ex.Message; }
     }
 
-    private void HandleAddMember()
+    private async Task HandleAddMember()
     {
         _groupError = null;
         if (_selectedGroup is null) return;
         try
         {
-            Groups.AddMember(_selectedGroup.GroupName, CurrentUsername, _addMemberName.Trim());
+            await GroupSvc.AddMemberAsync(_selectedGroup.GroupName, CurrentUsername, _addMemberName.Trim());
             _addMemberName = "";
-            RefreshGroups();
-            _selectedGroup = Groups.Find(_selectedGroup.GroupName);
+            await RefreshGroups();
+            _selectedGroup = await GroupSvc.FindAsync(_selectedGroup.GroupName);
         }
         catch (Exception ex) { _groupError = ex.Message; }
     }
 
-    private void HandleRemoveMember(string groupName, string username)
+    private async Task SelectGroup(string groupName)
+    {
+        _selectedGroup = await GroupSvc.FindAsync(groupName);
+    }
+
+    private async Task HandleRemoveMember(string groupName, string username)
     {
         _groupError = null;
         try
         {
-            Groups.RemoveMember(groupName, CurrentUsername, username);
-            RefreshGroups();
-            _selectedGroup = Groups.Find(groupName);
+            await GroupSvc.RemoveMemberAsync(groupName, CurrentUsername, username);
+            await RefreshGroups();
+            _selectedGroup = await GroupSvc.FindAsync(groupName);
         }
         catch (Exception ex) { _groupError = ex.Message; }
     }
@@ -583,7 +590,7 @@ else
             var (nonceB64, wrappedB64) = await E2ee.EncryptPrivateKey(privHandle, _keyPassword, saltB64, 310_000);
 
             // サーバーに公開鍵を登録
-            Users.UpdatePublicKey(CurrentUsername, pubKeyB64);
+            await AccountSvc.UpdatePublicKeyAsync(CurrentUsername, pubKeyB64);
 
             // 暗号化済み秘密鍵を localStorage に保存
             string key = $"e2ee_privkey_{CurrentUsername}";

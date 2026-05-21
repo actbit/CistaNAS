@@ -238,21 +238,21 @@ public static class E2eeEndpoints
 
     // ---- ECDH public key ----
 
-    private static IResult GetPublicKey(string username, UserStore userStore)
+    private static async Task<IResult> GetPublicKey(string username, AccountService accountService)
     {
-        var pubKey = userStore.GetPublicKey(username);
+        var pubKey = await accountService.GetPublicKeyAsync(username);
         return pubKey is not null
             ? Results.Ok(new { publicKey = pubKey })
             : Results.NotFound(new { error = "公開鍵が登録されていません。" });
     }
 
-    private static IResult SetMyPublicKey(SetPublicKeyRequest req, HttpContext ctx, UserStore userStore)
+    private static async Task<IResult> SetMyPublicKey(SetPublicKeyRequest req, HttpContext ctx, AccountService accountService)
     {
         string username = ctx.User.Identity?.Name ?? "";
         if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
         try
         {
-            userStore.UpdatePublicKey(username, req.PublicKey);
+            await accountService.UpdatePublicKeyAsync(username, req.PublicKey);
             return Results.Ok();
         }
         catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }

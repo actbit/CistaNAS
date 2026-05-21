@@ -4,7 +4,7 @@
 @implements IDisposable
 @inject AuthenticationStateService AuthState
 @inject InvitationService InvSvc
-@inject UserStore Users
+@inject AccountService AccountSvc
 @inject NavigationManager Nav
 
 <PageTitle>招待 - CistaNAS</PageTitle>
@@ -71,14 +71,14 @@ else
 
     private string CurrentUsername => AuthState.User?.Identity?.Name ?? "";
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
         AuthState.Subscribe(OnAuthStateChanged);
         _invite = InvSvc.Find(InvitationId);
-        _hasPublicKey = Users.GetPublicKey(CurrentUsername) is not null;
+        _hasPublicKey = await AccountSvc.GetPublicKeyAsync(CurrentUsername) is not null;
     }
 
-    private void HandleAccept()
+    private async Task HandleAccept()
     {
         _loading = true; _error = null;
         try
@@ -89,7 +89,7 @@ else
                 return;
             }
 
-            InvSvc.SetAcceptedData(InvitationId, Users.GetPublicKey(CurrentUsername)!, "");
+            InvSvc.SetAcceptedData(InvitationId, (await AccountSvc.GetPublicKeyAsync(CurrentUsername))!, "");
             _accepted = true;
         }
         catch (Exception ex) { _error = ex.Message; }

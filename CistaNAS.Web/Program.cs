@@ -4,9 +4,13 @@ using System.Threading.RateLimiting;
 using CistaNAS.Web.Api;
 using CistaNAS.Web.Components;
 using CistaNAS.Web.Configuration;
+using CistaNAS.Web.Identity;
 using CistaNAS.Web.Services;
+using CistaNAS.Web.Storage;
 using CistaNAS.Web.WebDav;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -127,6 +131,46 @@ builder.Services.AddCors(options =>
 });
 
 var app = builder.Build();
+
+// ---- DB 初期化 + データ移行 ----
+using (var initScope = app.Services.CreateAsyncScope())
+{
+    var dbOpts = initScope.ServiceProvider.GetRequiredService<IOptions<CistaNasOptions>>().Value;
+    var db = initScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+    // SQLite の場合、DB ファイルの親ディレクトリが存在することを確認
+    var dbPath = dbOpts.Database.ConnectionString
+        ?? Path.Combine(dbOpts.DataRoot, "cista.db");
+    Directory.CreateDirectory(Path.GetDirectoryName(dbPath) ?? dbOpts.DataRoot);
+
+    await db.Database.EnsureCreatedAsync();
+
+    // オブジェクトストレージ上の SQLite: 起動時にダウンロード
+    var cloudSync = initScope.ServiceProvider.GetService<CloudSqliteSync>();
+    if (cloudSync is not null)
+    {
+        await cloudSync.DownloadAsync();
+        // ダウンロード後に再接続（EnsureCreated は空DBで実行済み）
+        await db.Database.MigrateAsync();
+    }
+
+    // users.json / groups.json → DB 移行
+    var storage = initScope.ServiceProvider.GetRequiredService<IStorageProvider>();
+    var logger = initScope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("DataMigration");
+    await DataMigrationService.MigrateIfNeededAsync(storage, db, logger);
+}
+
+// ---- シャットダウン時に CloudSqliteSync をアップロード ----
+var lifetimeCloudSync = app.Services.GetService<CloudSqliteSync>();
+if (lifetimeCloudSync is not null)
+{
+    var appLifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+    appLifetime.ApplicationStopping.Register(() =>
+    {
+        lifetimeCloudSync.UploadIfDirtyAsync().GetAwaiter().GetResult();
+        lifetimeCloudSync.Dispose();
+    });
+}
 
 if (app.Environment.IsDevelopment())
 {

@@ -44,7 +44,7 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
             string username = decoded[..colon];
             string password = decoded[(colon + 1)..];
 
-            var loginResponse = _authService.Authenticate(username, password);
+            var loginResponse = await _authService.AuthenticateAsync(username, password);
             if (loginResponse is null)
             {
                 // ユーザーが存在しない場合もダミー計算を実行してタイミングを均一化

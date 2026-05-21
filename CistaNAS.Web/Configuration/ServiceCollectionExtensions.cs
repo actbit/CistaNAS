@@ -1,6 +1,9 @@
 using CistaNAS.Web.Components.Auth;
+using CistaNAS.Web.Identity;
 using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Web.Configuration;
@@ -30,12 +33,17 @@ public static class ServiceCollectionExtensions
             };
         });
 
+        // DB プロバイダ + ASP.NET Core Identity + EF Core
+        var sp = services.BuildServiceProvider();
+        var cista = sp.GetRequiredService<IOptions<CistaNasOptions>>().Value;
+        RegisterDatabaseAndIdentity(services, cista);
+
         // 認証
-        services.AddSingleton<UserStore>();
+        services.AddScoped<AccountService>();
         services.AddScoped<AuthService>();
 
         // グループ
-        services.AddSingleton<GroupStore>();
+        services.AddScoped<GroupService>();
         services.AddSingleton<InvitationService>();
 
         // ボリューム
@@ -53,6 +61,59 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<StreamingTokenService>();
 
         return services;
+    }
+
+    private static void RegisterDatabaseAndIdentity(IServiceCollection services, CistaNasOptions cista)
+    {
+        var db = cista.Database;
+        string provider = db.Provider.ToLowerInvariant();
+
+        switch (provider)
+        {
+            case "postgresql":
+                services.AddDbContext<AppDbContext>(o =>
+                    o.UseNpgsql(db.ConnectionString));
+                break;
+
+            case "s3":
+            case "azureblob":
+            case "gcs":
+            {
+                // オブジェクトストレージ上の SQLite: CloudSqliteSync でダウンロード
+                var storage = services.BuildServiceProvider().GetRequiredService<IStorageProvider>();
+                var storageOpts = cista.Storage;
+                var sync = new CloudSqliteSync(storage, storageOpts, db);
+                services.AddSingleton(sync);
+                services.AddDbContext<AppDbContext>(o =>
+                    o.UseSqlite($"Data Source={sync.LocalDbPath}"));
+                break;
+            }
+
+            default: // sqlite
+            {
+                var localPath = db.ConnectionString
+                    ?? Path.Combine(cista.DataRoot, "cista.db");
+                services.AddDbContext<AppDbContext>(o =>
+                    o.UseSqlite($"Data Source={localPath}"));
+                break;
+            }
+        }
+
+        services.AddIdentityCore<ApplicationUser>(o =>
+        {
+            o.Password.RequiredLength = 8;
+            o.Password.RequireNonAlphanumeric = false;
+            o.Password.RequireUppercase = false;
+            o.Password.RequireLowercase = false;
+            o.Password.RequireDigit = false;
+            o.Lockout.AllowedForNewUsers = false;
+            o.User.RequireUniqueEmail = false;
+        })
+        .AddRoles<ApplicationRole>()
+        .AddEntityFrameworkStores<AppDbContext>()
+        .AddDefaultTokenProviders();
+
+        services.AddScoped<IPasswordHasher<ApplicationUser>, LegacyPasswordHasher>();
     }
 
     private static IStorageProvider CreateS3Provider(StorageOptions s)

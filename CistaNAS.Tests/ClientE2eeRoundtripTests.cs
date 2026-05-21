@@ -1,41 +1,22 @@
 using System.Security.Cryptography;
 using System.Text.Json;
 using CistaNAS.Client.Crypto;
-using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Services;
-using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
 
-/// <summary>
-/// クライアント側 E2EE のラウンドトリップテスト。
-/// サーバーの VolumeService → VolumeHeader から wrapped key を取得し、
-/// クライアントの E2eeCrypto でアンラップしてファイル暗号化/復号まで検証。
-/// </summary>
 public class ClientE2eeRoundtripTests : IDisposable
 {
     private readonly string _dataRoot;
+    private readonly IServiceProvider _sp;
     private readonly VolumeService _vs;
 
     public ClientE2eeRoundtripTests()
     {
-        _dataRoot = Path.Combine(Path.GetTempPath(), "cista-client-e2ee-" + Guid.NewGuid().ToString("N"));
-        var opt = new CistaNasOptions
-        {
-            DataRoot = _dataRoot,
-            Volume = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
-        };
-        var io = Options.Create(opt);
-        var storage = new LocalStorageProvider(_dataRoot);
-        var metaStore = new VolumeMetadataStore(storage);
-        var gs = new GroupStore(storage, io, new ServiceCollection().BuildServiceProvider());
-        var sp = new ServiceCollection().AddLogging().BuildServiceProvider();
-        var us = new UserStore(storage, io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
-        _vs = new VolumeService(io, gs, us, metaStore);
+        (_sp, _dataRoot) = TestHelper.BuildTestServices();
+        _vs = _sp.GetRequiredService<VolumeService>();
     }
 
     [Fact]
@@ -161,6 +142,6 @@ public class ClientE2eeRoundtripTests : IDisposable
         {
             try { _vs.Lock(v.Name); } catch { }
         }
-        if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true);
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch { }
     }
 }

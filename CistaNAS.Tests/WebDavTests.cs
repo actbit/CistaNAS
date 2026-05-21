@@ -1,13 +1,10 @@
 using System.Text;
 using System.Xml;
 using CistaNAS.Web.Configuration;
-using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
-using CistaNAS.Web.Storage;
 using CistaNAS.Web.WebDav;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
@@ -15,28 +12,24 @@ namespace CistaNAS.Tests;
 public class WebDavTests : IDisposable
 {
     private readonly string _dataRoot;
+    private readonly IServiceProvider _sp;
     private readonly VolumeService _volumeService;
-    private readonly FileService _fileService;
-    private readonly WebDavHandler _handler;
 
     public WebDavTests()
     {
-        _dataRoot = Path.Combine(Path.GetTempPath(), "cista-webdav-" + Guid.NewGuid().ToString("N"));
-        var opt = new CistaNasOptions
-        {
-            DataRoot = _dataRoot,
-            Volume = new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
-        };
-        var io = Options.Create(opt);
-        var storage = new LocalStorageProvider(_dataRoot);
-        var metaStore = new VolumeMetadataStore(storage);
-        var gs = new GroupStore(storage, io, new ServiceCollection().BuildServiceProvider());
-        var sp = new ServiceCollection().AddLogging().BuildServiceProvider();
-        var us = new UserStore(storage, io, sp.GetRequiredService<ILogger<UserStore>>(), sp);
-        _volumeService = new VolumeService(io, gs, us, metaStore);
-        _fileService = new FileService(_volumeService, new JournalService(storage), storage);
-        var e2eeFs = new E2eeFileService(_volumeService, storage, io);
-        _handler = new WebDavHandler(_volumeService, _fileService, e2eeFs);
+        (_sp, _dataRoot) = TestHelper.BuildTestServices();
+        _volumeService = _sp.GetRequiredService<VolumeService>();
+    }
+
+    private (FileService fs, WebDavHandler handler) GetWebDavServices()
+    {
+        using var scope = _sp.CreateAsyncScope();
+        var fs = scope.ServiceProvider.GetRequiredService<FileService>();
+        var opt = _sp.GetRequiredService<IOptions<CistaNasOptions>>();
+        var storage = _sp.GetRequiredService<CistaNAS.Web.Storage.IStorageProvider>();
+        var e2eeFs = new E2eeFileService(_volumeService, storage, opt);
+        var handler = new WebDavHandler(_volumeService, fs, e2eeFs);
+        return (fs, handler);
     }
 
     private DefaultHttpContext NewContext(string username = "testuser")
@@ -53,8 +46,9 @@ public class WebDavTests : IDisposable
     [Fact]
     public async Task OptionsAsync_SetsDavHeader()
     {
+        var (_, handler) = GetWebDavServices();
         var ctx = new DefaultHttpContext();
-        await _handler.OptionsAsync(ctx);
+        await handler.OptionsAsync(ctx);
         Assert.Equal(200, ctx.Response.StatusCode);
         Assert.Equal("1", ctx.Response.Headers["DAV"]);
     }
@@ -62,69 +56,75 @@ public class WebDavTests : IDisposable
     [Fact]
     public async Task PropFindAsync_Root_EmptyDirectory()
     {
+        var (fs, handler) = GetWebDavServices();
         _volumeService.Create("test-vol", null, null, encrypted: false);
         var ctx = NewContext();
         using var ms = new MemoryStream();
         ctx.Response.Body = ms;
-        await _handler.PropFindAsync("test-vol", "", "1", ctx);
+        await handler.PropFindAsync("test-vol", "", "1", ctx);
         Assert.Equal(207, ctx.Response.StatusCode);
     }
 
     [Fact]
     public async Task Put_ThenGet_Roundtrip()
     {
+        var (fs, _) = GetWebDavServices();
         _volumeService.Create("io-vol", null, null, encrypted: false);
         var content = Encoding.UTF8.GetBytes("Hello WebDAV!");
         using var ms = new MemoryStream(content);
-        await _fileService.UploadAsync("io-vol", "hello.txt", ms, content.Length);
-        var list = await _fileService.ListAsync("io-vol");
+        await fs.UploadAsync("io-vol", "hello.txt", ms, content.Length);
+        var list = await fs.ListAsync("io-vol");
         Assert.Single(list.Files);
     }
 
     [Fact]
     public async Task PropFindAsync_WithDirectoryPaths()
     {
+        var (fs, handler) = GetWebDavServices();
         _volumeService.Create("dir-vol", null, null, encrypted: false);
-        await Upload("dir-vol", "docs/readme.txt", "readme");
-        await Upload("dir-vol", "docs/notes.txt", "notes");
-        await Upload("dir-vol", "root.txt", "root");
+        await Upload(fs, "dir-vol", "docs/readme.txt", "readme");
+        await Upload(fs, "dir-vol", "docs/notes.txt", "notes");
+        await Upload(fs, "dir-vol", "root.txt", "root");
 
         var ctx = NewContext();
         using var ms = new MemoryStream();
         ctx.Response.Body = ms;
-        await _handler.PropFindAsync("dir-vol", "", "1", ctx);
+        await handler.PropFindAsync("dir-vol", "", "1", ctx);
         Assert.Equal(207, ctx.Response.StatusCode);
     }
 
     [Fact]
     public async Task PropFindAsync_Subdirectory()
     {
+        var (fs, handler) = GetWebDavServices();
         _volumeService.Create("sub-vol", null, null, encrypted: false);
-        await Upload("sub-vol", "a/file1.txt", "one");
-        await Upload("sub-vol", "a/file2.txt", "two");
-        await Upload("sub-vol", "b/file3.txt", "three");
+        await Upload(fs, "sub-vol", "a/file1.txt", "one");
+        await Upload(fs, "sub-vol", "a/file2.txt", "two");
+        await Upload(fs, "sub-vol", "b/file3.txt", "three");
 
         var ctx = NewContext();
         using var ms = new MemoryStream();
         ctx.Response.Body = ms;
-        await _handler.PropFindAsync("sub-vol", "a", "1", ctx);
+        await handler.PropFindAsync("sub-vol", "a", "1", ctx);
         Assert.Equal(207, ctx.Response.StatusCode);
     }
 
     [Fact]
     public async Task Delete_File()
     {
+        var (fs, _) = GetWebDavServices();
         _volumeService.Create("del-vol", null, null, encrypted: false);
-        await Upload("del-vol", "todelete.txt", "bye");
-        await _fileService.DeleteAsync("del-vol", "todelete.txt");
-        Assert.Empty((await _fileService.ListAsync("del-vol")).Files);
+        await Upload(fs, "del-vol", "todelete.txt", "bye");
+        await fs.DeleteAsync("del-vol", "todelete.txt");
+        Assert.Empty((await fs.ListAsync("del-vol")).Files);
     }
 
     [Fact]
     public void MkCol_Succeeds()
     {
+        var (_, handler) = GetWebDavServices();
         _volumeService.Create("mkcol-vol", null, null, encrypted: false);
-        var result = _handler.MkCol("mkcol-vol", "newdir", NewContext());
+        var result = handler.MkCol("mkcol-vol", "newdir", NewContext());
         Assert.NotNull(result);
     }
 
@@ -143,11 +143,11 @@ public class WebDavTests : IDisposable
         Assert.Equal(2, doc.GetElementsByTagName("response", "DAV:").Count);
     }
 
-    private async Task Upload(string vol, string path, string content)
+    private static async Task Upload(FileService fs, string vol, string path, string content)
     {
         byte[] bytes = Encoding.UTF8.GetBytes(content);
         using var ms = new MemoryStream(bytes);
-        await _fileService.UploadAsync(vol, path, ms, bytes.Length);
+        await fs.UploadAsync(vol, path, ms, bytes.Length);
     }
 
     public void Dispose()
@@ -156,6 +156,6 @@ public class WebDavTests : IDisposable
         {
             try { _volumeService.Lock(v.Name); } catch { }
         }
-        if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true);
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch { }
     }
 }

@@ -1,13 +1,14 @@
 @page "/volumes"
 @using CistaNAS.Web.Components.Auth
+@using CistaNAS.Web.Identity
 @using CistaNAS.Web.Models
 @using CistaNAS.Web.Services
 @using CistaNAS.Web.Volume
 @implements IDisposable
 @inject AuthenticationStateService AuthState
 @inject VolumeService VolumeSvc
-@inject GroupStore GroupSvc
-@inject UserStore UserSvc
+@inject GroupService GroupSvc
+@inject AccountService AccountSvc
 @inject InvitationService InvSvc
 @inject E2eeInterop E2ee
 @inject IJSRuntime JS
@@ -351,7 +352,7 @@ else
     private IReadOnlyList<string> _shareUsers = [];
     private bool _shareIsE2ee;
     private IReadOnlyList<string> _shareGroups = [];
-    private IReadOnlyList<GroupAccount> _availableGroups = [];
+    private IReadOnlyList<GroupEntity> _availableGroups = [];
     private string _grantGroupName = "";
     private string _grantUsername = "";
     private string _grantPassword = "";
@@ -493,7 +494,7 @@ else
         _shareTarget = name; _shareUsers = vol.AuthorizedUsers;
         _shareIsE2ee = vol.EncryptionMode == "e2ee" && vol.Name.StartsWith("group__");
         _shareGroups = vol.AuthorizedGroups;
-        _availableGroups = GroupSvc.ListGroups();
+        _availableGroups = GroupSvc.ListGroupsAsync().GetAwaiter().GetResult();
         _grantGroupName = "";
         _grantUsername = ""; _grantPassword = ""; _grantGranterPassword = ""; _shareError = null;
     }
@@ -557,7 +558,7 @@ else
         try
         {
             // 相手の公開鍵を取得
-            string? recipientPubKey = UserSvc.GetPublicKey(_grantUsername.Trim());
+            string? recipientPubKey = await AccountSvc.GetPublicKeyAsync(_grantUsername.Trim());
             if (recipientPubKey is null)
             {
                 _shareError = "相手ユーザーの公開鍵が登録されていません。先に設定ページで鍵ペアを生成してください。";
