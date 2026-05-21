@@ -11,5 +11,28 @@ services:
       - CistaNas__Auth__DefaultAdminPassword=${ADMIN_PASSWORD:-}
       - ASPNETCORE_ENVIRONMENT=Development
 
+  # S3 互換ストレージ（MinIO）。ローカルで S3 プロバイダをテストする場合:
+  #   docker compose --profile s3 up
+  # CistaNAS 側の環境変数で S3 を有効化するには docker-compose.s3.yml も参照。
+  minio:
+    image: minio/minio:latest
+    profiles:
+      - s3
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
 volumes:
   cista-data:
+  minio-data:

@@ -1,0 +1,74 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+namespace: cistanas
+
+patches:
+  - target:
+      kind: PersistentVolumeClaim
+      name: cistanas-data
+    patch: |-
+      $patch: replace
+      $app: spec
+      data:
+        storageClassName: managed-premium
+        resources:
+          requests:
+            storage: 20Gi
+
+  - target:
+      kind: Deployment
+      name: cistanas
+    patch: |-
+      $patch: strategic-merge
+      $app: spec
+      data:
+        template:
+          spec:
+            containers:
+              - name: cistanas
+                env:
+                  - name: CistaNas__Storage__Provider
+                    value: azureblob
+                  - name: CistaNas__Storage__RegionOrConnectionString
+                    valueFrom:
+                      secretKeyRef:
+                        name: cistanas-secrets
+                        key: CistaNas__Storage__RegionOrConnectionString
+                        optional: true
+                  - name: CistaNas__Storage__BucketOrContainer
+                    valueFrom:
+                      secretKeyRef:
+                        name: cistanas-secrets
+                        key: CistaNas__Storage__BucketOrContainer
+                        optional: true
+                  - name: CistaNas__Storage__VolumeDataPath
+                    value: /app/data
+                resources:
+                  limits:
+                    memory: 1Gi
+                  requests:
+                    memory: 256Mi
+
+# Azure AGIC Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cistanas
+  namespace: cistanas
+  annotations:
+    kubernetes.io/ingress.class: azure-application-gateway
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cistanas
+                port:
+                  number: 80

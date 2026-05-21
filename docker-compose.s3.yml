@@ -1,0 +1,13 @@
+# S3 (MinIO) ストレージプロバイダ用オーバーレイ
+# 使い方: docker compose --profile s3 -f docker-compose.yml -f docker-compose.s3.yml up
+services:
+  cistanas:
+    environment:
+      - CistaNas__Storage__Provider=s3
+      - CistaNas__Storage__BucketOrContainer=cistanas
+      - CistaNas__Storage__RegionOrConnectionString=us-east-1
+      - CistaNas__Storage__EndpointOverride=http://minio:9000
+      - CistaNas__Storage__VolumeDataPath=/app/data
+    depends_on:
+      minio:
+        condition: service_healthy

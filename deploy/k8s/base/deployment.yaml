@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cistanas
+  namespace: cistanas
+  labels:
+    app.kubernetes.io/name: cistanas
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cistanas
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cistanas
+    spec:
+      containers:
+        - name: cistanas
+          image: cistanas:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: Production
+          envFrom:
+            - secretRef:
+                name: cistanas-secrets
+                optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: cistanas-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cistanas
+  namespace: cistanas
+  labels:
+    app.kubernetes.io/name: cistanas
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+  selector:
+    app.kubernetes.io/name: cistanas
