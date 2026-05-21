@@ -11,9 +11,11 @@ patches:
       kind: PersistentVolumeClaim
       name: cistanas-data
     patch: |-
-      $patch: replace
-      $app: spec
-      data:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: cistanas-data
+      spec:
         storageClassName: managed-premium
         resources:
           requests:
@@ -23,9 +25,11 @@ patches:
       kind: Deployment
       name: cistanas
     patch: |-
-      $patch: strategic-merge
-      $app: spec
-      data:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: cistanas
+      spec:
         template:
           spec:
             containers:

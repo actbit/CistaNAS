@@ -91,11 +91,11 @@ public sealed class GcsStorageProvider : IStorageProvider
         return result;
     }
 
-    public Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default)
+    public async Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default)
     {
         var semaphore = _locks.GetOrAdd(lockPath, _ => new SemaphoreSlim(1, 1));
-        semaphore.Wait(ct);
-        return Task.FromResult<IDisposable>(new LockReleaser(semaphore));
+        await semaphore.WaitAsync(ct);
+        return new LockReleaser(semaphore);
     }
 
     private sealed class LockReleaser(SemaphoreSlim semaphore) : IDisposable
