@@ -487,14 +487,14 @@ else
         try { VolumeSvc.Lock(name); RefreshList(); } catch { }
     }
 
-    private void ShowShareDialog(string name)
+    private async Task ShowShareDialog(string name)
     {
         var vol = _volumes.FirstOrDefault(v => v.Name == name);
         if (vol is null) return;
         _shareTarget = name; _shareUsers = vol.AuthorizedUsers;
         _shareIsE2ee = vol.EncryptionMode == "e2ee" && vol.Name.StartsWith("group__");
         _shareGroups = vol.AuthorizedGroups;
-        _availableGroups = GroupSvc.ListGroupsAsync().GetAwaiter().GetResult();
+        _availableGroups = await GroupSvc.ListGroupsAsync();
         _grantGroupName = "";
         _grantUsername = ""; _grantPassword = ""; _grantGranterPassword = ""; _shareError = null;
     }

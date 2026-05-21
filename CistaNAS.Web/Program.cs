@@ -138,21 +138,19 @@ using (var initScope = app.Services.CreateAsyncScope())
     var dbOpts = initScope.ServiceProvider.GetRequiredService<IOptions<CistaNasOptions>>().Value;
     var db = initScope.ServiceProvider.GetRequiredService<AppDbContext>();
 
+    // オブジェクトストレージ上の SQLite: 起動時にダウンロード（EnsureCreated の前）
+    var cloudSync = initScope.ServiceProvider.GetService<CloudSqliteSync>();
+    if (cloudSync is not null)
+    {
+        await cloudSync.DownloadAsync();
+    }
+
     // SQLite の場合、DB ファイルの親ディレクトリが存在することを確認
     var dbPath = dbOpts.Database.ConnectionString
         ?? Path.Combine(dbOpts.DataRoot, "cista.db");
     Directory.CreateDirectory(Path.GetDirectoryName(dbPath) ?? dbOpts.DataRoot);
 
     await db.Database.EnsureCreatedAsync();
-
-    // オブジェクトストレージ上の SQLite: 起動時にダウンロード
-    var cloudSync = initScope.ServiceProvider.GetService<CloudSqliteSync>();
-    if (cloudSync is not null)
-    {
-        await cloudSync.DownloadAsync();
-        // ダウンロード後に再接続（EnsureCreated は空DBで実行済み）
-        await db.Database.MigrateAsync();
-    }
 
     // users.json / groups.json → DB 移行
     var storage = initScope.ServiceProvider.GetRequiredService<IStorageProvider>();

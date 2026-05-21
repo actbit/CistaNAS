@@ -17,7 +17,7 @@ public static class ServiceCollectionExtensions
 {
     public static IServiceCollection AddCistaNasServices(this IServiceCollection services)
     {
-        // ストレージプロバイダ
+        // ストレージプロバイダ（遅延解決: ラムダ内で ServiceProvider から取得）
         services.AddSingleton<IStorageProvider>(sp =>
         {
             var options = sp.GetRequiredService<IOptions<CistaNasOptions>>().Value;
@@ -34,9 +34,10 @@ public static class ServiceCollectionExtensions
         });
 
         // DB プロバイダ + ASP.NET Core Identity + EF Core
-        var sp = services.BuildServiceProvider();
-        var cista = sp.GetRequiredService<IOptions<CistaNasOptions>>().Value;
-        RegisterDatabaseAndIdentity(services, cista);
+        // CistaNasOptions は Program.cs で Configure<T> により既にバインド済み
+        var tempSp = services.BuildServiceProvider();
+        var cista = tempSp.GetRequiredService<IOptions<CistaNasOptions>>().Value;
+        RegisterDatabaseAndIdentity(services, cista, tempSp);
 
         // 認証
         services.AddScoped<AccountService>();
@@ -63,7 +64,8 @@ public static class ServiceCollectionExtensions
         return services;
     }
 
-    private static void RegisterDatabaseAndIdentity(IServiceCollection services, CistaNasOptions cista)
+    private static void RegisterDatabaseAndIdentity(
+        IServiceCollection services, CistaNasOptions cista, ServiceProvider tempSp)
     {
         var db = cista.Database;
         string provider = db.Provider.ToLowerInvariant();
@@ -79,10 +81,9 @@ public static class ServiceCollectionExtensions
             case "azureblob":
             case "gcs":
             {
-                // オブジェクトストレージ上の SQLite: CloudSqliteSync でダウンロード
-                var storage = services.BuildServiceProvider().GetRequiredService<IStorageProvider>();
-                var storageOpts = cista.Storage;
-                var sync = new CloudSqliteSync(storage, storageOpts, db);
+                // tempSp から IStorageProvider を一度だけ取得（2回目の BuildServiceProvider を回避）
+                var storage = tempSp.GetRequiredService<IStorageProvider>();
+                var sync = new CloudSqliteSync(storage, cista.Storage, db);
                 services.AddSingleton(sync);
                 services.AddDbContext<AppDbContext>(o =>
                     o.UseSqlite($"Data Source={sync.LocalDbPath}"));

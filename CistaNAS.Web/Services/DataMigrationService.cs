@@ -36,8 +36,23 @@ public static class DataMigrationService
                 if (users is not null && users.Count > 0)
                 {
                     logger.LogInformation("users.json から {Count} 件のユーザーを移行します...", users.Count);
+
+                    // ロールをメモリ上で重複なく収集して一括追加
+                    var roleMap = new Dictionary<string, string>();
                     foreach (var entry in users)
                     {
+                        if (!roleMap.ContainsKey(entry.Role))
+                        {
+                            var roleId = Guid.NewGuid().ToString();
+                            db.Roles.Add(new ApplicationRole
+                            {
+                                Id = roleId,
+                                Name = entry.Role,
+                                NormalizedName = entry.Role.ToUpperInvariant(),
+                            });
+                            roleMap[entry.Role] = roleId;
+                        }
+
                         db.Users.Add(new ApplicationUser
                         {
                             Id = entry.Username,
@@ -51,21 +66,10 @@ public static class DataMigrationService
                             PublicKey = entry.PublicKey,
                         });
 
-                        // Role を IdentityRole テーブルに登録
-                        if (!await db.Roles.AnyAsync(r => r.Name == entry.Role, ct))
-                        {
-                            db.Roles.Add(new ApplicationRole
-                            {
-                                Id = Guid.NewGuid().ToString(),
-                                Name = entry.Role,
-                                NormalizedName = entry.Role.ToUpperInvariant(),
-                            });
-                        }
-
                         db.UserRoles.Add(new Microsoft.AspNetCore.Identity.IdentityUserRole<string>
                         {
                             UserId = entry.Username,
-                            RoleId = (await db.Roles.FirstAsync(r => r.Name == entry.Role, ct)).Id,
+                            RoleId = roleMap[entry.Role],
                         });
                     }
 
@@ -73,9 +77,9 @@ public static class DataMigrationService
                     logger.LogInformation("ユーザー移行完了。");
                 }
             }
-            catch (JsonException ex)
+            catch (Exception ex)
             {
-                logger.LogError(ex, "users.json の解析に失敗しました。移行をスキップします。");
+                logger.LogError(ex, "users.json の移行に失敗しました。");
             }
         }
 
@@ -105,9 +109,9 @@ public static class DataMigrationService
                     logger.LogInformation("グループ移行完了。");
                 }
             }
-            catch (JsonException ex)
+            catch (Exception ex)
             {
-                logger.LogError(ex, "groups.json の解析に失敗しました。移行をスキップします。");
+                logger.LogError(ex, "groups.json の移行に失敗しました。");
             }
         }
     }

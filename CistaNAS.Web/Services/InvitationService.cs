@@ -37,7 +37,7 @@ public sealed class InvitationService
     /// <summary>招待の受諾データを保存。</summary>
     public void SetAcceptedData(string invitationId, string encryptedPublicKey, string nonce)
     {
-        if (!_invitations.TryGetValue(invitationId, out var record))
+        if (!_invitations.TryGetValue(invitationId.ToLowerInvariant(), out var record))
             throw new InvalidOperationException("招待が見つかりません。");
         record.EncryptedPublicKey = encryptedPublicKey;
         record.Nonce = nonce;

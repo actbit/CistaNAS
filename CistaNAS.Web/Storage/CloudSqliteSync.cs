@@ -11,14 +11,14 @@ public sealed class CloudSqliteSync : IDisposable
     private readonly IStorageProvider _storage;
     private readonly string _blobKey;
     private readonly string _localPath;
-    private bool _dirty;
+    private int _dirty; // 0 = clean, 1 = dirty（Interlocked 用）
 
     public CloudSqliteSync(IStorageProvider storage, StorageOptions storageOpts, DatabaseOptions dbOpts)
     {
         _storage = storage;
         _blobKey = dbOpts.BlobKey ?? "cista.db";
         _localPath = Path.GetTempFileName();
-        _dirty = false;
+        _dirty = 0;
     }
 
     public string LocalDbPath => _localPath;
@@ -34,13 +34,12 @@ public sealed class CloudSqliteSync : IDisposable
     }
 
     /// <summary>変更をマークする。</summary>
-    public void MarkDirty() => _dirty = true;
+    public void MarkDirty() => Interlocked.Exchange(ref _dirty, 1);
 
     /// <summary>変更があればオブジェクトストレージにアップロードする。</summary>
     public async Task UploadIfDirtyAsync(CancellationToken ct = default)
     {
-        if (!_dirty) return;
-        _dirty = false;
+        if (Interlocked.CompareExchange(ref _dirty, 0, 1) == 0) return;
         await using var fs = File.OpenRead(_localPath);
         await _storage.WriteAtomicAsync(_blobKey, fs, ct);
     }

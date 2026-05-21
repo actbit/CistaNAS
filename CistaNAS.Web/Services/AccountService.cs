@@ -28,13 +28,21 @@ public sealed class AccountService(
     public async Task<IReadOnlyList<(ApplicationUser User, IList<string> Roles)>> ListWithRolesAsync()
     {
         var users = await userManager.Users.ToListAsync();
-        var result = new List<(ApplicationUser, IList<string>)>();
-        foreach (var user in users)
+
+        // 一括でユーザーロールを取得（N+1 回避）
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var userRoles = await db.UserRoles
+            .Join(db.Roles, ur => ur.RoleId, r => r.Id, (ur, r) => new { ur.UserId, r.Name })
+            .ToListAsync();
+        var roleDict = userRoles.GroupBy(x => x.UserId)
+            .ToDictionary(g => g.Key, g => (IList<string>)g.Select(x => x.Name).ToList());
+
+        return users.Select(u =>
         {
-            var roles = await userManager.GetRolesAsync(user);
-            result.Add((user, roles));
-        }
-        return result;
+            var roles = roleDict.TryGetValue(u.Id, out var r) ? r : Array.Empty<string>();
+            return (u, (IList<string>)roles);
+        }).ToList();
     }
 
     public async Task CreateUserAsync(string username, string password, string role = "user")
@@ -49,7 +57,10 @@ public sealed class AccountService(
         if (!result.Succeeded)
             throw new InvalidOperationException(string.Join(", ", result.Errors.Select(e => e.Description)));
 
-        await userManager.AddToRoleAsync(user, role);
+        var roleResult = await userManager.AddToRoleAsync(user, role);
+        if (!roleResult.Succeeded)
+            logger.LogWarning("ユーザー '{Username}' へのロール '{Role}' 割り当てに失敗: {Errors}",
+                username, role, string.Join(", ", roleResult.Errors.Select(e => e.Description)));
 
         // ホームボリューム自動作成（スコープ外で実行）
         try
@@ -85,7 +96,10 @@ public sealed class AccountService(
             var volumeService = scope.ServiceProvider.GetRequiredService<VolumeService>();
             volumeService.DeleteVolume($"home__{username}");
         }
-        catch { }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "ホームボリューム 'home__{Username}' の削除に失敗しました。", username);
+        }
     }
 
     public async Task UpdateRoleAsync(string username, string newRole)
@@ -96,8 +110,11 @@ public sealed class AccountService(
         await EnsureRoleAsync(newRole);
 
         var currentRoles = await userManager.GetRolesAsync(user);
-        await userManager.RemoveFromRolesAsync(user, currentRoles);
-        await userManager.AddToRoleAsync(user, newRole);
+        var removeResult = await userManager.RemoveFromRolesAsync(user, currentRoles);
+        var addResult = await userManager.AddToRoleAsync(user, newRole);
+        if (!addResult.Succeeded)
+            logger.LogWarning("ユーザー '{Username}' のロール変更に失敗: {Errors}",
+                username, string.Join(", ", addResult.Errors.Select(e => e.Description)));
     }
 
     public async Task<bool> IsAdminAsync(string username)
@@ -134,7 +151,10 @@ public sealed class AccountService(
         if (!result.Succeeded)
             throw new InvalidOperationException(string.Join(", ", result.Errors.Select(e => e.Description)));
 
-        await userManager.AddToRoleAsync(user, "admin");
+        var roleResult = await userManager.AddToRoleAsync(user, "admin");
+        if (!roleResult.Succeeded)
+            logger.LogWarning("初期管理者 '{Username}' への admin ロール割り当てに失敗: {Errors}",
+                username, string.Join(", ", roleResult.Errors.Select(e => e.Description)));
     }
 
     public async Task<bool> CheckPasswordAsync(ApplicationUser user, string password)
@@ -149,13 +169,24 @@ public sealed class AccountService(
         if (!await userManager.CheckPasswordAsync(user, oldPassword))
             return false;
 
-        // KEK 再ラップ（スコープ外で実行）
-        await using var scope = scopeFactory.CreateAsyncScope();
-        var volumeService = scope.ServiceProvider.GetRequiredService<VolumeService>();
-        volumeService.RewrapAllForUser(username, oldPassword, newPassword);
-
+        // 先に Identity 側のパスワードを変更（失敗時は KEK 再ラップをスキップ）
         var result = await userManager.ChangePasswordAsync(user, oldPassword, newPassword);
-        return result.Succeeded;
+        if (!result.Succeeded)
+            return false;
+
+        // KEK 再ラップ（スコープ外で実行）
+        try
+        {
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var volumeService = scope.ServiceProvider.GetRequiredService<VolumeService>();
+            volumeService.RewrapAllForUser(username, oldPassword, newPassword);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "パスワード変更後の KEK 再ラップに失敗しました（ユーザー: {Username}）。", username);
+        }
+
+        return true;
     }
 
     public async Task<IList<string>> GetRolesAsync(ApplicationUser user)

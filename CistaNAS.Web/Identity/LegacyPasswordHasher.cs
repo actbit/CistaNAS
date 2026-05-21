@@ -25,10 +25,17 @@ public sealed class LegacyPasswordHasher : IPasswordHasher<ApplicationUser>
 
         if (hashedPassword.StartsWith(LegacyPrefix + "$", StringComparison.Ordinal))
         {
-            bool valid = PasswordHasher.Verify(providedPassword, hashedPassword);
-            return valid
-                ? PasswordVerificationResult.SuccessRehashNeeded
-                : PasswordVerificationResult.Failed;
+            try
+            {
+                bool valid = PasswordHasher.Verify(providedPassword, hashedPassword);
+                return valid
+                    ? PasswordVerificationResult.SuccessRehashNeeded
+                    : PasswordVerificationResult.Failed;
+            }
+            catch
+            {
+                return PasswordVerificationResult.Failed;
+            }
         }
 
         return _newHasher.VerifyHashedPassword(user, hashedPassword, providedPassword);

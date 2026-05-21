@@ -117,6 +117,13 @@ else
                     <input type="password" class="form-control" @bind="_newPassword" />
                 </div>
                 <div class="col-auto">
+                    <label class="form-label">ロール</label>
+                    <select class="form-select" @bind="_newUserRole">
+                        <option value="user">user</option>
+                        <option value="admin">admin</option>
+                    </select>
+                </div>
+                <div class="col-auto">
                     <button class="btn btn-success" @onclick="HandleAddUser">追加</button>
                 </div>
             </div>
@@ -322,6 +329,7 @@ else
     private IReadOnlyList<(ApplicationUser User, IList<string> Roles)> _users = [];
     private string _newUsername = "";
     private string _newPassword = "";
+    private string _newUserRole = "user";
     private string? _userError;
     private bool _userSuccess;
 
@@ -404,8 +412,8 @@ else
         _userError = null; _userSuccess = false;
         try
         {
-            await AccountSvc.CreateUserAsync(_newUsername.Trim(), _newPassword, role: "admin");
-            _newUsername = ""; _newPassword = "";
+            await AccountSvc.CreateUserAsync(_newUsername.Trim(), _newPassword, role: _newUserRole);
+            _newUsername = ""; _newPassword = ""; _newUserRole = "user";
             _userSuccess = true;
             await RefreshUsers();
         }
