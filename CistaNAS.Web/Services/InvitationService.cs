@@ -45,7 +45,7 @@ public sealed class InvitationService
     }
 
     /// <summary>招待を削除（受諾完了後）。</summary>
-    public void Remove(string invitationId) => _invitations.TryRemove(invitationId, out _);
+    public void Remove(string invitationId) => _invitations.TryRemove(invitationId.ToLowerInvariant(), out _);
 
     /// <summary>期限切れ招待を一括削除。</summary>
     public void Cleanup(TimeSpan maxAge)

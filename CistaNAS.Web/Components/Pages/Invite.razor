@@ -89,7 +89,13 @@ else
                 return;
             }
 
-            InvSvc.SetAcceptedData(InvitationId, (await AccountSvc.GetPublicKeyAsync(CurrentUsername))!, "");
+            var pubKey = await AccountSvc.GetPublicKeyAsync(CurrentUsername);
+            if (pubKey is null)
+            {
+                _error = "公開鍵が見つかりません。";
+                return;
+            }
+            InvSvc.SetAcceptedData(InvitationId, pubKey, "");
             _accepted = true;
         }
         catch (Exception ex) { _error = ex.Message; }
