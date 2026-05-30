@@ -7,6 +7,7 @@
 ## 機能
 
 - **ボリューム暗号化** — AES-XTS (IEEE 1619) によるセクタ単位の透過暗号化。暗号化なしのボリュームも作成可能
+- **チャンクベースストレージ** — volume.dat を S3/R2 等にチャンク分割保存。VPS のローカルディスクを不要に。サーバー暗号化・E2EE 両対応
 - **E2EE（エンドツーエンド暗号化）** — クライアント側 AES-256-GCM チャンク暗号化。サーバーは暗号化済みデータのみを保持し、平文にアクセス不可
 - **マルチユーザー鍵管理** — ユーザーごとに独立した PBKDF2 → KEK でマスターキーをラップ。パスワード変更時は対象ユーザーのエントリのみ再ラップ
 - **共有ボリューム** — オーナーが他ユーザーにアクセス権を付与・取り消し可能。グループ単位のアクセス制御にも対応
@@ -30,7 +31,16 @@
 
 ## ストレージプロバイダ
 
-メタデータ（ボリュームヘッダ、カタログ、ジャーナル）の保存先を切り替え可能。ユーザー・グループ情報は DB（SQLite / PostgreSQL）に保存。`volume.dat`（暗号化ボリュームデータ）は AES-XTS のランダムアクセス要件により常にローカルディスクに配置。
+メタデータ（ボリュームヘッダ、カタログ、ジャーナル）の保存先を切り替え可能。ユーザー・グループ情報は DB（SQLite / PostgreSQL）に保存。
+
+### ボリュームデータの配置
+
+| ストレージモード | volume.dat の配置 | 対象 |
+|---|---|---|
+| `local`（デフォルト） | ローカルディスク | AES-XTS ランダムアクセスに最適 |
+| `chunk` | S3/R2 にチャンク分割保存 | VPS のローカルディスク不要。Range 対応ストリーミング |
+
+`ChunkStorage: "auto"` 設定時は、S3/R2 等のクラウドストレージプロバイダ使用時に自動的にチャンクモードに切り替わる。
 
 | プロバイダ | 設定値 | メタデータ保存先 |
 |---|---|---|
@@ -47,7 +57,7 @@ Pages (Blazor) / API Endpoints / WebDAV Handler
 Services
   └ ビジネスロジック
       VolumeService          ボリューム作成・マウント・ロック・アクセス管理 (Singleton)
-      FileService            ファイル CRUD・一覧 (Scoped)
+      FileService            ファイル CRUD・一覧・チャンクストレージ対応 (Scoped)
       E2eeFileService        E2EE ボリュームのカタログ・チャンク管理 (Scoped)
       StreamingTokenService  メディアストリーミング用短命トークン (Singleton)
       JournalService         ジャーナル記録・復旧 (Scoped)
@@ -57,10 +67,17 @@ Services
       InvitationService      招待コード管理 (Singleton)
 Crypto / Volume / Journal
   └ 低レベル実装
-      AesXtsStream           AES-XTS seekable ストリーム
+      AesXtsStream           AES-XTS seekable ストリーム（ローカル volume.dat 用）
+      AesXtsTransform        AES-XTS バッファ単位変換（チャンク暗号化用）
+      ChunkEncryptor         チャンク単位 AES-XTS 暗号化/復号ヘルパー
       E2eeCrypto             AES-256-GCM チャンク暗号化 (Client)
       PasswordHasher         PBKDF2-SHA256 パスワードハッシュ
       KeyDerivation          KEK 導出 (PBKDF2)
+Storage
+  └ ストレージ抽象
+      IStorageProvider       メタデータ保存先（local / S3 / Azure Blob / GCS）
+      IChunkStore            チャンクベースオブジェクトストレージ（チャンクモード用）
+      S3ChunkStore           IStorageProvider に委譲するチャンクストア実装
 Helpers
   └ MediaHelper             MIMEタイプ判定・メディア種別判定
 ```
@@ -128,7 +145,11 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
     },
     "Volume": {
       "SectorSize": 4096,
-      "KdfIterations": 310000
+      "KdfIterations": 600000,
+      "DefaultEncryptionMode": "server",
+      "E2eeChunkSize": 1048576,
+      "ChunkStorage": "local",
+      "ServerChunkSize": 4194304
     }
   }
 }
@@ -151,9 +172,13 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
 | `Storage:VolumeDataPath` | volume.dat のローカルパス（K8s では PV マウントパス）。未設定時は `DataRoot` |
 | `Jwt:SigningKey` | 未設定時は起動ごとにランダム生成（再起動でトークン失効） |
 | `Jwt:AccessTokenMinutes` | アクセストークンの有効期限（分） |
-| `Auth:Pbkdf2Iterations` | パスワードハッシュの反復回数 |
+| `Auth:Pbkdf2Iterations` | パスワードハッシュの反復回数（デフォルト 600,000） |
 | `Volume:SectorSize` | AES-XTS のセクタサイズ（16 の倍数） |
-| `Volume:KdfIterations` | KEK 導出の PBKDF2 反復回数 |
+| `Volume:KdfIterations` | KEK 導出の PBKDF2 反復回数（デフォルト 600,000） |
+| `Volume:DefaultEncryptionMode` | デフォルト暗号化モード（`server` / `e2ee` / `none`） |
+| `Volume:E2eeChunkSize` | E2EE チャンクサイズ（バイト、デフォルト 1 MiB） |
+| `Volume:ChunkStorage` | チャンクストレージモード（`local` = 常に volume.dat / `auto` = S3 使用時に自動チャンク） |
+| `Volume:ServerChunkSize` | チャンクモード時のサーバー側チャンクサイズ（バイト、デフォルト 4 MiB） |
 
 ## 暗号化の仕組み
 
@@ -165,6 +190,25 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
       └ AES-256-GCM でマスターキーをアンラップ
           └ マスターキー (64B) で AES-XTS ボリュームデータを暗号/復号
 ```
+
+#### ローカルモード（volume.dat）
+
+AES-XTS Stream を seekable に透過し、volume.dat に直接暗号化データを書き込む。
+
+#### チャンクモード（S3/R2）
+
+```
+Upload → ファイルをチャンク分割（4 MiB デフォルト）
+       → 各チャンクを AES-XTS で暗号化（nonce = chunkIndex × sectorsPerChunk）
+       → IChunkStore → S3 PUT "{volume}/chunks/{file}/{index}"
+
+Download → S3 GET → ChunkedReadStream（Seekable + Range 対応）
+         → 遅延取得 + チャンク単位復号（1チャンク分のみメモリに保持）
+```
+
+- チャンク間の nonce 一意性: `firstSectorIndex = chunkIndex × (chunkSize / sectorSize)`
+- ボリューム全体でセクタインデックスが重複しないため、ストリームモードと互換
+- E2EE ボリュームのチャンクモードでは暗号化済み blob をそのまま S3 に保存（サーバー側暗号化不要）
 
 ### E2EE（エンドツーエンド暗号化）
 
@@ -303,6 +347,8 @@ docker compose --profile s3 -f docker-compose.yml -f docker-compose.s3.yml up
 | `CistaNas__Storage__RegionOrConnectionString` | S3: リージョン、Azure: 接続文字列 |
 | `CistaNas__Storage__EndpointOverride` | S3: MinIO 等のエンドポイント URL |
 | `CistaNas__Storage__VolumeDataPath` | volume.dat のローカルパス |
+| `CistaNas__Volume__ChunkStorage` | `local` または `auto`（S3 使用時に自動チャンク） |
+| `CistaNas__Volume__ServerChunkSize` | サーバー側チャンクサイズ（バイト） |
 | `CistaNas__Jwt__SigningKey` | JWT 署名鍵（Base64） |
 | `CistaNas__Auth__DefaultAdminPassword` | 初期管理者パスワード |
 

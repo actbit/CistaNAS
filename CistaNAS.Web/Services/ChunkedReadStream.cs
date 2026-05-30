@@ -93,6 +93,30 @@ public sealed class ChunkedReadStream : Stream
         return totalRead;
     }
 
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        if (_position >= _totalLength) return 0;
+
+        int count = (int)Math.Min(buffer.Length, _totalLength - _position);
+        int totalRead = 0;
+
+        while (count > 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            (int chunkIdx, int offsetInChunk) = LocatePosition(_position);
+            byte[] plain = await GetDecryptedChunkAsync(chunkIdx, cancellationToken);
+            int available = plain.Length - offsetInChunk;
+            int toRead = Math.Min(count, available);
+            plain.AsMemory(offsetInChunk, toRead).CopyTo(buffer.Slice(totalRead));
+
+            _position += toRead;
+            totalRead += toRead;
+            count -= toRead;
+        }
+
+        return totalRead;
+    }
+
     public override long Seek(long offset, SeekOrigin origin)
     {
         long target = origin switch
@@ -127,16 +151,20 @@ public sealed class ChunkedReadStream : Stream
     }
 
     /// <summary>
-    /// チャンクを復号してキャッシュ。既にキャッシュ済みなら再利用。
-    /// Stream.Read は同期メソッドのため、同期コンテキストで実行。
+    /// チャンクを復号してキャッシュ。既にキャッシュ済みなら再利用（同期版）。
+    /// Stream.Read は同期メソッドのため、必要時のみ使用。
     /// </summary>
     private byte[] GetDecryptedChunk(int chunkIndex)
+        => GetDecryptedChunkAsync(chunkIndex).GetAwaiter().GetResult();
+
+    /// <summary>チャンクを復号してキャッシュ（非同期版）。ReadAsync で使用。</summary>
+    private async Task<byte[]> GetDecryptedChunkAsync(int chunkIndex, CancellationToken ct = default)
     {
         if (_cachedChunkIndex == chunkIndex && _cachedDecrypted is not null)
             return _cachedDecrypted;
 
-        byte[]? encrypted = _chunkStore.ReadChunkAsync(
-            _volumeName, _objectId, chunkIndex).GetAwaiter().GetResult();
+        byte[]? encrypted = await _chunkStore.ReadChunkAsync(
+            _volumeName, _objectId, chunkIndex, ct);
         if (encrypted is null)
             throw new InvalidOperationException($"チャンク {chunkIndex} がストレージに見つかりません。");
 

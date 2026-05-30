@@ -323,7 +323,6 @@ public sealed class FileService
         var pending = await _journalService.RecoverAsync(volumeName, ct);
         if (pending.Count == 0) return;
 
-        // 書き込み未完了エントリは無視（次回上書きで回復）
         // 削除済みエントリはカタログから取り除く
         var catalog = await LoadCatalogAsync(volumeName, ct);
         foreach (var entry in pending)
@@ -331,6 +330,30 @@ public sealed class FileService
             if (entry.Operation == JournalOp.DeleteFile)
                 catalog.Files.Remove(entry.Path);
         }
+
+        // チャンクモード: WriteFile 未完了のファイルでチャンク欠落がある場合はカタログから削除
+        if (IsChunkMode(volumeName))
+        {
+            var brokenFiles = new List<string>();
+            foreach (var (fileName, meta) in catalog.Files)
+            {
+                if (!meta.IsChunked) continue;
+                try
+                {
+                    var indices = await _chunkStore.ListChunksAsync(volumeName, fileName, ct);
+                    if (indices.Count < meta.ChunkCount)
+                        brokenFiles.Add(fileName);
+                }
+                catch (Exception)
+                {
+                    // チャンク一覧の取得自体が失敗 → ファイルを broken 扱い
+                    brokenFiles.Add(fileName);
+                }
+            }
+            foreach (var broken in brokenFiles)
+                catalog.Files.Remove(broken);
+        }
+
         await SaveCatalogAsync(volumeName, catalog, ct);
         await _journalService.CommitAsync(volumeName, ct);
     }
@@ -520,6 +543,28 @@ file sealed class MemoryChunkedStream : Stream
         return totalRead;
     }
 
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        if (_position >= _totalLength) return 0;
+        int count = (int)Math.Min(buffer.Length, _totalLength - _position);
+        int totalRead = 0;
+
+        while (count > 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            (int chunkIdx, int offsetInChunk) = LocatePosition(_position);
+            byte[] data = await GetChunkAsync(chunkIdx, cancellationToken);
+            int available = data.Length - offsetInChunk;
+            int toRead = Math.Min(count, available);
+            data.AsMemory(offsetInChunk, toRead).CopyTo(buffer.Slice(totalRead));
+
+            _position += toRead;
+            totalRead += toRead;
+            count -= toRead;
+        }
+        return totalRead;
+    }
+
     public override long Seek(long offset, SeekOrigin origin)
     {
         long target = origin switch
@@ -548,11 +593,14 @@ file sealed class MemoryChunkedStream : Stream
     }
 
     private byte[] GetChunk(int chunkIndex)
+        => GetChunkAsync(chunkIndex).GetAwaiter().GetResult();
+
+    private async Task<byte[]> GetChunkAsync(int chunkIndex, CancellationToken ct = default)
     {
         if (_cachedChunkIndex == chunkIndex && _cachedData is not null)
             return _cachedData;
 
-        byte[]? data = _chunkStore.ReadChunkAsync(_volumeName, _objectId, chunkIndex).GetAwaiter().GetResult();
+        byte[]? data = await _chunkStore.ReadChunkAsync(_volumeName, _objectId, chunkIndex, ct);
         if (data is null)
             throw new InvalidOperationException($"チャンク {chunkIndex} がストレージに見つかりません。");
 

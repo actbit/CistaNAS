@@ -146,7 +146,10 @@ public sealed class VolumeService : IDisposable
                     ?? throw new VolumeException("認証情報が正しくありません。");
             }
 
-            MountInternal(name, header, masterKey);
+            if (header.StorageMode == "chunk")
+                MountInternalChunked(name, header, masterKey);
+            else
+                MountInternal(name, header, masterKey);
             return ToInfo(name, header, true);
         }
         finally
@@ -170,7 +173,10 @@ public sealed class VolumeService : IDisposable
             if (!header.HasUserAccess(username))
                 throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
 
-            MountInternal(name, header, masterKey: null);
+            if (header.StorageMode == "chunk")
+                MountInternalChunked(name, header, masterKey: null);
+            else
+                MountInternal(name, header, masterKey: null);
             return ToInfo(name, header, true);
         }
         finally

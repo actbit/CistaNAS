@@ -20,6 +20,9 @@ public static class ChunkEncryptor
     /// <returns>暗号化済みデータ（16 の倍数にパディング済み）。</returns>
     public static byte[] EncryptChunk(ReadOnlySpan<byte> masterKey, int chunkIndex, int sectorSize, int chunkSize, ReadOnlySpan<byte> plaintext)
     {
+        // セクタサイズが未設定（E2EE 等）の場合はブロックサイズ（16）を使用
+        if (sectorSize <= 0) sectorSize = 16;
+
         // データを 16 の倍数にパディング
         int paddedLength = PadToBlockSize(plaintext.Length);
         byte[] padded = new byte[paddedLength];
@@ -44,6 +47,9 @@ public static class ChunkEncryptor
     /// <returns>復号済みデータ（元の長さにトリム済み）。</returns>
     public static byte[] DecryptChunk(ReadOnlySpan<byte> masterKey, int chunkIndex, int sectorSize, int chunkSize, ReadOnlySpan<byte> ciphertext, int originalLength)
     {
+        // セクタサイズが未設定（E2EE 等）の場合はブロックサイズ（16）を使用
+        if (sectorSize <= 0) sectorSize = 16;
+
         byte[] padded = ciphertext.ToArray();
 
         long firstSector = (long)chunkIndex * (chunkSize / sectorSize);
