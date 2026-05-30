@@ -129,7 +129,7 @@ export async function encryptChunk(plainBase64, masterKeyHandle, chunkIndex, fil
 
 export async function decryptChunk(encBase64, masterKeyHandle, chunkIndex, fileSaltBase64) {
     const masterKey = getKey(masterKeyHandle);
-    const encBytes = uint8FromBase64(encBase64);
+    let encBytes = uint8FromBase64(encBase64);
     const fileSalt = uint8FromBase64(fileSaltBase64);
     const fileKey = await deriveFileKey(masterKey, fileSalt);
     const fileKeyRaw = new Uint8Array(await crypto.subtle.exportKey("raw", fileKey));
@@ -138,9 +138,16 @@ export async function decryptChunk(encBase64, masterKeyHandle, chunkIndex, fileS
     const aad = new ArrayBuffer(4);
     new DataView(aad).setUint32(0, chunkIndex, true);
 
+    // チャンク 0 は salt(16) + ciphertext + tag(16) の形式で保存されている。
+    // salt は fileSaltBase64 として別途渡されているため、ここでは ciphertext + tag のみを復号対象とする。
+    let ciphertext = encBytes;
+    if (chunkIndex === 0 && encBytes.length > FILE_SALT_SIZE + GCM_TAG_SIZE) {
+        ciphertext = encBytes.slice(FILE_SALT_SIZE);
+    }
+
     const plain = await crypto.subtle.decrypt(
         { name: "AES-GCM", iv: nonce, additionalData: aad, tagLength: 128 },
-        fileKey, encBytes);
+        fileKey, ciphertext);
 
     return uint8ToBase64(new Uint8Array(plain));
 }

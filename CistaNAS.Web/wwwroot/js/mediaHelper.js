@@ -57,8 +57,6 @@ window.cistaMedia = {
         }
 
         // MSE で扱える MIME を判定
-        // ブラウザが mp4 を video/mp4; codecs=... でしか受け付けない場合があるため、
-        // 複数パターンを試す
         const codecsMap = {
             "video/mp4": ['video/mp4; codecs="avc1.42E01E,mp4a.40.2"', 'video/mp4; codecs="avc1.42E01E"', 'video/mp4; codecs="mp4a.40.2"', "video/mp4"],
             "video/webm": ['video/webm; codecs="vp8,vorbis"', 'video/webm; codecs="vp9,opus"', "video/webm"],
@@ -120,56 +118,14 @@ window.cistaMedia = {
             }
         } catch (err) {
             // MSE対応していてもコンテナ形式の問題で失敗することがある
-            // その場合は Blob にフォールバック
-            console.warn("MSE failed, falling back to Blob:", err);
+            // 部分消費済みジェネレータでは Blob 再構築が不可能なため、
+            // エラーを Blazor 側に伝播して全チャンク再ダウンロードさせる
+            console.warn("MSE failed:", err);
             element.pause();
             element.removeAttribute("src");
             element.load();
-            // 最初からBlobでやり直し
-            return await fallbackBlob(element, mimeType, getNextChunk, onProgress, true);
+            throw err;
         }
-    },
-
-    /**
-     * base64 → Uint8Array
-     */
-    base64ToUint8(base64) {
-        return base64ToUint8(base64);
-    }
-};
-
-// ---- 内部ヘルパー ----
-
-function base64ToUint8(base64) {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-}
-
-function appendToBuffer(sourceBuffer, data) {
-    return new Promise((resolve, reject) => {
-        if (sourceBuffer.updating) {
-            sourceBuffer.addEventListener("updateend", () => {
-                appendToBuffer(sourceBuffer, data).then(resolve).catch(reject);
-            }, { once: true });
-            return;
-        }
-        try {
-            sourceBuffer.addEventListener("updateend", resolve, { once: true });
-            sourceBuffer.addEventListener("error", reject, { once: true });
-            sourceBuffer.appendBuffer(data);
-        } catch (e) {
-            reject(e);
-        }
-    });
-}
-
-    /**
-     * base64 → Uint8Array
-     */
-    base64ToUint8(base64) {
-        return base64ToUint8(base64);
     },
 
     // ---- E2EE ボリューム: サーバー直接取得 + JS内復号 + MSE ----
@@ -228,16 +184,39 @@ function appendToBuffer(sourceBuffer, data) {
         };
 
         return await this.streamE2ee(element, options.mimeType, getNextChunk, onProgress);
-    },
+    }
 };
-async function fallbackBlob(element, mimeType, getNextChunk, onProgress, resetGenerator) {
+
+// ---- 内部ヘルパー ----
+
+function base64ToUint8(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+}
+
+function appendToBuffer(sourceBuffer, data) {
+    return new Promise((resolve, reject) => {
+        if (sourceBuffer.updating) {
+            sourceBuffer.addEventListener("updateend", () => {
+                appendToBuffer(sourceBuffer, data).then(resolve).catch(reject);
+            }, { once: true });
+            return;
+        }
+        try {
+            sourceBuffer.addEventListener("updateend", resolve, { once: true });
+            sourceBuffer.addEventListener("error", reject, { once: true });
+            sourceBuffer.appendBuffer(data);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+async function fallbackBlob(element, mimeType, getNextChunk, onProgress) {
     const chunks = [];
     let index = 0;
-
-    // ジェネレーターをリセットできないので、残りのチャンクだけ收集
-    // resetGenerator=true の場合、getNextChunk は最初からやり直せないため
-    // すでに消費したチャンクは失われている。このパスでは新しいジェネレーターが必要。
-    // Blazor 側で再ダウンロード → 再復号して渡す設計。
 
     while (true) {
         const chunk = await getNextChunk();
