@@ -38,7 +38,8 @@ public sealed class StreamingTokenService : BackgroundService
     public (string Username, string VolumeName, string FileName)? Validate(string token)
     {
         if (!_tokens.TryGetValue(token, out var t)) return null;
-        if (t.ExpiresAt + ClockSkew < DateTimeOffset.UtcNow)
+        // ClockSkew 窓内では有効と見なす（eager に削除しない）
+        if (t.ExpiresAt < DateTimeOffset.UtcNow && t.ExpiresAt + ClockSkew < DateTimeOffset.UtcNow)
         {
             _tokens.TryRemove(token, out _);
             return null;

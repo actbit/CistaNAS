@@ -56,7 +56,11 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
 
     public async Task WriteAsync(string blobPath, Stream content, CancellationToken ct = default)
     {
-        if (content.CanSeek) content.Position = 0;
+        // 呼び出し側が正しい Position を設定済みの前提。
+        // 上位の VolumeMetadataStore.SaveAsync は MemoryStream を渡すため不要だが、
+        // 将来の呼び出し元での誤用を防ぐため検査を残す。
+        if (content.CanSeek && content.Position != 0 && content.Length > 0)
+            content.Position = 0;
         var request = new PutObjectRequest
         {
             BucketName = _bucket,

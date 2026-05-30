@@ -32,8 +32,6 @@ public sealed class FileService
     private readonly JournalService _journalService;
     private readonly IStorageProvider _storage;
 
-    public VolumeService VolumeService => _volumeService;
-
     public FileService(
         VolumeService volumeService,
         JournalService journalService,

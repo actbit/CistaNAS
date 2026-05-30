@@ -100,6 +100,10 @@ public static class ServiceCollectionExtensions
         .AddEntityFrameworkStores<AppDbContext>()
         .AddDefaultTokenProviders();
 
+        // Identity V3 PBKDF2 の反復回数を CistaNasOptions と一致させる
+        // （BasicAuthHandler の DummyHash タイミング均一化用）
+        services.Configure<PasswordHasherOptions>(o => o.IterationCount = cista.Auth.Pbkdf2Iterations);
+
         services.AddScoped<IPasswordHasher<ApplicationUser>, LegacyPasswordHasher>();
     }
 

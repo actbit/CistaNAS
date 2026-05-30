@@ -19,7 +19,7 @@ namespace CistaNAS.Web.Services;
 /// </summary>
 public sealed class VolumeService : IDisposable
 {
-    private bool _disposed;
+    private int _disposed;
     private readonly string _volumeDataPath;
     private readonly VolumeOptions _volOpts;
     private readonly IServiceScopeFactory _scopeFactory;
@@ -678,8 +678,7 @@ public sealed class VolumeService : IDisposable
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
 
         foreach (var kvp in _mounted)
         {
