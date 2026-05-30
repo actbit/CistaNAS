@@ -165,10 +165,71 @@ function appendToBuffer(sourceBuffer, data) {
     });
 }
 
-/**
- * Blob フォールバック: 全チャンクを結合してから再生。
- * MSE非対応形式や、MSEが失敗した場合のフォールバック。
- */
+    /**
+     * base64 → Uint8Array
+     */
+    base64ToUint8(base64) {
+        return base64ToUint8(base64);
+    },
+
+    // ---- E2EE ボリューム: サーバー直接取得 + JS内復号 + MSE ----
+
+    /**
+     * E2EE メディアを JS 側で完結ストリーミング。
+     * fetch で暗号化チャンクを取得し、Web Crypto で復号、MSE でプログレッシブ再生。
+     *
+     * @param {object} options
+     * @param {string} options.elementId - video/audio 要素の ID
+     * @param {string} options.mimeType
+     * @param {string} options.apiUrl - ベース URL（末尾スラッシュなし）
+     * @param {string} options.jwtToken
+     * @param {string} options.volumeName
+     * @param {string} options.fileId
+     * @param {number} options.chunkCount
+     * @param {string} options.masterKeyHandle - e2ee.js の鍵ハンドル
+     * @param {string} options.fileSaltBase64
+     * @param {object} options.dotNetRef - DotNetObjectReference（OnProgress コールバック用）
+     */
+    async streamE2eeDirect(options) {
+        const element = document.getElementById(options.elementId);
+        if (!element) throw new Error("media element not found: " + options.elementId);
+
+        let idx = 0;
+        const total = options.chunkCount;
+
+        const getNextChunk = async () => {
+            if (idx >= total) return null;
+            const url = options.apiUrl + "/api/v1/e2ee/" + encodeURIComponent(options.volumeName)
+                + "/download-chunk/" + options.fileId + "/" + idx;
+            const resp = await fetch(url, {
+                headers: { "Authorization": "Bearer " + options.jwtToken }
+            });
+            if (!resp.ok) throw new Error("chunk download failed: " + resp.status + " idx=" + idx);
+            const encBuf = await resp.arrayBuffer();
+
+            // ArrayBuffer → base64
+            const bytes = new Uint8Array(encBuf);
+            let binary = "";
+            for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+            const encB64 = btoa(binary);
+
+            // Web Crypto で復号
+            const plainB64 = await window.cistaE2ee.decryptChunk(
+                encB64, options.masterKeyHandle, idx, options.fileSaltBase64);
+
+            idx++;
+            try { options.dotNetRef.invokeMethod("OnProgress", idx); } catch {}
+
+            return plainB64;
+        };
+
+        const onProgress = (loaded, _total) => {
+            // getNextChunk 内で DotNet コールバック済み
+        };
+
+        return await this.streamE2ee(element, options.mimeType, getNextChunk, onProgress);
+    },
+};
 async function fallbackBlob(element, mimeType, getNextChunk, onProgress, resetGenerator) {
     const chunks = [];
     let index = 0;

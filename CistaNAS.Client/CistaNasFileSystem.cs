@@ -17,6 +17,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
     private readonly int _chunkSize;
 
     private readonly Dictionary<string, FileCache> _cache = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _fileIdCache = new(StringComparer.OrdinalIgnoreCase);
 
     public CistaNasFileSystem(CistaNasApiClient api, byte[] masterKey, string volumeName, int chunkSize = 1048576)
     {
@@ -31,6 +32,8 @@ public sealed class CistaNasFileSystem : IDokanOperations
         public string PlainName = "";
         public int ChunkCount;
         public long EncryptedLength;
+        public long PlainLength;
+        public byte[]? FileKey;
         public Dictionary<int, byte[]> DecryptedChunks = new();
     }
 
@@ -80,37 +83,61 @@ public sealed class CistaNasFileSystem : IDokanOperations
         var cache = GetOrCreateCache(fileId);
         if (cache is null) return DokanResult.FileNotFound;
 
+        // チャンク 0 から salt を抽出して fileKey を確定
+        if (cache.FileKey is null)
+        {
+            if (!cache.DecryptedChunks.TryGetValue(0, out _))
+            {
+                try
+                {
+                    var encData = _api.DownloadChunkAsync(_volumeName, fileId, 0).GetAwaiter().GetResult();
+                    if (encData.Length <= 16)
+                        return DokanResult.InternalError;
+
+                    byte[] salt = new byte[16];
+                    Buffer.BlockCopy(encData, 0, salt, 0, 16);
+                    cache.FileKey = E2eeCrypto.DeriveFileKey(_masterKey, salt);
+                    var chunk = E2eeCrypto.DecryptChunk(encData, cache.FileKey, 0, out _);
+                    cache.DecryptedChunks[0] = chunk;
+                }
+                catch
+                {
+                    return DokanResult.InternalError;
+                }
+            }
+            else
+            {
+                // チャンク 0 はキャッシュにあるが fileKey が未設定（異常状態）。
+                // 念のため再ダウンロードして salt を取得。
+                try
+                {
+                    var encData = _api.DownloadChunkAsync(_volumeName, fileId, 0).GetAwaiter().GetResult();
+                    byte[] salt = new byte[16];
+                    Buffer.BlockCopy(encData, 0, salt, 0, 16);
+                    cache.FileKey = E2eeCrypto.DeriveFileKey(_masterKey, salt);
+                }
+                catch
+                {
+                    return DokanResult.InternalError;
+                }
+            }
+        }
+
+        byte[] fileKey = cache.FileKey;
+
         long fileOffset = 0;
         for (int i = 0; i < cache.ChunkCount && bytesRead < buffer.Length; i++)
         {
+            // ファイル末尾を超えるリードは打ち切る
+            if (offset + bytesRead >= cache.PlainLength)
+                break;
+
             if (!cache.DecryptedChunks.TryGetValue(i, out var chunk))
             {
                 try
                 {
                     var encData = _api.DownloadChunkAsync(_volumeName, fileId, i).GetAwaiter().GetResult();
-                    // 最初は salt なしで試行、失敗したら salt 抽出してリトライ
-                    byte[] fileKey = E2eeCrypto.DeriveFileKey(_masterKey, []);
-                    try
-                    {
-                        chunk = E2eeCrypto.DecryptChunk(encData, fileKey, i, out var salt);
-                        if (salt.Length > 0)
-                        {
-                            fileKey = E2eeCrypto.DeriveFileKey(_masterKey, salt);
-                            chunk = E2eeCrypto.DecryptChunk(encData, fileKey, i, out _);
-                        }
-                    }
-                    catch
-                    {
-                        // salt を最初のチャンクから抽出
-                        if (i == 0 && encData.Length > 16)
-                        {
-                            byte[] salt = new byte[16];
-                            Buffer.BlockCopy(encData, 0, salt, 0, 16);
-                            fileKey = E2eeCrypto.DeriveFileKey(_masterKey, salt);
-                            chunk = E2eeCrypto.DecryptChunk(encData, fileKey, i, out _);
-                        }
-                        else throw;
-                    }
+                    chunk = E2eeCrypto.DecryptChunk(encData, fileKey, i, out _);
                     cache.DecryptedChunks[i] = chunk;
                 }
                 catch
@@ -122,12 +149,18 @@ public sealed class CistaNasFileSystem : IDokanOperations
             long chunkStart = fileOffset;
             long chunkEnd = chunkStart + chunk.Length;
 
-            if (offset < chunkEnd && offset + bytesRead < chunkEnd)
+            if (offset < chunkEnd)
             {
                 int copyOffset = (int)Math.Max(0, offset - chunkStart);
-                int copyLen = Math.Min(chunk.Length - copyOffset, buffer.Length - bytesRead);
-                Buffer.BlockCopy(chunk, copyOffset, buffer, bytesRead, copyLen);
-                bytesRead += copyLen;
+                // ファイル末尾でクリップ
+                int maxCopy = Math.Min(chunk.Length - copyOffset, buffer.Length - bytesRead);
+                if (offset + bytesRead + maxCopy > cache.PlainLength)
+                    maxCopy = (int)Math.Max(0, cache.PlainLength - offset - bytesRead);
+                if (maxCopy > 0)
+                {
+                    Buffer.BlockCopy(chunk, copyOffset, buffer, bytesRead, maxCopy);
+                    bytesRead += maxCopy;
+                }
             }
 
             fileOffset += chunk.Length;
@@ -149,16 +182,18 @@ public sealed class CistaNasFileSystem : IDokanOperations
             byte[] fileSalt = E2eeCrypto.GenerateFileSalt();
             byte[] fileKey = E2eeCrypto.DeriveFileKey(_masterKey, fileSalt);
 
-            int chunkCount = (buffer.Length + _chunkSize - 1) / _chunkSize;
+            int plainLength = buffer.Length;
+            int chunkCount = (plainLength + _chunkSize - 1) / _chunkSize;
             if (chunkCount == 0) chunkCount = 1;
 
-            long encLength = fileSalt.Length + (long)chunkCount * (_chunkSize + 16);
+            // 暗号化後の長さ: salt(16) + 平文長 + チャンク数 × tag(16)
+            long encLength = 16L + plainLength + (long)chunkCount * 16;
             string fileId = _api.CreateFileAsync(_volumeName, encName, encLength, chunkCount).GetAwaiter().GetResult();
 
             int written = 0;
             for (int i = 0; i < chunkCount; i++)
             {
-                int chunkLen = Math.Min(_chunkSize, buffer.Length - written);
+                int chunkLen = Math.Min(_chunkSize, plainLength - written);
                 byte[] chunk = new byte[chunkLen];
                 Buffer.BlockCopy(buffer, written, chunk, 0, chunkLen);
 
@@ -167,8 +202,19 @@ public sealed class CistaNasFileSystem : IDokanOperations
                 written += chunkLen;
             }
 
-            _api.FinalizeFileAsync(_volumeName, fileId, written).GetAwaiter().GetResult();
-            bytesWritten = buffer.Length;
+            _api.FinalizeFileAsync(_volumeName, fileId, encLength).GetAwaiter().GetResult();
+
+            // キャッシュを更新
+            _fileIdCache[plainName] = fileId;
+            _cache[fileId] = new FileCache
+            {
+                PlainName = plainName,
+                ChunkCount = chunkCount,
+                EncryptedLength = encLength,
+                PlainLength = plainLength,
+            };
+
+            bytesWritten = plainLength;
             return DokanResult.Success;
         }
         catch
@@ -196,7 +242,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
         var cache = GetOrCreateCache(fileId);
         if (cache is not null)
         {
-            fileInfo.Length = cache.EncryptedLength;
+            fileInfo.Length = cache.PlainLength;
             fileInfo.FileName = cache.PlainName;
         }
 
@@ -212,11 +258,13 @@ public sealed class CistaNasFileSystem : IDokanOperations
             foreach (var entry in entries)
             {
                 string plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey);
+                // 平文長を計算: EncryptedLength - salt(16) - ChunkCount × tag(16)
+                long plainLength = entry.EncryptedLength - 16L - (long)entry.ChunkCount * 16;
                 files.Add(new FileInformation
                 {
                     FileName = plainName,
                     Attributes = FileAttributes.Normal,
-                    Length = entry.EncryptedLength,
+                    Length = plainLength,
                     CreationTime = entry.CreatedAt.DateTime,
                     LastWriteTime = entry.ModifiedAt.DateTime,
                 });
@@ -247,7 +295,14 @@ public sealed class CistaNasFileSystem : IDokanOperations
         var fileId = FindFileId(fileName.TrimStart('\\'));
         if (fileId is null) return DokanResult.FileNotFound;
         _api.DeleteFileAsync(_volumeName, fileId).GetAwaiter().GetResult();
-        _cache.Remove(fileId);
+
+        // キャッシュから削除（逆引きも含む）
+        if (_cache.TryGetValue(fileId, out var c))
+        {
+            _fileIdCache.Remove(c.PlainName);
+            _cache.Remove(fileId);
+        }
+
         return DokanResult.Success;
     }
 
@@ -318,15 +373,18 @@ public sealed class CistaNasFileSystem : IDokanOperations
 
     private string? FindFileId(string plainName)
     {
+        if (_fileIdCache.TryGetValue(plainName, out var fileId))
+            return fileId;
+
         try
         {
             var entries = _api.ListFilesAsync(_volumeName).GetAwaiter().GetResult();
             foreach (var entry in entries)
             {
                 string decrypted = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey);
-                if (string.Equals(decrypted, plainName, StringComparison.OrdinalIgnoreCase))
-                    return entry.FileId;
+                _fileIdCache[decrypted] = entry.FileId;
             }
+            return _fileIdCache.TryGetValue(plainName, out var found) ? found : null;
         }
         catch { }
         return null;
@@ -343,13 +401,17 @@ public sealed class CistaNasFileSystem : IDokanOperations
             {
                 if (entry.FileId == fileId)
                 {
+                    string plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey);
+                    long plainLength = entry.EncryptedLength - 16L - (long)entry.ChunkCount * 16;
                     var cache = new FileCache
                     {
-                        PlainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey),
+                        PlainName = plainName,
                         ChunkCount = entry.ChunkCount,
                         EncryptedLength = entry.EncryptedLength,
+                        PlainLength = plainLength,
                     };
                     _cache[fileId] = cache;
+                    _fileIdCache[plainName] = fileId;
                     return cache;
                 }
             }

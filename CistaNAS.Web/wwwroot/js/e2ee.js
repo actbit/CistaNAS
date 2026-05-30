@@ -351,3 +351,7 @@ export async function decryptFromInvitation(ciphertextBase64, nonceBase64, invit
     const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, ct);
     return uint8ToBase64(new Uint8Array(plain));
 }
+
+// ---- グローバル公開（非モジュールスクリプトからの呼び出し用） ----
+
+window.cistaE2ee = { decryptChunk, generateFileSalt };

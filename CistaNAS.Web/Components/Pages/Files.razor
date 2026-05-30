@@ -6,6 +6,7 @@
 @using CistaNAS.Web.Services
 @using CistaNAS.Web.Volume
 @using CistaNAS.Web.Helpers
+@using Microsoft.JSInterop
 @inject AuthenticationStateService AuthState
 @inject VolumeService VolumeSvc
 @inject FileService FileSvc
@@ -292,8 +293,7 @@ else
     // ---- メディアプレビュー: E2EE ボリューム ----
 
     /// <summary>
-    /// チャンクを順次復号し、MediaSource Extensions でプログレッシブ再生。
-    /// MSE非対応形式は Blob フォールバック。
+    /// E2EE メディアプレビュー。動画/音声は MSE ストリーミング、画像は Blob フォールバック。
     /// </summary>
     private async Task HandleE2eePreview(E2eeFileViewItem item)
     {
@@ -308,15 +308,91 @@ else
         _previewStreamUrl = null;
         _previewVisible = true;
 
-        // ローディング表示
-        _previewRef?.SetE2eeLoading(item.Entry.ChunkCount);
+        var entry = item.Entry;
+        var mimeType = MediaHelper.GetMimeType(item.PlainName) ?? "application/octet-stream";
+
+        // 画像は Blob 方式（サイズが小さいためストリーミング不要）
+        if (mediaType == MediaHelper.MediaType.Image)
+        {
+            await HandleE2eePreviewBlob(item, entry, mimeType);
+            item.Downloading = false;
+            return;
+        }
+
+        // 動画/音声: MSE ストリーミング
+        _previewRef?.SetE2eeLoading(entry.ChunkCount);
+
+        // salt を先頭チャンクから取得
+        string fileSaltB64;
+        try
+        {
+            var (chunkStream, chunkLen) = await E2eeFileSvc.DownloadChunkAsync(VolumeName, entry.FileId, 0);
+            byte[] firstChunk = new byte[chunkLen];
+            using (chunkStream)
+            {
+                int read = 0;
+                while (read < chunkLen)
+                {
+                    int n = await chunkStream.ReadAsync(firstChunk, read, (int)chunkLen - read);
+                    if (n == 0) break;
+                    read += n;
+                }
+            }
+            byte[] salt = new byte[16];
+            Buffer.BlockCopy(firstChunk, 0, salt, 0, 16);
+            fileSaltB64 = Convert.ToBase64String(salt);
+        }
+        catch (Exception ex)
+        {
+            _operationError = $"プレビューエラー: {ex.Message}";
+            _previewRef?.SetError(ex.Message);
+            item.Downloading = false;
+            return;
+        }
+
+        var controller = new E2eeStreamController(_previewRef);
+        var dotNetRef = DotNetObjectReference.Create(controller);
 
         try
         {
-            var entry = item.Entry;
-            string? fileSaltB64 = null;
+            await JS.InvokeVoidAsync("cistaMedia.streamE2eeDirect", new
+            {
+                elementId = MediaPreview.ElementId,
+                mimeType,
+                apiUrl = Nav.BaseUri.TrimEnd('/'),
+                jwtToken = AuthState.Token,
+                volumeName = VolumeName,
+                fileId = entry.FileId,
+                chunkCount = entry.ChunkCount,
+                masterKeyHandle = _masterKeyHandle,
+                fileSaltBase64 = fileSaltB64,
+                dotNetRef,
+            });
+        }
+        catch (JSDisconnectedException) { }
+        catch (TaskCanceledException) { }
+        catch (Exception)
+        {
+            // MSE 失敗 → Blob フォールバック
+            _previewRef?.SetE2eeLoading(entry.ChunkCount);
+            await HandleE2eePreviewBlob(item, entry, mimeType);
+        }
+        finally
+        {
+            dotNetRef.Dispose();
+        }
 
-            // チャンクを順次復号
+        item.Downloading = false;
+    }
+
+    /// <summary>E2EE 画像または MSE フォールバック: 全チャンクダウンロード → Blob。</summary>
+    private async Task HandleE2eePreviewBlob(E2eeFileViewItem item, E2eeFileEntry entry, string mimeType)
+    {
+        _previewRef?.SetE2eeLoading(entry.ChunkCount);
+
+        try
+        {
+            string? fileSaltB64 = null;
             var decryptedChunks = new List<string>();
 
             for (int i = 0; i < entry.ChunkCount; i++)
@@ -348,10 +424,6 @@ else
                 _previewRef?.UpdateProgress(i + 1);
             }
 
-            // 全チャンク復号完了 → Blob URL 生成
-            var mimeType = MediaHelper.GetMimeType(item.PlainName) ?? "application/octet-stream";
-
-            // Blob URL を JS で生成
             string blobUrl = await JS.InvokeAsync<string>("cistaCreateMediaBlobUrl", decryptedChunks, mimeType);
             _previewStreamUrl = blobUrl;
             _previewRef?.SetE2eeBlobUrl(blobUrl);
@@ -361,7 +433,6 @@ else
             _operationError = $"プレビューエラー: {ex.Message}";
             _previewRef?.SetError(ex.Message);
         }
-        item.Downloading = false;
     }
 
     private async Task ClosePreview()
@@ -622,4 +693,11 @@ else
     private void OnAuthStateChanged() => StateHasChanged();
 
     public void Dispose() => AuthState.Unsubscribe(OnAuthStateChanged);
+
+    /// <summary>MSE ストリーミングの進捗コールバック用。JS から [JSInvokable] で呼ばれる。</summary>
+    private sealed class E2eeStreamController(MediaPreview? preview)
+    {
+        [JSInvokable]
+        public void OnProgress(int loaded) => preview?.UpdateProgress(loaded);
+    }
 }
