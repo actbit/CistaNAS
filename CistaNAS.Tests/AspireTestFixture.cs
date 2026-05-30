@@ -75,7 +75,7 @@ public class AspireFixture : IAsyncLifetime
         if (Directory.Exists(_tempDataRoot))
         {
             try { Directory.Delete(_tempDataRoot, true); }
-            catch { /* ベストエフォート */ }
+            catch (IOException) { /* ベストエフォート */ }
         }
     }
 }

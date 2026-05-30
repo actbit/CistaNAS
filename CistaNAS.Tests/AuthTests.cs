@@ -93,6 +93,6 @@ public class AuthTests : IDisposable
     public void Dispose()
     {
         _scope.Dispose();
-        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch { }
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch (IOException) { }
     }
 }

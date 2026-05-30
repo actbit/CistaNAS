@@ -158,6 +158,6 @@ public class WebDavTests : IAsyncDisposable
             }
             catch (Exception) { }
         }
-        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch (Exception) { }
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch (IOException) { }
     }
 }
