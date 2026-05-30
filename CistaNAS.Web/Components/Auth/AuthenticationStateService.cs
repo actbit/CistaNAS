@@ -14,7 +14,9 @@ public sealed class AuthenticationStateService : IDisposable
     public event Action?StateChanged;
 
     public ClaimsPrincipal? User { get; private set; }
-    public bool IsLoggedIn => User?.Identity?.IsAuthenticated == true;
+    public DateTimeOffset? ExpiresAt { get; private set; }
+    public bool IsLoggedIn => User?.Identity?.IsAuthenticated == true
+        && ExpiresAt.HasValue && ExpiresAt.Value > DateTimeOffset.UtcNow;
 
     public AuthenticationStateService(AuthService authService)
     {
@@ -29,6 +31,7 @@ public sealed class AuthenticationStateService : IDisposable
 
         User = await _authService.ValidateTokenAsync(res.AccessToken);
         Token = res.AccessToken;
+        ExpiresAt = res.ExpiresAt;
         StateChanged?.Invoke();
         return true;
     }
@@ -37,6 +40,7 @@ public sealed class AuthenticationStateService : IDisposable
     {
         User = null;
         Token = null;
+        ExpiresAt = null;
         StateChanged?.Invoke();
     }
 

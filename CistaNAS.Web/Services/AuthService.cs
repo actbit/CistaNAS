@@ -106,6 +106,7 @@ public sealed class AuthService(
             ValidateIssuerSigningKey = true,
             IssuerSigningKey = new SymmetricSecurityKey(signingKey.Value),
             ValidateLifetime = true,
+            ValidAlgorithms = [SecurityAlgorithms.HmacSha256],
             ClockSkew = TimeSpan.FromSeconds(30),
         });
 

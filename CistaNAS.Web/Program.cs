@@ -48,6 +48,9 @@ var signingKeyBytes = !string.IsNullOrWhiteSpace(cista.Jwt.SigningKey)
     ? Encoding.UTF8.GetBytes(cista.Jwt.SigningKey)
     : RandomNumberGenerator.GetBytes(48);
 
+if (signingKeyBytes.Length < 32)
+    throw new InvalidOperationException("JWT 署名鍵は 32 バイト以上である必要があります。");
+
 builder.Services.AddSingleton(new JwtSigningKey(signingKeyBytes));
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -62,6 +65,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateIssuerSigningKey = true,
             IssuerSigningKey = new SymmetricSecurityKey(signingKeyBytes),
             ValidateLifetime = true,
+            ValidAlgorithms = [SecurityAlgorithms.HmacSha256],
             ClockSkew = TimeSpan.FromSeconds(30),
         };
     })
