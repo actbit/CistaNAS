@@ -6,8 +6,7 @@
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <!-- CS9113: プライマリコンストラクタで未使用パラメーター（将来使用予定） -->
-    <!-- CA1416: FileStream.Lock/Unlock は Windows 専用（ローカルストレージ） -->
-    <NoWarn>$(NoWarn);CS9113;CA1416</NoWarn>
+    <NoWarn>$(NoWarn);CS9113</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace CistaNAS.Web.Storage;
 
 /// <summary>ローカルファイルシステムを使用する IStorageProvider 実装（デフォルト）。</summary>
@@ -78,7 +80,8 @@ public sealed class LocalStorageProvider : IStorageProvider
         try
         {
             lockStream = new FileStream(fullPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-            lockStream.Lock(0, 1);
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                lockStream.Lock(0, 1);
         }
         catch
         {
@@ -106,7 +109,8 @@ public sealed class LocalStorageProvider : IStorageProvider
     {
         public void Dispose()
         {
-            try { fs.Unlock(0, 1); } catch (IOException) { }
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                try { fs.Unlock(0, 1); } catch (IOException) { }
             fs.Dispose();
         }
     }

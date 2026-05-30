@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Text.Json;
 
 namespace CistaNAS.Web.Journal;
@@ -39,7 +40,8 @@ public sealed class JournalFile
             FileMode.OpenOrCreate,
             FileAccess.ReadWrite,
             FileShare.None);
-        lockStream.Lock(0, 1);
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            lockStream.Lock(0, 1);
 
         JournalFile journal;
         if (File.Exists(journalPath))
@@ -70,7 +72,8 @@ public sealed class JournalFile
             FileMode.OpenOrCreate,
             FileAccess.ReadWrite,
             FileShare.None);
-        lockStream.Lock(0, 1);
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            lockStream.Lock(0, 1);
 
         List<JournalEntry> entries;
         using (var fs = File.OpenRead(journalPath))
