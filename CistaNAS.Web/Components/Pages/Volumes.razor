@@ -149,7 +149,7 @@ else
                                 <span class="badge bg-secondary">なし</span>
                             }
                         </td>
-                        <td>@v.OwnerUser</td>
+                        <td class="d-none d-md-table-cell">@v.OwnerUser</td>
                         <td class="d-none d-md-table-cell">@(v.AuthorizedUsers.Count > 1 ? $"{v.AuthorizedUsers.Count} ユーザー" : "-")</td>
                         <td>
                             @if (v.IsMounted)
