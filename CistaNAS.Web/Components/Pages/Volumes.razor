@@ -112,75 +112,75 @@ else
     else
     {
         <div class="table-responsive">
-        <table class="table table-striped table-hover">
-            <thead>
-                <tr>
-                    <th>名前</th>
-                    <th>暗号化</th>
-                    <th class="d-none d-md-table-cell">所有ユーザー</th>
-                    <th class="d-none d-md-table-cell">共有</th>
-                    <th>状態</th>
-                    <th class="d-none d-lg-table-cell">作成日</th>
-                    <th class="text-nowrap">操作</th>
-                </tr>
-            </thead>
-            <tbody>
-                @foreach (var v in _volumes)
-                {
+            <table class="table table-striped table-hover">
+                <thead>
                     <tr>
-                        <td>
-                            @v.Name
-                            @if (v.IsHome)
-                            {
-                                <span class="badge bg-info ms-1">Home</span>
-                            }
-                        </td>
-                        <td>
-                            @if (v.EncryptionMode == "e2ee")
-                            {
-                                <span class="badge bg-info">E2EE</span>
-                            }
-                            else if (v.Encrypted)
-                            {
-                                <span class="badge bg-primary">サーバー</span>
-                            }
-                            else
-                            {
-                                <span class="badge bg-secondary">なし</span>
-                            }
-                        </td>
-                        <td class="d-none d-md-table-cell">@v.OwnerUser</td>
-                        <td class="d-none d-md-table-cell">@(v.AuthorizedUsers.Count > 1 ? $"{v.AuthorizedUsers.Count} ユーザー" : "-")</td>
-                        <td>
-                            @if (v.IsMounted)
-                            {
-                                <span class="badge bg-success">マウント済み</span>
-                            }
-                            else
-                            {
-                                <span class="badge bg-secondary">未マウント</span>
-                            }
-                        </td>
-                        <td class="d-none d-lg-table-cell">@v.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</td>
-                        <td>
-                            @if (v.IsMounted)
-                            {
-                                <button class="btn btn-sm btn-outline-danger me-1" @onclick="() => HandleLockAsync(v.Name)">ロック</button>
-                                <a href="/files/@v.Name" class="btn btn-sm btn-outline-primary me-1">ファイル</a>
-                            }
-                            else
-                            {
-                                <button class="btn btn-sm btn-outline-primary me-1" @onclick="() => ShowMountDialog(v.Name, v.Encrypted, v.EncryptionMode)">マウント</button>
-                            }
-                            @if (v.OwnerUser == CurrentUsername && v.Encrypted && !v.IsHome)
-                            {
-                                <button class="btn btn-sm btn-outline-secondary" @onclick="() => ShowShareDialog(v.Name)">共有</button>
-                            }
-                        </td>
+                        <th>名前</th>
+                        <th>暗号化</th>
+                        <th class="d-none d-md-table-cell">所有ユーザー</th>
+                        <th class="d-none d-md-table-cell">共有</th>
+                        <th>状態</th>
+                        <th class="d-none d-lg-table-cell">作成日</th>
+                        <th class="text-nowrap">操作</th>
                     </tr>
-                }
-            </tbody>
-        </table>
+                </thead>
+                <tbody>
+                    @foreach (var v in _volumes)
+                    {
+                        <tr>
+                            <td>
+                                @v.Name
+                                @if (v.IsHome)
+                                {
+                                    <span class="badge bg-info ms-1">Home</span>
+                                }
+                            </td>
+                            <td>
+                                @if (v.EncryptionMode == "e2ee")
+                                {
+                                    <span class="badge bg-info">E2EE</span>
+                                }
+                                else if (v.Encrypted)
+                                {
+                                    <span class="badge bg-primary">サーバー</span>
+                                }
+                                else
+                                {
+                                    <span class="badge bg-secondary">なし</span>
+                                }
+                            </td>
+                            <td class="d-none d-md-table-cell">@v.OwnerUser</td>
+                            <td class="d-none d-md-table-cell">@(v.AuthorizedUsers.Count > 1 ? $"{v.AuthorizedUsers.Count} ユーザー" : "-")</td>
+                            <td>
+                                @if (v.IsMounted)
+                                {
+                                    <span class="badge bg-success">マウント済み</span>
+                                }
+                                else
+                                {
+                                    <span class="badge bg-secondary">未マウント</span>
+                                }
+                            </td>
+                            <td class="d-none d-lg-table-cell">@v.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</td>
+                            <td>
+                                @if (v.IsMounted)
+                                {
+                                    <button class="btn btn-sm btn-outline-danger me-1" @onclick="() => HandleLockAsync(v.Name)">ロック</button>
+                                    <a href="/files/@v.Name" class="btn btn-sm btn-outline-primary me-1">ファイル</a>
+                                }
+                                else
+                                {
+                                    <button class="btn btn-sm btn-outline-primary me-1" @onclick="() => ShowMountDialog(v.Name, v.Encrypted, v.EncryptionMode)">マウント</button>
+                                }
+                                @if (v.OwnerUser == CurrentUsername && v.Encrypted && !v.IsHome)
+                                {
+                                    <button class="btn btn-sm btn-outline-secondary" @onclick="() => ShowShareDialog(v.Name)">共有</button>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
         </div>
     }
 
