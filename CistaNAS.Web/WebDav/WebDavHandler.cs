@@ -1,4 +1,3 @@
-using System.Text;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
 using Microsoft.AspNetCore.Http;
@@ -13,33 +12,36 @@ public sealed class WebDavHandler
 {
     private readonly VolumeService _volumeService;
     private readonly FileService _fileService;
-    private readonly E2eeFileService _e2eeFileService;
 
-    public WebDavHandler(VolumeService volumeService, FileService fileService, E2eeFileService e2eeFileService)
+    public WebDavHandler(VolumeService volumeService, FileService fileService)
     {
         _volumeService = volumeService;
         _fileService = fileService;
-        _e2eeFileService = e2eeFileService;
     }
+
+    private const string E2eeErrorMessage = "E2EE ボリュームは WebDAV 経由でのアクセスに対応していません。WebUI を使用してください。";
 
     private static string? GetUsername(HttpContext ctx) => ctx.User.Identity?.Name;
 
-    private bool CheckAccess(string volumeName, HttpContext ctx)
-    {
-        if (!_volumeService.IsMounted(volumeName)) return false;
-        string? username = GetUsername(ctx);
-        if (username is null) return false;
-        return _volumeService.HasAccess(volumeName, username);
-    }
+    private enum AccessResult { Ok, Forbidden, E2eeUnsupported }
 
-    private bool IsE2ee(string volumeName)
+    private async Task<AccessResult> CheckAccessAsync(string volumeName, HttpContext ctx)
     {
+        if (!_volumeService.IsMounted(volumeName)) return AccessResult.Forbidden;
         try
         {
             var (_, header) = _volumeService.GetMounted(volumeName);
-            return header.IsE2ee;
+            if (header.IsE2ee) return AccessResult.E2eeUnsupported;
         }
-        catch { return false; }
+        catch
+        {
+            return AccessResult.Forbidden;
+        }
+        string? username = GetUsername(ctx);
+        if (username is null) return AccessResult.Forbidden;
+        return await _volumeService.HasAccessAsync(volumeName, username)
+            ? AccessResult.Ok
+            : AccessResult.Forbidden;
     }
 
     // ---- OPTIONS ----
@@ -56,16 +58,17 @@ public sealed class WebDavHandler
 
     public async Task PropFindAsync(string volumeName, string path, string? depthHeader, HttpContext ctx)
     {
-        if (!CheckAccess(volumeName, ctx))
+        var access = await CheckAccessAsync(volumeName, ctx);
+        if (access == AccessResult.E2eeUnsupported)
+        {
+            ctx.Response.StatusCode = 403;
+            await ctx.Response.WriteAsJsonAsync(new { error = E2eeErrorMessage });
+            return;
+        }
+        if (access != AccessResult.Ok)
         {
             ctx.Response.StatusCode = 403;
             await ctx.Response.WriteAsJsonAsync(new { error = $"ボリューム '{volumeName}' はマウントされていません。" });
-            return;
-        }
-        // E2EE ボリュームの場合は opaque なファイル一覧を返す
-        if (IsE2ee(volumeName))
-        {
-            await PropFindE2ee(volumeName, path, ctx);
             return;
         }
 
@@ -129,9 +132,12 @@ public sealed class WebDavHandler
 
     // ---- GET ----
 
-    public IResult Get(string volumeName, string path, HttpContext ctx)
+    public async Task<IResult> Get(string volumeName, string path, HttpContext ctx)
     {
-        if (!CheckAccess(volumeName, ctx))
+        var access = await CheckAccessAsync(volumeName, ctx);
+        if (access == AccessResult.E2eeUnsupported)
+            return Results.BadRequest(new { error = E2eeErrorMessage });
+        if (access != AccessResult.Ok)
             return Results.Forbid();
 
         string name = NormalizePath(path);
@@ -140,7 +146,7 @@ public sealed class WebDavHandler
 
         try
         {
-            var dl = _fileService.Download(volumeName, name);
+            var dl = await _fileService.DownloadAsync(volumeName, name, ctx.RequestAborted);
             return Results.Stream(dl.Stream, "application/octet-stream", dl.FileName);
         }
         catch (FileServiceException)
@@ -153,7 +159,10 @@ public sealed class WebDavHandler
 
     public async Task<IResult> Put(string volumeName, string path, HttpRequest request)
     {
-        if (!CheckAccess(volumeName, request.HttpContext))
+        var access = await CheckAccessAsync(volumeName, request.HttpContext);
+        if (access == AccessResult.E2eeUnsupported)
+            return Results.BadRequest(new { error = E2eeErrorMessage });
+        if (access != AccessResult.Ok)
             return Results.Forbid();
 
         string name = NormalizePath(path);
@@ -174,7 +183,10 @@ public sealed class WebDavHandler
 
     public async Task<IResult> Delete(string volumeName, string path, HttpContext ctx)
     {
-        if (!CheckAccess(volumeName, ctx))
+        var access = await CheckAccessAsync(volumeName, ctx);
+        if (access == AccessResult.E2eeUnsupported)
+            return Results.BadRequest(new { error = E2eeErrorMessage });
+        if (access != AccessResult.Ok)
             return Results.Forbid();
 
         string name = NormalizePath(path);
@@ -194,11 +206,15 @@ public sealed class WebDavHandler
 
     // ---- MKCOL ----
 
-    public IResult MkCol(string volumeName, string path, HttpContext ctx)
+    public async Task<IResult> MkCol(string volumeName, string path, HttpContext ctx)
     {
-        if (!CheckAccess(volumeName, ctx))
+        var access = await CheckAccessAsync(volumeName, ctx);
+        if (access == AccessResult.E2eeUnsupported)
+            return Results.BadRequest(new { error = E2eeErrorMessage });
+        if (access != AccessResult.Ok)
             return Results.Forbid();
 
+        // MKCOL は何もしない（ディレクトリ構造を持たないため）
         return Results.Created();
     }
 
@@ -207,7 +223,15 @@ public sealed class WebDavHandler
     private static string NormalizePath(string? path)
     {
         if (string.IsNullOrEmpty(path)) return "";
-        string decoded = Uri.UnescapeDataString(path.Trim('/'));
+        string decoded;
+        try
+        {
+            decoded = Uri.UnescapeDataString(path.Trim('/'));
+        }
+        catch
+        {
+            throw new FileServiceException("ファイルパスに不正なエンコーディングが含まれています。");
+        }
         string normalized = decoded.Replace('\\', '/');
 
         var parts = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
@@ -215,10 +239,14 @@ public sealed class WebDavHandler
         foreach (var part in parts)
         {
             if (part == ".." || part == ".") continue;
-            if (part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) continue;
+            if (part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                throw new FileServiceException("ファイル名に使用できない文字が含まれています。");
             safeParts.Add(part);
         }
-        return string.Join('/', safeParts);
+        string safe = string.Join('/', safeParts);
+        if (string.IsNullOrEmpty(safe))
+            throw new FileServiceException("ファイル名が無効です。");
+        return safe;
     }
 
     private static List<WebDavResource> GetDirectChildren(
@@ -271,35 +299,4 @@ public sealed class WebDavHandler
         return result;
     }
 
-    // ---- E2EE 対応 ----
-
-    private Task PropFindE2ee(string volumeName, string path, HttpContext ctx)
-    {
-        var e2eeFiles = _e2eeFileService.ListFiles(volumeName).Files;
-        var resources = new List<WebDavResource>();
-
-        resources.Add(new WebDavResource
-        {
-            Path = NormalizePath(path),
-            IsCollection = true,
-            LastModified = DateTimeOffset.UtcNow,
-        });
-
-        foreach (var f in e2eeFiles)
-        {
-            resources.Add(new WebDavResource
-            {
-                Path = f.EncryptedName,
-                IsCollection = false,
-                Size = f.EncryptedLength,
-                LastModified = f.ModifiedAt,
-            });
-        }
-
-        string baseUrl = $"/dav/{Uri.EscapeDataString(volumeName)}";
-        string xml = WebDavXml.BuildMultiStatus(resources, baseUrl);
-        ctx.Response.StatusCode = 207;
-        ctx.Response.ContentType = "application/xml; charset=utf-8";
-        return ctx.Response.WriteAsync(xml);
-    }
 }

@@ -1,3 +1,5 @@
+using System.ComponentModel.DataAnnotations;
+
 namespace CistaNAS.Web.Configuration;
 
 /// <summary>
@@ -15,6 +17,13 @@ public sealed class CistaNasOptions
     public JwtOptions Jwt { get; set; } = new();
     public AuthOptions Auth { get; set; } = new();
     public VolumeOptions Volume { get; set; } = new();
+
+    /// <summary>CORS で許可するオリジンリスト。空なら CORS ポリシーは適用されない（same-origin のみ）。</summary>
+    public List<string> CorsAllowedOrigins { get; set; } = [];
+
+    /// <summary>ストリーミングトークンの TTL（秒）。デフォルト 30 秒。</summary>
+    [Range(1, int.MaxValue, ErrorMessage = "StreamingTokenTtlSeconds は 1 以上である必要があります。")]
+    public int StreamingTokenTtlSeconds { get; set; } = 30;
 }
 
 /// <summary>ユーザー/グループDBのプロバイダ設定。</summary>
@@ -74,6 +83,7 @@ public sealed class JwtOptions
     /// </summary>
     public string? SigningKey { get; set; }
 
+    [Range(1, 1440)]
     public int AccessTokenMinutes { get; set; } = 60;
 }
 
@@ -86,20 +96,24 @@ public sealed class AuthOptions
     public string? DefaultAdminPassword { get; set; }
 
     /// <summary>ログインパスワードハッシュの PBKDF2 反復回数。</summary>
+    [Range(100_000, 10_000_000)]
     public int Pbkdf2Iterations { get; set; } = 210_000;
 }
 
 public sealed class VolumeOptions
 {
     /// <summary>AES-XTS のデータユニット(セクタ)サイズ。16 の倍数であること。</summary>
+    [Range(512, 4096)]
     public int SectorSize { get; set; } = 4096;
 
     /// <summary>ボリュームパスワードからマスター鍵を導出する際の PBKDF2 反復回数。</summary>
+    [Range(100_000, 10_000_000)]
     public int KdfIterations { get; set; } = 310_000;
 
     /// <summary>新規ボリューム作成時のデフォルト暗号化モード。"server" | "e2ee" | "none"。</summary>
     public string DefaultEncryptionMode { get; set; } = "server";
 
     /// <summary>E2EE ボリュームのデフォルトチャンクサイズ（バイト）。</summary>
+    [Range(65536, 16777216)]
     public int E2eeChunkSize { get; set; } = 1048576;
 }

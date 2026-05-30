@@ -9,7 +9,7 @@ using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
 
-public class WebDavTests : IDisposable
+public class WebDavTests : IAsyncDisposable
 {
     private readonly string _dataRoot;
     private readonly IServiceProvider _sp;
@@ -25,10 +25,7 @@ public class WebDavTests : IDisposable
     {
         using var scope = _sp.CreateAsyncScope();
         var fs = scope.ServiceProvider.GetRequiredService<FileService>();
-        var opt = _sp.GetRequiredService<IOptions<CistaNasOptions>>();
-        var storage = _sp.GetRequiredService<CistaNAS.Web.Storage.IStorageProvider>();
-        var e2eeFs = new E2eeFileService(_volumeService, storage, opt);
-        var handler = new WebDavHandler(_volumeService, fs, e2eeFs);
+        var handler = new WebDavHandler(_volumeService, fs);
         return (fs, handler);
     }
 
@@ -57,7 +54,7 @@ public class WebDavTests : IDisposable
     public async Task PropFindAsync_Root_EmptyDirectory()
     {
         var (fs, handler) = GetWebDavServices();
-        _volumeService.Create("test-vol", null, null, encrypted: false);
+        await _volumeService.CreateAsync("test-vol", null, null, encrypted: false);
         var ctx = NewContext();
         using var ms = new MemoryStream();
         ctx.Response.Body = ms;
@@ -69,7 +66,7 @@ public class WebDavTests : IDisposable
     public async Task Put_ThenGet_Roundtrip()
     {
         var (fs, _) = GetWebDavServices();
-        _volumeService.Create("io-vol", null, null, encrypted: false);
+        await _volumeService.CreateAsync("io-vol", null, null, encrypted: false);
         var content = Encoding.UTF8.GetBytes("Hello WebDAV!");
         using var ms = new MemoryStream(content);
         await fs.UploadAsync("io-vol", "hello.txt", ms, content.Length);
@@ -81,7 +78,7 @@ public class WebDavTests : IDisposable
     public async Task PropFindAsync_WithDirectoryPaths()
     {
         var (fs, handler) = GetWebDavServices();
-        _volumeService.Create("dir-vol", null, null, encrypted: false);
+        await _volumeService.CreateAsync("dir-vol", null, null, encrypted: false);
         await Upload(fs, "dir-vol", "docs/readme.txt", "readme");
         await Upload(fs, "dir-vol", "docs/notes.txt", "notes");
         await Upload(fs, "dir-vol", "root.txt", "root");
@@ -97,7 +94,7 @@ public class WebDavTests : IDisposable
     public async Task PropFindAsync_Subdirectory()
     {
         var (fs, handler) = GetWebDavServices();
-        _volumeService.Create("sub-vol", null, null, encrypted: false);
+        await _volumeService.CreateAsync("sub-vol", null, null, encrypted: false);
         await Upload(fs, "sub-vol", "a/file1.txt", "one");
         await Upload(fs, "sub-vol", "a/file2.txt", "two");
         await Upload(fs, "sub-vol", "b/file3.txt", "three");
@@ -113,18 +110,18 @@ public class WebDavTests : IDisposable
     public async Task Delete_File()
     {
         var (fs, _) = GetWebDavServices();
-        _volumeService.Create("del-vol", null, null, encrypted: false);
+        await _volumeService.CreateAsync("del-vol", null, null, encrypted: false);
         await Upload(fs, "del-vol", "todelete.txt", "bye");
         await fs.DeleteAsync("del-vol", "todelete.txt");
         Assert.Empty((await fs.ListAsync("del-vol")).Files);
     }
 
     [Fact]
-    public void MkCol_Succeeds()
+    public async Task MkCol_Succeeds()
     {
         var (_, handler) = GetWebDavServices();
-        _volumeService.Create("mkcol-vol", null, null, encrypted: false);
-        var result = handler.MkCol("mkcol-vol", "newdir", NewContext());
+        await _volumeService.CreateAsync("mkcol-vol", null, null, encrypted: false);
+        var result = await handler.MkCol("mkcol-vol", "newdir", NewContext());
         Assert.NotNull(result);
     }
 
@@ -150,12 +147,17 @@ public class WebDavTests : IDisposable
         await fs.UploadAsync(vol, path, ms, bytes.Length);
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
-        foreach (var v in _volumeService.ListAll())
+        foreach (var v in await _volumeService.ListAllAsync())
         {
-            try { _volumeService.Lock(v.Name); } catch { }
+            try
+            {
+                var header = await _volumeService.GetVolumeHeaderAsync(v.Name);
+                await _volumeService.LockAsync(v.Name, header.OwnerUser);
+            }
+            catch (Exception) { }
         }
-        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch { }
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch (Exception) { }
     }
 }

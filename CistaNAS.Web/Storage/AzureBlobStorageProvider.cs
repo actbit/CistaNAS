@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Threading;
 using Azure;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
@@ -15,11 +16,14 @@ public sealed class AzureBlobStorageProvider : IStorageProvider
     private readonly string _prefix;
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.Ordinal);
 
+    /// <summary>コンテナの初期化タスク（遅延実行）。</summary>
+    private readonly Task _init;
+
     public AzureBlobStorageProvider(string connectionString, string containerName, string? pathPrefix)
     {
         _prefix = NormalizePrefix(pathPrefix);
         _container = new BlobContainerClient(connectionString, containerName);
-        _container.CreateIfNotExists();
+        _init = _container.CreateIfNotExistsAsync();
     }
 
     private string FullPath(string blobPath) => _prefix + blobPath;
@@ -29,6 +33,7 @@ public sealed class AzureBlobStorageProvider : IStorageProvider
 
     public async Task<byte[]?> ReadAsync(string blobPath, CancellationToken ct = default)
     {
+        await _init;
         try
         {
             var client = _container.GetBlobClient(FullPath(blobPath));
@@ -44,6 +49,7 @@ public sealed class AzureBlobStorageProvider : IStorageProvider
 
     public async Task WriteAsync(string blobPath, Stream content, CancellationToken ct = default)
     {
+        await _init;
         var client = _container.GetBlobClient(FullPath(blobPath));
         await client.UploadAsync(content, overwrite: true, ct);
     }
@@ -53,22 +59,25 @@ public sealed class AzureBlobStorageProvider : IStorageProvider
 
     public async Task DeleteAsync(string blobPath, CancellationToken ct = default)
     {
+        await _init;
         try
         {
             var client = _container.GetBlobClient(FullPath(blobPath));
             await client.DeleteAsync(cancellationToken: ct);
         }
-        catch (RequestFailedException) { }
+        catch (RequestFailedException ex) when (ex.Status == 404) { }
     }
 
     public async Task<bool> ExistsAsync(string blobPath, CancellationToken ct = default)
     {
+        await _init;
         var client = _container.GetBlobClient(FullPath(blobPath));
         return await client.ExistsAsync(ct);
     }
 
     public async Task<IReadOnlyList<string>> ListAsync(string? prefix = null, CancellationToken ct = default)
     {
+        await _init;
         var result = new List<string>();
         string blobPrefix = string.IsNullOrEmpty(prefix) ? _prefix : FullPath(prefix);
         await foreach (var blob in _container.GetBlobsAsync(
@@ -85,13 +94,25 @@ public sealed class AzureBlobStorageProvider : IStorageProvider
 
     public async Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default)
     {
+        await _init;
         var semaphore = _locks.GetOrAdd(lockPath, _ => new SemaphoreSlim(1, 1));
         await semaphore.WaitAsync(ct);
         return new LockReleaser(semaphore);
     }
 
+    /// <summary>ロックを辞書から解除（セマフォは最後の LockReleaser が解放後に GC される）。</summary>
+    public void RemoveLock(string lockPath)
+    {
+        _locks.TryRemove(lockPath, out _);
+    }
+
     private sealed class LockReleaser(SemaphoreSlim semaphore) : IDisposable
     {
-        public void Dispose() => semaphore.Release();
+        private int _released;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _released, 1) == 0)
+                semaphore.Release();
+        }
     }
 }

@@ -44,6 +44,7 @@ public static class TestHelper
             o.Password.RequireLowercase = false;
             o.Password.RequireDigit = false;
             o.Lockout.AllowedForNewUsers = false;
+            o.Lockout.MaxFailedAccessAttempts = 99;
             o.User.RequireUniqueEmail = false;
         })
         .AddEntityFrameworkStores<AppDbContext>()
@@ -69,6 +70,7 @@ public static class TestHelper
         services.AddSingleton<VolumeService>();
         services.AddScoped<JournalService>();
         services.AddScoped<FileService>();
+        services.AddScoped<E2eeFileService>();
         services.AddLogging();
 
         var sp = services.BuildServiceProvider();

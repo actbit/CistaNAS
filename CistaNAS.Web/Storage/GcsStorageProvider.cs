@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Threading;
+using Google;
 using Google.Cloud.Storage.V1;
 
 namespace CistaNAS.Web.Storage;
@@ -8,7 +10,7 @@ namespace CistaNAS.Web.Storage;
 /// メタデータを GCS バケットに保存し、volume.dat はローカルに保持。
 /// Application Default Credentials (ADC) で認証。
 /// </summary>
-public sealed class GcsStorageProvider : IStorageProvider
+public sealed class GcsStorageProvider : IStorageProvider, IAsyncDisposable
 {
     private readonly StorageClient _client;
     private readonly string _bucket;
@@ -29,9 +31,7 @@ public sealed class GcsStorageProvider : IStorageProvider
 
     private static bool IsGcsNotFound(Exception ex)
     {
-        var prop = ex.GetType().GetProperty("HttpStatusCode");
-        if (prop == null) return false;
-        return prop.GetValue(ex) is System.Net.HttpStatusCode s && s == System.Net.HttpStatusCode.NotFound;
+        return ex is GoogleApiException gae && gae.HttpStatusCode == System.Net.HttpStatusCode.NotFound;
     }
 
     public async Task<byte[]?> ReadAsync(string blobPath, CancellationToken ct = default)
@@ -61,14 +61,15 @@ public sealed class GcsStorageProvider : IStorageProvider
     public async Task DeleteAsync(string blobPath, CancellationToken ct = default)
     {
         try { await _client.DeleteObjectAsync(_bucket, FullPath(blobPath), cancellationToken: ct); }
-        catch (Exception) { }
+        catch (Exception ex) when (IsGcsNotFound(ex)) { }
     }
 
     public async Task<bool> ExistsAsync(string blobPath, CancellationToken ct = default)
     {
         try
         {
-            await _client.GetObjectAsync(_bucket, FullPath(blobPath), cancellationToken: ct);
+            var obj = await _client.GetObjectAsync(_bucket, FullPath(blobPath), cancellationToken: ct);
+            // GetObjectAsync はメタデータのみを取得（コンテンツはダウンロードしない）
             return true;
         }
         catch (Exception ex) when (IsGcsNotFound(ex))
@@ -98,8 +99,24 @@ public sealed class GcsStorageProvider : IStorageProvider
         return new LockReleaser(semaphore);
     }
 
+    /// <summary>ロックを辞書から解除（セマフォは最後の LockReleaser が解放後に GC される）。</summary>
+    public void RemoveLock(string lockPath)
+    {
+        _locks.TryRemove(lockPath, out _);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _client.Dispose();
+    }
+
     private sealed class LockReleaser(SemaphoreSlim semaphore) : IDisposable
     {
-        public void Dispose() => semaphore.Release();
+        private int _released;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _released, 1) == 0)
+                semaphore.Release();
+        }
     }
 }

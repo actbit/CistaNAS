@@ -9,7 +9,7 @@ using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
 
-public class EcdhTests : IDisposable
+public class EcdhTests : IAsyncDisposable
 {
     private readonly string _dataRoot;
     private readonly IServiceProvider _sp;
@@ -65,7 +65,7 @@ public class EcdhTests : IDisposable
         var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
         await gs.CreateGroupAsync("team-a", "alice");
         var wrappedKey = CreatePasswordWrappedKey("alice", "pw", out _);
-        var info = _vs.CreateGroupE2ee("team-a", "alice", wrappedKey);
+        var info = await _vs.CreateGroupE2eeAsync("team-a", "alice", wrappedKey);
 
         Assert.Equal("group__team-a", info.Name);
         Assert.True(info.Encrypted);
@@ -80,8 +80,8 @@ public class EcdhTests : IDisposable
         var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
         await gs.CreateGroupAsync("dup-vol", "alice");
         var wk = CreatePasswordWrappedKey("alice", "pw", out _);
-        _vs.CreateGroupE2ee("dup-vol", "alice", wk);
-        Assert.Throws<VolumeException>(() => _vs.CreateGroupE2ee("dup-vol", "alice", wk));
+        await _vs.CreateGroupE2eeAsync("dup-vol", "alice", wk);
+        await Assert.ThrowsAsync<VolumeException>(() => _vs.CreateGroupE2eeAsync("dup-vol", "alice", wk));
     }
 
     // ---- AddE2eeWrappedKey (ECDH) ----
@@ -93,12 +93,12 @@ public class EcdhTests : IDisposable
         var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
         await gs.CreateGroupAsync("share-vol", "alice");
         var wk = CreatePasswordWrappedKey("alice", "pw", out _);
-        var info = _vs.CreateGroupE2ee("share-vol", "alice", wk);
+        var info = await _vs.CreateGroupE2eeAsync("share-vol", "alice", wk);
 
         var ecdhKey = CreateEcdhWrappedKey();
-        _vs.AddE2eeWrappedKey(info.Name, "alice", "bob", ecdhKey);
+        await _vs.AddE2eeWrappedKeyAsync(info.Name, "alice", "bob", ecdhKey);
 
-        var list = _vs.ListForUser("bob");
+        var list = await _vs.ListForUserAsync("bob");
         Assert.Single(list);
         Assert.Equal(info.Name, list[0].Name);
     }
@@ -112,12 +112,12 @@ public class EcdhTests : IDisposable
         var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
         await gs.CreateGroupAsync("wrap-vol", "alice");
         var wk = CreatePasswordWrappedKey("alice", "pw", out _);
-        var info = _vs.CreateGroupE2ee("wrap-vol", "alice", wk);
+        var info = await _vs.CreateGroupE2eeAsync("wrap-vol", "alice", wk);
 
         var ecdhKey = CreateEcdhWrappedKey();
-        _vs.AddE2eeWrappedKey(info.Name, "alice", "bob", ecdhKey);
+        await _vs.AddE2eeWrappedKeyAsync(info.Name, "alice", "bob", ecdhKey);
 
-        var volInfo = _vs.GetVolumeInfo(info.Name);
+        var volInfo = await _vs.GetVolumeInfoAsync(info.Name);
         Assert.NotNull(volInfo!.UserWrapTypes);
         Assert.Equal("password", volInfo.UserWrapTypes["alice"]);
         Assert.Equal("ecdh", volInfo.UserWrapTypes["bob"]);
@@ -126,25 +126,25 @@ public class EcdhTests : IDisposable
     // ---- GetVolumeInfo / GetVolumeHeader ----
 
     [Fact]
-    public void GetVolumeInfo_Existing_ReturnsInfo()
+    public async Task GetVolumeInfo_Existing_ReturnsInfo()
     {
-        _vs.Create("info-vol", "alice", "pw", encrypted: true);
-        var info = _vs.GetVolumeInfo("info-vol");
+        await _vs.CreateAsync("info-vol", "alice", "pw", encrypted: true);
+        var info = await _vs.GetVolumeInfoAsync("info-vol");
         Assert.NotNull(info);
         Assert.Equal("info-vol", info.Name);
     }
 
     [Fact]
-    public void GetVolumeInfo_NonExistent_ReturnsNull()
+    public async Task GetVolumeInfo_NonExistent_ReturnsNull()
     {
-        Assert.Null(_vs.GetVolumeInfo("no-such-vol"));
+        Assert.Null(await _vs.GetVolumeInfoAsync("no-such-vol"));
     }
 
     [Fact]
-    public void GetVolumeHeader_ReturnsHeader()
+    public async Task GetVolumeHeader_ReturnsHeader()
     {
-        _vs.Create("hdr-vol", "alice", "pw", encrypted: true);
-        var hdr = _vs.GetVolumeHeader("hdr-vol");
+        await _vs.CreateAsync("hdr-vol", "alice", "pw", encrypted: true);
+        var hdr = await _vs.GetVolumeHeaderAsync("hdr-vol");
         Assert.Equal("alice", hdr.OwnerUser);
     }
 
@@ -157,14 +157,14 @@ public class EcdhTests : IDisposable
         var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
         await gs.CreateGroupAsync("revoke-vol", "alice");
         var wk = CreatePasswordWrappedKey("alice", "pw", out _);
-        var info = _vs.CreateGroupE2ee("revoke-vol", "alice", wk);
+        var info = await _vs.CreateGroupE2eeAsync("revoke-vol", "alice", wk);
 
         var ecdhKey = CreateEcdhWrappedKey();
-        _vs.AddE2eeWrappedKey(info.Name, "alice", "bob", ecdhKey);
+        await _vs.AddE2eeWrappedKeyAsync(info.Name, "alice", "bob", ecdhKey);
 
-        _vs.RevokeAccess(info.Name, "alice", "bob");
+        await _vs.RevokeAccessAsync(info.Name, "alice", "bob");
 
-        var bobList = _vs.ListForUser("bob");
+        var bobList = await _vs.ListForUserAsync("bob");
         Assert.Empty(bobList);
     }
 
@@ -248,12 +248,17 @@ public class EcdhTests : IDisposable
         };
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
-        foreach (var v in _vs.ListAll())
+        foreach (var v in await _vs.ListAllAsync())
         {
-            try { _vs.Lock(v.Name); } catch { }
+            try
+            {
+                var header = await _vs.GetVolumeHeaderAsync(v.Name);
+                await _vs.LockAsync(v.Name, header.OwnerUser);
+            }
+            catch (Exception) { }
         }
-        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch { }
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch (Exception) { }
     }
 }

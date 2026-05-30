@@ -13,6 +13,7 @@
 @inject E2eeInterop E2ee
 @inject NavigationManager Nav
 @inject IJSRuntime JS
+@inject StreamingTokenService StreamingTokenSvc
 
 <PageTitle>ファイル: @VolumeName - CistaNAS</PageTitle>
 
@@ -24,6 +25,13 @@ else if (!VolumeSvc.IsMounted(VolumeName))
 {
     <div class="alert alert-warning">
         ボリューム「@VolumeName」はマウントされていません。
+        <a href="/volumes">ボリューム管理に戻る</a>
+    </div>
+}
+else if (!_hasAccess)
+{
+    <div class="alert alert-danger">
+        ボリューム「@VolumeName」へのアクセス権がありません。
         <a href="/volumes">ボリューム管理に戻る</a>
     </div>
 }
@@ -73,6 +81,10 @@ else
             @if (_uploadError is not null)
             {
                 <div class="alert alert-danger mt-2">@_uploadError</div>
+            }
+            @if (_operationError is not null)
+            {
+                <div class="alert alert-danger mt-2">@_operationError</div>
             }
         </div>
     </div>
@@ -185,6 +197,7 @@ else
     // 通常ボリューム
     private List<FileMetadata> _files = [];
     private string? _uploadError;
+    private string? _operationError;
 
     // E2EE 状態
     private bool _isE2ee;
@@ -202,12 +215,22 @@ else
     private string? _previewStreamUrl;
     private MediaPreview? _previewRef;
 
+    // アクセス権限
+    private bool _hasAccess;
+
     private string CurrentUsername => AuthState.User?.Identity?.Name ?? "";
 
     protected override async Task OnInitializedAsync()
     {
         AuthState.Subscribe(OnAuthStateChanged);
         _isE2ee = GetVolumeEncryptionMode() == "e2ee";
+
+        // ボリュームへのアクセス権を確認
+        if (!string.IsNullOrEmpty(CurrentUsername) && VolumeSvc.IsMounted(VolumeName))
+        {
+            _hasAccess = await VolumeSvc.HasAccessAsync(VolumeName, CurrentUsername);
+        }
+
         if (!_isE2ee)
         {
             await RefreshList();
@@ -251,13 +274,12 @@ else
         try
         {
             var baseUri = Nav.BaseUri.TrimEnd('/');
-            var jwt = AuthState.Token ?? "";
-            _previewStreamUrl = await JS.InvokeAsync<string>(
-                "cistaMedia.getStreamUrl", baseUri, VolumeName, fileName, jwt);
+            var streamToken = StreamingTokenSvc.Issue(CurrentUsername, VolumeName, fileName);
+            _previewStreamUrl = $"{baseUri}/api/v1/stream/{Uri.EscapeDataString(VolumeName)}/{Uri.EscapeDataString(fileName)}?token={streamToken}";
         }
         catch (Exception ex)
         {
-            _uploadError = $"プレビューエラー: {ex.Message}";
+            _operationError = $"プレビューエラー: {ex.Message}";
             _previewVisible = false;
         }
     }
@@ -294,7 +316,7 @@ else
 
             for (int i = 0; i < entry.ChunkCount; i++)
             {
-                var (chunkStream, chunkLen) = E2eeFileSvc.DownloadChunk(VolumeName, entry.FileId, i);
+                var (chunkStream, chunkLen) = await E2eeFileSvc.DownloadChunkAsync(VolumeName, entry.FileId, i);
                 byte[] encData = new byte[chunkLen];
                 using (chunkStream)
                 {
@@ -331,7 +353,7 @@ else
         }
         catch (Exception ex)
         {
-            _uploadError = $"プレビューエラー: {ex.Message}";
+            _operationError = $"プレビューエラー: {ex.Message}";
             _previewRef?.SetError(ex.Message);
         }
         item.Downloading = false;
@@ -394,7 +416,7 @@ else
     {
         try
         {
-            var response = E2eeFileSvc.ListFiles(VolumeName);
+            var response = await E2eeFileSvc.ListFilesAsync(VolumeName);
             _e2eeFiles = [];
             foreach (var entry in response.Files)
             {
@@ -412,6 +434,7 @@ else
     private async Task HandleUpload(InputFileChangeEventArgs e)
     {
         _uploadError = null;
+        _operationError = null;
         try
         {
             if (_isE2ee && _e2eeUnlocked)
@@ -449,7 +472,7 @@ else
             if (totalChunks == 0) totalChunks = 1;
 
             long estimatedLength = 16 + (long)totalChunks * (chunkSize + 16);
-            var entry = E2eeFileSvc.CreateFile(VolumeName, new E2eeCreateFileRequest(encName, estimatedLength, totalChunks));
+            var entry = await E2eeFileSvc.CreateFileAsync(VolumeName, new E2eeCreateFileRequest(encName, estimatedLength, totalChunks));
 
             long bytesRemaining = totalSize;
             for (int i = 0; i < totalChunks; i++)
@@ -474,7 +497,7 @@ else
             }
 
             long actualLength = 16 + (totalChunks > 1 ? ((long)(totalChunks - 1) * (chunkSize + 16)) : 0) + (totalSize - (totalChunks > 1 ? (long)(totalChunks - 1) * chunkSize : 0)) + 16;
-            E2eeFileSvc.FinalizeFile(VolumeName, entry.FileId, new E2eeFinalizeFileRequest(actualLength));
+            await E2eeFileSvc.FinalizeFileAsync(VolumeName, entry.FileId, new E2eeFinalizeFileRequest(actualLength));
         }
 
         await RefreshE2eeList();
@@ -493,7 +516,7 @@ else
 
             for (int i = 0; i < entry.ChunkCount; i++)
             {
-                var (chunkStream, chunkLen) = E2eeFileSvc.DownloadChunk(VolumeName, entry.FileId, i);
+                var (chunkStream, chunkLen) = await E2eeFileSvc.DownloadChunkAsync(VolumeName, entry.FileId, i);
                 byte[] encData = new byte[chunkLen];
                 using (chunkStream)
                 {
@@ -523,7 +546,7 @@ else
         }
         catch (Exception ex)
         {
-            _uploadError = $"ダウンロードエラー: {ex.Message}";
+            _operationError = $"ダウンロードエラー: {ex.Message}";
         }
         item.Downloading = false;
     }
@@ -532,12 +555,12 @@ else
     {
         try
         {
-            E2eeFileSvc.DeleteFile(VolumeName, fileId);
+            await E2eeFileSvc.DeleteFileAsync(VolumeName, fileId);
             await RefreshE2eeList();
         }
         catch (FileServiceException ex)
         {
-            _uploadError = ex.Message;
+            _operationError = ex.Message;
         }
     }
 
@@ -548,14 +571,13 @@ else
         try
         {
             var baseUri = Nav.BaseUri.TrimEnd('/');
-            var jwt = AuthState.Token ?? "";
-            var streamUrl = await JS.InvokeAsync<string>(
-                "cistaMedia.getStreamUrl", baseUri, VolumeName, fileName, jwt);
+            var streamToken = StreamingTokenSvc.Issue(CurrentUsername, VolumeName, fileName);
+            var streamUrl = $"{baseUri}/api/v1/stream/{Uri.EscapeDataString(VolumeName)}/{Uri.EscapeDataString(fileName)}?token={streamToken}";
             Nav.NavigateTo(streamUrl, forceLoad: true);
         }
         catch (Exception ex)
         {
-            _uploadError = $"ダウンロードエラー: {ex.Message}";
+            _operationError = $"ダウンロードエラー: {ex.Message}";
         }
     }
 
@@ -568,7 +590,7 @@ else
         }
         catch (FileServiceException ex)
         {
-            _uploadError = ex.Message;
+            _operationError = ex.Message;
         }
     }
 

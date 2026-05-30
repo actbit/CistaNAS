@@ -4,7 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace CistaNAS.Tests;
 
-public class GroupTests : IDisposable
+public class GroupTests : IAsyncDisposable
 {
     private readonly string _dataRoot;
     private readonly IServiceProvider _sp;
@@ -134,13 +134,13 @@ public class GroupTests : IDisposable
         using var scope = _sp.CreateAsyncScope();
         var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
 
-        _vs.Create("grp-vol1", "alice", "pw", encrypted: true);
+        await _vs.CreateAsync("grp-vol1", "alice", "pw", encrypted: true);
         await gs.CreateGroupAsync("team1", "alice");
         await gs.AddMemberAsync("team1", "alice", "bob");
 
-        _vs.GrantGroupAccess("grp-vol1", "alice", "team1");
+        await _vs.GrantGroupAccessAsync("grp-vol1", "alice", "team1");
 
-        var bobList = _vs.ListForUser("bob");
+        var bobList = await _vs.ListForUserAsync("bob");
         Assert.Single(bobList);
         Assert.Equal("grp-vol1", bobList[0].Name);
     }
@@ -151,14 +151,14 @@ public class GroupTests : IDisposable
         using var scope = _sp.CreateAsyncScope();
         var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
 
-        _vs.Create("grp-vol2", "alice", "pw", encrypted: true);
+        await _vs.CreateAsync("grp-vol2", "alice", "pw", encrypted: true);
         await gs.CreateGroupAsync("team2", "alice");
         await gs.AddMemberAsync("team2", "alice", "bob");
 
-        _vs.GrantGroupAccess("grp-vol2", "alice", "team2");
-        _vs.RevokeGroupAccess("grp-vol2", "alice", "team2");
+        await _vs.GrantGroupAccessAsync("grp-vol2", "alice", "team2");
+        await _vs.RevokeGroupAccessAsync("grp-vol2", "alice", "team2");
 
-        var bobList = _vs.ListForUser("bob");
+        var bobList = await _vs.ListForUserAsync("bob");
         Assert.Empty(bobList);
     }
 
@@ -168,9 +168,9 @@ public class GroupTests : IDisposable
         using var scope = _sp.CreateAsyncScope();
         var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
 
-        _vs.Create("grp-vol3", "alice", "pw", encrypted: true);
+        await _vs.CreateAsync("grp-vol3", "alice", "pw", encrypted: true);
         await gs.CreateGroupAsync("team3", "alice");
-        Assert.Throws<VolumeException>(() => _vs.GrantGroupAccess("grp-vol3", "bob", "team3"));
+        await Assert.ThrowsAsync<VolumeException>(() => _vs.GrantGroupAccessAsync("grp-vol3", "bob", "team3"));
     }
 
     [Fact]
@@ -179,48 +179,53 @@ public class GroupTests : IDisposable
         using var scope = _sp.CreateAsyncScope();
         var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
 
-        _vs.Create("grp-vol4", "alice", "pw", encrypted: true);
+        await _vs.CreateAsync("grp-vol4", "alice", "pw", encrypted: true);
         await gs.CreateGroupAsync("team4", "alice");
         await gs.AddMemberAsync("team4", "alice", "bob");
-        _vs.GrantGroupAccess("grp-vol4", "alice", "team4");
+        await _vs.GrantGroupAccessAsync("grp-vol4", "alice", "team4");
 
         await gs.DeleteGroupAsync("team4", "alice");
 
-        var bobList = _vs.ListForUser("bob");
+        var bobList = await _vs.ListForUserAsync("bob");
         Assert.Empty(bobList);
     }
 
     // ---- Home volume naming ----
 
     [Fact]
-    public void Create_HomePrefix_Throws()
+    public async Task Create_HomePrefix_Throws()
     {
-        Assert.Throws<VolumeException>(() => _vs.Create("home__test", "alice", "pw", encrypted: true));
+        await Assert.ThrowsAsync<VolumeException>(() => _vs.CreateAsync("home__test", "alice", "pw", encrypted: true));
     }
 
     [Fact]
-    public void Create_NormalName_Succeeds()
+    public async Task Create_NormalName_Succeeds()
     {
-        var info = _vs.Create("regular-vol", "alice", "pw", encrypted: true);
+        var info = await _vs.CreateAsync("regular-vol", "alice", "pw", encrypted: true);
         Assert.Equal("regular-vol", info.Name);
         Assert.False(info.IsHome);
     }
 
     [Fact]
-    public void ListForUser_IncludesHomeVolume()
+    public async Task ListForUser_IncludesHomeVolume()
     {
-        _vs.CreateInternal("home__alice", "alice", null, encrypted: false);
-        var list = _vs.ListForUser("alice");
+        await _vs.CreateInternalAsync("home__alice", "alice", null, encrypted: false);
+        var list = await _vs.ListForUserAsync("alice");
         Assert.Single(list);
         Assert.True(list[0].IsHome);
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
-        foreach (var v in _vs.ListAll())
+        foreach (var v in await _vs.ListAllAsync())
         {
-            try { _vs.Lock(v.Name); } catch { }
+            try
+            {
+                var header = await _vs.GetVolumeHeaderAsync(v.Name);
+                await _vs.LockAsync(v.Name, header.OwnerUser);
+            }
+            catch (Exception) { }
         }
-        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch { }
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch (Exception) { }
     }
 }

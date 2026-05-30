@@ -13,4 +13,5 @@ public interface IStorageProvider
     Task<bool> ExistsAsync(string blobPath, CancellationToken ct = default);
     Task<IReadOnlyList<string>> ListAsync(string? prefix = null, CancellationToken ct = default);
     Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default);
+    void RemoveLock(string lockPath);
 }

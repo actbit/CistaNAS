@@ -8,6 +8,9 @@ public sealed class VolumeMetadataStore(IStorageProvider storage)
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
+    /// <summary>基盤ストレージプロバイダへのアクセス（ロック解除等で使用）。</summary>
+    public IStorageProvider Storage => storage;
+
     public async Task<VolumeHeader?> LoadAsync(string volumeName, CancellationToken ct = default)
     {
         byte[]? data = await storage.ReadAsync($"{volumeName}/{VolumeHeader.FileName}", ct);

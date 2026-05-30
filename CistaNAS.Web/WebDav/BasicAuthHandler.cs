@@ -2,6 +2,7 @@ using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
+using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Services;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.Options;
@@ -15,15 +16,18 @@ namespace CistaNAS.Web.WebDav;
 public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchemeOptions>
 {
     private readonly AuthService _authService;
+    private readonly int _iterations;
 
     public BasicAuthHandler(
         IOptionsMonitor<AuthenticationSchemeOptions> options,
         ILoggerFactory logger,
         UrlEncoder encoder,
-        AuthService authService)
+        AuthService authService,
+        IOptions<CistaNasOptions> cistaOptions)
         : base(options, logger, encoder)
     {
         _authService = authService;
+        _iterations = cistaOptions.Value.Auth.Pbkdf2Iterations;
     }
 
     protected override async Task<AuthenticateResult> HandleAuthenticateAsync()
@@ -48,13 +52,13 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
             if (loginResponse is null)
             {
                 // ユーザーが存在しない場合もダミー計算を実行してタイミングを均一化
-                DummyHash();
+                DummyHash(_iterations);
                 return AuthenticateResult.Fail("Invalid credentials.");
             }
 
-            var principal = await _authService.ValidateTokenAsync(loginResponse.AccessToken);
+            var principal = await _authService.GetPrincipalAsync(username);
             if (principal is null)
-                return AuthenticateResult.Fail("Token validation failed.");
+                return AuthenticateResult.Fail("認証後にユーザーが見つかりません。");
 
             var ticket = new AuthenticationTicket(principal, Scheme.Name);
             return AuthenticateResult.Success(ticket);
@@ -65,9 +69,13 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
         }
     }
 
-    private static void DummyHash()
+    private static void DummyHash(int iterations)
     {
-        Rfc2898DeriveBytes.Pbkdf2("dummy"u8, RandomNumberGenerator.GetBytes(16), 1, HashAlgorithmName.SHA256, 32);
+        // 実認証（Identity の PBKDF2）の iteration に近い回数でダミー計算を実行し、
+        // ユーザー存在の有無によるタイミング差を最小化。
+        // 呼び出し毎にランダムソルトを生成し、事前計算攻撃を防止。
+        byte[] salt = RandomNumberGenerator.GetBytes(16);
+        Rfc2898DeriveBytes.Pbkdf2("dummy"u8, salt, iterations, HashAlgorithmName.SHA256, 32);
     }
 
     protected override Task HandleChallengeAsync(AuthenticationProperties properties)

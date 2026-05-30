@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Threading;
 using Amazon.S3;
 using Amazon.S3.Model;
 
@@ -8,7 +9,7 @@ namespace CistaNAS.Web.Storage;
 /// AWS S3 互換ストレージプロバイダ（MinIO / LocalStack 対応）。
 /// メタデータを S3 バケットに保存し、volume.dat はローカルに保持。
 /// </summary>
-public sealed class S3StorageProvider : IStorageProvider
+public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
 {
     private readonly IAmazonS3 _client;
     private readonly string _bucket;
@@ -42,7 +43,7 @@ public sealed class S3StorageProvider : IStorageProvider
     {
         try
         {
-            var response = await _client.GetObjectAsync(_bucket, FullPath(blobPath), ct);
+            using var response = await _client.GetObjectAsync(_bucket, FullPath(blobPath), ct);
             using var ms = new MemoryStream();
             await response.ResponseStream.CopyToAsync(ms, ct);
             return ms.ToArray();
@@ -55,6 +56,7 @@ public sealed class S3StorageProvider : IStorageProvider
 
     public async Task WriteAsync(string blobPath, Stream content, CancellationToken ct = default)
     {
+        if (content.CanSeek) content.Position = 0;
         var request = new PutObjectRequest
         {
             BucketName = _bucket,
@@ -70,7 +72,7 @@ public sealed class S3StorageProvider : IStorageProvider
     public async Task DeleteAsync(string blobPath, CancellationToken ct = default)
     {
         try { await _client.DeleteObjectAsync(_bucket, FullPath(blobPath), ct); }
-        catch (AmazonS3Exception) { }
+        catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound) { }
     }
 
     public async Task<bool> ExistsAsync(string blobPath, CancellationToken ct = default)
@@ -119,8 +121,24 @@ public sealed class S3StorageProvider : IStorageProvider
         return new LockReleaser(semaphore);
     }
 
+    /// <summary>ロックを辞書から解除（セマフォは最後の LockReleaser が解放後に GC される）。</summary>
+    public void RemoveLock(string lockPath)
+    {
+        _locks.TryRemove(lockPath, out _);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _client.Dispose();
+    }
+
     private sealed class LockReleaser(SemaphoreSlim semaphore) : IDisposable
     {
-        public void Dispose() => semaphore.Release();
+        private int _released;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _released, 1) == 0)
+                semaphore.Release();
+        }
     }
 }

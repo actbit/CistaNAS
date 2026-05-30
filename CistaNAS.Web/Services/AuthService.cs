@@ -15,13 +15,13 @@ namespace CistaNAS.Web.Services;
 /// </summary>
 public sealed class AuthService(
     AccountService accountService,
-    UserManager<ApplicationUser> userManager,
     JwtSigningKey signingKey,
     IOptions<CistaNasOptions> options,
     ILogger<AuthService> logger)
 {
     /// <summary>
     /// 資格情報を検証し、成功時に JWT を発行する。失敗時は null。
+    /// ロックアウト状態のユーザーは拒否し、失敗回数を追跡する。
     /// </summary>
     public async Task<LoginResponse?> AuthenticateAsync(string username, string password)
     {
@@ -29,11 +29,29 @@ public sealed class AuthService(
             return null;
 
         var user = await accountService.FindAsync(username);
-        if (user is null || !await accountService.CheckPasswordAsync(user, password))
+        if (user is null)
         {
             logger.LogWarning("ログイン失敗: ユーザー '{Username}'", username);
             return null;
         }
+
+        // ロックアウト状態のチェック（JWT ログイン・WebDAV 共通）
+        if (await accountService.IsLockedOutAsync(user))
+        {
+            logger.LogWarning("ログイン拒否（ロックアウト中）: ユーザー '{Username}'", username);
+            return null;
+        }
+
+        if (!await accountService.CheckPasswordAsync(user, password))
+        {
+            // 認証失敗回数をインクリメント（ロックアウトポリシーに連動）
+            await accountService.AccessFailedAsync(user);
+            logger.LogWarning("ログイン失敗: ユーザー '{Username}'", username);
+            return null;
+        }
+
+        // 認証成功時に失敗カウンタをリセット
+        await accountService.ResetAccessFailedCountAsync(user);
 
         logger.LogInformation("ログイン成功: ユーザー '{Username}'", username);
         return await IssueTokenAsync(user);
@@ -46,7 +64,13 @@ public sealed class AuthService(
         var expires = now.AddMinutes(jwt.AccessTokenMinutes);
 
         var roles = await accountService.GetRolesAsync(user);
-        var role = roles.FirstOrDefault() ?? "user";
+        var claims = new List<Claim>
+        {
+            new Claim(JwtRegisteredClaimNames.Sub, user.UserName ?? user.Id),
+            new Claim(ClaimTypes.Name, user.UserName ?? user.Id),
+        };
+        foreach (var r in roles)
+            claims.Add(new Claim(ClaimTypes.Role, r));
 
         var descriptor = new SecurityTokenDescriptor
         {
@@ -55,12 +79,7 @@ public sealed class AuthService(
             IssuedAt = now.UtcDateTime,
             NotBefore = now.UtcDateTime,
             Expires = expires.UtcDateTime,
-            Subject = new ClaimsIdentity(
-            [
-                new Claim(JwtRegisteredClaimNames.Sub, user.UserName ?? user.Id),
-                new Claim(ClaimTypes.Name, user.UserName ?? user.Id),
-                new Claim(ClaimTypes.Role, role),
-            ]),
+            Subject = new ClaimsIdentity(claims),
             SigningCredentials = new SigningCredentials(
                 new SymmetricSecurityKey(signingKey.Value),
                 SecurityAlgorithms.HmacSha256),
@@ -91,6 +110,24 @@ public sealed class AuthService(
         });
 
         return result.IsValid ? new ClaimsPrincipal(result.ClaimsIdentity) : null;
+    }
+
+    /// <summary>
+    /// ユーザー名から ClaimsPrincipal を構築する（Basic 認証ハンドラ用）。
+    /// JWT 再検証を回避し、DB から直接ロールを取得する。
+    /// </summary>
+    public async Task<ClaimsPrincipal?> GetPrincipalAsync(string username)
+    {
+        var user = await accountService.FindAsync(username);
+        if (user is null) return null;
+        var roles = await accountService.GetRolesAsync(user);
+        var claims = new List<Claim>
+        {
+            new(ClaimTypes.Name, username),
+        };
+        foreach (var r in roles)
+            claims.Add(new Claim(ClaimTypes.Role, r));
+        return new ClaimsPrincipal(new ClaimsIdentity(claims, "BasicAuth"));
     }
 
     /// <summary>パスワードを変更し、全ボリュームの KEK を再ラップ。</summary>

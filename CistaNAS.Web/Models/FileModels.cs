@@ -23,9 +23,10 @@ public sealed class FileServiceException(string message) : Exception(message);
 // ---- E2EE 関連モデル ----
 
 /// <summary>E2EE ボリューム作成リクエスト（クライアントからラップ済み鍵を受け取る）。</summary>
+/// <remarks>Username フィールドは互換性のために残しているが、サーバー側では使用しない（認証済みユーザーをオーナーとする）。</remarks>
 public sealed record E2eeCreateVolumeRequest(
     [Required] [StringLength(64, MinimumLength = 1)] string VolumeName,
-    [Required] [StringLength(128)] string Username,
+    [StringLength(128)] string? Username,
     [Required] VolumeHeader.UserWrappedKey WrappedMasterKey,
     [Range(4096, 67108864)] int ChunkSize = 1048576);
 

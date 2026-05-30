@@ -4,7 +4,6 @@ using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Web.Configuration;
 
@@ -15,29 +14,14 @@ namespace CistaNAS.Web.Configuration;
 /// </summary>
 public static class ServiceCollectionExtensions
 {
-    public static IServiceCollection AddCistaNasServices(this IServiceCollection services)
+    public static IServiceCollection AddCistaNasServices(this IServiceCollection services, CistaNasOptions cista)
     {
-        // ストレージプロバイダ（遅延解決: ラムダ内で ServiceProvider から取得）
-        services.AddSingleton<IStorageProvider>(sp =>
-        {
-            var options = sp.GetRequiredService<IOptions<CistaNasOptions>>().Value;
-            var storage = options.Storage;
-            return storage.Provider.ToLowerInvariant() switch
-            {
-                "local" => new LocalStorageProvider(options.DataRoot),
-                "s3" => CreateS3Provider(storage),
-                "azureblob" => CreateAzureBlobProvider(storage),
-                "gcs" => CreateGcsProvider(storage),
-                _ => throw new InvalidOperationException(
-                    $"Unknown storage provider: {storage.Provider}. Supported: local, s3, azureblob, gcs")
-            };
-        });
+        // ストレージプロバイダ（直接インスタンス化。DI ラムダ外で生成するため ServiceProvider 構築不要）
+        var storage = CreateStorageProvider(cista);
+        services.AddSingleton<IStorageProvider>(storage);
 
         // DB プロバイダ + ASP.NET Core Identity + EF Core
-        // CistaNasOptions は Program.cs で Configure<T> により既にバインド済み
-        var tempSp = services.BuildServiceProvider();
-        var cista = tempSp.GetRequiredService<IOptions<CistaNasOptions>>().Value;
-        RegisterDatabaseAndIdentity(services, cista, tempSp);
+        RegisterDatabaseAndIdentity(services, cista, storage);
 
         // 認証
         services.AddScoped<AccountService>();
@@ -45,6 +29,7 @@ public static class ServiceCollectionExtensions
 
         // グループ
         services.AddScoped<GroupService>();
+        // BackgroundService は Singleton 登録でホストが自動起動
         services.AddSingleton<InvitationService>();
 
         // ボリューム
@@ -54,18 +39,19 @@ public static class ServiceCollectionExtensions
         // ファイル・ジャーナル
         services.AddScoped<JournalService>();
         services.AddScoped<FileService>();
+        services.AddScoped<E2eeFileService>();
 
         // Blazor 認証状態
         services.AddScoped<AuthenticationStateService>();
 
-        // メディアストリーミング
+        // メディアストリーミング（BackgroundService）
         services.AddSingleton<StreamingTokenService>();
 
         return services;
     }
 
     private static void RegisterDatabaseAndIdentity(
-        IServiceCollection services, CistaNasOptions cista, ServiceProvider tempSp)
+        IServiceCollection services, CistaNasOptions cista, IStorageProvider storage)
     {
         var db = cista.Database;
         string provider = db.Provider.ToLowerInvariant();
@@ -81,8 +67,6 @@ public static class ServiceCollectionExtensions
             case "azureblob":
             case "gcs":
             {
-                // tempSp から IStorageProvider を一度だけ取得（2回目の BuildServiceProvider を回避）
-                var storage = tempSp.GetRequiredService<IStorageProvider>();
                 var sync = new CloudSqliteSync(storage, cista.Storage, db);
                 services.AddSingleton(sync);
                 services.AddDbContext<AppDbContext>(o =>
@@ -102,12 +86,14 @@ public static class ServiceCollectionExtensions
 
         services.AddIdentityCore<ApplicationUser>(o =>
         {
-            o.Password.RequiredLength = 8;
+            o.Password.RequiredLength = 12;
             o.Password.RequireNonAlphanumeric = false;
             o.Password.RequireUppercase = false;
-            o.Password.RequireLowercase = false;
-            o.Password.RequireDigit = false;
-            o.Lockout.AllowedForNewUsers = false;
+            o.Password.RequireLowercase = true;
+            o.Password.RequireDigit = true;
+            o.Lockout.AllowedForNewUsers = true;
+            o.Lockout.MaxFailedAccessAttempts = 5;
+            o.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(15);
             o.User.RequireUniqueEmail = false;
         })
         .AddRoles<ApplicationRole>()
@@ -115,6 +101,20 @@ public static class ServiceCollectionExtensions
         .AddDefaultTokenProviders();
 
         services.AddScoped<IPasswordHasher<ApplicationUser>, LegacyPasswordHasher>();
+    }
+
+    private static IStorageProvider CreateStorageProvider(CistaNasOptions cista)
+    {
+        var storage = cista.Storage;
+        return storage.Provider.ToLowerInvariant() switch
+        {
+            "local" => new LocalStorageProvider(cista.DataRoot),
+            "s3" => CreateS3Provider(storage),
+            "azureblob" => CreateAzureBlobProvider(storage),
+            "gcs" => CreateGcsProvider(storage),
+            _ => throw new InvalidOperationException(
+                $"Unknown storage provider: {storage.Provider}. Supported: local, s3, azureblob, gcs")
+        };
     }
 
     private static IStorageProvider CreateS3Provider(StorageOptions s)

@@ -9,7 +9,7 @@ using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
 
-public class VolumeTests : IDisposable
+public class VolumeTests : IAsyncDisposable
 {
     private readonly string _dataRoot;
     private readonly IServiceProvider _sp;
@@ -22,9 +22,9 @@ public class VolumeTests : IDisposable
     }
 
     [Fact]
-    public void Create_Encrypted_PopulatesUserKeys()
+    public async Task Create_Encrypted_PopulatesUserKeys()
     {
-        var info = _vs.Create("test-vol", "alice", "password123", encrypted: true);
+        var info = await _vs.CreateAsync("test-vol", "alice", "password123", encrypted: true);
         Assert.Equal("test-vol", info.Name);
         Assert.True(info.IsMounted);
         Assert.True(info.Encrypted);
@@ -33,206 +33,206 @@ public class VolumeTests : IDisposable
     }
 
     [Fact]
-    public void Create_Plain_NoUserKeys()
+    public async Task Create_Plain_NoUserKeys()
     {
-        var info = _vs.Create("plain-vol", null, null, encrypted: false);
+        var info = await _vs.CreateAsync("plain-vol", null, null, encrypted: false);
         Assert.False(info.Encrypted);
         Assert.Empty(info.AuthorizedUsers);
     }
 
     [Fact]
-    public void Mount_SameUser_SamePassword_Succeeds()
+    public async Task Mount_SameUser_SamePassword_Succeeds()
     {
-        _vs.Create("vol-b", "alice", "pw", encrypted: true);
-        _vs.Lock("vol-b");
-        var info = _vs.Mount("vol-b", "alice", "pw");
+        await _vs.CreateAsync("vol-b", "alice", "pw", encrypted: true);
+        await _vs.LockAsync("vol-b", "alice");
+        var info = await _vs.MountAsync("vol-b", "alice", "pw");
         Assert.True(info.IsMounted);
     }
 
     [Fact]
-    public void Mount_WrongPassword_Fails()
+    public async Task Mount_WrongPassword_Fails()
     {
-        _vs.Create("vol-c", "alice", "right", encrypted: true);
-        _vs.Lock("vol-c");
-        Assert.Throws<VolumeException>(() => _vs.Mount("vol-c", "alice", "wrong"));
+        await _vs.CreateAsync("vol-c", "alice", "right", encrypted: true);
+        await _vs.LockAsync("vol-c", "alice");
+        await Assert.ThrowsAsync<VolumeException>(() => _vs.MountAsync("vol-c", "alice", "wrong"));
     }
 
     [Fact]
-    public void Mount_DifferentUser_Fails()
+    public async Task Mount_DifferentUser_Fails()
     {
-        _vs.Create("vol-d", "alice", "shared-pw", encrypted: true);
-        _vs.Lock("vol-d");
-        Assert.Throws<VolumeException>(() => _vs.Mount("vol-d", "bob", "shared-pw"));
+        await _vs.CreateAsync("vol-d", "alice", "shared-pw", encrypted: true);
+        await _vs.LockAsync("vol-d", "alice");
+        await Assert.ThrowsAsync<VolumeException>(() => _vs.MountAsync("vol-d", "bob", "shared-pw"));
     }
 
     [Fact]
-    public void GrantAccess_SecondUser_CanMount()
+    public async Task GrantAccess_SecondUser_CanMount()
     {
-        _vs.Create("shared", "alice", "alice-pw", encrypted: true);
-        _vs.Lock("shared");
+        await _vs.CreateAsync("shared", "alice", "alice-pw", encrypted: true);
+        await _vs.LockAsync("shared", "alice");
 
-        _vs.GrantAccess("shared", "alice", "alice-pw", "bob", "bob-pw");
+        await _vs.GrantAccessAsync("shared", "alice", "alice-pw", "bob", "bob-pw");
 
-        var info = _vs.Mount("shared", "bob", "bob-pw");
+        var info = await _vs.MountAsync("shared", "bob", "bob-pw");
         Assert.True(info.IsMounted);
         Assert.Contains("alice", info.AuthorizedUsers);
         Assert.Contains("bob", info.AuthorizedUsers);
     }
 
     [Fact]
-    public void RevokeAccess_RemovesUser()
+    public async Task RevokeAccess_RemovesUser()
     {
-        _vs.Create("rev-test", "alice", "alice-pw", encrypted: true);
-        _vs.GrantAccess("rev-test", "alice", "alice-pw", "bob", "bob-pw");
-        _vs.RevokeAccess("rev-test", "alice", "bob");
+        await _vs.CreateAsync("rev-test", "alice", "alice-pw", encrypted: true);
+        await _vs.GrantAccessAsync("rev-test", "alice", "alice-pw", "bob", "bob-pw");
+        await _vs.RevokeAccessAsync("rev-test", "alice", "bob");
 
-        _vs.Lock("rev-test");
-        Assert.Throws<VolumeException>(() => _vs.Mount("rev-test", "bob", "bob-pw"));
+        await _vs.LockAsync("rev-test", "alice");
+        await Assert.ThrowsAsync<VolumeException>(() => _vs.MountAsync("rev-test", "bob", "bob-pw"));
     }
 
     [Fact]
-    public void RevokeAccess_Owner_Throws()
+    public async Task RevokeAccess_Owner_Throws()
     {
-        _vs.Create("owner-test", "alice", "pw", encrypted: true);
-        Assert.Throws<VolumeException>(() => _vs.RevokeAccess("owner-test", "alice", "alice"));
+        await _vs.CreateAsync("owner-test", "alice", "pw", encrypted: true);
+        await Assert.ThrowsAsync<VolumeException>(() => _vs.RevokeAccessAsync("owner-test", "alice", "alice"));
     }
 
     [Fact]
-    public void RewrapAllForUser_PasswordChange()
+    public async Task RewrapAllForUser_PasswordChange()
     {
-        _vs.Create("rewrap", "alice", "old-pw", encrypted: true);
-        _vs.Lock("rewrap");
+        await _vs.CreateAsync("rewrap", "alice", "old-pw", encrypted: true);
+        await _vs.LockAsync("rewrap", "alice");
 
-        _vs.RewrapAllForUser("alice", "old-pw", "new-pw");
+        await _vs.RewrapAllForUserAsync("alice", "old-pw", "new-pw");
 
-        Assert.Throws<VolumeException>(() => _vs.Mount("rewrap", "alice", "old-pw"));
+        await Assert.ThrowsAsync<VolumeException>(() => _vs.MountAsync("rewrap", "alice", "old-pw"));
 
-        var info = _vs.Mount("rewrap", "alice", "new-pw");
+        var info = await _vs.MountAsync("rewrap", "alice", "new-pw");
         Assert.True(info.IsMounted);
     }
 
     [Fact]
-    public void RewrapAllForUser_OnlyAffectsTargetUser()
+    public async Task RewrapAllForUser_OnlyAffectsTargetUser()
     {
-        _vs.Create("multi", "alice", "alice-pw", encrypted: true);
-        _vs.GrantAccess("multi", "alice", "alice-pw", "bob", "bob-pw");
-        _vs.Lock("multi");
+        await _vs.CreateAsync("multi", "alice", "alice-pw", encrypted: true);
+        await _vs.GrantAccessAsync("multi", "alice", "alice-pw", "bob", "bob-pw");
+        await _vs.LockAsync("multi", "alice");
 
-        _vs.RewrapAllForUser("alice", "alice-pw", "alice-new");
+        await _vs.RewrapAllForUserAsync("alice", "alice-pw", "alice-new");
 
-        var info = _vs.Mount("multi", "bob", "bob-pw");
+        var info = await _vs.MountAsync("multi", "bob", "bob-pw");
         Assert.True(info.IsMounted);
     }
 
     [Fact]
-    public void ListForUser_ReturnsOnlyAccessible()
+    public async Task ListForUser_ReturnsOnlyAccessible()
     {
-        _vs.Create("a1", "alice", "pw", encrypted: true);
-        _vs.Create("b1", "bob", "pw", encrypted: true);
+        await _vs.CreateAsync("a1", "alice", "pw", encrypted: true);
+        await _vs.CreateAsync("b1", "bob", "pw", encrypted: true);
 
-        var aliceList = _vs.ListForUser("alice");
+        var aliceList = await _vs.ListForUserAsync("alice");
         Assert.Single(aliceList);
         Assert.Equal("a1", aliceList[0].Name);
     }
 
     [Fact]
-    public void HasAccess_ReturnsCorrectly()
+    public async Task HasAccess_ReturnsCorrectly()
     {
-        _vs.Create("acc", "alice", "pw", encrypted: true);
-        Assert.True(_vs.HasAccess("acc", "alice"));
-        Assert.False(_vs.HasAccess("acc", "bob"));
+        await _vs.CreateAsync("acc", "alice", "pw", encrypted: true);
+        Assert.True(await _vs.HasAccessAsync("acc", "alice"));
+        Assert.False(await _vs.HasAccessAsync("acc", "bob"));
     }
 
     [Fact]
-    public void Lock_ClearsMountedState()
+    public async Task Lock_ClearsMountedState()
     {
-        _vs.Create("lock-test", "alice", "pw", encrypted: true);
+        await _vs.CreateAsync("lock-test", "alice", "pw", encrypted: true);
         Assert.True(_vs.IsMounted("lock-test"));
-        _vs.Lock("lock-test");
+        await _vs.LockAsync("lock-test", "alice");
         Assert.False(_vs.IsMounted("lock-test"));
     }
 
     [Fact]
-    public void Create_GroupPrefix_Throws()
+    public async Task Create_GroupPrefix_Throws()
     {
-        Assert.Throws<VolumeException>(() =>
-            _vs.Create("group__test", "alice", "pw", encrypted: true));
+        await Assert.ThrowsAsync<VolumeException>(() =>
+            _vs.CreateAsync("group__test", "alice", "pw", encrypted: true));
     }
 
     [Fact]
-    public void Create_InvalidChars_Throws()
+    public async Task Create_InvalidChars_Throws()
     {
-        Assert.Throws<VolumeException>(() =>
-            _vs.Create("bad|name", "alice", "pw", encrypted: true));
+        await Assert.ThrowsAsync<VolumeException>(() =>
+            _vs.CreateAsync("bad|name", "alice", "pw", encrypted: true));
     }
 
     [Fact]
-    public void Create_TooLong_Throws()
+    public async Task Create_TooLong_Throws()
     {
         string longName = new('a', 65);
-        Assert.Throws<VolumeException>(() =>
-            _vs.Create(longName, "alice", "pw", encrypted: true));
+        await Assert.ThrowsAsync<VolumeException>(() =>
+            _vs.CreateAsync(longName, "alice", "pw", encrypted: true));
     }
 
     [Fact]
-    public void DoubleMount_Throws()
+    public async Task DoubleMount_Throws()
     {
-        _vs.Create("dm", "alice", "pw", encrypted: true);
-        Assert.Throws<VolumeException>(() => _vs.Mount("dm", "alice", "pw"));
+        await _vs.CreateAsync("dm", "alice", "pw", encrypted: true);
+        await Assert.ThrowsAsync<VolumeException>(() => _vs.MountAsync("dm", "alice", "pw"));
     }
 
     [Fact]
-    public void Lock_NotMounted_Throws()
+    public async Task Lock_NotMounted_Throws()
     {
-        Assert.Throws<VolumeException>(() => _vs.Lock("nonexistent"));
+        await Assert.ThrowsAsync<VolumeException>(() => _vs.LockAsync("nonexistent", "alice"));
     }
 
     [Fact]
-    public void DeleteVolume_RemovesDirectory()
+    public async Task DeleteVolume_RemovesDirectory()
     {
-        _vs.Create("to-delete", "alice", "pw", encrypted: true);
+        await _vs.CreateAsync("to-delete", "alice", "pw", encrypted: true);
         Assert.True(Directory.Exists(Path.Combine(_dataRoot, "to-delete")));
 
-        _vs.DeleteVolume("to-delete");
+        await _vs.DeleteVolumeAsync("to-delete");
         Assert.False(Directory.Exists(Path.Combine(_dataRoot, "to-delete")));
         Assert.False(_vs.IsMounted("to-delete"));
     }
 
     [Fact]
-    public void MountE2ee_Success()
+    public async Task MountE2ee_Success()
     {
         byte[] masterKey = RandomNumberGenerator.GetBytes(32);
         byte[] salt = RandomNumberGenerator.GetBytes(16);
         byte[] kek = E2eeCrypto.DeriveKek("alice", "pw", salt, 1000);
         var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
 
-        _vs.CreateE2ee("e2ee-mount", "alice", new VolumeHeader.UserWrappedKey
+        await _vs.CreateE2eeAsync("e2ee-mount", "alice", new VolumeHeader.UserWrappedKey
         {
             Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = 1000, Salt = salt },
             WrappedMasterKey = new() { Algorithm = "aes-256-gcm", Nonce = nonce, Ciphertext = ct, Tag = tag },
         });
 
-        _vs.Lock("e2ee-mount");
-        var info = _vs.MountE2ee("e2ee-mount", "alice");
+        await _vs.LockAsync("e2ee-mount", "alice");
+        var info = await _vs.MountE2eeAsync("e2ee-mount", "alice");
         Assert.True(info.IsMounted);
     }
 
     [Fact]
-    public void MountE2ee_WrongUser_Throws()
+    public async Task MountE2ee_WrongUser_Throws()
     {
         byte[] masterKey = RandomNumberGenerator.GetBytes(32);
         byte[] salt = RandomNumberGenerator.GetBytes(16);
         byte[] kek = E2eeCrypto.DeriveKek("alice", "pw", salt, 1000);
         var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
 
-        _vs.CreateE2ee("e2ee-mount2", "alice", new VolumeHeader.UserWrappedKey
+        await _vs.CreateE2eeAsync("e2ee-mount2", "alice", new VolumeHeader.UserWrappedKey
         {
             Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = 1000, Salt = salt },
             WrappedMasterKey = new() { Algorithm = "aes-256-gcm", Nonce = nonce, Ciphertext = ct, Tag = tag },
         });
 
-        _vs.Lock("e2ee-mount2");
-        Assert.Throws<VolumeException>(() => _vs.MountE2ee("e2ee-mount2", "bob"));
+        await _vs.LockAsync("e2ee-mount2", "alice");
+        await Assert.ThrowsAsync<VolumeException>(() => _vs.MountE2eeAsync("e2ee-mount2", "bob"));
     }
 
     [Fact]
@@ -247,22 +247,27 @@ public class VolumeTests : IDisposable
         var gs = scope.ServiceProvider.GetRequiredService<GroupService>();
         await gs.CreateGroupAsync("testg", "alice");
 
-        _vs.CreateE2ee("e2ee-group", "alice", new VolumeHeader.UserWrappedKey
+        await _vs.CreateE2eeAsync("e2ee-group", "alice", new VolumeHeader.UserWrappedKey
         {
             Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = 1000, Salt = salt },
             WrappedMasterKey = new() { Algorithm = "aes-256-gcm", Nonce = nonce, Ciphertext = ct, Tag = tag },
         });
 
-        Assert.Throws<VolumeException>(() =>
-            _vs.GrantGroupAccess("e2ee-group", "alice", "testg"));
+        await Assert.ThrowsAsync<VolumeException>(() =>
+            _vs.GrantGroupAccessAsync("e2ee-group", "alice", "testg"));
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
-        foreach (var v in _vs.ListAll())
+        foreach (var v in await _vs.ListAllAsync())
         {
-            try { _vs.Lock(v.Name); } catch { }
+            try
+            {
+                var header = await _vs.GetVolumeHeaderAsync(v.Name);
+                await _vs.LockAsync(v.Name, header.OwnerUser);
+            }
+            catch (Exception) { }
         }
-        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch { }
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch (Exception) { }
     }
 }

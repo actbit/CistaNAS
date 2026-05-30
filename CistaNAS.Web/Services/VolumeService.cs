@@ -7,6 +7,7 @@ using CistaNAS.Web.Models;
 using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Web.Services;
@@ -16,32 +17,35 @@ namespace CistaNAS.Web.Services;
 /// メタデータは VolumeMetadataStore（IStorageProvider）経由で保存し、
 /// volume.dat はローカルファイルシステムに配置。
 /// </summary>
-public sealed class VolumeService
+public sealed class VolumeService : IDisposable
 {
+    private bool _disposed;
     private readonly string _volumeDataPath;
     private readonly VolumeOptions _volOpts;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly VolumeMetadataStore _metaStore;
+    private readonly ILogger<VolumeService> _logger;
 
     private readonly ConcurrentDictionary<string, MountedVolume> _mounted = new();
     private readonly SemaphoreSlim _mountGate = new(1, 1);
 
-    public VolumeService(IOptions<CistaNasOptions> options, IServiceScopeFactory scopeFactory, VolumeMetadataStore metaStore)
+    public VolumeService(IOptions<CistaNasOptions> options, IServiceScopeFactory scopeFactory, VolumeMetadataStore metaStore, ILogger<VolumeService> logger)
     {
         _volumeDataPath = options.Value.Storage.VolumeDataPath ?? options.Value.DataRoot;
         _volOpts = options.Value.Volume;
         _scopeFactory = scopeFactory;
         _metaStore = metaStore;
+        _logger = logger;
         Directory.CreateDirectory(_volumeDataPath);
     }
 
-    public VolumeInfo Create(string name, string? username, string? password, bool encrypted = true)
+    public async Task<VolumeInfo> CreateAsync(string name, string? username, string? password, bool encrypted = true)
     {
         ValidateName(name);
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
-            return CreateInternal(name, username, password, encrypted);
+            return await CreateInternalAsync(name, username, password, encrypted);
         }
         finally
         {
@@ -50,17 +54,17 @@ public sealed class VolumeService
     }
 
     /// <summary>ホームボリューム等、内部用途の作成（home__ プレフィックスを許可）。</summary>
-    public VolumeInfo CreateInternal(string name, string? username, string? password, bool encrypted = true)
+    public async Task<VolumeInfo> CreateInternalAsync(string name, string? username, string? password, bool encrypted = true)
     {
         if (encrypted) { ArgumentException.ThrowIfNullOrEmpty(username); ArgumentException.ThrowIfNullOrEmpty(password); }
 
-        if (_metaStore.ExistsAsync(name).GetAwaiter().GetResult())
+        if (await _metaStore.ExistsAsync(name))
             throw new VolumeException($"ボリューム '{name}' は既に存在します。");
 
         var (header, masterKey) = VolumeHeader.Create(name, username, password, _volOpts.SectorSize, _volOpts.KdfIterations, encrypted);
 
         Directory.CreateDirectory(VolumeDir(name));
-        _metaStore.SaveAsync(name, header).GetAwaiter().GetResult();
+        await _metaStore.SaveAsync(name, header);
         File.Create(GetDataPath(name)).Dispose();
         MountInternal(name, header, masterKey);
 
@@ -68,21 +72,21 @@ public sealed class VolumeService
     }
 
     /// <summary>E2EE ボリュームを作成（クライアントから wrappedMasterKey を受け取る）。</summary>
-    public VolumeInfo CreateE2ee(string name, string username, VolumeHeader.UserWrappedKey wrappedKey, int chunkSize = 1048576)
+    public async Task<VolumeInfo> CreateE2eeAsync(string name, string username, VolumeHeader.UserWrappedKey wrappedKey, int chunkSize = 1048576)
     {
         ValidateName(name);
         ArgumentException.ThrowIfNullOrEmpty(username);
 
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
-            if (_metaStore.ExistsAsync(name).GetAwaiter().GetResult())
+            if (await _metaStore.ExistsAsync(name))
                 throw new VolumeException($"ボリューム '{name}' は既に存在します。");
 
             var header = VolumeHeader.CreateE2ee(name, username, wrappedKey, chunkSize);
 
             Directory.CreateDirectory(VolumeDir(name));
-            _metaStore.SaveAsync(name, header).GetAwaiter().GetResult();
+            await _metaStore.SaveAsync(name, header);
             File.Create(GetDataPath(name)).Dispose();
             MountInternal(name, header, masterKey: null);
 
@@ -94,15 +98,15 @@ public sealed class VolumeService
         }
     }
 
-    public VolumeInfo Mount(string name, string username, string? password)
+    public async Task<VolumeInfo> MountAsync(string name, string username, string? password)
     {
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
             if (_mounted.ContainsKey(name))
                 throw new VolumeException($"ボリューム '{name}' は既にマウントされています。");
 
-            var header = LoadHeaderOrThrow(name);
+            var header = await LoadHeaderOrThrowAsync(name);
             byte[]? masterKey = null;
             if (header.Encrypted)
             {
@@ -122,15 +126,15 @@ public sealed class VolumeService
     }
 
     /// <summary>E2EE ボリュームをマウント（アクセス権チェックのみ、鍵アンラップなし）。</summary>
-    public VolumeInfo MountE2ee(string name, string username)
+    public async Task<VolumeInfo> MountE2eeAsync(string name, string username)
     {
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
             if (_mounted.ContainsKey(name))
                 throw new VolumeException($"ボリューム '{name}' は既にマウントされています。");
 
-            var header = LoadHeaderOrThrow(name);
+            var header = await LoadHeaderOrThrowAsync(name);
             if (!header.IsE2ee)
                 throw new VolumeException($"ボリューム '{name}' は E2EE ボリュームではありません。");
             if (!header.HasUserAccess(username))
@@ -146,19 +150,19 @@ public sealed class VolumeService
     }
 
     /// <summary>E2EE ボリュームに wrapped key を追加（クライアント側で再ラップ済み）。</summary>
-    public void AddE2eeWrappedKey(string volumeName, string granterUsername, string targetUsername, VolumeHeader.UserWrappedKey wrappedKey)
+    public async Task AddE2eeWrappedKeyAsync(string volumeName, string granterUsername, string targetUsername, VolumeHeader.UserWrappedKey wrappedKey)
     {
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
-            var header = LoadHeaderOrThrow(volumeName);
+            var header = await LoadHeaderOrThrowAsync(volumeName);
             if (!header.IsE2ee)
                 throw new VolumeException($"ボリューム '{volumeName}' は E2EE ボリュームではありません。");
             if (header.OwnerUser != granterUsername)
                 throw new VolumeException("オーナーのみがアクセス権を付与できます。");
             if (!header.HasUserAccess(targetUsername))
                 header.AddWrappedKey(targetUsername, wrappedKey);
-            _metaStore.SaveAsync(volumeName, header).GetAwaiter().GetResult();
+            await _metaStore.SaveAsync(volumeName, header);
             RefreshMountedHeader(volumeName, header);
         }
         finally
@@ -167,13 +171,21 @@ public sealed class VolumeService
         }
     }
 
-    public void Lock(string name)
+    /// <summary>ボリュームをロック（アンマウント）する。オーナーのみ実行可能。</summary>
+    public async Task LockAsync(string name, string username)
     {
-        _mountGate.Wait();
+        ArgumentException.ThrowIfNullOrEmpty(username);
+
+        await _mountGate.WaitAsync();
         try
         {
-            if (!_mounted.TryRemove(name, out var mv))
+            if (!_mounted.TryGetValue(name, out var mv))
                 throw new VolumeException($"ボリューム '{name}' はマウントされていません。");
+
+            if (mv.Header.OwnerUser != username)
+                throw new VolumeException("オーナーのみがボリュームをロックできます。");
+
+            _mounted.TryRemove(name, out _);
             mv.Stream.Dispose();
             if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
         }
@@ -184,27 +196,27 @@ public sealed class VolumeService
     }
 
     /// <summary>ボリューム情報を返す。存在しない場合は null。</summary>
-    public VolumeInfo? GetVolumeInfo(string name)
+    public async Task<VolumeInfo?> GetVolumeInfoAsync(string name)
     {
-        var header = LoadHeaderIfExists(name);
+        var header = await LoadHeaderIfExistsAsync(name);
         if (header is null) return null;
         return ToInfo(name, header, _mounted.ContainsKey(name));
     }
 
     /// <summary>ボリュームヘッダを返す。存在しない場合は例外。</summary>
-    public VolumeHeader GetVolumeHeader(string name) => LoadHeaderOrThrow(name);
+    public async Task<VolumeHeader> GetVolumeHeaderAsync(string name) => await LoadHeaderOrThrowAsync(name);
 
     /// <summary>指定ユーザーがアクセスできるボリューム一覧を返す。</summary>
-    public IReadOnlyList<VolumeInfo> ListForUser(string username)
+    public async Task<IReadOnlyList<VolumeInfo>> ListForUserAsync(string username)
     {
         var result = new List<VolumeInfo>();
-        var volumeNames = _metaStore.ListVolumeNamesAsync().GetAwaiter().GetResult();
+        var volumeNames = await _metaStore.ListVolumeNamesAsync();
 
-        var userGroups = GetGroupsForUser(username);
+        var userGroups = await GetGroupsForUserAsync(username);
 
         foreach (var name in volumeNames)
         {
-            var header = LoadHeaderIfExists(name);
+            var header = await LoadHeaderIfExistsAsync(name);
             if (header is null) continue;
 
             if (!HasAccessInternal(header, username, userGroups)) continue;
@@ -214,14 +226,14 @@ public sealed class VolumeService
         return result;
     }
 
-    public IReadOnlyList<VolumeInfo> ListAll()
+    public async Task<IReadOnlyList<VolumeInfo>> ListAllAsync()
     {
         var result = new List<VolumeInfo>();
-        var volumeNames = _metaStore.ListVolumeNamesAsync().GetAwaiter().GetResult();
+        var volumeNames = await _metaStore.ListVolumeNamesAsync();
 
         foreach (var name in volumeNames)
         {
-            var header = LoadHeaderIfExists(name);
+            var header = await LoadHeaderIfExistsAsync(name);
             if (header is null) continue;
             result.Add(ToInfo(name, header, _mounted.ContainsKey(name)));
         }
@@ -238,11 +250,11 @@ public sealed class VolumeService
     public bool IsMounted(string name) => _mounted.ContainsKey(name);
 
     /// <summary>ボリュームが指定ユーザーのアクセス権を持つか。</summary>
-    public bool HasAccess(string volumeName, string username)
+    public async Task<bool> HasAccessAsync(string volumeName, string username)
     {
-        var header = LoadHeaderIfExists(volumeName);
+        var header = await LoadHeaderIfExistsAsync(volumeName);
         if (header is null) return false;
-        var userGroups = GetGroupsForUser(username);
+        var userGroups = await GetGroupsForUserAsync(username);
         return HasAccessInternal(header, username, userGroups);
     }
 
@@ -258,7 +270,7 @@ public sealed class VolumeService
     // ---- 共有 ----
 
     /// <summary>ボリュームに別ユーザーのアクセス権を付与。</summary>
-    public void GrantAccess(string volumeName, string granterUsername, string granterPassword,
+    public async Task GrantAccessAsync(string volumeName, string granterUsername, string granterPassword,
         string targetUsername, string targetPassword)
     {
         ArgumentException.ThrowIfNullOrEmpty(granterUsername);
@@ -266,12 +278,12 @@ public sealed class VolumeService
         ArgumentException.ThrowIfNullOrEmpty(targetUsername);
         ArgumentException.ThrowIfNullOrEmpty(targetPassword);
 
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
-            var header = LoadHeaderOrThrow(volumeName);
-            if (!header.HasUserAccess(granterUsername))
-                throw new VolumeException($"ユーザー '{granterUsername}' はこのボリュームにアクセス権がありません。");
+            var header = await LoadHeaderOrThrowAsync(volumeName);
+            if (header.OwnerUser != granterUsername)
+                throw new VolumeException("オーナーのみがアクセス権を付与できます。");
 
             byte[]? masterKey = header.UnwrapMasterKey(granterUsername, granterPassword)
                 ?? throw new VolumeException("付与者の認証情報が正しくありません。");
@@ -279,7 +291,7 @@ public sealed class VolumeService
             try
             {
                 header.AddUserWrap(targetUsername, targetPassword, masterKey, _volOpts.KdfIterations);
-                _metaStore.SaveAsync(volumeName, header).GetAwaiter().GetResult();
+                await _metaStore.SaveAsync(volumeName, header);
                 RefreshMountedHeader(volumeName, header);
             }
             finally
@@ -294,19 +306,19 @@ public sealed class VolumeService
     }
 
     /// <summary>ボリュームからユーザーのアクセス権を剥奪。</summary>
-    public void RevokeAccess(string volumeName, string revokerUsername, string targetUsername)
+    public async Task RevokeAccessAsync(string volumeName, string revokerUsername, string targetUsername)
     {
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
-            var header = LoadHeaderOrThrow(volumeName);
+            var header = await LoadHeaderOrThrowAsync(volumeName);
             if (header.OwnerUser != revokerUsername)
                 throw new VolumeException("オーナーのみがアクセス権を剥奪できます。");
             if (targetUsername == header.OwnerUser)
                 throw new VolumeException("オーナーのアクセス権は剥奪できません。");
 
             header.RemoveUserWrap(targetUsername);
-            _metaStore.SaveAsync(volumeName, header).GetAwaiter().GetResult();
+            await _metaStore.SaveAsync(volumeName, header);
             RefreshMountedHeader(volumeName, header);
         }
         finally
@@ -316,20 +328,20 @@ public sealed class VolumeService
     }
 
     /// <summary>ユーザーのパスワード変更時に全ボリュームの鍵を再ラップ。</summary>
-    public void RewrapAllForUser(string username, string oldPassword, string newPassword)
+    public async Task RewrapAllForUserAsync(string username, string oldPassword, string newPassword)
     {
-        var volumeNames = _metaStore.ListVolumeNamesAsync().GetAwaiter().GetResult();
+        var volumeNames = await _metaStore.ListVolumeNamesAsync();
 
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
             foreach (var name in volumeNames)
             {
-                var header = LoadHeaderIfExists(name);
+                var header = await LoadHeaderIfExistsAsync(name);
                 if (header is null || !header.HasUserAccess(username)) continue;
 
                 header.RewrapUser(username, oldPassword, newPassword, _volOpts.KdfIterations);
-                _metaStore.SaveAsync(name, header).GetAwaiter().GetResult();
+                await _metaStore.SaveAsync(name, header);
                 RefreshMountedHeader(name, header);
             }
         }
@@ -341,21 +353,21 @@ public sealed class VolumeService
 
     // ---- グループアクセス ----
 
-    public void GrantGroupAccess(string volumeName, string granterUsername, string groupName)
+    public async Task GrantGroupAccessAsync(string volumeName, string granterUsername, string groupName)
     {
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
-            var header = LoadHeaderOrThrow(volumeName);
-        if (header.OwnerUser != granterUsername)
-            throw new VolumeException("オーナーのみがグループアクセスを付与できます。");
-        if (header.IsE2ee)
-            throw new VolumeException("E2EE ボリュームはグループ共有に対応していません。");
-        if (FindGroup(groupName) is null)
-            throw new VolumeException($"グループ '{groupName}' が見つかりません。");
+            var header = await LoadHeaderOrThrowAsync(volumeName);
+            if (header.OwnerUser != granterUsername)
+                throw new VolumeException("オーナーのみがグループアクセスを付与できます。");
+            if (header.IsE2ee)
+                throw new VolumeException("E2EE ボリュームはグループ共有に対応していません。");
+            if (await FindGroupAsync(groupName) is null)
+                throw new VolumeException($"グループ '{groupName}' が見つかりません。");
 
             header.AuthorizedGroups.Add(groupName);
-            _metaStore.SaveAsync(volumeName, header).GetAwaiter().GetResult();
+            await _metaStore.SaveAsync(volumeName, header);
             RefreshMountedHeader(volumeName, header);
         }
         finally
@@ -364,18 +376,18 @@ public sealed class VolumeService
         }
     }
 
-    public void RevokeGroupAccess(string volumeName, string revokerUsername, string groupName)
+    public async Task RevokeGroupAccessAsync(string volumeName, string revokerUsername, string groupName)
     {
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
-            var header = LoadHeaderOrThrow(volumeName);
+            var header = await LoadHeaderOrThrowAsync(volumeName);
             if (header.OwnerUser != revokerUsername)
                 throw new VolumeException("オーナーのみがグループアクセスを剥奪できます。");
             if (!header.AuthorizedGroups.Remove(groupName))
                 throw new VolumeException($"グループ '{groupName}' はこのボリュームにアクセス権がありません。");
 
-            _metaStore.SaveAsync(volumeName, header).GetAwaiter().GetResult();
+            await _metaStore.SaveAsync(volumeName, header);
             RefreshMountedHeader(volumeName, header);
         }
         finally
@@ -384,20 +396,20 @@ public sealed class VolumeService
         }
     }
 
-    public void RemoveGroupFromAllVolumes(string groupName)
+    public async Task RemoveGroupFromAllVolumesAsync(string groupName)
     {
-        var volumeNames = _metaStore.ListVolumeNamesAsync().GetAwaiter().GetResult();
+        var volumeNames = await _metaStore.ListVolumeNamesAsync();
 
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
             foreach (var name in volumeNames)
             {
-                var header = LoadHeaderIfExists(name);
+                var header = await LoadHeaderIfExistsAsync(name);
                 if (header is null) continue;
                 if (header.AuthorizedGroups.Remove(groupName))
                 {
-                    _metaStore.SaveAsync(name, header).GetAwaiter().GetResult();
+                    await _metaStore.SaveAsync(name, header);
                     RefreshMountedHeader(name, header);
                 }
             }
@@ -411,26 +423,29 @@ public sealed class VolumeService
     // ---- グループ E2EE ボリューム ----
 
     /// <summary>グループ専用E2EEボリュームを作成（group__ プレフィックス付き）。</summary>
-    public VolumeInfo CreateGroupE2ee(string groupName, string ownerUsername,
+    public async Task<VolumeInfo> CreateGroupE2eeAsync(string groupName, string ownerUsername,
         VolumeHeader.UserWrappedKey ownerWrappedKey, int chunkSize = 1048576)
     {
         ArgumentException.ThrowIfNullOrEmpty(groupName);
         ArgumentException.ThrowIfNullOrEmpty(ownerUsername);
 
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
-            if (FindGroup(groupName) is null)
-                throw new VolumeException($"グループ '{groupName}' が見つかりません。");
+            var group = await FindGroupAsync(groupName)
+                ?? throw new VolumeException($"グループ '{groupName}' が見つかりません。");
+
+            if (!group.Members.Any(m => string.Equals(m.Username, ownerUsername, StringComparison.Ordinal)))
+                throw new VolumeException($"ユーザー '{ownerUsername}' はグループ '{groupName}' のメンバーではありません。");
 
             string volName = $"group__{groupName}";
-            if (_metaStore.ExistsAsync(volName).GetAwaiter().GetResult())
+            if (await _metaStore.ExistsAsync(volName))
                 throw new VolumeException($"グループボリューム '{volName}' は既に存在します。");
 
             var header = VolumeHeader.CreateE2ee(volName, ownerUsername, ownerWrappedKey, chunkSize);
 
             Directory.CreateDirectory(VolumeDir(volName));
-            _metaStore.SaveAsync(volName, header).GetAwaiter().GetResult();
+            await _metaStore.SaveAsync(volName, header);
             File.Create(GetDataPath(volName)).Dispose();
             MountInternal(volName, header, masterKey: null);
 
@@ -443,16 +458,16 @@ public sealed class VolumeService
     }
 
     /// <summary>グループのE2EEボリューム一覧を取得（グループオーナー用）。</summary>
-    public IReadOnlyList<VolumeInfo> GetGroupE2eeVolumes(string groupName)
+    public async Task<IReadOnlyList<VolumeInfo>> GetGroupE2eeVolumesAsync(string groupName)
     {
         var result = new List<VolumeInfo>();
         string prefix = $"group__{groupName}";
-        var volumeNames = _metaStore.ListVolumeNamesAsync().GetAwaiter().GetResult();
+        var volumeNames = await _metaStore.ListVolumeNamesAsync();
 
         foreach (var name in volumeNames)
         {
             if (name != prefix) continue;
-            var header = LoadHeaderIfExists(name);
+            var header = await LoadHeaderIfExistsAsync(name);
             if (header is null || !header.IsE2ee) continue;
             result.Add(ToInfo(name, header, _mounted.ContainsKey(name)));
         }
@@ -460,10 +475,10 @@ public sealed class VolumeService
     }
 
     /// <summary>グループメンバーの公開鍵一覧を取得（ECDH共有用）。</summary>
-    public IReadOnlyList<(string Username, string? PublicKey)> GetGroupMembersWithPublicKeys(
+    public async Task<IReadOnlyList<(string Username, string? PublicKey)>> GetGroupMembersWithPublicKeysAsync(
         string volumeName, string requesterUsername)
     {
-        var header = LoadHeaderOrThrow(volumeName);
+        var header = await LoadHeaderOrThrowAsync(volumeName);
         if (header.OwnerUser != requesterUsername)
             throw new VolumeException("オーナーのみがメンバー情報を取得できます。");
         if (!header.IsE2ee)
@@ -475,23 +490,24 @@ public sealed class VolumeService
         if (string.IsNullOrEmpty(groupName))
             throw new VolumeException("グループボリュームではありません。");
 
-        var group = FindGroup(groupName)
+        var group = await FindGroupAsync(groupName)
             ?? throw new VolumeException($"グループ '{groupName}' が見つかりません。");
 
-        return group.Members
+        var members = await GetGroupMembersWithPublicKeysAsync(group.Members
             .Where(m => !header.HasUserAccess(m.Username))
-            .Select(m => (m.Username, GetPublicKey(m.Username)))
-            .ToList();
+            .Select(m => m.Username)
+            .ToList());
+        return members;
     }
 
     /// <summary>E2EEボリュームにECDHラップ済み鍵を一括追加。</summary>
-    public void AddE2eeWrappedKeysBatch(string volumeName, string requesterUsername,
+    public async Task AddE2eeWrappedKeysBatchAsync(string volumeName, string requesterUsername,
         Dictionary<string, VolumeHeader.UserWrappedKey> wrappedKeys)
     {
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
-            var header = LoadHeaderOrThrow(volumeName);
+            var header = await LoadHeaderOrThrowAsync(volumeName);
             if (header.OwnerUser != requesterUsername)
                 throw new VolumeException("オーナーのみが鍵を追加できます。");
 
@@ -500,7 +516,7 @@ public sealed class VolumeService
                 if (!header.HasUserAccess(username))
                     header.AddWrappedKey(username, wrappedKey);
             }
-            _metaStore.SaveAsync(volumeName, header).GetAwaiter().GetResult();
+            await _metaStore.SaveAsync(volumeName, header);
             RefreshMountedHeader(volumeName, header);
         }
         finally
@@ -511,41 +527,70 @@ public sealed class VolumeService
 
     // ---- ボリューム削除 ----
 
-    public void DeleteVolume(string name)
+    /// <summary>ボリュームを削除する。username が非 null の場合はオーナーまたは admin のみ実行可能。</summary>
+    public async Task DeleteVolumeAsync(string name, string? username = null, bool isAdmin = false)
     {
-        _mountGate.Wait();
+        await _mountGate.WaitAsync();
         try
         {
+            // 認可: username が指定されている場合はオーナーまたは admin に限定
+            if (username is not null && !isAdmin)
+            {
+                var header = await LoadHeaderOrThrowAsync(name);
+                if (header.OwnerUser != username)
+                    throw new VolumeException("オーナーのみがボリュームを削除できます。");
+            }
             if (_mounted.TryRemove(name, out var mv))
             {
                 mv.Stream.Dispose();
                 if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
             }
+
+            // メタデータとローカルファイルの削除をマウントゲート内で実行
+            // （アンマウントと削除の間に別リクエストが介入するのを防止）
+
+            // メタデータをストレージプロバイダ経由で削除
+            try { await _metaStore.DeleteAllAsync(name); }
+            catch (Exception ex) { _logger.LogWarning(ex, "ボリューム '{Volume}' のメタデータ削除に失敗しました。", name); }
+
+            // ロックを解除（ボリューム削除後は不要）
+            try { _metaStore.Storage.RemoveLock(name); }
+            catch (Exception ex) { _logger.LogWarning(ex, "ボリューム '{Volume}' のロック解除に失敗しました。", name); }
+
+            // ローカルの volume.dat を削除
+            string dataPath = GetDataPath(name);
+            if (File.Exists(dataPath))
+                File.Delete(dataPath);
+
+            // 空になったローカルディレクトリを掃除
+            string dir = VolumeDir(name);
+            if (Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any())
+                Directory.Delete(dir);
+
+            // ストリームロック・カタログロック・E2EEファイルゲートを解放
+            try
+            {
+                await using var scope = _scopeFactory.CreateAsyncScope();
+                var fileService = scope.ServiceProvider.GetRequiredService<FileService>();
+                FileService.RemoveStreamLock(name);
+                FileService.RemoveCatalogLock(name);
+
+                var e2eeFs = scope.ServiceProvider.GetRequiredService<E2eeFileService>();
+                e2eeFs.CleanupVolumeGates(name);
+            }
+            catch (Exception ex) { _logger.LogWarning(ex, "ボリューム '{Volume}' のリソース解放に失敗しました。", name); }
         }
         finally
         {
             _mountGate.Release();
         }
-
-        // メタデータをストレージプロバイダ経由で削除
-        try { _metaStore.DeleteAllAsync(name).GetAwaiter().GetResult(); } catch { }
-
-        // ローカルの volume.dat を削除
-        string dataPath = GetDataPath(name);
-        if (File.Exists(dataPath))
-            File.Delete(dataPath);
-
-        // 空になったローカルディレクトリを掃除
-        string dir = VolumeDir(name);
-        if (Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any())
-            Directory.Delete(dir);
     }
 
     // ---- 内部 ----
 
     private void MountInternal(string name, VolumeHeader header, byte[]? masterKey)
     {
-        // E2EE はサーバー側で暗号化しないため、FileStream を排他保持しない
+        // E2EEはサーバー側で暗号化しないため、FileStream を排他保持しない
         var share = header.IsE2ee ? FileShare.ReadWrite : FileShare.None;
         var fs = new FileStream(GetDataPath(name), FileMode.Open, FileAccess.ReadWrite, share);
         Stream stream = (header.Encrypted && masterKey is not null)
@@ -554,14 +599,14 @@ public sealed class VolumeService
         _mounted[name] = new MountedVolume(header, masterKey, stream);
     }
 
-    private VolumeHeader LoadHeaderOrThrow(string name)
+    private async Task<VolumeHeader> LoadHeaderOrThrowAsync(string name)
     {
-        return _metaStore.LoadAsync(name).GetAwaiter().GetResult()
+        return (await _metaStore.LoadAsync(name))
             ?? throw new VolumeException($"ボリューム '{name}' が見つかりません。");
     }
 
-    private VolumeHeader? LoadHeaderIfExists(string name)
-        => _metaStore.LoadAsync(name).GetAwaiter().GetResult();
+    private async Task<VolumeHeader?> LoadHeaderIfExistsAsync(string name)
+        => await _metaStore.LoadAsync(name);
 
     private void RefreshMountedHeader(string name, VolumeHeader updated)
     {
@@ -584,26 +629,33 @@ public sealed class VolumeService
     private string VolumeDir(string name) => Path.Combine(_volumeDataPath, name);
     private string GetDataPath(string name) => Path.Combine(VolumeDir(name), "volume.dat");
 
-    private HashSet<string> GetGroupsForUser(string username)
+    private async Task<HashSet<string>> GetGroupsForUserAsync(string username)
     {
-        using var scope = _scopeFactory.CreateScope();
+        await using var scope = _scopeFactory.CreateAsyncScope();
         var groupService = scope.ServiceProvider.GetRequiredService<GroupService>();
-        return groupService.GetGroupsForUserAsync(username).GetAwaiter().GetResult()
-            .Select(g => g.GroupName).ToHashSet(StringComparer.Ordinal);
+        var groups = await groupService.GetGroupsForUserAsync(username);
+        return groups.Select(g => g.GroupName).ToHashSet(StringComparer.Ordinal);
     }
 
-    private GroupEntity? FindGroup(string groupName)
+    private async Task<GroupEntity?> FindGroupAsync(string groupName)
     {
-        using var scope = _scopeFactory.CreateScope();
+        await using var scope = _scopeFactory.CreateAsyncScope();
         var groupService = scope.ServiceProvider.GetRequiredService<GroupService>();
-        return groupService.FindAsync(groupName).GetAwaiter().GetResult();
+        return await groupService.FindAsync(groupName);
     }
 
-    private string? GetPublicKey(string username)
+    private async Task<IReadOnlyList<(string Username, string? PublicKey)>> GetGroupMembersWithPublicKeysAsync(
+        List<string> usernames)
     {
-        using var scope = _scopeFactory.CreateScope();
+        var results = new List<(string Username, string? PublicKey)>(usernames.Count);
+        await using var scope = _scopeFactory.CreateAsyncScope();
         var accountService = scope.ServiceProvider.GetRequiredService<AccountService>();
-        return accountService.GetPublicKeyAsync(username).GetAwaiter().GetResult();
+        foreach (var username in usernames)
+        {
+            var pubKey = await accountService.GetPublicKeyAsync(username);
+            results.Add((username, pubKey));
+        }
+        return results;
     }
 
     private static void ValidateName(string name)
@@ -613,15 +665,36 @@ public sealed class VolumeService
             throw new VolumeException("'home__' で始まる名前は予約されています。");
         if (name.StartsWith("group__", StringComparison.Ordinal))
             throw new VolumeException("'group__' で始まる名前は予約されています。グループボリュームは別途作成してください。");
-        if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
-            throw new VolumeException("ボリューム名に使用できない文字が含まれています。");
         if (name.Length > 64)
             throw new VolumeException("ボリューム名は 64 文字以内にしてください。");
+        foreach (char c in name)
+        {
+            if (!char.IsLetterOrDigit(c) && c != '-' && c != '_' && c != '.')
+                throw new VolumeException("ボリューム名に使用できない文字が含まれています。");
+        }
+        if (name == "." || name == "..")
+            throw new VolumeException("ボリューム名に使用できない文字が含まれています。");
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        foreach (var kvp in _mounted)
+        {
+            kvp.Value.Stream.Dispose();
+            if (kvp.Value.MasterKey is not null)
+                CryptographicOperations.ZeroMemory(kvp.Value.MasterKey);
+        }
+        _mounted.Clear();
+        _mountGate.Dispose();
     }
 
     private sealed class MountedVolume(VolumeHeader header, byte[]? masterKey, Stream stream)
     {
-        public VolumeHeader Header { get; private set; } = header;
+        private volatile VolumeHeader _header = header;
+        public VolumeHeader Header { get => _header; private set => _header = value; }
         public byte[]? MasterKey { get; } = masterKey;
         public Stream Stream { get; } = stream;
         public void UpdateHeader(VolumeHeader h) => Header = h;

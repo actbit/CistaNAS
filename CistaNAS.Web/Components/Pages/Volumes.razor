@@ -164,7 +164,7 @@ else
                         <td>
                             @if (v.IsMounted)
                             {
-                                <button class="btn btn-sm btn-outline-danger me-1" @onclick="() => HandleLock(v.Name)">ロック</button>
+                                <button class="btn btn-sm btn-outline-danger me-1" @onclick="() => HandleLockAsync(v.Name)">ロック</button>
                                 <a href="/files/@v.Name" class="btn btn-sm btn-outline-primary me-1">ファイル</a>
                             }
                             else
@@ -180,6 +180,11 @@ else
                 }
             </tbody>
         </table>
+    }
+
+    @if (_lockError is not null)
+    {
+        <div class="alert alert-danger mt-2">@_lockError</div>
     }
 
     @if (_mountTarget is not null)
@@ -247,7 +252,7 @@ else
                                     @u
                                     @if (u != CurrentUsername)
                                     {
-                                        <button class="btn btn-sm btn-outline-danger" @onclick="() => HandleRevoke(_shareTarget, u)">削除</button>
+                                        <button class="btn btn-sm btn-outline-danger" @onclick="() => HandleRevokeAsync(_shareTarget, u)">削除</button>
                                     }
                                     else
                                     {
@@ -280,7 +285,7 @@ else
                                         <li class="list-group-item d-flex justify-content-between align-items-center">
                                             @gn
                                             <button class="btn btn-sm btn-outline-danger"
-                                                    @onclick="() => HandleRevokeGroup(_shareTarget!, gn)">削除</button>
+                                                    @onclick="() => HandleRevokeGroupAsync(_shareTarget!, gn)">削除</button>
                                         </li>
                                     }
                                 </ul>
@@ -300,7 +305,7 @@ else
                                     </select>
                                 </div>
                                 <div class="col-auto">
-                                    <button class="btn btn-sm btn-outline-primary" @onclick="HandleGrantGroup">追加</button>
+                                    <button class="btn btn-sm btn-outline-primary" @onclick="HandleGrantGroupAsync">追加</button>
                                 </div>
                             </div>
                         }
@@ -313,7 +318,7 @@ else
                             </p>
                             <div class="row g-2 align-items-end">
                                 <div class="col">
-                                    <input class="form-control form-control-sm" placeholder="ユーザー名" @bind="_grantUsername" />
+                                    <input class="form-control form-control-sm" placeholder="ユーザー名" @bind="_ecdhUsername" />
                                 </div>
                                 <div class="col-auto">
                                     <button class="btn btn-sm btn-outline-primary" @onclick="HandleEcdhGrant">ECDH 共有</button>
@@ -327,7 +332,7 @@ else
                     </div>
                     <div class="modal-footer">
                         <button type="button" class="btn btn-secondary" @onclick="CloseShareDialog">閉じる</button>
-                        <button type="button" class="btn btn-primary" @onclick="HandleGrant">ユーザー追加</button>
+                        <button type="button" class="btn btn-primary" @onclick="HandleGrantAsync">ユーザー追加</button>
                     </div>
                 </div>
             </div>
@@ -358,6 +363,8 @@ else
     private string _grantPassword = "";
     private string _grantGranterPassword = "";
     private string? _shareError;
+    private string? _lockError;
+    private string _ecdhUsername = "";
 
     private sealed class CreateModel
     {
@@ -369,12 +376,12 @@ else
 
     private string CurrentUsername => AuthState.User?.Identity?.Name ?? "";
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
         AuthState.Subscribe(OnAuthStateChanged);
-        RefreshList();
+        await RefreshListAsync();
     }
-    private void RefreshList() => _volumes = VolumeSvc.ListForUser(CurrentUsername).ToList();
+    private async Task RefreshListAsync() => _volumes = (await VolumeSvc.ListForUserAsync(CurrentUsername)).ToList();
 
     private async Task HandleCreate()
     {
@@ -391,10 +398,10 @@ else
             }
             else
             {
-                VolumeSvc.Create(_createModel.Name, CurrentUsername, _createModel.Password, _createModel.Encrypted);
+                await VolumeSvc.CreateAsync(_createModel.Name, CurrentUsername, _createModel.Password, _createModel.Encrypted);
             }
             _createModel = new() { Encrypted = true };
-            RefreshList();
+            await RefreshListAsync();
         }
         catch (Exception ex) { _createError = ex.Message; }
         _isCreating = false;
@@ -402,45 +409,35 @@ else
 
     private async Task HandleCreateE2ee()
     {
-        // クライアント側で KEK 導出 → マスターキー生成 → ラップ
-        byte[] salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
-        string saltB64 = Convert.ToBase64String(salt);
-        string kekHandle = await E2ee.DeriveKek(_createModel.Password, saltB64, 310_000);
-        string mkHandle = await E2ee.GenerateMasterKey();
-        var (nonceB64, ctB64, tagB64) = await E2ee.WrapMasterKey(mkHandle, kekHandle);
-        await E2ee.ClearKey(kekHandle);
-        await E2ee.ClearKey(mkHandle);
-
-        var wrappedKey = new VolumeHeader.UserWrappedKey
-        {
-            Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = 310_000, Salt = salt },
-            WrappedMasterKey = new()
-            {
-                Algorithm = "aes-256-gcm",
-                Nonce = Convert.FromBase64String(nonceB64),
-                Ciphertext = Convert.FromBase64String(ctB64),
-                Tag = Convert.FromBase64String(tagB64),
-            },
-        };
-
-        VolumeSvc.CreateE2ee(_createModel.Name, CurrentUsername, wrappedKey);
+        var wrappedKey = await CreatePasswordWrappedKeyAsync(_createModel.Password);
+        await VolumeSvc.CreateE2eeAsync(_createModel.Name, CurrentUsername, wrappedKey);
     }
 
     private async Task HandleCreateGroupE2ee()
     {
-        // パスワードラップでオーナー鍵を作成
+        var ownerWrappedKey = await CreatePasswordWrappedKeyAsync(_createModel.Password, wrapType: "password");
+        await VolumeSvc.CreateGroupE2eeAsync(_createModel.Name, CurrentUsername, ownerWrappedKey);
+    }
+
+    /// <summary>
+    /// ブラウザ側 JS Interop でパスワードから KEK 導出 → マスターキー生成 → AES-256-GCM ラップを行い、
+    /// サーバー送信用の <see cref="VolumeHeader.UserWrappedKey"/> を構築する。
+    /// </summary>
+    private async Task<VolumeHeader.UserWrappedKey> CreatePasswordWrappedKeyAsync(
+        string password, string wrapType = "password", int iterations = 310_000)
+    {
         byte[] salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
         string saltB64 = Convert.ToBase64String(salt);
-        string kekHandle = await E2ee.DeriveKek(_createModel.Password, saltB64, 310_000);
+        string kekHandle = await E2ee.DeriveKek(password, saltB64, iterations);
         string mkHandle = await E2ee.GenerateMasterKey();
         var (nonceB64, ctB64, tagB64) = await E2ee.WrapMasterKey(mkHandle, kekHandle);
         await E2ee.ClearKey(kekHandle);
         await E2ee.ClearKey(mkHandle);
 
-        var ownerWrappedKey = new VolumeHeader.UserWrappedKey
+        return new VolumeHeader.UserWrappedKey
         {
-            WrapType = "password",
-            Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = 310_000, Salt = salt },
+            WrapType = wrapType,
+            Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = iterations, Salt = salt },
             WrappedMasterKey = new()
             {
                 Algorithm = "aes-256-gcm",
@@ -449,15 +446,33 @@ else
                 Tag = Convert.FromBase64String(tagB64),
             },
         };
+    }
 
-        VolumeSvc.CreateGroupE2ee(_createModel.Name, CurrentUsername, ownerWrappedKey);
+    /// <summary>
+    /// ECDH 共有済みラップ結果から <see cref="VolumeHeader.UserWrappedKey"/> を構築する。
+    /// </summary>
+    private static VolumeHeader.UserWrappedKey BuildEcdhWrappedKey(
+        string ephemeralPubKeyB64, string nonceB64, string ctB64, string tagB64)
+    {
+        return new VolumeHeader.UserWrappedKey
+        {
+            WrapType = "ecdh",
+            EphemeralPublicKey = Convert.FromBase64String(ephemeralPubKeyB64),
+            WrappedMasterKey = new()
+            {
+                Algorithm = "aes-256-gcm",
+                Nonce = Convert.FromBase64String(nonceB64),
+                Ciphertext = Convert.FromBase64String(ctB64),
+                Tag = Convert.FromBase64String(tagB64),
+            },
+        };
     }
 
     private void ShowMountDialog(string name, bool encrypted, string encryptionMode)
     {
         _mountTarget = name;
         _mountNeedsPassword = encrypted;
-        _mountIsE2ee = encryptionMode == "e2ee";
+        _mountIsE2ee = encryptionMode == "e2ee" || encryptionMode == "group-e2ee";
         _mountPassword = ""; _mountError = null; _isMounting = false;
     }
     private void CloseMountDialog() { _mountTarget = null; _mountError = null; }
@@ -470,21 +485,26 @@ else
             if (_mountIsE2ee)
             {
                 // E2EE: サーバー側でマウント（アクセス権チェックのみ）
-                VolumeSvc.MountE2ee(_mountTarget!, CurrentUsername);
+                await VolumeSvc.MountE2eeAsync(_mountTarget!, CurrentUsername);
             }
             else
             {
-                VolumeSvc.Mount(_mountTarget!, CurrentUsername, _mountNeedsPassword ? _mountPassword : null);
+                await VolumeSvc.MountAsync(_mountTarget!, CurrentUsername, _mountNeedsPassword ? _mountPassword : null);
             }
-            CloseMountDialog(); RefreshList();
+            CloseMountDialog(); await RefreshListAsync();
         }
         catch (VolumeException ex) { _mountError = ex.Message; }
         _isMounting = false;
     }
 
-    private void HandleLock(string name)
+    private async Task HandleLockAsync(string name)
     {
-        try { VolumeSvc.Lock(name); RefreshList(); } catch { }
+        _lockError = null;
+        try
+        {
+            await VolumeSvc.LockAsync(name, CurrentUsername); await RefreshListAsync();
+        }
+        catch (VolumeException ex) { _lockError = ex.Message; }
     }
 
     private async Task ShowShareDialog(string name)
@@ -492,7 +512,7 @@ else
         var vol = _volumes.FirstOrDefault(v => v.Name == name);
         if (vol is null) return;
         _shareTarget = name; _shareUsers = vol.AuthorizedUsers;
-        _shareIsE2ee = vol.EncryptionMode == "e2ee" && vol.Name.StartsWith("group__");
+        _shareIsE2ee = vol.EncryptionMode == "e2ee";
         _shareGroups = vol.AuthorizedGroups;
         _availableGroups = await GroupSvc.ListGroupsAsync();
         _grantGroupName = "";
@@ -500,12 +520,12 @@ else
     }
     private void CloseShareDialog() { _shareTarget = null; _shareError = null; }
 
-    private void HandleGrant()
+    private async Task HandleGrantAsync()
     {
         try
         {
-            VolumeSvc.GrantAccess(_shareTarget!, CurrentUsername, _grantGranterPassword, _grantUsername, _grantPassword);
-            RefreshList();
+            await VolumeSvc.GrantAccessAsync(_shareTarget!, CurrentUsername, _grantGranterPassword, _grantUsername, _grantPassword);
+            await RefreshListAsync();
             var vol = _volumes.FirstOrDefault(v => v.Name == _shareTarget);
             if (vol is not null) _shareUsers = vol.AuthorizedUsers;
             _grantUsername = ""; _grantPassword = ""; _grantGranterPassword = ""; _shareError = null;
@@ -513,25 +533,25 @@ else
         catch (VolumeException ex) { _shareError = ex.Message; }
     }
 
-    private void HandleRevoke(string volumeName, string targetUser)
+    private async Task HandleRevokeAsync(string volumeName, string targetUser)
     {
         try
         {
-            VolumeSvc.RevokeAccess(volumeName, CurrentUsername, targetUser);
-            RefreshList();
+            await VolumeSvc.RevokeAccessAsync(volumeName, CurrentUsername, targetUser);
+            await RefreshListAsync();
             var vol = _volumes.FirstOrDefault(v => v.Name == _shareTarget);
             if (vol is not null) _shareUsers = vol.AuthorizedUsers;
         }
         catch (VolumeException ex) { _shareError = ex.Message; }
     }
 
-    private void HandleGrantGroup()
+    private async Task HandleGrantGroupAsync()
     {
         if (string.IsNullOrEmpty(_grantGroupName)) return;
         try
         {
-            VolumeSvc.GrantGroupAccess(_shareTarget!, CurrentUsername, _grantGroupName);
-            RefreshList();
+            await VolumeSvc.GrantGroupAccessAsync(_shareTarget!, CurrentUsername, _grantGroupName);
+            await RefreshListAsync();
             var vol = _volumes.FirstOrDefault(v => v.Name == _shareTarget);
             if (vol is not null) _shareGroups = vol.AuthorizedGroups;
             _grantGroupName = ""; _shareError = null;
@@ -539,12 +559,12 @@ else
         catch (VolumeException ex) { _shareError = ex.Message; }
     }
 
-    private void HandleRevokeGroup(string volumeName, string groupName)
+    private async Task HandleRevokeGroupAsync(string volumeName, string groupName)
     {
         try
         {
-            VolumeSvc.RevokeGroupAccess(volumeName, CurrentUsername, groupName);
-            RefreshList();
+            await VolumeSvc.RevokeGroupAccessAsync(volumeName, CurrentUsername, groupName);
+            await RefreshListAsync();
             var vol = _volumes.FirstOrDefault(v => v.Name == _shareTarget);
             if (vol is not null) _shareGroups = vol.AuthorizedGroups;
         }
@@ -554,11 +574,11 @@ else
     private async Task HandleEcdhGrant()
     {
         _shareError = null;
-        if (string.IsNullOrWhiteSpace(_grantUsername)) { _shareError = "ユーザー名を入力してください。"; return; }
+        if (string.IsNullOrWhiteSpace(_ecdhUsername)) { _shareError = "ユーザー名を入力してください。"; return; }
         try
         {
             // 相手の公開鍵を取得
-            string? recipientPubKey = await AccountSvc.GetPublicKeyAsync(_grantUsername.Trim());
+            string? recipientPubKey = await AccountSvc.GetPublicKeyAsync(_ecdhUsername.Trim());
             if (recipientPubKey is null)
             {
                 _shareError = "相手ユーザーの公開鍵が登録されていません。先に設定ページで鍵ペアを生成してください。";
@@ -573,7 +593,7 @@ else
             }
 
             // ボリュームヘッダから自分の wrapped key を取得してアンラップ
-            var vol = VolumeSvc.GetVolumeInfo(_shareTarget!);
+            var vol = await VolumeSvc.GetVolumeInfoAsync(_shareTarget!);
             if (vol?.UserWrapTypes is null || !vol.UserWrapTypes.TryGetValue(CurrentUsername, out var wrapType))
             {
                 _shareError = "自分の wrapped key が見つかりません。";
@@ -581,7 +601,7 @@ else
             }
 
             // KEK 導出 → マスターキー アンラップ
-            var header = VolumeSvc.GetVolumeHeader(_shareTarget!);
+            var header = await VolumeSvc.GetVolumeHeaderAsync(_shareTarget!);
             var myKey = header.UserKeys[CurrentUsername];
             string kekHandle = await E2ee.DeriveKek(_grantGranterPassword,
                 Convert.ToBase64String(myKey.Kdf.Salt), myKey.Kdf.Iterations);
@@ -595,24 +615,13 @@ else
             var (ephPubKey, nonce, ct, tag) = await E2ee.EcdhWrap(mkHandle, recipientPubKey);
             await E2ee.ClearKey(mkHandle);
 
-            var ecdhWrappedKey = new VolumeHeader.UserWrappedKey
-            {
-                WrapType = "ecdh",
-                EphemeralPublicKey = Convert.FromBase64String(ephPubKey),
-                WrappedMasterKey = new()
-                {
-                    Algorithm = "aes-256-gcm",
-                    Nonce = Convert.FromBase64String(nonce),
-                    Ciphertext = Convert.FromBase64String(ct),
-                    Tag = Convert.FromBase64String(tag),
-                },
-            };
+            var ecdhWrappedKey = BuildEcdhWrappedKey(ephPubKey, nonce, ct, tag);
 
-            VolumeSvc.AddE2eeWrappedKey(_shareTarget!, CurrentUsername, _grantUsername.Trim(), ecdhWrappedKey);
-            RefreshList();
+            await VolumeSvc.AddE2eeWrappedKeyAsync(_shareTarget!, CurrentUsername, _ecdhUsername.Trim(), ecdhWrappedKey);
+            await RefreshListAsync();
             vol = _volumes.FirstOrDefault(v => v.Name == _shareTarget);
             if (vol is not null) _shareUsers = vol.AuthorizedUsers;
-            _grantUsername = ""; _grantGranterPassword = ""; _shareError = null;
+            _ecdhUsername = ""; _grantGranterPassword = ""; _shareError = null;
         }
         catch (Exception ex) { _shareError = ex.Message; }
     }

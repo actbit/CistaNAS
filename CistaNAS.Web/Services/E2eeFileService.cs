@@ -23,6 +23,7 @@ public sealed class E2eeFileService
 
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _fileGates = new(StringComparer.Ordinal);
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _volumeGates = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, ConcurrentBag<string>> _volumeFileIds = new(StringComparer.Ordinal);
 
     public E2eeFileService(VolumeService volumeService, IStorageProvider storage, IOptions<CistaNasOptions> options)
     {
@@ -41,15 +42,15 @@ public sealed class E2eeFileService
     }
 
     /// <summary>ファイルエントリを作成し、FileId を返す。</summary>
-    public E2eeFileEntry CreateFile(string volumeName, E2eeCreateFileRequest request)
+    public async Task<E2eeFileEntry> CreateFileAsync(string volumeName, E2eeCreateFileRequest request, CancellationToken ct = default)
     {
-        var header = GetE2eeHeader(volumeName);
+        GetE2eeHeader(volumeName);
 
         var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
-        volGate.Wait();
+        await volGate.WaitAsync(ct);
         try
         {
-            var catalog = LoadCatalog(volumeName);
+            var catalog = await LoadCatalogAsync(volumeName, ct);
 
             string fileId = Guid.NewGuid().ToString("N");
             string dataPath = GetDataPath(volumeName);
@@ -67,9 +68,10 @@ public sealed class E2eeFileService
             };
 
             catalog.Files[fileId] = entry;
-            SaveCatalog(volumeName, catalog);
+            await SaveCatalogAsync(volumeName, catalog, ct);
 
             _fileGates.TryAdd(fileId, new SemaphoreSlim(1, 1));
+            _volumeFileIds.GetOrAdd(volumeName, _ => new ConcurrentBag<string>()).Add(fileId);
             return entry;
         }
         finally
@@ -87,35 +89,55 @@ public sealed class E2eeFileService
         await gate.WaitAsync(ct);
         try
         {
-            var catalog = LoadCatalog(volumeName);
+            var catalog = await LoadCatalogAsync(volumeName, ct);
 
             if (!catalog.Files.TryGetValue(fileId, out var entry))
                 throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
 
-            long chunkOffset = entry.Offset + entry.ChunkSizes.Sum(s => (long)s);
+            if (chunkIndex < 0 || chunkIndex >= entry.ChunkCount)
+                throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です（0-{entry.ChunkCount - 1}）。");
 
-            string dataPath = GetDataPath(volumeName);
-            using var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
-            fs.Seek(chunkOffset, SeekOrigin.Begin);
+            // 順不同アップロードの検出: 前のチャンクが未完了なら拒否
+            if (chunkIndex > 0 && entry.ChunkSizes.Count < chunkIndex)
+                throw new FileServiceException($"チャンク {chunkIndex - 1} が未アップロードです。順番にアップロードしてください。");
 
-            long written = 0;
-            byte[] buffer = new byte[81920];
-            long remaining = dataLength;
-            while (remaining > 0)
+            long chunkOffset = entry.Offset;
+            for (int i = 0; i < chunkIndex; i++)
+                chunkOffset += entry.ChunkSizes[i];
+
+            // ボリュームゲートで volume.dat への書き込みを直列化
+            var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+            await volGate.WaitAsync(ct);
+            long written;
+            try
             {
-                int toRead = (int)Math.Min(buffer.Length, remaining);
-                int read = await data.ReadAsync(buffer.AsMemory(0, toRead), ct);
-                if (read == 0) break;
-                fs.Write(buffer, 0, read);
-                written += read;
-                remaining -= read;
+                string dataPath = GetDataPath(volumeName);
+                using var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+                fs.Seek(chunkOffset, SeekOrigin.Begin);
+
+                written = 0;
+                byte[] buffer = new byte[81920];
+                long remaining = dataLength;
+                while (remaining > 0)
+                {
+                    int toRead = (int)Math.Min(buffer.Length, remaining);
+                    int read = await data.ReadAsync(buffer.AsMemory(0, toRead), ct);
+                    if (read == 0) break;
+                    fs.Write(buffer, 0, read);
+                    written += read;
+                    remaining -= read;
+                }
+                fs.Flush();
             }
-            fs.Flush();
+            finally
+            {
+                volGate.Release();
+            }
 
             while (entry.ChunkSizes.Count <= chunkIndex)
                 entry.ChunkSizes.Add(0);
             entry.ChunkSizes[chunkIndex] = (int)written;
-            SaveCatalog(volumeName, catalog);
+            await SaveCatalogAsync(volumeName, catalog, ct);
         }
         finally
         {
@@ -124,10 +146,10 @@ public sealed class E2eeFileService
     }
 
     /// <summary>チャンクをダウンロード。</summary>
-    public (Stream Stream, long Length) DownloadChunk(string volumeName, string fileId, int chunkIndex)
+    public async Task<(Stream Stream, long Length)> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
-        var catalog = LoadCatalog(volumeName);
+        var catalog = await LoadCatalogAsync(volumeName, ct);
 
         if (!catalog.Files.TryGetValue(fileId, out var entry))
             throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
@@ -158,24 +180,31 @@ public sealed class E2eeFileService
     }
 
     /// <summary>アップロード完了を確定。</summary>
-    public void FinalizeFile(string volumeName, string fileId, E2eeFinalizeFileRequest request)
+    public async Task FinalizeFileAsync(string volumeName, string fileId, E2eeFinalizeFileRequest request, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
-        var catalog = LoadCatalog(volumeName);
-
-        if (!catalog.Files.TryGetValue(fileId, out var entry))
-            throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
-
-        entry.EncryptedLength = request.ActualEncryptedLength;
-        entry.ModifiedAt = DateTimeOffset.UtcNow;
-        SaveCatalog(volumeName, catalog);
+        var gate = _fileGates.GetOrAdd(fileId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            var catalog = await LoadCatalogAsync(volumeName, ct);
+            if (!catalog.Files.TryGetValue(fileId, out var entry))
+                throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+            entry.EncryptedLength = request.ActualEncryptedLength;
+            entry.ModifiedAt = DateTimeOffset.UtcNow;
+            await SaveCatalogAsync(volumeName, catalog, ct);
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     /// <summary>ファイル一覧を返す。</summary>
-    public E2eeListFilesResponse ListFiles(string volumeName)
+    public async Task<E2eeListFilesResponse> ListFilesAsync(string volumeName, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
-        var catalog = LoadCatalog(volumeName);
+        var catalog = await LoadCatalogAsync(volumeName, ct);
 
         foreach (var kvp in _fileGates)
         {
@@ -190,15 +219,42 @@ public sealed class E2eeFileService
     }
 
     /// <summary>ファイルを削除。</summary>
-    public void DeleteFile(string volumeName, string fileId)
+    public async Task DeleteFileAsync(string volumeName, string fileId, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
-        var catalog = LoadCatalog(volumeName);
+        var gate = _fileGates.GetOrAdd(fileId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            var catalog = await LoadCatalogAsync(volumeName, ct);
+            if (!catalog.Files.Remove(fileId))
+                throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+            await SaveCatalogAsync(volumeName, catalog, ct);
+        }
+        finally
+        {
+            gate.Release();
+        }
 
-        if (!catalog.Files.Remove(fileId))
-            throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+        // ファイル削除後に対応する SemaphoreSlim を破棄
+        if (_fileGates.TryRemove(fileId, out var g))
+            g.Dispose();
+    }
 
-        SaveCatalog(volumeName, catalog);
+    /// <summary>ボリューム削除時に対応する SemaphoreSlim を破棄。</summary>
+    public void CleanupVolumeGates(string volumeName)
+    {
+        if (_volumeFileIds.TryRemove(volumeName, out var fileIds))
+        {
+            foreach (var fileId in fileIds)
+            {
+                if (_fileGates.TryRemove(fileId, out var gate))
+                    gate.Dispose();
+            }
+        }
+
+        if (_volumeGates.TryRemove(volumeName, out var volGate))
+            volGate.Dispose();
     }
 
     /// <summary>E2EE マウント情報を返す。</summary>
@@ -210,19 +266,19 @@ public sealed class E2eeFileService
 
     // ---- 内部ヘルパー ----
 
-    private E2eeCatalog LoadCatalog(string volumeName)
+    private async Task<E2eeCatalog> LoadCatalogAsync(string volumeName, CancellationToken ct)
     {
-        byte[]? data = _storage.ReadAsync($"{volumeName}/catalog-e2ee.json").GetAwaiter().GetResult();
+        byte[]? data = await _storage.ReadAsync($"{volumeName}/catalog-e2ee.json", ct);
         if (data is null) return new E2eeCatalog();
         return JsonSerializer.Deserialize<E2eeCatalog>(data, JsonOptions) ?? new E2eeCatalog();
     }
 
-    private void SaveCatalog(string volumeName, E2eeCatalog catalog)
+    private async Task SaveCatalogAsync(string volumeName, E2eeCatalog catalog, CancellationToken ct)
     {
         using var ms = new MemoryStream();
         JsonSerializer.Serialize(ms, catalog, JsonOptions);
         ms.Position = 0;
-        _storage.WriteAtomicAsync($"{volumeName}/catalog-e2ee.json", ms).GetAwaiter().GetResult();
+        await _storage.WriteAtomicAsync($"{volumeName}/catalog-e2ee.json", ms, ct);
     }
 
     private string GetDataPath(string volumeName)

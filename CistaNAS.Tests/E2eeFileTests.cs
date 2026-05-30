@@ -10,7 +10,7 @@ using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
 
-public class E2eeFileTests : IDisposable
+public class E2eeFileTests : IAsyncDisposable
 {
     private readonly string _dataRoot;
     private readonly IServiceProvider _sp;
@@ -33,11 +33,11 @@ public class E2eeFileTests : IDisposable
     }
 
     [Fact]
-    public void CreateFile_ReturnsEntryWithFileId()
+    public async Task CreateFile_ReturnsEntryWithFileId()
     {
-        string vol = MountE2ee("test-create");
+        string vol = await MountE2eeAsync("test-create");
         var e2eeFs = GetE2eeFileService();
-        var entry = e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc-name-abc", 2048, 2));
+        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc-name-abc", 2048, 2));
 
         Assert.False(string.IsNullOrEmpty(entry.FileId));
         Assert.Equal("enc-name-abc", entry.EncryptedName);
@@ -48,11 +48,11 @@ public class E2eeFileTests : IDisposable
     [Fact]
     public async Task UploadAndDownloadChunk_Roundtrip()
     {
-        string vol = MountE2ee("test-io");
+        string vol = await MountE2eeAsync("test-io");
         const int chunkSize = 4096;
 
         var e2eeFs = GetE2eeFileService();
-        var entry = e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc-file", chunkSize * 2 + 16 * 2 + 16, 2));
+        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc-file", chunkSize * 2 + 16 * 2 + 16, 2));
 
         byte[] fileSalt = E2eeCrypto.GenerateFileSalt();
         byte[] fileKey = E2eeCrypto.DeriveFileKey(_masterKey, fileSalt);
@@ -67,12 +67,12 @@ public class E2eeFileTests : IDisposable
         using (var ms1 = new MemoryStream(encChunk1))
             await e2eeFs.UploadChunkAsync(vol, entry.FileId, 1, ms1, encChunk1.Length);
 
-        var (stream0, len0) = e2eeFs.DownloadChunk(vol, entry.FileId, 0);
+        var (stream0, len0) = await e2eeFs.DownloadChunkAsync(vol, entry.FileId, 0);
         byte[] dl0 = new byte[len0];
         using (stream0) await stream0.ReadExactlyAsync(dl0);
         Assert.Equal(encChunk0, dl0);
 
-        var (stream1, len1) = e2eeFs.DownloadChunk(vol, entry.FileId, 1);
+        var (stream1, len1) = await e2eeFs.DownloadChunkAsync(vol, entry.FileId, 1);
         byte[] dl1 = new byte[len1];
         using (stream1) await stream1.ReadExactlyAsync(dl1);
         Assert.Equal(encChunk1, dl1);
@@ -86,61 +86,61 @@ public class E2eeFileTests : IDisposable
     }
 
     [Fact]
-    public void ListFiles_ReturnsCreatedFiles()
+    public async Task ListFiles_ReturnsCreatedFiles()
     {
-        string vol = MountE2ee("test-list");
+        string vol = await MountE2eeAsync("test-list");
         var e2eeFs = GetE2eeFileService();
-        e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc-a", 100, 1));
-        e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc-b", 200, 1));
+        await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc-a", 100, 1));
+        await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc-b", 200, 1));
 
-        var result = e2eeFs.ListFiles(vol);
+        var result = await e2eeFs.ListFilesAsync(vol);
         Assert.Equal(2, result.Files.Count);
         Assert.Contains(result.Files, f => f.EncryptedName == "enc-a");
         Assert.Contains(result.Files, f => f.EncryptedName == "enc-b");
     }
 
     [Fact]
-    public void DeleteFile_RemovesFromCatalog()
+    public async Task DeleteFile_RemovesFromCatalog()
     {
-        string vol = MountE2ee("test-delete");
+        string vol = await MountE2eeAsync("test-delete");
         var e2eeFs = GetE2eeFileService();
-        var entry = e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("to-delete", 100, 1));
+        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("to-delete", 100, 1));
 
-        Assert.Single(e2eeFs.ListFiles(vol).Files);
-        e2eeFs.DeleteFile(vol, entry.FileId);
-        Assert.Empty(e2eeFs.ListFiles(vol).Files);
+        Assert.Single((await e2eeFs.ListFilesAsync(vol)).Files);
+        await e2eeFs.DeleteFileAsync(vol, entry.FileId);
+        Assert.Empty((await e2eeFs.ListFilesAsync(vol)).Files);
     }
 
     [Fact]
-    public void FinalizeFile_UpdatesLength()
+    public async Task FinalizeFile_UpdatesLength()
     {
-        string vol = MountE2ee("test-finalize");
+        string vol = await MountE2eeAsync("test-finalize");
         var e2eeFs = GetE2eeFileService();
-        var entry = e2eeFs.CreateFile(vol, new E2eeCreateFileRequest("enc", 2048, 2));
+        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc", 2048, 2));
 
-        e2eeFs.FinalizeFile(vol, entry.FileId, new E2eeFinalizeFileRequest(1500));
+        await e2eeFs.FinalizeFileAsync(vol, entry.FileId, new E2eeFinalizeFileRequest(1500));
 
-        var list = e2eeFs.ListFiles(vol);
+        var list = await e2eeFs.ListFilesAsync(vol);
         Assert.Single(list.Files);
         Assert.Equal(1500, list.Files[0].EncryptedLength);
     }
 
     [Fact]
-    public void DeleteFile_NonExistent_Throws()
+    public async Task DeleteFile_NonExistent_Throws()
     {
-        string vol = MountE2ee("test-del-missing");
+        string vol = await MountE2eeAsync("test-del-missing");
         var e2eeFs = GetE2eeFileService();
-        Assert.Throws<FileServiceException>(() =>
-            e2eeFs.DeleteFile(vol, "nonexistent-id"));
+        await Assert.ThrowsAsync<FileServiceException>(() =>
+            e2eeFs.DeleteFileAsync(vol, "nonexistent-id"));
     }
 
-    private string MountE2ee(string name)
+    private async Task<string> MountE2eeAsync(string name)
     {
         byte[] salt = RandomNumberGenerator.GetBytes(16);
         byte[] kek = E2eeCrypto.DeriveKek("testuser", "testpass", salt, 1000);
         var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(_masterKey, kek);
 
-        _volumeService.CreateE2ee(name, "testuser", new VolumeHeader.UserWrappedKey
+        await _volumeService.CreateE2eeAsync(name, "testuser", new VolumeHeader.UserWrappedKey
         {
             Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = 1000, Salt = salt },
             WrappedMasterKey = new()
@@ -155,12 +155,17 @@ public class E2eeFileTests : IDisposable
         return name;
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
-        foreach (var v in _volumeService.ListAll())
+        foreach (var v in await _volumeService.ListAllAsync())
         {
-            try { _volumeService.Lock(v.Name); } catch { }
+            try
+            {
+                var header = await _volumeService.GetVolumeHeaderAsync(v.Name);
+                await _volumeService.LockAsync(v.Name, header.OwnerUser);
+            }
+            catch (Exception) { }
         }
-        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch { }
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch (Exception) { }
     }
 }

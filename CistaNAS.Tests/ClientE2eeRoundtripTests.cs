@@ -7,7 +7,7 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace CistaNAS.Tests;
 
-public class ClientE2eeRoundtripTests : IDisposable
+public class ClientE2eeRoundtripTests : IAsyncDisposable
 {
     private readonly string _dataRoot;
     private readonly IServiceProvider _sp;
@@ -20,7 +20,7 @@ public class ClientE2eeRoundtripTests : IDisposable
     }
 
     [Fact]
-    public void FullRoundtrip_WrapOnServer_UnwrapOnClient_EncryptDecryptFile()
+    public async Task FullRoundtrip_WrapOnServer_UnwrapOnClient_EncryptDecryptFile()
     {
         string username = "alice";
         string password = "test-password-123";
@@ -46,10 +46,10 @@ public class ClientE2eeRoundtripTests : IDisposable
             },
         };
 
-        _vs.CreateE2ee(volName, username, wrappedKey);
+        await _vs.CreateE2eeAsync(volName, username, wrappedKey);
 
         // --- クライアント側: VolumeHeader から wrapped key を取得 ---
-        var header = _vs.GetVolumeHeader(volName);
+        var header = await _vs.GetVolumeHeaderAsync(volName);
         var userKey = header.UserKeys[username];
 
         // --- クライアント側: KEK 導出 → マスターキー アンラップ ---
@@ -136,12 +136,17 @@ public class ClientE2eeRoundtripTests : IDisposable
         Assert.Equal(masterKey, clientMasterKey);
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
-        foreach (var v in _vs.ListAll())
+        foreach (var v in await _vs.ListAllAsync())
         {
-            try { _vs.Lock(v.Name); } catch { }
+            try
+            {
+                var header = await _vs.GetVolumeHeaderAsync(v.Name);
+                await _vs.LockAsync(v.Name, header.OwnerUser);
+            }
+            catch (Exception) { }
         }
-        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch { }
+        try { if (Directory.Exists(_dataRoot)) Directory.Delete(_dataRoot, recursive: true); } catch (Exception) { }
     }
 }

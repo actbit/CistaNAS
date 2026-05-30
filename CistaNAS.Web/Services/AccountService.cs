@@ -52,7 +52,7 @@ public sealed class AccountService(
 
         await EnsureRoleAsync(role);
 
-        var user = new ApplicationUser { UserName = username, Email = $"{username}@cista.local" };
+        var user = new ApplicationUser { UserName = username };
         var result = await userManager.CreateAsync(user, password);
         if (!result.Succeeded)
             throw new InvalidOperationException(string.Join(", ", result.Errors.Select(e => e.Description)));
@@ -68,9 +68,12 @@ public sealed class AccountService(
             await using var scope = scopeFactory.CreateAsyncScope();
             var volumeService = scope.ServiceProvider.GetRequiredService<VolumeService>();
             string homeName = $"home__{username}";
-            volumeService.CreateInternal(homeName, username, password: null, encrypted: false);
+            await volumeService.CreateInternalAsync(homeName, username, password: null, encrypted: false);
         }
-        catch { /* 既に存在する等は無視 */ }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "ホームボリューム作成に失敗しました（ユーザー: {Username}）。", username);
+        }
     }
 
     public async Task DeleteUserAsync(string username)
@@ -87,14 +90,17 @@ public sealed class AccountService(
             var groupService = scope.ServiceProvider.GetRequiredService<GroupService>();
             await groupService.RemoveUserFromAllGroupsAsync(username);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "ユーザー '{Username}' のグループからの除去に失敗しました。", username);
+        }
 
         // ホームボリューム削除
         try
         {
             await using var scope = scopeFactory.CreateAsyncScope();
             var volumeService = scope.ServiceProvider.GetRequiredService<VolumeService>();
-            volumeService.DeleteVolume($"home__{username}");
+            await volumeService.DeleteVolumeAsync($"home__{username}", username: null);
         }
         catch (Exception ex)
         {
@@ -146,7 +152,7 @@ public sealed class AccountService(
 
         await EnsureRoleAsync("admin");
 
-        var user = new ApplicationUser { UserName = username, Email = $"{username}@cista.local" };
+        var user = new ApplicationUser { UserName = username };
         var result = await userManager.CreateAsync(user, password);
         if (!result.Succeeded)
             throw new InvalidOperationException(string.Join(", ", result.Errors.Select(e => e.Description)));
@@ -159,6 +165,18 @@ public sealed class AccountService(
 
     public async Task<bool> CheckPasswordAsync(ApplicationUser user, string password)
         => await userManager.CheckPasswordAsync(user, password);
+
+    /// <summary>ユーザーがロックアウト状態かどうかを確認。</summary>
+    public async Task<bool> IsLockedOutAsync(ApplicationUser user)
+        => await userManager.IsLockedOutAsync(user);
+
+    /// <summary>認証失敗回数をインクリメント。</summary>
+    public async Task AccessFailedAsync(ApplicationUser user)
+        => await userManager.AccessFailedAsync(user);
+
+    /// <summary>認証失敗カウンタをリセット。</summary>
+    public async Task ResetAccessFailedCountAsync(ApplicationUser user)
+        => await userManager.ResetAccessFailedCountAsync(user);
 
     /// <summary>パスワードを変更し、全ボリュームの KEK を再ラップ。</summary>
     public async Task<bool> ChangePasswordAsync(string username, string oldPassword, string newPassword)
@@ -179,7 +197,7 @@ public sealed class AccountService(
         {
             await using var scope = scopeFactory.CreateAsyncScope();
             var volumeService = scope.ServiceProvider.GetRequiredService<VolumeService>();
-            volumeService.RewrapAllForUser(username, oldPassword, newPassword);
+            await volumeService.RewrapAllForUserAsync(username, oldPassword, newPassword);
         }
         catch (Exception ex)
         {

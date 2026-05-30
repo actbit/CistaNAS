@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading.RateLimiting;
 using CistaNAS.Web.Api;
+using CistaNAS.Web.Authorization;
 using CistaNAS.Web.Components;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Identity;
@@ -9,6 +10,7 @@ using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
 using CistaNAS.Web.WebDav;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
@@ -18,7 +20,7 @@ var builder = WebApplication.CreateBuilder(args);
 // ---- Kestrel リクエストサイズ制限 ----
 builder.WebHost.ConfigureKestrel(kestrel =>
 {
-    kestrel.Limits.MaxRequestBodySize = 2L * 1024 * 1024 * 1024; // 2 GiB（NAS 用途）
+    kestrel.Limits.MaxRequestBodySize = 10L * 1024 * 1024 * 1024; // 10 GiB（NAS 用途）
     kestrel.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(30);
     kestrel.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(2);
 });
@@ -29,6 +31,7 @@ builder.AddServiceDefaults();
 // ---- 設定 ----
 builder.Services.AddOptions<CistaNasOptions>()
     .Bind(builder.Configuration.GetSection(CistaNasOptions.SectionName))
+    .ValidateDataAnnotations()
     .ValidateOnStart();
 var cista = builder.Configuration.GetSection(CistaNasOptions.SectionName)
     .Get<CistaNasOptions>() ?? new CistaNasOptions();
@@ -67,11 +70,44 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 
 builder.Services.AddAuthorization(options =>
 {
-    // JWT と Basic Auth の両方を受け付けるポリシー
+    // WebDAV: JWT と Basic Auth の両方を受け付けるポリシー
     options.AddPolicy("AnyAuth", policy =>
         policy.RequireAuthenticatedUser()
               .AddAuthenticationSchemes(JwtBearerDefaults.AuthenticationScheme, "BasicAuth"));
+
+    // ボリュームアクセス権 — ルートパラメータ "volumeName"（files / e2ee グループ）
+    options.AddPolicy(CistaAuthorities.VolumeAccess, policy =>
+        policy.RequireAuthenticatedUser()
+              .AddAuthenticationSchemes(JwtBearerDefaults.AuthenticationScheme)
+              .AddRequirements(new CistaAuthorizationRequirement(CistaAuthorities.VolumeAccess, "volumeName")));
+
+    // ボリュームアクセス権 — ルートパラメータ "name"（volumes グループ）
+    options.AddPolicy("VolumeAccessByName", policy =>
+        policy.RequireAuthenticatedUser()
+              .AddAuthenticationSchemes(JwtBearerDefaults.AuthenticationScheme)
+              .AddRequirements(new CistaAuthorizationRequirement(CistaAuthorities.VolumeAccess, "name")));
+
+    // ボリュームオーナー — ルートパラメータ "name"（E2EE の "volumeName" は ExtractVolumeName フォールバックで対応）
+    options.AddPolicy(CistaAuthorities.VolumeOwner, policy =>
+        policy.RequireAuthenticatedUser()
+              .AddAuthenticationSchemes(JwtBearerDefaults.AuthenticationScheme)
+              .AddRequirements(new CistaAuthorizationRequirement(CistaAuthorities.VolumeOwner, "name")));
+
+    // ボリュームオーナーまたは admin — ルートパラメータ "name"
+    options.AddPolicy(CistaAuthorities.VolumeOwnerOrAdmin, policy =>
+        policy.RequireAuthenticatedUser()
+              .AddAuthenticationSchemes(JwtBearerDefaults.AuthenticationScheme)
+              .AddRequirements(new CistaAuthorizationRequirement(CistaAuthorities.VolumeOwnerOrAdmin, "name")));
+
+    // admin ロール必須
+    options.AddPolicy(CistaAuthorities.AdminOnly, policy =>
+        policy.RequireAuthenticatedUser()
+              .AddAuthenticationSchemes(JwtBearerDefaults.AuthenticationScheme)
+              .AddRequirements(new CistaAuthorizationRequirement(CistaAuthorities.AdminOnly)));
 });
+
+// 認可ハンドラ — VolumeService（Singleton）に依存するため Singleton 登録
+builder.Services.AddSingleton<IAuthorizationHandler, CistaAuthorizationHandler>();
 builder.Services.AddCascadingAuthenticationState();
 
 // ---- レート制限 ----
@@ -104,13 +140,12 @@ builder.Services.AddRateLimiter(options =>
 });
 
 // ---- Service 層 DI 登録 ----
-builder.Services.AddCistaNasServices();
+builder.Services.AddCistaNasServices(cista);
 
 // ---- WebDAV ----
 builder.Services.AddScoped<WebDavHandler>();
 
 // ---- E2EE ----
-builder.Services.AddScoped<E2eeFileService>();
 builder.Services.AddScoped<E2eeInterop>();
 
 // ---- Blazor (Interactive Server rendering) ----
@@ -120,17 +155,25 @@ builder.Services.AddRazorComponents()
 // ---- CORS（外部クライアント向け） ----
 builder.Services.AddCors(options =>
 {
-    options.AddDefaultPolicy(policy =>
+    var allowedOrigins = cista.CorsAllowedOrigins;
+    if (allowedOrigins.Count > 0)
     {
-        policy.AllowAnyHeader()
-              .AllowAnyMethod()
-              .SetIsOriginAllowed(origin =>
-                  string.Equals(origin, "null", StringComparison.OrdinalIgnoreCase) || // Blazor SSR same-origin
-                  true); // 制限する場合は特定ドメインに絞る
-    });
+        options.AddDefaultPolicy(policy =>
+        {
+            policy.WithOrigins(allowedOrigins.ToArray())
+                  .AllowAnyHeader()
+                  .AllowAnyMethod();
+        });
+    }
 });
 
 var app = builder.Build();
+
+if (string.IsNullOrWhiteSpace(cista.Jwt.SigningKey))
+{
+    var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Startup");
+    logger.LogWarning("JWT 署名鍵が未設定です。ランダム鍵を生成しました。再起動で全トークンが失効します。");
+}
 
 // ---- DB 初期化 + データ移行 ----
 using (var initScope = app.Services.CreateAsyncScope())
@@ -165,7 +208,13 @@ if (lifetimeCloudSync is not null)
     var appLifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
     appLifetime.ApplicationStopping.Register(() =>
     {
-        lifetimeCloudSync.UploadIfDirtyAsync().GetAwaiter().GetResult();
+        try
+        {
+            var uploadTask = lifetimeCloudSync.UploadIfDirtyAsync();
+            if (!uploadTask.Wait(TimeSpan.FromSeconds(10)))
+                Console.Error.WriteLine("[Warning] Cloud sync upload timed out during shutdown.");
+        }
+        catch { /* シャットダウン中の競合は無視 */ }
         lifetimeCloudSync.Dispose();
     });
 }
@@ -226,16 +275,16 @@ dav.MapMethods("", ["OPTIONS"], (WebDavHandler h, HttpContext ctx) => h.OptionsA
 dav.MapMethods("{*path}", ["PROPFIND"],
     (string volumeName, string path, HttpContext ctx, WebDavHandler h) =>
         h.PropFindAsync(volumeName, path, ctx.Request.Headers["Depth"].FirstOrDefault(), ctx));
-dav.MapGet("{*path}", (string volumeName, string path, HttpContext ctx, WebDavHandler h) =>
-    h.Get(volumeName, path, ctx));
+dav.MapGet("{*path}", async (string volumeName, string path, HttpContext ctx, WebDavHandler h) =>
+    await h.Get(volumeName, path, ctx));
 dav.MapMethods("{*path}", ["PUT"],
     (string volumeName, string path, HttpContext ctx, WebDavHandler h) =>
         h.Put(volumeName, path, ctx.Request));
 dav.MapDelete("{*path}", (string volumeName, string path, HttpContext ctx, WebDavHandler h) =>
     h.Delete(volumeName, path, ctx));
 dav.MapMethods("{*path}", ["MKCOL"],
-    (string volumeName, string path, HttpContext ctx, WebDavHandler h) =>
-        h.MkCol(volumeName, path, ctx));
+    async (string volumeName, string path, HttpContext ctx, WebDavHandler h) =>
+        await h.MkCol(volumeName, path, ctx));
 
 app.MapDefaultEndpoints();
 

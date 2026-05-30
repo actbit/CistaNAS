@@ -1,3 +1,4 @@
+using CistaNAS.Web.Authorization;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
 using CistaNAS.Web.Volume;
@@ -14,16 +15,32 @@ public static class E2eeEndpoints
     {
         var e2ee = group.MapGroup("/e2ee").RequireAuthorization();
 
+        // ---- ボリューム操作（VolumeAccess ポリシー） ----
         e2ee.MapPost("/create-volume", CreateVolume);
-        e2ee.MapPost("/{volumeName}/mount", Mount);
-        e2ee.MapGet("/{volumeName}/wrapped-key/{username}", GetWrappedKey);
-        e2ee.MapPost("/{volumeName}/create-file", CreateFile);
-        e2ee.MapPost("/{volumeName}/upload-chunk/{fileId}/{chunkIndex}", UploadChunk);
-        e2ee.MapGet("/{volumeName}/download-chunk/{fileId}/{chunkIndex}", DownloadChunk);
-        e2ee.MapPatch("/{volumeName}/finalize-file/{fileId}", FinalizeFile);
-        e2ee.MapDelete("/{volumeName}/files/{fileId}", DeleteFile);
-        e2ee.MapGet("/{volumeName}/files", ListFiles);
-        e2ee.MapPost("/{volumeName}/add-wrapped-key", AddWrappedKey);
+        e2ee.MapPost("/{volumeName}/mount", Mount)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapGet("/{volumeName}/wrapped-key/{username}", GetWrappedKey)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapPost("/{volumeName}/create-file", CreateFile)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapPost("/{volumeName}/upload-chunk/{fileId}/{chunkIndex}", UploadChunk)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapGet("/{volumeName}/download-chunk/{fileId}/{chunkIndex}", DownloadChunk)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapPatch("/{volumeName}/finalize-file/{fileId}", FinalizeFile)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapDelete("/{volumeName}/files/{fileId}", DeleteFile)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapGet("/{volumeName}/files", ListFiles)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
+
+        // ---- オーナー限定操作（VolumeOwner ポリシー） ----
+        e2ee.MapPost("/{volumeName}/add-wrapped-key", AddWrappedKey)
+            .RequireAuthorization(CistaAuthorities.VolumeOwner);
+        e2ee.MapGet("/{volumeName}/group-members", GetGroupMembers)
+            .RequireAuthorization(CistaAuthorities.VolumeOwner);
+        e2ee.MapPost("/{volumeName}/add-wrapped-keys-batch", AddWrappedKeysBatch)
+            .RequireAuthorization(CistaAuthorities.VolumeOwner);
 
         // ---- ECDH public key management ----
         e2ee.MapGet("/public-key/{username}", GetPublicKey);
@@ -31,8 +48,6 @@ public static class E2eeEndpoints
 
         // ---- Group E2EE volume ----
         e2ee.MapPost("/create-group-volume", CreateGroupVolume);
-        e2ee.MapGet("/{volumeName}/group-members", GetGroupMembers);
-        e2ee.MapPost("/{volumeName}/add-wrapped-keys-batch", AddWrappedKeysBatch);
 
         // ---- Invitation ----
         e2ee.MapPost("/invitations", CreateInvitation);
@@ -42,7 +57,7 @@ public static class E2eeEndpoints
         return e2ee;
     }
 
-    private static IResult CreateVolume(E2eeCreateVolumeRequest req, VolumeService volumeService, HttpContext ctx)
+    private static async Task<IResult> CreateVolume(E2eeCreateVolumeRequest req, VolumeService volumeService, HttpContext ctx)
     {
         string username = ctx.User.Identity?.Name ?? "";
         if (string.IsNullOrEmpty(username))
@@ -50,7 +65,7 @@ public static class E2eeEndpoints
 
         try
         {
-            var info = volumeService.CreateE2ee(req.VolumeName, req.Username, req.WrappedMasterKey, req.ChunkSize);
+            var info = await volumeService.CreateE2eeAsync(req.VolumeName, username, req.WrappedMasterKey, req.ChunkSize);
             return Results.Created($"/api/v1/e2ee/{req.VolumeName}/mount", info);
         }
         catch (VolumeException ex)
@@ -59,7 +74,7 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult Mount(string volumeName, VolumeService volumeService, HttpContext ctx)
+    private static async Task<IResult> Mount(string volumeName, VolumeService volumeService, HttpContext ctx)
     {
         string username = ctx.User.Identity?.Name ?? "";
         if (string.IsNullOrEmpty(username))
@@ -67,7 +82,7 @@ public static class E2eeEndpoints
 
         try
         {
-            var info = volumeService.MountE2ee(volumeName, username);
+            var info = await volumeService.MountE2eeAsync(volumeName, username);
             return Results.Ok(info);
         }
         catch (VolumeException ex)
@@ -76,7 +91,7 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult GetWrappedKey(string volumeName, string username, VolumeService vs, HttpContext ctx)
+    private static async Task<IResult> GetWrappedKey(string volumeName, string username, VolumeService vs, HttpContext ctx)
     {
         string caller = ctx.User.Identity?.Name ?? "";
         if (string.IsNullOrEmpty(caller))
@@ -85,12 +100,17 @@ public static class E2eeEndpoints
         if (caller != username)
             return Results.Forbid();
 
+        // defense-in-depth: ポリシーで VolumeAccess をチェック済みだが
+        // アクセス権取消後にラップ鍵が残存するケースを防ぐため再チェック
+        if (!await vs.HasAccessAsync(volumeName, caller))
+            return Results.Forbid();
+
         if (!vs.IsMounted(volumeName))
             return Results.NotFound(new { error = "ボリュームがマウントされていません。" });
 
         try
         {
-            var header = vs.GetVolumeHeader(volumeName);
+            var header = await vs.GetVolumeHeaderAsync(volumeName);
             if (!header.UserKeys.TryGetValue(username, out var key))
                 return Results.NotFound(new { error = "このユーザーの wrapped key が見つかりません。" });
 
@@ -121,14 +141,11 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult CreateFile(string volumeName, E2eeCreateFileRequest req, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
+    private static async Task<IResult> CreateFile(string volumeName, E2eeCreateFileRequest req, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
     {
-        var accessCheck = CheckVolumeAccess(volumeName, ctx, vs);
-        if (accessCheck != null) return accessCheck;
-
         try
         {
-            var entry = e2eeFs.CreateFile(volumeName, req);
+            var entry = await e2eeFs.CreateFileAsync(volumeName, req, ctx.RequestAborted);
             return Results.Created($"/api/v1/e2ee/{volumeName}/upload-chunk/{entry.FileId}/0", entry);
         }
         catch (FileServiceException ex)
@@ -140,9 +157,6 @@ public static class E2eeEndpoints
     private static async Task<IResult> UploadChunk(string volumeName, string fileId, int chunkIndex,
         HttpRequest request, VolumeService vs, E2eeFileService e2eeFs)
     {
-        var accessCheck = CheckVolumeAccess(volumeName, request.HttpContext, vs);
-        if (accessCheck != null) return accessCheck;
-
         long len = request.ContentLength ?? 0;
         try
         {
@@ -155,14 +169,11 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult DownloadChunk(string volumeName, string fileId, int chunkIndex, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
+    private static async Task<IResult> DownloadChunk(string volumeName, string fileId, int chunkIndex, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
     {
-        var accessCheck = CheckVolumeAccess(volumeName, ctx, vs);
-        if (accessCheck != null) return accessCheck;
-
         try
         {
-            var (stream, length) = e2eeFs.DownloadChunk(volumeName, fileId, chunkIndex);
+            var (stream, length) = await e2eeFs.DownloadChunkAsync(volumeName, fileId, chunkIndex, ctx.RequestAborted);
             return Results.Stream(stream, "application/octet-stream");
         }
         catch (FileServiceException ex)
@@ -171,14 +182,11 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult FinalizeFile(string volumeName, string fileId, E2eeFinalizeFileRequest req, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
+    private static async Task<IResult> FinalizeFile(string volumeName, string fileId, E2eeFinalizeFileRequest req, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
     {
-        var accessCheck = CheckVolumeAccess(volumeName, ctx, vs);
-        if (accessCheck != null) return accessCheck;
-
         try
         {
-            e2eeFs.FinalizeFile(volumeName, fileId, req);
+            await e2eeFs.FinalizeFileAsync(volumeName, fileId, req, ctx.RequestAborted);
             return Results.Ok();
         }
         catch (FileServiceException ex)
@@ -187,14 +195,11 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult DeleteFile(string volumeName, string fileId, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
+    private static async Task<IResult> DeleteFile(string volumeName, string fileId, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
     {
-        var accessCheck = CheckVolumeAccess(volumeName, ctx, vs);
-        if (accessCheck != null) return accessCheck;
-
         try
         {
-            e2eeFs.DeleteFile(volumeName, fileId);
+            await e2eeFs.DeleteFileAsync(volumeName, fileId, ctx.RequestAborted);
             return Results.NoContent();
         }
         catch (FileServiceException ex)
@@ -203,14 +208,11 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult ListFiles(string volumeName, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
+    private static async Task<IResult> ListFiles(string volumeName, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
     {
-        var accessCheck = CheckVolumeAccess(volumeName, ctx, vs);
-        if (accessCheck != null) return accessCheck;
-
         try
         {
-            return Results.Ok(e2eeFs.ListFiles(volumeName));
+            return Results.Ok(await e2eeFs.ListFilesAsync(volumeName, ctx.RequestAborted));
         }
         catch (FileServiceException ex)
         {
@@ -218,7 +220,7 @@ public static class E2eeEndpoints
         }
     }
 
-    private static IResult AddWrappedKey(string volumeName, E2eeAddWrappedKeyRequest req,
+    private static async Task<IResult> AddWrappedKey(string volumeName, E2eeAddWrappedKeyRequest req,
         VolumeService volumeService, HttpContext ctx)
     {
         string granter = ctx.User.Identity?.Name ?? "";
@@ -227,7 +229,7 @@ public static class E2eeEndpoints
 
         try
         {
-            volumeService.AddE2eeWrappedKey(volumeName, granter, req.Username, req.WrappedMasterKey);
+            await volumeService.AddE2eeWrappedKeyAsync(volumeName, granter, req.Username, req.WrappedMasterKey);
             return Results.Ok();
         }
         catch (VolumeException ex)
@@ -238,8 +240,13 @@ public static class E2eeEndpoints
 
     // ---- ECDH public key ----
 
-    private static async Task<IResult> GetPublicKey(string username, AccountService accountService)
+    private static async Task<IResult> GetPublicKey(string username, HttpContext ctx, AccountService accountService)
     {
+        string caller = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(caller)) return Results.Unauthorized();
+
+        // 公開鍵は暗号プロトコル上公開を前提とするため、認証済みユーザー間で相互参照を許可。
+        // ECDH 鍵共有ワークフローで他ユーザーの公開鍵を取得する必要がある。
         var pubKey = await accountService.GetPublicKeyAsync(username);
         return pubKey is not null
             ? Results.Ok(new { publicKey = pubKey })
@@ -260,39 +267,39 @@ public static class E2eeEndpoints
 
     // ---- Group E2EE volume ----
 
-    private static IResult CreateGroupVolume(CreateGroupE2eeVolumeRequest req,
+    private static async Task<IResult> CreateGroupVolume(CreateGroupE2eeVolumeRequest req,
         VolumeService vs, HttpContext ctx)
     {
         string username = ctx.User.Identity?.Name ?? "";
         if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
         try
         {
-            var info = vs.CreateGroupE2ee(req.GroupName, username, req.OwnerWrappedKey, req.ChunkSize);
+            var info = await vs.CreateGroupE2eeAsync(req.GroupName, username, req.OwnerWrappedKey, req.ChunkSize);
             return Results.Created($"/api/v1/e2ee/{info.Name}/mount", info);
         }
         catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
     }
 
-    private static IResult GetGroupMembers(string volumeName, VolumeService vs, HttpContext ctx)
+    private static async Task<IResult> GetGroupMembers(string volumeName, VolumeService vs, HttpContext ctx)
     {
         string username = ctx.User.Identity?.Name ?? "";
         if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
         try
         {
-            var members = vs.GetGroupMembersWithPublicKeys(volumeName, username);
+            var members = await vs.GetGroupMembersWithPublicKeysAsync(volumeName, username);
             return Results.Ok(members.Select(m => new { m.Username, m.PublicKey }));
         }
         catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
     }
 
-    private static IResult AddWrappedKeysBatch(string volumeName, AddE2eeWrappedKeysBatchRequest req,
+    private static async Task<IResult> AddWrappedKeysBatch(string volumeName, AddE2eeWrappedKeysBatchRequest req,
         VolumeService vs, HttpContext ctx)
     {
         string username = ctx.User.Identity?.Name ?? "";
         if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
         try
         {
-            vs.AddE2eeWrappedKeysBatch(volumeName, username, req.WrappedKeys);
+            await vs.AddE2eeWrappedKeysBatchAsync(volumeName, username, req.WrappedKeys);
             return Results.Ok();
         }
         catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
@@ -344,14 +351,5 @@ public static class E2eeEndpoints
             return Results.Ok();
         }
         catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
-    }
-
-    private static IResult? CheckVolumeAccess(string volumeName, HttpContext ctx, VolumeService vs)
-    {
-        string username = ctx.User.Identity?.Name ?? "";
-        if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
-        if (!vs.HasAccess(volumeName, username))
-            return Results.Forbid();
-        return null;
     }
 }

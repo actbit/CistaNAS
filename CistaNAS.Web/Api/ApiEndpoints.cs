@@ -1,3 +1,4 @@
+using CistaNAS.Web.Authorization;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
 using StreamingTokenService = CistaNAS.Web.Services.StreamingTokenService;
@@ -11,7 +12,9 @@ internal static class PathSanitizer
     /// </summary>
     public static string SanitizeFileName(string raw)
     {
-        string decoded = Uri.UnescapeDataString(raw.TrimStart('/'));
+        string decoded;
+        try { decoded = Uri.UnescapeDataString(raw.TrimStart('/')); }
+        catch (UriFormatException) { throw new FileServiceException("ファイル名に無効なエンコーディングが含まれています。"); }
         string normalized = decoded.Replace('\\', '/');
 
         // ディレクトリトラバーサル要素を除去
@@ -69,7 +72,7 @@ public static class ApiEndpoints
             string? username = ctx.User.Identity?.Name;
             if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
             bool ok = await auth.ChangePasswordAsync(username, req.OldPassword, req.NewPassword);
-            return ok ? Results.Ok() : Results.BadRequest(new { error = "パスワードが正しくありません。" });
+            return ok ? Results.Ok() : Results.BadRequest(new { error = "認証に失敗しました。" });
         })
         .WithName("ChangePassword");
 
@@ -77,77 +80,103 @@ public static class ApiEndpoints
         var volumes = api.MapGroup("/volumes")
             .RequireAuthorization();
 
-        volumes.MapPost("/", (CreateVolumeRequest req, VolumeService vs) =>
+        volumes.MapPost("/", async (CreateVolumeRequest req, VolumeService vs, HttpContext ctx) =>
         {
+            string? username = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
             try
             {
-                var info = vs.Create(req.Name, req.Username, req.Password, req.Encrypted);
+                var info = await vs.CreateAsync(req.Name, username, req.Password, req.Encrypted);
                 return Results.Created($"/api/v1/volumes/{Uri.EscapeDataString(req.Name)}", info);
             }
             catch (VolumeException ex) { return Results.Conflict(new { error = ex.Message }); }
         })
         .WithName("CreateVolume");
 
-        volumes.MapPost("/{name}/mount", (string name, MountRequest req, VolumeService vs) =>
+        volumes.MapPost("/{name}/mount", async (string name, MountRequest req, VolumeService vs, HttpContext ctx) =>
         {
+            string? username = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
             try
             {
-                return Results.Ok(vs.Mount(name, req.Username, req.Password));
+                return Results.Ok(await vs.MountAsync(name, username, req.Password));
             }
             catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
+        .RequireAuthorization("VolumeAccessByName")
         .WithName("MountVolume");
 
-        volumes.MapPost("/{name}/lock", (string name, VolumeService vs) =>
+        volumes.MapPost("/{name}/lock", async (string name, VolumeService vs, HttpContext ctx) =>
         {
             try
             {
-                vs.Lock(name);
+                string? username = ctx.User.Identity?.Name;
+                if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+                await vs.LockAsync(name, username);
                 return Results.NoContent();
             }
             catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
+        .RequireAuthorization(CistaAuthorities.VolumeOwner)
         .WithName("LockVolume");
 
-        volumes.MapGet("/", (VolumeService vs, HttpContext ctx) =>
+        volumes.MapGet("/", async (VolumeService vs, HttpContext ctx) =>
         {
             string? username = ctx.User.Identity?.Name;
-            var list = username is not null ? vs.ListForUser(username) : vs.ListAll();
+            if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+            var list = await vs.ListForUserAsync(username);
             return Results.Ok(list);
         })
         .WithName("ListVolumes");
 
-        volumes.MapPost("/{name}/grant", (string name, GrantAccessRequest req, HttpContext ctx, VolumeService vs) =>
+        volumes.MapDelete("/{name}", async (string name, VolumeService vs, HttpContext ctx) =>
+        {
+            string? username = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+            bool isAdmin = ctx.User.IsInRole("admin");
+            try
+            {
+                await vs.DeleteVolumeAsync(name, username, isAdmin);
+                return Results.NoContent();
+            }
+            catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .RequireAuthorization(CistaAuthorities.VolumeOwnerOrAdmin)
+        .WithName("DeleteVolume");
+
+        volumes.MapPost("/{name}/grant", async (string name, GrantAccessRequest req, HttpContext ctx, VolumeService vs) =>
         {
             try
             {
                 string? granter = ctx.User.Identity?.Name;
                 if (string.IsNullOrEmpty(granter)) return Results.Unauthorized();
-                vs.GrantAccess(name, granter, req.GranterPassword, req.TargetUsername, req.TargetPassword);
+                await vs.GrantAccessAsync(name, granter, req.GranterPassword, req.TargetUsername, req.TargetPassword);
                 return Results.Ok();
             }
             catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
+        .RequireAuthorization(CistaAuthorities.VolumeOwner)
         .WithName("GrantAccess");
 
-        volumes.MapPost("/{name}/revoke", (string name, RevokeAccessRequest req, HttpContext ctx, VolumeService vs) =>
+        volumes.MapPost("/{name}/revoke", async (string name, RevokeAccessRequest req, HttpContext ctx, VolumeService vs) =>
         {
             try
             {
                 string? revoker = ctx.User.Identity?.Name;
                 if (string.IsNullOrEmpty(revoker)) return Results.Unauthorized();
-                vs.RevokeAccess(name, revoker, req.TargetUsername);
+                await vs.RevokeAccessAsync(name, revoker, req.TargetUsername);
                 return Results.Ok();
             }
             catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
+        .RequireAuthorization(CistaAuthorities.VolumeOwner)
         .WithName("RevokeAccess");
 
         // ---- ファイル ----
         var files = api.MapGroup("/files/{volumeName}")
-            .RequireAuthorization();
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
 
-        files.MapGet("/", async (string volumeName, FileService fs) =>
+        files.MapGet("/", async (string volumeName, FileService fs, HttpContext ctx) =>
         {
             try
             {
@@ -163,7 +192,7 @@ public static class ApiEndpoints
             {
                 string fileName = PathSanitizer.SanitizeFileName(filePath);
                 long len = ctx.Request.ContentLength ?? 0;
-                using var stream = ctx.Request.Body;
+                var stream = ctx.Request.Body;
                 var meta = await fs.UploadAsync(volumeName, fileName, stream, len, ctx.RequestAborted);
                 return Results.Ok(meta);
             }
@@ -172,12 +201,12 @@ public static class ApiEndpoints
         })
         .WithName("UploadFile");
 
-        files.MapGet("/{*filePath}", (string volumeName, string filePath, FileService fs) =>
+        files.MapGet("/{*filePath}", async (string volumeName, string filePath, FileService fs, HttpContext ctx, CancellationToken ct) =>
         {
             try
             {
                 string fileName = PathSanitizer.SanitizeFileName(filePath);
-                var dl = fs.Download(volumeName, fileName);
+                var dl = await fs.DownloadAsync(volumeName, fileName, ct);
                 return Results.Stream(dl.Stream, "application/octet-stream", dl.FileName,
                     enableRangeProcessing: false);
             }
@@ -186,7 +215,7 @@ public static class ApiEndpoints
         })
         .WithName("DownloadFile");
 
-        files.MapDelete("/{*filePath}", async (string volumeName, string filePath, FileService fs) =>
+        files.MapDelete("/{*filePath}", async (string volumeName, string filePath, FileService fs, HttpContext ctx) =>
         {
             try
             {
@@ -204,11 +233,11 @@ public static class ApiEndpoints
 
         // ---- メディアストリーミング ----
         // ストリーミングトークン発行（認証必須 + ボリュームアクセス権チェック）
-        api.MapPost("/stream/token", (StreamTokenRequest req, HttpContext ctx, StreamingTokenService sts, VolumeService vs) =>
+        api.MapPost("/stream/token", async (StreamTokenRequest req, HttpContext ctx, StreamingTokenService sts, VolumeService vs) =>
         {
             string? username = ctx.User.Identity?.Name;
             if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
-            if (!vs.HasAccess(req.VolumeName, username)) return Results.Forbid();
+            if (!await vs.HasAccessAsync(req.VolumeName, username)) return Results.Forbid();
             string token = sts.Issue(username, req.VolumeName, req.FileName);
             return Results.Ok(new { token });
         })
@@ -216,7 +245,7 @@ public static class ApiEndpoints
         .WithName("IssueStreamToken");
 
         // ストリーミングエンドポイント（短命トークン認証、Range対応）
-        api.MapGet("/stream/{volumeName}/{*filePath}", (
+        api.MapGet("/stream/{volumeName}/{*filePath}", async (
             string volumeName, string filePath, string? token,
             StreamingTokenService sts, VolumeService vs, FileService fs,
             HttpContext ctx) =>
@@ -227,13 +256,13 @@ public static class ApiEndpoints
             if (validated is null) return Results.Unauthorized();
             var (user, vol, file) = validated.Value;
             if (!string.Equals(vol, volumeName, StringComparison.Ordinal)) return Results.Forbid();
-            if (!vs.HasAccess(volumeName, user)) return Results.Forbid();
+            if (!await vs.HasAccessAsync(volumeName, user)) return Results.Forbid();
 
             try
             {
                 string fileName = PathSanitizer.SanitizeFileName(filePath);
                 if (!string.Equals(file, fileName, StringComparison.Ordinal)) return Results.Forbid();
-                var dl = fs.Download(volumeName, fileName);
+                var dl = await fs.DownloadAsync(volumeName, fileName, ctx.RequestAborted);
                 return Results.Stream(dl.Stream, "application/octet-stream", dl.FileName,
                     enableRangeProcessing: true);
             }
@@ -247,13 +276,18 @@ public static class ApiEndpoints
         var groups = api.MapGroup("/groups")
             .RequireAuthorization();
 
-        groups.MapGet("/", async (GroupService gs) =>
-            Results.Ok(await gs.ListGroupsAsync()))
+        groups.MapGet("/", async (GroupService gs, HttpContext ctx) =>
+        {
+            string? username = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+            return Results.Ok(await gs.GetGroupsForUserAsync(username));
+        })
             .WithName("ListGroups");
 
         groups.MapPost("/", async (CreateGroupRequest req, HttpContext ctx, GroupService gs) =>
         {
-            string username = ctx.User.Identity?.Name ?? "";
+            string? username = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
             try
             {
                 await gs.CreateGroupAsync(req.GroupName, username);
@@ -265,7 +299,8 @@ public static class ApiEndpoints
 
         groups.MapDelete("/{groupName}", async (string groupName, HttpContext ctx, GroupService gs) =>
         {
-            string username = ctx.User.Identity?.Name ?? "";
+            string? username = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
             try
             {
                 await gs.DeleteGroupAsync(groupName, username);
@@ -278,7 +313,8 @@ public static class ApiEndpoints
         groups.MapPost("/{groupName}/members", async (string groupName, AddGroupMemberRequest req,
             HttpContext ctx, GroupService gs) =>
         {
-            string username = ctx.User.Identity?.Name ?? "";
+            string? username = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
             try
             {
                 await gs.AddMemberAsync(groupName, username, req.Username);
@@ -291,7 +327,8 @@ public static class ApiEndpoints
         groups.MapDelete("/{groupName}/members/{username}", async (string groupName, string username,
             HttpContext ctx, GroupService gs) =>
         {
-            string requester = ctx.User.Identity?.Name ?? "";
+            string? requester = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(requester)) return Results.Unauthorized();
             try
             {
                 await gs.RemoveMemberAsync(groupName, requester, username);
@@ -302,30 +339,34 @@ public static class ApiEndpoints
         .WithName("RemoveGroupMember");
 
         // ---- ボリューム グループアクセス ----
-        volumes.MapPost("/{name}/grant-group", (string name, GrantGroupAccessRequest req,
+        volumes.MapPost("/{name}/grant-group", async (string name, GrantGroupAccessRequest req,
             HttpContext ctx, VolumeService vs) =>
         {
             try
             {
-                string granter = ctx.User.Identity?.Name ?? "";
-                vs.GrantGroupAccess(name, granter, req.GroupName);
+                string? granter = ctx.User.Identity?.Name;
+                if (string.IsNullOrEmpty(granter)) return Results.Unauthorized();
+                await vs.GrantGroupAccessAsync(name, granter, req.GroupName);
                 return Results.Ok();
             }
             catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
+        .RequireAuthorization(CistaAuthorities.VolumeOwner)
         .WithName("GrantGroupAccess");
 
-        volumes.MapPost("/{name}/revoke-group", (string name, GrantGroupAccessRequest req,
+        volumes.MapPost("/{name}/revoke-group", async (string name, GrantGroupAccessRequest req,
             HttpContext ctx, VolumeService vs) =>
         {
             try
             {
-                string revoker = ctx.User.Identity?.Name ?? "";
-                vs.RevokeGroupAccess(name, revoker, req.GroupName);
+                string? revoker = ctx.User.Identity?.Name;
+                if (string.IsNullOrEmpty(revoker)) return Results.Unauthorized();
+                await vs.RevokeGroupAccessAsync(name, revoker, req.GroupName);
                 return Results.Ok();
             }
             catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
+        .RequireAuthorization(CistaAuthorities.VolumeOwner)
         .WithName("RevokeGroupAccess");
 
         return api;

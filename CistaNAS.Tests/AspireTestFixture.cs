@@ -20,7 +20,7 @@ public class AspireFixture : IAsyncLifetime
     public string Token { get; private set; } = "";
 
     public const string Username = "admin";
-    public const string Password = "initial-pw";
+    public const string Password = "initial-pw-1234";
 
     public async Task InitializeAsync()
     {

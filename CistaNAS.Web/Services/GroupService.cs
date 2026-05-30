@@ -65,9 +65,12 @@ public sealed class GroupService(
         {
             await using var scope = scopeFactory.CreateAsyncScope();
             var volumeService = scope.ServiceProvider.GetRequiredService<VolumeService>();
-            volumeService.RemoveGroupFromAllVolumes(groupName);
+            await volumeService.RemoveGroupFromAllVolumesAsync(groupName);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "グループ '{GroupName}' 削除後のボリューム参照除去に失敗しました。", groupName);
+        }
     }
 
     public async Task AddMemberAsync(string groupName, string requester, string username)

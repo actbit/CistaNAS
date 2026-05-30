@@ -79,6 +79,12 @@ public sealed class LocalStorageProvider : IStorageProvider
         return Task.FromResult<IDisposable>(new FileLockReleaser(lockStream));
     }
 
+    /// <summary>ローカルファイルベースのロックは削除不要（インターフェース実装のみ）。</summary>
+    public void RemoveLock(string lockPath)
+    {
+        // ファイルベースロックは IDisposable で自動解放されるため、ここでは何もしない
+    }
+
     private string ToFullPath(string blobPath) => Path.Combine(_basePath, blobPath.Replace('/', Path.DirectorySeparatorChar));
 
     private static void ListRecursive(string dir, string basePath, List<string> results)
