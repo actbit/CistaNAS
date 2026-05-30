@@ -13,6 +13,7 @@
     <div class="alert alert-danger">@ErrorMessage</div>
 }
 
+<div class="form-narrow">
 <EditForm Model="_model" OnValidSubmit="HandleLogin" FormName="LoginForm">
     <DataAnnotationsValidator />
     <div class="mb-3">
@@ -27,6 +28,7 @@
         @(IsLoading ? "ログイン中..." : "ログイン")
     </button>
 </EditForm>
+</div>
 
 @code {
     private LoginModel _model = new();

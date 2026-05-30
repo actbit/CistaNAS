@@ -111,16 +111,17 @@ else
     }
     else
     {
-        <table class="table table-striped">
+        <div class="table-responsive">
+        <table class="table table-striped table-hover">
             <thead>
                 <tr>
                     <th>名前</th>
                     <th>暗号化</th>
-                    <th>所有ユーザー</th>
-                    <th>共有</th>
+                    <th class="d-none d-md-table-cell">所有ユーザー</th>
+                    <th class="d-none d-md-table-cell">共有</th>
                     <th>状態</th>
-                    <th>作成日</th>
-                    <th>操作</th>
+                    <th class="d-none d-lg-table-cell">作成日</th>
+                    <th class="text-nowrap">操作</th>
                 </tr>
             </thead>
             <tbody>
@@ -149,7 +150,7 @@ else
                             }
                         </td>
                         <td>@v.OwnerUser</td>
-                        <td>@(v.AuthorizedUsers.Count > 1 ? $"{v.AuthorizedUsers.Count} ユーザー" : "-")</td>
+                        <td class="d-none d-md-table-cell">@(v.AuthorizedUsers.Count > 1 ? $"{v.AuthorizedUsers.Count} ユーザー" : "-")</td>
                         <td>
                             @if (v.IsMounted)
                             {
@@ -160,7 +161,7 @@ else
                                 <span class="badge bg-secondary">未マウント</span>
                             }
                         </td>
-                        <td>@v.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</td>
+                        <td class="d-none d-lg-table-cell">@v.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</td>
                         <td>
                             @if (v.IsMounted)
                             {
@@ -180,6 +181,7 @@ else
                 }
             </tbody>
         </table>
+        </div>
     }
 
     @if (_lockError is not null)
@@ -190,7 +192,7 @@ else
     @if (_mountTarget is not null)
     {
         <div class="modal d-block" tabindex="-1" style="background-color:rgba(0,0,0,0.5)">
-            <div class="modal-dialog">
+            <div class="modal-dialog modal-dialog-scrollable modal-dialog-centered">
                 <div class="modal-content">
                     <div class="modal-header">
                         <h5 class="modal-title">マウント: @_mountTarget</h5>
@@ -237,7 +239,7 @@ else
     @if (_shareTarget is not null)
     {
         <div class="modal d-block" tabindex="-1" style="background-color:rgba(0,0,0,0.5)">
-            <div class="modal-dialog">
+            <div class="modal-dialog modal-dialog-scrollable modal-dialog-centered">
                 <div class="modal-content">
                     <div class="modal-header">
                         <h5 class="modal-title">共有: @_shareTarget</h5>

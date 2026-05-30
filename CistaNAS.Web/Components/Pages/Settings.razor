@@ -24,7 +24,7 @@ else
     <h1>設定</h1>
 
     <!-- パスワード変更 -->
-    <div class="card mb-4" style="max-width:500px">
+    <div class="card mb-4 form-narrow">
         <div class="card-header">パスワード変更</div>
         <div class="card-body">
             @if (_passwordSuccess)
@@ -65,6 +65,7 @@ else
     <div class="card mb-4">
         <div class="card-header">ユーザー管理</div>
         <div class="card-body">
+            <div class="table-responsive">
             <table class="table table-sm table-striped">
                 <thead>
                     <tr>
@@ -96,6 +97,7 @@ else
                     }
                 </tbody>
             </table>
+            </div>
 
             <hr />
             <h6>ユーザー追加</h6>
@@ -107,7 +109,7 @@ else
             {
                 <div class="alert alert-success">ユーザーを追加しました。</div>
             }
-            <div class="row g-2 align-items-end" style="max-width:500px">
+            <div class="row g-2 align-items-end form-narrow">
                 <div class="col">
                     <label class="form-label">ユーザー名</label>
                     <input class="form-control" @bind="_newUsername" />
@@ -141,7 +143,8 @@ else
             }
             else
             {
-                <table class="table table-sm table-striped">
+                <div class="table-responsive">
+            <table class="table table-sm table-striped">
                     <thead>
                         <tr><th>グループ名</th><th>オーナー</th><th>メンバー</th><th>操作</th></tr>
                     </thead>
@@ -163,6 +166,7 @@ else
                         }
                     </tbody>
                 </table>
+                </div>
             }
 
             <hr />
@@ -202,7 +206,7 @@ else
                         </li>
                     }
                 </ul>
-                <div class="row g-2 align-items-end" style="max-width:400px">
+                <div class="row g-2 align-items-end">
                     <div class="col">
                         <input class="form-control" placeholder="ユーザー名" @bind="_addMemberName" />
                     </div>
@@ -218,7 +222,7 @@ else
     <div class="card mb-4">
         <div class="card-header">暗号化設定</div>
         <div class="card-body">
-            <div class="row g-3" style="max-width:500px">
+            <div class="row g-3 form-narrow">
                 <div class="col-12">
                     <label class="form-label">デフォルト暗号化モード（新規ボリューム作成時）</label>
                     <select class="form-select" @bind="_encSettings.DefaultEncryptionMode">
@@ -299,7 +303,7 @@ else
             }
             <div class="mb-3">
                 <label class="form-label">パスワード（秘密鍵の暗号化用）</label>
-                <input type="password" class="form-control" style="max-width:300px" @bind="_keyPassword" />
+                <input type="password" class="form-control input-narrow" @bind="_keyPassword" />
             </div>
             <button class="btn btn-primary" disabled="@_keyLoading" @onclick="HandleGenerateKeyPair">
                 @(_keyLoading ? "生成中..." : "鍵ペアを生成・登録")

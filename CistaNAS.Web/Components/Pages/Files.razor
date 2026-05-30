@@ -99,12 +99,13 @@ else
         }
         else
         {
-            <table class="table table-striped">
+        <div class="table-responsive">
+            <table class="table table-striped table-hover">
                 <thead>
                     <tr>
                         <th>ファイル名</th>
-                        <th>チャンク数</th>
-                        <th>操作</th>
+                        <th class="d-none d-md-table-cell">チャンク数</th>
+                        <th class="text-nowrap">操作</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -112,7 +113,7 @@ else
                     {
                         <tr>
                             <td>@f.PlainName</td>
-                            <td>@f.Entry.ChunkCount</td>
+                            <td class="d-none d-md-table-cell">@f.Entry.ChunkCount</td>
                             <td>
                                 @if (MediaHelper.IsMedia(f.PlainName))
                                 {
@@ -136,50 +137,54 @@ else
                     }
                 </tbody>
             </table>
+            </div>
         }
     }
     else
     {
+        <h2>ファイル一覧</h2>
         @if (_files.Count == 0)
         {
             <p>ファイルがありません。</p>
         }
         else
         {
-            <table class="table table-striped">
-                <thead>
-                    <tr>
-                        <th>ファイル名</th>
-                        <th>サイズ</th>
-                        <th>更新日時</th>
-                        <th>操作</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    @foreach (var f in _files)
-                    {
+            <div class="table-responsive">
+                <table class="table table-striped table-hover">
+                    <thead>
                         <tr>
-                            <td>@f.Name</td>
-                            <td>@FormatSize(f.Length)</td>
-                            <td>@f.ModifiedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")</td>
-                            <td>
-                                @if (MediaHelper.IsMedia(f.Name))
-                                {
-                                    <button class="btn btn-sm btn-outline-success me-1"
-                                            @onclick="() => HandlePreview(f.Name)">
-                                        プレビュー
-                                    </button>
-                                }
-                                <button class="btn btn-sm btn-outline-primary me-1" @onclick="() => HandleDownload(f.Name)">ダウンロード</button>
-                                <button class="btn btn-sm btn-outline-danger" @onclick="() => HandleDelete(f.Name)">削除</button>
-                            </td>
+                            <th>ファイル名</th>
+                            <th class="d-none d-md-table-cell">サイズ</th>
+                            <th class="d-none d-lg-table-cell">更新日時</th>
+                            <th class="text-nowrap">操作</th>
                         </tr>
-                    }
-                </tbody>
-            </table>
+                    </thead>
+                    <tbody>
+                        @foreach (var f in _files)
+                        {
+                            <tr>
+                                <td>@f.Name</td>
+                                <td class="d-none d-md-table-cell">@FormatSize(f.Length)</td>
+                                <td class="d-none d-lg-table-cell">@f.ModifiedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")</td>
+                                <td>
+                                    @if (MediaHelper.IsMedia(f.Name))
+                                    {
+                                        <button class="btn btn-sm btn-outline-success me-1"
+                                                @onclick="() => HandlePreview(f.Name)">
+                                            プレビュー
+                                        </button>
+                                    }
+                                    <button class="btn btn-sm btn-outline-primary me-1" @onclick="() => HandleDownload(f.Name)">ダウンロード</button>
+                                    <button class="btn btn-sm btn-outline-danger" @onclick="() => HandleDelete(f.Name)">削除</button>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
         }
     }
-}
+    }
 
 <!-- メディアプレビューモーダル -->
 @if (_previewVisible)
