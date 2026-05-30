@@ -208,7 +208,7 @@ public static class ApiEndpoints
                 string fileName = PathSanitizer.SanitizeFileName(filePath);
                 var dl = await fs.DownloadAsync(volumeName, fileName, ct);
                 return Results.Stream(dl.Stream, "application/octet-stream", dl.FileName,
-                    enableRangeProcessing: false);
+                    enableRangeProcessing: true);
             }
             catch (FileServiceException ex) { return Results.NotFound(new { error = ex.Message }); }
             catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }

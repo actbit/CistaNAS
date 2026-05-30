@@ -9,7 +9,7 @@ services:
       - CistaNas__DataRoot=/app/data
       - CistaNas__Jwt__SigningKey=${JWT_SIGNING_KEY:-}
       - CistaNas__Auth__DefaultAdminPassword=${ADMIN_PASSWORD:-}
-      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_ENVIRONMENT=Production
 
   # S3 互換ストレージ（MinIO）。ローカルで S3 プロバイダをテストする場合:
   #   docker compose --profile s3 up

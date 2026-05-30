@@ -70,7 +70,7 @@ public static class ServiceCollectionExtensions
                 var sync = new CloudSqliteSync(storage, cista.Storage, db);
                 services.AddSingleton(sync);
                 services.AddDbContext<AppDbContext>(o =>
-                    o.UseSqlite($"Data Source={sync.LocalDbPath}"));
+                o.UseSqlite($"Data Source={sync.LocalDbPath};Mode=ReadWriteCreate;Cache=Shared"));
                 break;
             }
 
@@ -79,7 +79,7 @@ public static class ServiceCollectionExtensions
                 var localPath = db.ConnectionString
                     ?? Path.Combine(cista.DataRoot, "cista.db");
                 services.AddDbContext<AppDbContext>(o =>
-                    o.UseSqlite($"Data Source={localPath}"));
+                o.UseSqlite($"Data Source={localPath};Mode=ReadWriteCreate;Cache=Shared"));
                 break;
             }
         }

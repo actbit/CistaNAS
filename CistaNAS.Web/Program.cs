@@ -229,7 +229,15 @@ else
     app.UseHsts();
 }
 
-app.UseHttpsRedirection();
+// リバースプロキシ（nginx / Caddy / Traefik）背後で正しい IP とスキームを取得
+// X-Forwarded-For / X-Forwarded-Proto ヘッダーを信用する
+app.UseForwardedHeaders();
+
+// Kestrel が HTTPS でリッスンしている場合のみリダイレクトを有効化
+// （リバースプロキシで TLS 終端する構成では ASPNETCORE_URLS が http になるため無効化）
+var urls = builder.Configuration["ASPNETCORE_URLS"] ?? "";
+if (urls.Contains("https://", StringComparison.OrdinalIgnoreCase))
+    app.UseHttpsRedirection();
 
 // ---- セキュリティヘッダー ----
 app.Use(async (ctx, next) =>
