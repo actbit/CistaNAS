@@ -13,7 +13,7 @@ public static class E2eeEndpoints
 {
     public static IEndpointRouteBuilder MapE2eeApi(this IEndpointRouteBuilder group)
     {
-        var e2ee = group.MapGroup("/e2ee").RequireAuthorization();
+        var e2ee = group.MapGroup("/e2ee").RequireAuthorization().RequireRateLimiting("api");
 
         // ---- ボリューム操作（VolumeAccess ポリシー） ----
         e2ee.MapPost("/create-volume", CreateVolume);

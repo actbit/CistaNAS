@@ -29,6 +29,7 @@ public partial class MainViewModel : ObservableObject
     public ObservableCollection<string> AvailableDrives { get; } = [];
 
     private CistaNasApiClient? _api;
+    private HttpClient? _http;
     private readonly MountService _mountService = new();
 
     public MainViewModel()
@@ -44,9 +45,13 @@ public partial class MainViewModel : ObservableObject
         StatusMessage = "ログイン中...";
         try
         {
-            var http = new HttpClient { BaseAddress = new Uri(ServerUrl.TrimEnd('/')) };
-            http.Timeout = TimeSpan.FromSeconds(10);
-            _api = new CistaNasApiClient(http);
+            var baseUrl = new Uri(ServerUrl.TrimEnd('/'));
+            if (_http is null || _http.BaseAddress!.GetLeftPart(UriPartial.Authority) != baseUrl.GetLeftPart(UriPartial.Authority))
+            {
+                _http?.Dispose();
+                _http = new HttpClient { BaseAddress = baseUrl, Timeout = TimeSpan.FromSeconds(10) };
+            }
+            _api = new CistaNasApiClient(_http);
             string token = await _api.LoginAsync(Username, Password);
             _api.SetToken(token);
             IsLoggedIn = true;

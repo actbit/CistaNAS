@@ -22,7 +22,7 @@ public sealed class CistaNasOptions
     public List<string> CorsAllowedOrigins { get; set; } = [];
 
     /// <summary>ストリーミングトークンの TTL（秒）。デフォルト 30 秒。</summary>
-    [Range(1, int.MaxValue, ErrorMessage = "StreamingTokenTtlSeconds は 1 以上である必要があります。")]
+    [Range(1, 3600, ErrorMessage = "StreamingTokenTtlSeconds は 1 〜 3600 の範囲で指定してください。")]
     public int StreamingTokenTtlSeconds { get; set; } = 30;
 }
 
@@ -96,8 +96,8 @@ public sealed class AuthOptions
     public string? DefaultAdminPassword { get; set; }
 
     /// <summary>ログインパスワードハッシュの PBKDF2 反復回数。</summary>
-    [Range(100_000, 10_000_000)]
-    public int Pbkdf2Iterations { get; set; } = 210_000;
+    [Range(600_000, 10_000_000)]
+    public int Pbkdf2Iterations { get; set; } = 600_000;
 }
 
 public sealed class VolumeOptions
@@ -107,8 +107,8 @@ public sealed class VolumeOptions
     public int SectorSize { get; set; } = 4096;
 
     /// <summary>ボリュームパスワードからマスター鍵を導出する際の PBKDF2 反復回数。</summary>
-    [Range(100_000, 10_000_000)]
-    public int KdfIterations { get; set; } = 310_000;
+    [Range(600_000, 10_000_000)]
+    public int KdfIterations { get; set; } = 600_000;
 
     /// <summary>新規ボリューム作成時のデフォルト暗号化モード。"server" | "e2ee" | "none"。</summary>
     public string DefaultEncryptionMode { get; set; } = "server";

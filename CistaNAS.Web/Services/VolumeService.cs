@@ -592,7 +592,7 @@ public sealed class VolumeService : IDisposable
     {
         // E2EEはサーバー側で暗号化しないため、FileStream を排他保持しない
         var share = header.IsE2ee ? FileShare.ReadWrite : FileShare.None;
-        var fs = new FileStream(GetDataPath(name), FileMode.Open, FileAccess.ReadWrite, share);
+        var fs = new FileStream(GetDataPath(name), FileMode.Open, FileAccess.ReadWrite, share, 4096, FileOptions.Asynchronous);
         Stream stream = (header.Encrypted && masterKey is not null)
             ? new AesXtsStream(fs, masterKey, header.SectorSize, fs.Length, writable: true)
             : fs;

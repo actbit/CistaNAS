@@ -74,8 +74,17 @@ public sealed class LocalStorageProvider : IStorageProvider
     {
         string fullPath = ToFullPath(lockPath);
         Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-        var lockStream = new FileStream(fullPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-        lockStream.Lock(0, 1);
+        FileStream? lockStream = null;
+        try
+        {
+            lockStream = new FileStream(fullPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            lockStream.Lock(0, 1);
+        }
+        catch
+        {
+            lockStream?.Dispose();
+            throw;
+        }
         return Task.FromResult<IDisposable>(new FileLockReleaser(lockStream));
     }
 
@@ -97,7 +106,7 @@ public sealed class LocalStorageProvider : IStorageProvider
     {
         public void Dispose()
         {
-            try { fs.Unlock(0, 1); } catch { }
+            try { fs.Unlock(0, 1); } catch (IOException) { }
             fs.Dispose();
         }
     }
