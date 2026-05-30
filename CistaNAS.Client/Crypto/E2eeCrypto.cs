@@ -140,11 +140,8 @@ public static class E2eeCrypto
     private static byte[] DeriveChunkNonce(byte[] fileKey, int chunkIndex)
     {
         byte[] indexBytes = BitConverter.GetBytes(chunkIndex);
-        byte[] input = new byte[fileKey.Length + indexBytes.Length];
-        Buffer.BlockCopy(fileKey, 0, input, 0, fileKey.Length);
-        Buffer.BlockCopy(indexBytes, 0, input, fileKey.Length, indexBytes.Length);
-        byte[] hash = SHA256.HashData(input);
-        return hash[..GcmNonceSize];
+        byte[] mac = HMACSHA256.HashData(fileKey, indexBytes);
+        return mac[..GcmNonceSize];
     }
 
     private static byte[] HkdfSha256(byte[] ikm, byte[] salt, byte[] info, int outputLength)

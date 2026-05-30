@@ -102,8 +102,9 @@ async function deriveFileKey(masterKey, fileSalt) {
 async function deriveChunkNonce(fileKeyRaw, chunkIndex) {
     const chunkIndexBuf = new ArrayBuffer(4);
     new DataView(chunkIndexBuf).setUint32(0, chunkIndex, true);
-    const hash = await crypto.subtle.digest("SHA-256", concatBufs(fileKeyRaw, new Uint8Array(chunkIndexBuf)));
-    return new Uint8Array(hash).slice(0, GCM_NONCE_SIZE);
+    const key = await crypto.subtle.importKey("raw", fileKeyRaw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const mac = await crypto.subtle.sign("HMAC", key, new Uint8Array(chunkIndexBuf));
+    return new Uint8Array(mac).slice(0, GCM_NONCE_SIZE);
 }
 
 export async function encryptChunk(plainBase64, masterKeyHandle, chunkIndex, fileSaltBase64, isFirstChunk) {
