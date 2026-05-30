@@ -5,6 +5,7 @@ using CistaNAS.Web.Crypto;
 using CistaNAS.Web.Journal;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Storage;
+using CistaNAS.Web.Volume;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Web.Services;
@@ -31,16 +32,30 @@ public sealed class FileService
     private readonly VolumeService _volumeService;
     private readonly JournalService _journalService;
     private readonly IStorageProvider _storage;
+    private readonly IChunkStore _chunkStore;
 
     public FileService(
         VolumeService volumeService,
         JournalService journalService,
-        IStorageProvider storage)
+        IStorageProvider storage,
+        IChunkStore chunkStore)
     {
         _volumeService = volumeService;
         _journalService = journalService;
         _storage = storage;
+        _chunkStore = chunkStore;
     }
+
+    /// <summary>ボリュームがチャンクストレージモードか。</summary>
+    private bool IsChunkMode(string volumeName)
+    {
+        var (header, _) = _volumeService.GetMountedKeys(volumeName);
+        return header.StorageMode == "chunk";
+    }
+
+    /// <summary>ボリュームのマウント情報（チャンク暗号化用）を取得。</summary>
+    private (VolumeHeader Header, byte[]? MasterKey) GetVolumeKeys(string volumeName)
+        => _volumeService.GetMountedKeys(volumeName);
 
     /// <summary>ボリューム内の全ファイルを一覧。</summary>
     public async Task<ListFilesResponse> ListAsync(string volumeName, CancellationToken ct = default)
@@ -54,6 +69,9 @@ public sealed class FileService
     {
         ArgumentException.ThrowIfNullOrEmpty(fileName);
         if (contentLength < 0) throw new ArgumentOutOfRangeException(nameof(contentLength));
+
+        if (IsChunkMode(volumeName))
+            return await UploadChunkedAsync(volumeName, fileName, content, contentLength, ct);
 
         var (stream, _) = _volumeService.GetMounted(volumeName);
 
@@ -133,11 +151,88 @@ public sealed class FileService
         return meta;
     }
 
+    /// <summary>チャンクモード: ファイルをチャンク分割して暗号化し S3 に保存。</summary>
+    private async Task<FileMetadata> UploadChunkedAsync(string volumeName, string fileName, Stream content, long contentLength, CancellationToken ct = default)
+    {
+        var (header, masterKey) = GetVolumeKeys(volumeName);
+        int chunkSize = header.ServerChunkSize > 0 ? header.ServerChunkSize : 4194304;
+
+        // ジャーナル: 書き込み前
+        await _journalService.RecordAsync(volumeName, new JournalEntry
+        {
+            Operation = JournalOp.WriteFile,
+            Path = fileName,
+            Length = checked((int)Math.Min(contentLength, int.MaxValue)),
+        }, ct);
+
+        SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await catLock.WaitAsync(ct);
+        try
+        {
+            var catalog = await LoadCatalogAsync(volumeName, ct);
+            catalog.Files.TryGetValue(fileName, out var existing);
+
+            // 既存ファイルのチャンクを削除（上書き時）
+            if (existing is not null && existing.IsChunked)
+            {
+                try { await _chunkStore.DeleteChunksAsync(volumeName, fileName, ct); }
+                catch (Exception) { /* ベストエフォート */ }
+            }
+
+            var chunkSizes = new List<int>();
+            byte[] buffer = new byte[chunkSize];
+            int chunkIndex = 0;
+            long remaining = contentLength;
+            int sectorSize = header.SectorSize > 0 ? header.SectorSize : 4096;
+
+            while (remaining > 0)
+            {
+                int toRead = (int)Math.Min(buffer.Length, remaining);
+                int read = await content.ReadAsync(buffer.AsMemory(0, toRead), ct);
+                if (read == 0) break;
+
+                byte[] chunkData = buffer[..read].ToArray();
+
+                // 暗号化ボリュームの場合は AES-XTS でチャンク暗号化
+                if (header.Encrypted && masterKey is not null)
+                {
+                    chunkData = ChunkEncryptor.EncryptChunk(masterKey, chunkIndex, sectorSize, chunkSize, chunkData);
+                }
+
+                // S3 にチャンクを保存
+                using var ms = new MemoryStream(chunkData);
+                await _chunkStore.WriteChunkAsync(volumeName, fileName, chunkIndex, ms, ct);
+
+                chunkSizes.Add(read);
+                chunkIndex++;
+                remaining -= read;
+            }
+
+            var meta = new FileMetadata
+            {
+                Name = fileName,
+                Offset = 0, // チャンクモードでは使用しない
+                Length = contentLength - remaining, // 実際に読み取ったバイト数
+                ChunkCount = chunkSizes.Count,
+                ChunkSizes = chunkSizes,
+                CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
+                ModifiedAt = DateTimeOffset.UtcNow,
+            };
+            catalog.Files[fileName] = meta;
+            await SaveCatalogAsync(volumeName, catalog, ct);
+
+            await _journalService.CommitAsync(volumeName, ct);
+            return meta;
+        }
+        finally
+        {
+            catLock.Release();
+        }
+    }
+
     /// <summary>ファイルをダウンロード。</summary>
     public async Task<FileDownloadResponse> DownloadAsync(string volumeName, string fileName, CancellationToken ct = default)
     {
-        var (stream, _) = _volumeService.GetMounted(volumeName);
-
         SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
         await catLock.WaitAsync(ct);
         try
@@ -146,7 +241,11 @@ public sealed class FileService
             if (!catalog.Files.TryGetValue(fileName, out var meta))
                 throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
 
-            // カタログロック内でオフセットを取得し、ロック解除後にストリーミング読み取り
+            if (meta.IsChunked && IsChunkMode(volumeName))
+                return await DownloadChunkedAsync(volumeName, fileName, meta, ct);
+
+            // ローカルモード: 従来のストリームベース
+            var (stream, _) = _volumeService.GetMounted(volumeName);
             long offset = meta.Offset;
             long length = meta.Length;
             string name = meta.Name;
@@ -159,9 +258,34 @@ public sealed class FileService
         }
     }
 
+    /// <summary>チャンクモード: チャンクを遅延取得して Seekable なストリームで返す。</summary>
+    private Task<FileDownloadResponse> DownloadChunkedAsync(string volumeName, string fileName, FileMetadata meta, CancellationToken ct)
+    {
+        var (header, masterKey) = GetVolumeKeys(volumeName);
+        int sectorSize = header.SectorSize > 0 ? header.SectorSize : 4096;
+        int chunkSize = header.ServerChunkSize > 0 ? header.ServerChunkSize : 4194304;
+
+        Stream chunkedStream;
+        if (header.Encrypted && masterKey is not null)
+        {
+            chunkedStream = new ChunkedReadStream(
+                _chunkStore, volumeName, fileName, masterKey,
+                sectorSize, chunkSize, meta.ChunkSizes);
+        }
+        else
+        {
+            // 非暗号化: ChunkedReadStream の代わりに MemoryChunkedStream を使用
+            chunkedStream = new MemoryChunkedStream(_chunkStore, volumeName, fileName, meta.ChunkSizes);
+        }
+
+        return Task.FromResult(new FileDownloadResponse(chunkedStream, meta.Name, meta.Length));
+    }
+
     /// <summary>ファイルを削除。</summary>
     public async Task DeleteAsync(string volumeName, string fileName, CancellationToken ct = default)
     {
+        bool isChunkMode = IsChunkMode(volumeName);
+
         await _journalService.RecordAsync(volumeName, new JournalEntry
         {
             Operation = JournalOp.DeleteFile,
@@ -182,6 +306,14 @@ public sealed class FileService
         {
             catLock.Release();
         }
+
+        // チャンクモード: S3 からチャンクを削除
+        if (isChunkMode)
+        {
+            try { await _chunkStore.DeleteChunksAsync(volumeName, fileName, ct); }
+            catch (Exception) { /* ベストエフォート */ }
+        }
+
         await _journalService.CommitAsync(volumeName, ct);
     }
 
@@ -314,4 +446,122 @@ file sealed class FileSubStream(Stream baseStream, long offset, long length, Sem
     public override void SetLength(long value) => throw new NotSupportedException();
 
     public override void Write(byte[] buffer, int writeOffset, int count) => throw new NotSupportedException();
+}
+
+/// <summary>非暗号化チャンクストアから遅延取得する Seekable ストリーム。</summary>
+file sealed class MemoryChunkedStream : Stream
+{
+    private readonly IChunkStore _chunkStore;
+    private readonly string _volumeName;
+    private readonly string _objectId;
+    private readonly IReadOnlyList<int> _chunkSizes;
+    private readonly long[] _cumulativeSizes;
+    private readonly long _totalLength;
+
+    private long _position;
+    private int _cachedChunkIndex = -1;
+    private byte[]? _cachedData;
+
+    public MemoryChunkedStream(
+        IChunkStore chunkStore,
+        string volumeName,
+        string objectId,
+        IReadOnlyList<int> chunkSizes)
+    {
+        _chunkStore = chunkStore;
+        _volumeName = volumeName;
+        _objectId = objectId;
+        _chunkSizes = chunkSizes;
+
+        _cumulativeSizes = new long[chunkSizes.Count];
+        long acc = 0;
+        for (int i = 0; i < chunkSizes.Count; i++)
+        {
+            _cumulativeSizes[i] = acc;
+            acc += chunkSizes[i];
+        }
+        _totalLength = acc;
+    }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => true;
+    public override bool CanWrite => false;
+    public override long Length => _totalLength;
+
+    public override long Position
+    {
+        get => _position;
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(value, _totalLength);
+            _position = value;
+        }
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        if (_position >= _totalLength) return 0;
+        count = (int)Math.Min(count, _totalLength - _position);
+        int totalRead = 0;
+
+        while (count > 0)
+        {
+            (int chunkIdx, int offsetInChunk) = LocatePosition(_position);
+            byte[] data = GetChunk(chunkIdx);
+            int available = data.Length - offsetInChunk;
+            int toRead = Math.Min(count, available);
+            Buffer.BlockCopy(data, offsetInChunk, buffer, offset + totalRead, toRead);
+
+            _position += toRead;
+            totalRead += toRead;
+            count -= toRead;
+        }
+        return totalRead;
+    }
+
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+        long target = origin switch
+        {
+            SeekOrigin.Begin => offset,
+            SeekOrigin.Current => _position + offset,
+            SeekOrigin.End => _totalLength + offset,
+            _ => throw new ArgumentOutOfRangeException(nameof(origin)),
+        };
+        ArgumentOutOfRangeException.ThrowIfNegative(target);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(target, _totalLength);
+        _position = target;
+        return _position;
+    }
+
+    private (int ChunkIndex, int OffsetInChunk) LocatePosition(long position)
+    {
+        int lo = 0, hi = _cumulativeSizes.Length - 1;
+        while (lo < hi)
+        {
+            int mid = (lo + hi + 1) / 2;
+            if (_cumulativeSizes[mid] <= position) lo = mid;
+            else hi = mid - 1;
+        }
+        return (lo, (int)(position - _cumulativeSizes[lo]));
+    }
+
+    private byte[] GetChunk(int chunkIndex)
+    {
+        if (_cachedChunkIndex == chunkIndex && _cachedData is not null)
+            return _cachedData;
+
+        byte[]? data = _chunkStore.ReadChunkAsync(_volumeName, _objectId, chunkIndex).GetAwaiter().GetResult();
+        if (data is null)
+            throw new InvalidOperationException($"チャンク {chunkIndex} がストレージに見つかりません。");
+
+        _cachedData = data;
+        _cachedChunkIndex = chunkIndex;
+        return data;
+    }
+
+    public override void Flush() { }
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 }

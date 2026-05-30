@@ -22,22 +22,35 @@ public sealed class VolumeService : IDisposable
     private int _disposed;
     private readonly string _volumeDataPath;
     private readonly VolumeOptions _volOpts;
+    private readonly string _storageProvider;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly VolumeMetadataStore _metaStore;
+    private readonly IChunkStore _chunkStore;
     private readonly ILogger<VolumeService> _logger;
 
     private readonly ConcurrentDictionary<string, MountedVolume> _mounted = new();
     private readonly SemaphoreSlim _mountGate = new(1, 1);
 
-    public VolumeService(IOptions<CistaNasOptions> options, IServiceScopeFactory scopeFactory, VolumeMetadataStore metaStore, ILogger<VolumeService> logger)
+    public VolumeService(
+        IOptions<CistaNasOptions> options,
+        IServiceScopeFactory scopeFactory,
+        VolumeMetadataStore metaStore,
+        IChunkStore chunkStore,
+        ILogger<VolumeService> logger)
     {
         _volumeDataPath = options.Value.Storage.VolumeDataPath ?? options.Value.DataRoot;
         _volOpts = options.Value.Volume;
+        _storageProvider = options.Value.Storage.Provider.ToLowerInvariant();
         _scopeFactory = scopeFactory;
         _metaStore = metaStore;
+        _chunkStore = chunkStore;
         _logger = logger;
         Directory.CreateDirectory(_volumeDataPath);
     }
+
+    /// <summary>"auto" 設定時に、S3 プロバイダ使用中ならチャンクモードにするかを判定。</summary>
+    private bool ShouldUseChunkMode() =>
+        _volOpts.ChunkStorage == "auto" && _storageProvider != "local";
 
     public async Task<VolumeInfo> CreateAsync(string name, string? username, string? password, bool encrypted = true)
     {
@@ -63,10 +76,27 @@ public sealed class VolumeService : IDisposable
 
         var (header, masterKey) = VolumeHeader.Create(name, username, password, _volOpts.SectorSize, _volOpts.KdfIterations, encrypted);
 
+        // チャンクモード判定: "auto" かつ S3 プロバイダ使用時
+        bool chunkMode = ShouldUseChunkMode();
+        if (chunkMode)
+        {
+            header.StorageMode = "chunk";
+            header.ServerChunkSize = _volOpts.ServerChunkSize;
+        }
+
         Directory.CreateDirectory(VolumeDir(name));
         await _metaStore.SaveAsync(name, header);
-        File.Create(GetDataPath(name)).Dispose();
-        MountInternal(name, header, masterKey);
+
+        if (chunkMode)
+        {
+            // チャンクモード: volume.dat は作成しない
+            MountInternalChunked(name, header, masterKey);
+        }
+        else
+        {
+            File.Create(GetDataPath(name)).Dispose();
+            MountInternal(name, header, masterKey);
+        }
 
         return ToInfo(name, header, true);
     }
@@ -245,6 +275,14 @@ public sealed class VolumeService : IDisposable
         if (!_mounted.TryGetValue(name, out var mv))
             throw new VolumeException($"ボリューム '{name}' はマウントされていません。");
         return (mv.Stream, mv.Header);
+    }
+
+    /// <summary>マウント済みボリュームの Header と MasterKey を取得（Stream は不要なケース用）。</summary>
+    public (VolumeHeader Header, byte[]? MasterKey) GetMountedKeys(string name)
+    {
+        if (!_mounted.TryGetValue(name, out var mv))
+            throw new VolumeException($"ボリューム '{name}' はマウントされていません。");
+        return (mv.Header, mv.MasterKey);
     }
 
     public bool IsMounted(string name) => _mounted.ContainsKey(name);
@@ -562,6 +600,10 @@ public sealed class VolumeService : IDisposable
             if (File.Exists(dataPath))
                 File.Delete(dataPath);
 
+            // チャンクモード: S3 からボリューム配下の全チャンクを削除
+            try { await _chunkStore.DeleteVolumeChunksAsync(name); }
+            catch (Exception ex) { _logger.LogWarning(ex, "ボリューム '{Volume}' のチャンク削除に失敗しました。", name); }
+
             // 空になったローカルディレクトリを掃除
             string dir = VolumeDir(name);
             if (Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any())
@@ -597,6 +639,14 @@ public sealed class VolumeService : IDisposable
             ? new AesXtsStream(fs, masterKey, header.SectorSize, fs.Length, writable: true)
             : fs;
         _mounted[name] = new MountedVolume(header, masterKey, stream);
+    }
+
+    /// <summary>チャンクモード: FileStream を開かずにマウント。データは IChunkStore 経由でアクセス。</summary>
+    private void MountInternalChunked(string name, VolumeHeader header, byte[]? masterKey)
+    {
+        // チャンクモードでは FileStream を持たない。ダミーの空ストリームを設定。
+        // GetMounted() はチャンクモードでは呼ばれない前提（GetMountedKeys を使用）。
+        _mounted[name] = new MountedVolume(header, masterKey, Stream.Null);
     }
 
     private async Task<VolumeHeader> LoadHeaderOrThrowAsync(string name)

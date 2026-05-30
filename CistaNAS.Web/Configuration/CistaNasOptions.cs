@@ -116,4 +116,11 @@ public sealed class VolumeOptions
     /// <summary>E2EE ボリュームのデフォルトチャンクサイズ（バイト）。</summary>
     [Range(65536, 16777216)]
     public int E2eeChunkSize { get; set; } = 1048576;
+
+    /// <summary>チャンクストレージモード。"local" は常に volume.dat、"auto" は S3 provider 使用時にチャンクモード。</summary>
+    public string ChunkStorage { get; set; } = "local";
+
+    /// <summary>チャンクモード時のサーバー側チャンクサイズ（バイト）。4 MiB デフォルト。</summary>
+    [Range(1048576, 67108864)]
+    public int ServerChunkSize { get; set; } = 4194304;
 }

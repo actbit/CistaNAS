@@ -58,6 +58,11 @@ public static class TestHelper
             var o = sp.GetRequiredService<IOptions<CistaNasOptions>>().Value;
             return new LocalStorageProvider(o.DataRoot);
         });
+        services.AddSingleton<IChunkStore>(sp =>
+        {
+            var storage = sp.GetRequiredService<IStorageProvider>();
+            return new S3ChunkStore(storage);
+        });
         services.AddSingleton(io);
 
         // Services

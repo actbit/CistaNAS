@@ -29,7 +29,8 @@ public class E2eeFileTests : IAsyncDisposable
         using var scope = _sp.CreateAsyncScope();
         var opt = _sp.GetRequiredService<IOptions<CistaNasOptions>>();
         var storage = _sp.GetRequiredService<IStorageProvider>();
-        return new E2eeFileService(_volumeService, storage, opt);
+        var chunkStore = _sp.GetRequiredService<IChunkStore>();
+        return new E2eeFileService(_volumeService, storage, chunkStore, opt);
     }
 
     [Fact]

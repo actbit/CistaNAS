@@ -20,6 +20,9 @@ public static class ServiceCollectionExtensions
         var storage = CreateStorageProvider(cista);
         services.AddSingleton<IStorageProvider>(storage);
 
+        // チャンクストレージ（常に登録。ローカルモードでもテストや将来の拡張で使用可能）
+        services.AddSingleton<IChunkStore>(new S3ChunkStore(storage));
+
         // DB プロバイダ + ASP.NET Core Identity + EF Core
         RegisterDatabaseAndIdentity(services, cista, storage);
 

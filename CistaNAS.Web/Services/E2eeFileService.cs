@@ -19,26 +19,35 @@ public sealed class E2eeFileService
 
     private readonly VolumeService _volumeService;
     private readonly IStorageProvider _storage;
+    private readonly IChunkStore _chunkStore;
     private readonly string _volumeDataPath;
 
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _fileGates = new(StringComparer.Ordinal);
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _volumeGates = new(StringComparer.Ordinal);
     private static readonly ConcurrentDictionary<string, ConcurrentBag<string>> _volumeFileIds = new(StringComparer.Ordinal);
 
-    public E2eeFileService(VolumeService volumeService, IStorageProvider storage, IOptions<CistaNasOptions> options)
+    public E2eeFileService(VolumeService volumeService, IStorageProvider storage, IChunkStore chunkStore, IOptions<CistaNasOptions> options)
     {
         _volumeService = volumeService;
         _storage = storage;
+        _chunkStore = chunkStore;
         _volumeDataPath = options.Value.Storage.VolumeDataPath ?? options.Value.DataRoot;
     }
 
     /// <summary>E2EE ボリュームのヘッダを取得。E2EE でなければ例外。</summary>
     private VolumeHeader GetE2eeHeader(string volumeName)
     {
-        var (_, header) = _volumeService.GetMounted(volumeName);
+        var (header, _) = _volumeService.GetMountedKeys(volumeName);
         if (!header.IsE2ee)
             throw new FileServiceException($"ボリューム '{volumeName}' は E2EE ボリュームではありません。");
         return header;
+    }
+
+    /// <summary>ボリュームがチャンクストレージモードか。</summary>
+    private bool IsChunkMode(string volumeName)
+    {
+        var (header, _) = _volumeService.GetMountedKeys(volumeName);
+        return header.StorageMode == "chunk";
     }
 
     /// <summary>ファイルエントリを作成し、FileId を返す。</summary>
@@ -80,7 +89,7 @@ public sealed class E2eeFileService
         }
     }
 
-    /// <summary>チャンクをアップロードして volume.dat に書き込む。</summary>
+    /// <summary>チャンクをアップロードして volume.dat またはチャンクストアに書き込む。</summary>
     public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, Stream data, long dataLength, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
@@ -101,42 +110,54 @@ public sealed class E2eeFileService
             if (chunkIndex > 0 && entry.ChunkSizes.Count < chunkIndex)
                 throw new FileServiceException($"チャンク {chunkIndex - 1} が未アップロードです。順番にアップロードしてください。");
 
-            long chunkOffset = entry.Offset;
-            for (int i = 0; i < chunkIndex; i++)
-                chunkOffset += entry.ChunkSizes[i];
-
-            // ボリュームゲートで volume.dat への書き込みを直列化
-            var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
-            await volGate.WaitAsync(ct);
-            long written;
-            try
+            if (IsChunkMode(volumeName))
             {
-                string dataPath = GetDataPath(volumeName);
-                using var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
-                fs.Seek(chunkOffset, SeekOrigin.Begin);
+                await _chunkStore.WriteChunkAsync(volumeName, fileId, chunkIndex, data, ct);
 
-                written = 0;
-                byte[] buffer = new byte[81920];
-                long remaining = dataLength;
-                while (remaining > 0)
+                while (entry.ChunkSizes.Count <= chunkIndex)
+                    entry.ChunkSizes.Add(0);
+                entry.ChunkSizes[chunkIndex] = (int)dataLength;
+            }
+            else
+            {
+                long chunkOffset = entry.Offset;
+                for (int i = 0; i < chunkIndex; i++)
+                    chunkOffset += entry.ChunkSizes[i];
+
+                // ボリュームゲートで volume.dat への書き込みを直列化
+                var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+                await volGate.WaitAsync(ct);
+                long written;
+                try
                 {
-                    int toRead = (int)Math.Min(buffer.Length, remaining);
-                    int read = await data.ReadAsync(buffer.AsMemory(0, toRead), ct);
-                    if (read == 0) break;
-                    fs.Write(buffer, 0, read);
-                    written += read;
-                    remaining -= read;
+                    string dataPath = GetDataPath(volumeName);
+                    using var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+                    fs.Seek(chunkOffset, SeekOrigin.Begin);
+
+                    written = 0;
+                    byte[] buffer = new byte[81920];
+                    long remaining = dataLength;
+                    while (remaining > 0)
+                    {
+                        int toRead = (int)Math.Min(buffer.Length, remaining);
+                        int read = await data.ReadAsync(buffer.AsMemory(0, toRead), ct);
+                        if (read == 0) break;
+                        fs.Write(buffer, 0, read);
+                        written += read;
+                        remaining -= read;
+                    }
+                    fs.Flush();
                 }
-                fs.Flush();
-            }
-            finally
-            {
-                volGate.Release();
+                finally
+                {
+                    volGate.Release();
+                }
+
+                while (entry.ChunkSizes.Count <= chunkIndex)
+                    entry.ChunkSizes.Add(0);
+                entry.ChunkSizes[chunkIndex] = (int)written;
             }
 
-            while (entry.ChunkSizes.Count <= chunkIndex)
-                entry.ChunkSizes.Add(0);
-            entry.ChunkSizes[chunkIndex] = (int)written;
             await SaveCatalogAsync(volumeName, catalog, ct);
         }
         finally
@@ -157,13 +178,21 @@ public sealed class E2eeFileService
         if (chunkIndex < 0 || chunkIndex >= entry.ChunkCount)
             throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です。");
 
-        long chunkOffset = entry.Offset;
-        for (int i = 0; i < chunkIndex; i++)
-            chunkOffset += entry.ChunkSizes[i];
-
         long chunkLength = chunkIndex < entry.ChunkSizes.Count
             ? entry.ChunkSizes[chunkIndex]
             : 0;
+
+        if (IsChunkMode(volumeName))
+        {
+            byte[]? chunkData = await _chunkStore.ReadChunkAsync(volumeName, fileId, chunkIndex, ct);
+            if (chunkData is null)
+                throw new FileServiceException($"チャンク {chunkIndex} が見つかりません。");
+            return (new MemoryStream(chunkData), chunkData.Length);
+        }
+
+        long chunkOffset = entry.Offset;
+        for (int i = 0; i < chunkIndex; i++)
+            chunkOffset += entry.ChunkSizes[i];
 
         string dataPath = GetDataPath(volumeName);
         var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
@@ -222,6 +251,7 @@ public sealed class E2eeFileService
     public async Task DeleteFileAsync(string volumeName, string fileId, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
+        bool isChunkMode = IsChunkMode(volumeName);
         var gate = _fileGates.GetOrAdd(fileId, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct);
         try
@@ -234,6 +264,13 @@ public sealed class E2eeFileService
         finally
         {
             gate.Release();
+        }
+
+        // チャンクモード: S3 からチャンクを削除
+        if (isChunkMode)
+        {
+            try { await _chunkStore.DeleteChunksAsync(volumeName, fileId, ct); }
+            catch (Exception) { /* ベストエフォート */ }
         }
 
         // ファイル削除後に対応する SemaphoreSlim を破棄

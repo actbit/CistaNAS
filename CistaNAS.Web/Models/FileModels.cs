@@ -11,6 +11,15 @@ public sealed class FileMetadata
     public long Length { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset ModifiedAt { get; set; }
+
+    /// <summary>チャンクモード時のチャンク数。0 なら従来のシーケンシャル配置。</summary>
+    public int ChunkCount { get; set; }
+
+    /// <summary>チャンクモード時の各チャンクサイズ。ChunkCount と要素数が一致する。</summary>
+    public List<int> ChunkSizes { get; set; } = [];
+
+    /// <summary>チャンクモードで保存されているか。</summary>
+    public bool IsChunked => ChunkCount > 0;
 }
 
 public sealed record ListFilesResponse(IReadOnlyList<FileMetadata> Files);

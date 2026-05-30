@@ -28,6 +28,12 @@ public sealed class VolumeHeader
     /// <summary>"server" (サーバー側 AES-XTS) or "e2ee" (クライアント側暗号化)。</summary>
     public string EncryptionMode { get; set; } = "server";
 
+    /// <summary>ストレージモード。"local" (volume.dat) or "chunk" (S3/R2 チャンク分割)。</summary>
+    public string StorageMode { get; set; } = "local";
+
+    /// <summary>チャンクモード時のサーバー側チャンクサイズ（バイト）。EncryptionMode=="server" かつ StorageMode=="chunk" の場合に使用。</summary>
+    public int ServerChunkSize { get; set; } = 4194304; // 4 MiB
+
     /// <summary>E2EE チャンクサイズ（バイト）。EncryptionMode が "e2ee" の場合のみ使用。</summary>
     public int ChunkSize { get; set; } = 1048576;
 
