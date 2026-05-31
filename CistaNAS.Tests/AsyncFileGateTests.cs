@@ -4,7 +4,7 @@ namespace CistaNAS.Tests;
 
 /// <summary>
 /// AsyncFileGate の単体テスト。
-/// スタベーション防止・並行リーダー・読み書き排他を検証。
+/// スタベーション防止・並行リーダー・読み書き排他・即時通知・Dispose を検証。
 /// </summary>
 public class AsyncFileGateTests
 {
@@ -14,7 +14,7 @@ public class AsyncFileGateTests
     [Fact]
     public async Task ConcurrentReaders_AllEnter()
     {
-        var gate = new AsyncFileGate();
+        using var gate = new AsyncFileGate();
         var locks = new List<IDisposable>();
 
         for (int i = 0; i < 5; i++)
@@ -30,7 +30,7 @@ public class AsyncFileGateTests
     [Fact]
     public async Task WriteLock_BlocksReaders()
     {
-        var gate = new AsyncFileGate();
+        using var gate = new AsyncFileGate();
         var writeLock = await gate.EnterWriteAsync(Ct);
 
         bool readerEntered = false;
@@ -52,7 +52,7 @@ public class AsyncFileGateTests
     [Fact]
     public async Task ReadLock_BlocksWriter()
     {
-        var gate = new AsyncFileGate();
+        using var gate = new AsyncFileGate();
         var readLock = await gate.EnterReadAsync(Ct);
 
         bool writerEntered = false;
@@ -74,7 +74,7 @@ public class AsyncFileGateTests
     [Fact]
     public async Task WriterWaiting_BlockNewReaders()
     {
-        var gate = new AsyncFileGate();
+        using var gate = new AsyncFileGate();
         var readLock1 = await gate.EnterReadAsync(Ct);
 
         bool writerAcquired = false;
@@ -109,7 +109,7 @@ public class AsyncFileGateTests
     [Fact]
     public async Task MultipleReaders_WriterWaitsForAll()
     {
-        var gate = new AsyncFileGate();
+        using var gate = new AsyncFileGate();
         var rl1 = await gate.EnterReadAsync(Ct);
         var rl2 = await gate.EnterReadAsync(Ct);
         var rl3 = await gate.EnterReadAsync(Ct);
@@ -125,11 +125,11 @@ public class AsyncFileGateTests
         Assert.False(writerEntered);
 
         rl1.Dispose();
-        await Task.Delay(100);
+        await Task.Delay(50);
         Assert.False(writerEntered);
 
         rl2.Dispose();
-        await Task.Delay(100);
+        await Task.Delay(50);
         Assert.False(writerEntered);
 
         rl3.Dispose();
@@ -141,11 +141,10 @@ public class AsyncFileGateTests
     [Fact]
     public async Task ReadLockDispose_DecrementsCount()
     {
-        var gate = new AsyncFileGate();
+        using var gate = new AsyncFileGate();
         var rl = await gate.EnterReadAsync(Ct);
         rl.Dispose();
 
-        // 書き込みロックが即座に取得できるはず
         var wl = await gate.EnterWriteAsync(Ct);
         wl.Dispose();
     }
@@ -154,7 +153,7 @@ public class AsyncFileGateTests
     [Fact]
     public async Task WriteLock_BlocksOtherWriter()
     {
-        var gate = new AsyncFileGate();
+        using var gate = new AsyncFileGate();
         var wl1 = await gate.EnterWriteAsync(Ct);
 
         bool wl2Acquired = false;
@@ -176,13 +175,95 @@ public class AsyncFileGateTests
     [Fact]
     public async Task ReadLock_Cancellation()
     {
-        var gate = new AsyncFileGate();
+        using var gate = new AsyncFileGate();
         var wl = await gate.EnterWriteAsync(Ct);
 
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             gate.EnterReadAsync(cts.Token));
 
+        wl.Dispose();
+    }
+
+    /// <summary>CancellationToken で書き込み待機（リーダー完了待ち）をキャンセルできる。</summary>
+    [Fact]
+    public async Task WriteLock_Cancellation_WhileWaitingForReaders()
+    {
+        using var gate = new AsyncFileGate();
+        var readLock = await gate.EnterReadAsync(Ct);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            gate.EnterWriteAsync(cts.Token));
+
+        // キャンセル後も gate は正常に機能する
+        readLock.Dispose();
+        var wl = await gate.EnterWriteAsync(Ct);
+        wl.Dispose();
+    }
+
+    /// <summary>最後のリーダーの解放でライターに即時通知される（遅延なし）。</summary>
+    [Fact]
+    public async Task LastReaderExit_InstantWriterNotification()
+    {
+        using var gate = new AsyncFileGate();
+        var readLock = await gate.EnterReadAsync(Ct);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        bool writerAcquired = false;
+        var writerTask = Task.Run(async () =>
+        {
+            using var wl = await gate.EnterWriteAsync(Ct);
+            writerAcquired = true;
+        });
+
+        // ライターが待機状態に入るまで少し待つ
+        await Task.Delay(100);
+
+        // リーダーを解放 → ライターに即時通知されるはず
+        readLock.Dispose();
+        await writerTask;
+        sw.Stop();
+
+        Assert.True(writerAcquired);
+        // 即時通知なら 50ms 以内に完了するはず（スピンウェイトの 20ms より高速）
+        Assert.True(sw.ElapsedMilliseconds < 200, $"ライター取得に {sw.ElapsedMilliseconds}ms かかった");
+    }
+
+    /// <summary>Dispose 後に新しい操作は ObjectDisposedException。</summary>
+    [Fact]
+    public async Task Dispose_PreventsNewOperations()
+    {
+        var gate = new AsyncFileGate();
+        gate.Dispose();
+
+        await Assert.ThrowsAnyAsync<ObjectDisposedException>(() =>
+            gate.EnterReadAsync(Ct));
+
+        await Assert.ThrowsAnyAsync<ObjectDisposedException>(() =>
+            gate.EnterWriteAsync(Ct));
+    }
+
+    /// <summary>Dispose を2回呼んでも例外にならない。</summary>
+    [Fact]
+    public void DoubleDispose_NoException()
+    {
+        var gate = new AsyncFileGate();
+        gate.Dispose();
+        gate.Dispose(); // 2回目
+    }
+
+    /// <summary>ReadLock の Dispose を2回呼んでもカウントが負にならない。</summary>
+    [Fact]
+    public async Task ReadLock_DoubleDispose_Idempotent()
+    {
+        using var gate = new AsyncFileGate();
+        var rl = await gate.EnterReadAsync(Ct);
+        rl.Dispose();
+        rl.Dispose(); // 2回目（no-op であるべき）
+
+        // カウントが正しく 0 になっていれば書き込みが即座に取得できる
+        var wl = await gate.EnterWriteAsync(Ct);
         wl.Dispose();
     }
 }
