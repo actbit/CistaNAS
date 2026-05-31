@@ -569,6 +569,16 @@ public sealed class VolumeService : IDisposable
         }
     }
 
+    // ---- ユーザークオータ ----
+
+    /// <summary>ユーザーのクオータを設定する（ボリュームオーナーのみ）。</summary>
+    public async Task SetUserQuotaAsync(string volumeName, string targetUsername, long maxBytes)
+    {
+        var header = await LoadHeaderOrThrowAsync(volumeName);
+        header.UserQuotas[targetUsername] = maxBytes;
+        await _metaStore.SaveAsync(volumeName, header);
+    }
+
     // ---- ボリューム削除 ----
 
     /// <summary>ボリュームを削除する。username が非 null の場合はオーナーまたは admin のみ実行可能。</summary>

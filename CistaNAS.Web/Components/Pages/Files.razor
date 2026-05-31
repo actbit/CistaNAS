@@ -548,7 +548,7 @@ else
             if (totalChunks == 0) totalChunks = 1;
 
             long estimatedLength = 16 + (long)totalChunks * (chunkSize + 16);
-            var entry = await E2eeFileSvc.CreateFileAsync(VolumeName, new E2eeCreateFileRequest(encName, estimatedLength, totalChunks));
+            var entry = await E2eeFileSvc.CreateFileAsync(VolumeName, new E2eeCreateFileRequest(encName, estimatedLength, totalChunks), CurrentUsername);
 
             long bytesRemaining = totalSize;
             for (int i = 0; i < totalChunks; i++)

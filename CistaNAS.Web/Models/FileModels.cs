@@ -50,6 +50,9 @@ public sealed class E2eeFileEntry
     public List<int> ChunkSizes { get; set; } = [];
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset ModifiedAt { get; set; }
+
+    /// <summary>ファイルを作成したユーザー（JWT から抽出）。</summary>
+    public string OwnerUsername { get; set; } = "";
 }
 
 public sealed record E2eeCreateFileRequest(
@@ -59,6 +62,17 @@ public sealed record E2eeCreateFileRequest(
 public sealed record E2eeFinalizeFileRequest([Range(0, long.MaxValue)] long ActualEncryptedLength);
 public sealed record E2eeListFilesResponse(IReadOnlyList<E2eeFileEntry> Files);
 public sealed record E2eeMountResponse(int ChunkSize, string EncryptionMode);
+
+/// <summary>E2EE ボリュームの使用量統計。</summary>
+public sealed record E2eeVolumeStats(
+    long TotalUsedBytes,
+    long UserUsedBytes,
+    long UserQuotaBytes,
+    int TotalFiles,
+    int UserFiles);
+
+/// <summary>ユーザークオータ設定リクエスト。</summary>
+public sealed record E2eeSetQuotaRequest([Range(0, long.MaxValue)] long MaxBytes);
 
 /// <summary>E2EE 共有時の鍵追加リクエスト。</summary>
 public sealed record E2eeAddWrappedKeyRequest(

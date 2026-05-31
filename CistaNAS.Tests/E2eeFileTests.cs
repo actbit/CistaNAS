@@ -38,7 +38,7 @@ public class E2eeFileTests : IAsyncDisposable
     {
         string vol = await MountE2eeAsync("test-create");
         var e2eeFs = GetE2eeFileService();
-        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc-name-abc", 2048, 2));
+        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc-name-abc", 2048, 2), "testuser");
 
         Assert.False(string.IsNullOrEmpty(entry.FileId));
         Assert.Equal("enc-name-abc", entry.EncryptedName);
@@ -53,7 +53,7 @@ public class E2eeFileTests : IAsyncDisposable
         const int chunkSize = 4096;
 
         var e2eeFs = GetE2eeFileService();
-        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc-file", chunkSize * 2 + 16 * 2 + 16, 2));
+        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc-file", chunkSize * 2 + 16 * 2 + 16, 2), "testuser");
 
         byte[] fileSalt = E2eeCrypto.GenerateFileSalt();
         byte[] fileKey = E2eeCrypto.DeriveFileKey(_masterKey, fileSalt);
@@ -91,8 +91,8 @@ public class E2eeFileTests : IAsyncDisposable
     {
         string vol = await MountE2eeAsync("test-list");
         var e2eeFs = GetE2eeFileService();
-        await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc-a", 100, 1));
-        await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc-b", 200, 1));
+        await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc-a", 100, 1), "testuser");
+        await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc-b", 200, 1), "testuser");
 
         var result = await e2eeFs.ListFilesAsync(vol);
         Assert.Equal(2, result.Files.Count);
@@ -105,7 +105,7 @@ public class E2eeFileTests : IAsyncDisposable
     {
         string vol = await MountE2eeAsync("test-delete");
         var e2eeFs = GetE2eeFileService();
-        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("to-delete", 100, 1));
+        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("to-delete", 100, 1), "testuser");
 
         Assert.Single((await e2eeFs.ListFilesAsync(vol)).Files);
         await e2eeFs.DeleteFileAsync(vol, entry.FileId);
@@ -117,7 +117,7 @@ public class E2eeFileTests : IAsyncDisposable
     {
         string vol = await MountE2eeAsync("test-finalize");
         var e2eeFs = GetE2eeFileService();
-        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc", 2048, 2));
+        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc", 2048, 2), "testuser");
 
         await e2eeFs.FinalizeFileAsync(vol, entry.FileId, new E2eeFinalizeFileRequest(1500));
 

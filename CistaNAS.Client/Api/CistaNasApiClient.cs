@@ -168,6 +168,21 @@ public sealed class CistaNasApiClient
         }
         return result;
     }
+
+    public async Task<VolumeStats> GetVolumeStatsAsync(string volumeName)
+    {
+        var res = await _http.GetAsync($"/api/v1/e2ee/{volumeName}/stats");
+        res.EnsureSuccessStatusCode();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        return new VolumeStats
+        {
+            TotalUsedBytes = json.GetProperty("totalUsedBytes").GetInt64(),
+            UserUsedBytes = json.GetProperty("userUsedBytes").GetInt64(),
+            UserQuotaBytes = json.GetProperty("userQuotaBytes").GetInt64(),
+            TotalFiles = json.GetProperty("totalFiles").GetInt32(),
+            UserFiles = json.GetProperty("userFiles").GetInt32(),
+        };
+    }
 }
 
 public class E2eeFileEntry
@@ -187,6 +202,15 @@ public class VolumeListItem
     public string EncryptionMode { get; set; } = "server";
     public bool IsMounted { get; set; }
     public string OwnerUser { get; set; } = "";
+}
+
+public class VolumeStats
+{
+    public long TotalUsedBytes { get; set; }
+    public long UserUsedBytes { get; set; }
+    public long UserQuotaBytes { get; set; }
+    public int TotalFiles { get; set; }
+    public int UserFiles { get; set; }
 }
 
 public class WrappedKeyInfo

@@ -26,6 +26,10 @@ public sealed class CistaNasFileSystem : IDokanOperations
     // Level 3: ファイル一覧キャッシュ（TTL ベース）
     private readonly ListingCache _listingCache = new();
 
+    // クオータ統計キャッシュ（Write/Delete 後に無効化）
+    private (long UserUsedBytes, long UserQuotaBytes)? _cachedStats;
+    private readonly object _statsLock = new();
+
     public CistaNasFileSystem(CistaNasApiClient api, byte[] masterKey, string volumeName, int chunkSize = 1048576)
     {
         _api = api;
@@ -511,6 +515,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
         _cache.TryRemove(fileId, out _);
         _fileIdCache.TryRemove(plainName, out _);
         _listingCache.Invalidate();
+        _cachedStats = null;
 
         return DokanResult.Success;
     }
@@ -536,10 +541,13 @@ public sealed class CistaNasFileSystem : IDokanOperations
     public NtStatus GetDiskFreeSpace(out long freeBytesAvailable, out long totalNumberOfBytes,
         out long totalNumberOfFreeBytes, IDokanFileInfo info)
     {
-        const long tb100 = 100L * 1024 * 1024 * 1024 * 1024;
-        freeBytesAvailable = tb100;
-        totalNumberOfBytes = tb100 * 2;
-        totalNumberOfFreeBytes = tb100;
+        var stats = GetOrRefreshStats();
+        const long unlimited = 100L * 1024 * 1024 * 1024 * 1024; // 100 TB fallback
+        long quota = stats.UserQuotaBytes > 0 ? stats.UserQuotaBytes : unlimited;
+        long free = Math.Max(0, quota - stats.UserUsedBytes);
+        freeBytesAvailable = free;
+        totalNumberOfBytes = quota;
+        totalNumberOfFreeBytes = free;
         return DokanResult.Success;
     }
 
@@ -643,6 +651,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
             PlainLength = plainLength,
         };
         _listingCache.Invalidate();
+        _cachedStats = null; // 使用量が変わったので再取得
     }
 
     private string? FindFileId(string plainName)
@@ -703,6 +712,27 @@ public sealed class CistaNasFileSystem : IDokanOperations
         if (pattern == "*") return true;
         try { return System.Text.RegularExpressions.Regex.IsMatch(name, WildcardToRegex(pattern)); }
         catch { return false; }
+    }
+
+    private (long UserUsedBytes, long UserQuotaBytes) GetOrRefreshStats()
+    {
+        lock (_statsLock)
+        {
+            if (_cachedStats is not null) return _cachedStats.Value;
+
+            try
+            {
+                var stats = _api.GetVolumeStatsAsync(_volumeName).GetAwaiter().GetResult();
+                var result = (stats.UserUsedBytes, stats.UserQuotaBytes);
+                _cachedStats = result;
+                return result;
+            }
+            catch
+            {
+                // API 取得失敗時は無制限を返す
+                return (0, 0);
+            }
+        }
     }
 
     private static string WildcardToRegex(string pattern)

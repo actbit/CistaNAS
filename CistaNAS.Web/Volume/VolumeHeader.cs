@@ -46,6 +46,9 @@ public sealed class VolumeHeader
     /// <summary>アクセスを許可されたグループ名（サーバー暗号化ボリュームのみ）。</summary>
     public HashSet<string> AuthorizedGroups { get; set; } = new(StringComparer.Ordinal);
 
+    /// <summary>ユーザーごとのクオータ（バイト）。0 = 無制限。キー = ユーザー名。</summary>
+    public Dictionary<string, long> UserQuotas { get; set; } = new(StringComparer.Ordinal);
+
     public sealed class UserWrappedKey
     {
         public string WrapType { get; set; } = "password"; // "password" or "ecdh"

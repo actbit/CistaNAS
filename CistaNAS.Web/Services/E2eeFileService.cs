@@ -51,7 +51,7 @@ public sealed class E2eeFileService
     }
 
     /// <summary>ファイルエントリを作成し、FileId を返す。</summary>
-    public async Task<E2eeFileEntry> CreateFileAsync(string volumeName, E2eeCreateFileRequest request, CancellationToken ct = default)
+    public async Task<E2eeFileEntry> CreateFileAsync(string volumeName, E2eeCreateFileRequest request, string ownerUsername, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
 
@@ -74,6 +74,7 @@ public sealed class E2eeFileService
                 ChunkCount = request.ChunkCount,
                 CreatedAt = DateTimeOffset.UtcNow,
                 ModifiedAt = DateTimeOffset.UtcNow,
+                OwnerUsername = ownerUsername,
             };
 
             catalog.Files[fileId] = entry;
@@ -299,6 +300,25 @@ public sealed class E2eeFileService
     {
         var header = GetE2eeHeader(volumeName);
         return new E2eeMountResponse(header.ChunkSize, header.EncryptionMode);
+    }
+
+    /// <summary>ボリュームの使用量統計を返す。</summary>
+    public async Task<E2eeVolumeStats> GetStatsAsync(string volumeName, string username, CancellationToken ct = default)
+    {
+        GetE2eeHeader(volumeName);
+        var catalog = await LoadCatalogAsync(volumeName, ct);
+        var header = _volumeService.GetMounted(volumeName).Header;
+
+        long totalUsed = catalog.Files.Values.Sum(f => f.EncryptedLength);
+        long userUsed = catalog.Files.Values
+            .Where(f => f.OwnerUsername == username || string.IsNullOrEmpty(f.OwnerUsername))
+            .Sum(f => f.EncryptedLength);
+        long quota = header.UserQuotas.TryGetValue(username, out var q) ? q : 0;
+        int totalFiles = catalog.Files.Count;
+        int userFiles = catalog.Files.Values
+            .Count(f => f.OwnerUsername == username || string.IsNullOrEmpty(f.OwnerUsername));
+
+        return new E2eeVolumeStats(totalUsed, userUsed, quota, totalFiles, userFiles);
     }
 
     // ---- 内部ヘルパー ----

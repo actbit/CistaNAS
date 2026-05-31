@@ -33,6 +33,8 @@ public static class E2eeEndpoints
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
         e2ee.MapGet("/{volumeName}/files", ListFiles)
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapGet("/{volumeName}/stats", GetStats)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
 
         // ---- オーナー限定操作（VolumeOwner ポリシー） ----
         e2ee.MapPost("/{volumeName}/add-wrapped-key", AddWrappedKey)
@@ -40,6 +42,8 @@ public static class E2eeEndpoints
         e2ee.MapGet("/{volumeName}/group-members", GetGroupMembers)
             .RequireAuthorization(CistaAuthorities.VolumeOwner);
         e2ee.MapPost("/{volumeName}/add-wrapped-keys-batch", AddWrappedKeysBatch)
+            .RequireAuthorization(CistaAuthorities.VolumeOwner);
+        e2ee.MapPut("/{volumeName}/quota/{username}", SetQuota)
             .RequireAuthorization(CistaAuthorities.VolumeOwner);
 
         // ---- ECDH public key management ----
@@ -143,9 +147,10 @@ public static class E2eeEndpoints
 
     private static async Task<IResult> CreateFile(string volumeName, E2eeCreateFileRequest req, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
     {
+        string username = ctx.User.Identity?.Name ?? "";
         try
         {
-            var entry = await e2eeFs.CreateFileAsync(volumeName, req, ctx.RequestAborted);
+            var entry = await e2eeFs.CreateFileAsync(volumeName, req, username, ctx.RequestAborted);
             return Results.Created($"/api/v1/e2ee/{volumeName}/upload-chunk/{entry.FileId}/0", entry);
         }
         catch (FileServiceException ex)
@@ -351,5 +356,37 @@ public static class E2eeEndpoints
             return Results.Ok();
         }
         catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
+    }
+
+    // ---- クオータ ----
+
+    private static async Task<IResult> GetStats(string volumeName, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
+    {
+        string username = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+
+        try
+        {
+            var stats = await e2eeFs.GetStatsAsync(volumeName, username, ctx.RequestAborted);
+            return Results.Ok(stats);
+        }
+        catch (FileServiceException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
+
+    private static async Task<IResult> SetQuota(string volumeName, string username, E2eeSetQuotaRequest req,
+        VolumeService vs, HttpContext ctx)
+    {
+        try
+        {
+            await vs.SetUserQuotaAsync(volumeName, username, req.MaxBytes);
+            return Results.Ok(new { maxBytes = req.MaxBytes });
+        }
+        catch (VolumeException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
     }
 }
