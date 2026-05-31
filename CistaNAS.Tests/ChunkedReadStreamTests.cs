@@ -25,14 +25,14 @@ public class ChunkedReadStreamTests
         {
             int size = (i < chunksCount - 1) ? ChunkSize : plainData.Length - offset;
             byte[] chunkPlain = plainData[offset..(offset + size)];
-            byte[] encrypted = ChunkEncryptor.EncryptChunk(key, i, SectorSize, ChunkSize, chunkPlain);
+            byte[] encrypted = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, i, SectorSize, ChunkSize, chunkPlain);
             using var ms = new MemoryStream(encrypted);
             store.WriteChunkAsync("vol", "file", i, ms).Wait();
             chunkSizes.Add(size);
             offset += size;
         }
 
-        var stream = new ChunkedReadStream(store, "vol", "file", key, SectorSize, ChunkSize, chunkSizes);
+        var stream = new ChunkedReadStream(store, "vol", "file", key, CipherAlgorithm.Aes256Xts, SectorSize, ChunkSize, chunkSizes);
         return (stream, plainData, store);
     }
 
@@ -219,7 +219,7 @@ public class ChunkedReadStreamTests
         var store = new InMemoryChunkStore();
         // チャンクを書き込まない → ReadChunkAsync が null を返す
 
-        var stream = new ChunkedReadStream(store, "vol", "missing", key, SectorSize, ChunkSize, new List<int> { 100 });
+        var stream = new ChunkedReadStream(store, "vol", "missing", key, CipherAlgorithm.Aes256Xts, SectorSize, ChunkSize, new List<int> { 100 });
 
         byte[] buf = new byte[10];
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
@@ -263,13 +263,13 @@ public class ChunkedReadStreamTests
         var chunkSizes = new List<int> { ChunkSize * 10 };
 
         byte[] plain = RandomNumberGenerator.GetBytes(ChunkSize);
-        byte[] encrypted = ChunkEncryptor.EncryptChunk(key, 0, SectorSize, ChunkSize, plain);
+        byte[] encrypted = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 0, SectorSize, ChunkSize, plain);
         using var ms = new MemoryStream(encrypted);
         store.WriteChunkAsync("vol", "cancel", 0, ms).Wait();
 
         // 2チャンク目を書き込まない → 2チャンク目読み取り時にチャンクが見つからない
         var bigSizes = new List<int> { ChunkSize, ChunkSize };
-        var stream = new ChunkedReadStream(store, "vol", "cancel", key, SectorSize, ChunkSize, bigSizes);
+        var stream = new ChunkedReadStream(store, "vol", "cancel", key, CipherAlgorithm.Aes256Xts, SectorSize, ChunkSize, bigSizes);
 
         using var cts = new CancellationTokenSource();
         cts.CancelAfter(TimeSpan.FromMilliseconds(100));
@@ -285,7 +285,7 @@ public class ChunkedReadStreamTests
     {
         byte[] key = MasterKey();
         var store = new InMemoryChunkStore();
-        var stream = new ChunkedReadStream(store, "vol", "empty", key, SectorSize, ChunkSize, new List<int>());
+        var stream = new ChunkedReadStream(store, "vol", "empty", key, CipherAlgorithm.Aes256Xts, SectorSize, ChunkSize, new List<int>());
 
         Assert.Equal(0, stream.Length);
         byte[] buf = new byte[10];

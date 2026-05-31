@@ -8,19 +8,20 @@ namespace CistaNAS.Client;
 
 /// <summary>
 /// Dokan ベースの仮想ファイルシステム。
-/// CistaNAS の E2EE ボリュームを Windows エクスプローラーにマウントする。
+/// CistaNAS のボリューム（E2EE/非E2EE両対応）を Windows エクスプローラーにマウントする。
 /// </summary>
 public sealed class CistaNasFileSystem : IDokanOperations
 {
     private readonly CistaNasApiClient _api;
-    private readonly byte[] _masterKey;
+    private readonly byte[]? _masterKey;  // E2EE モードでのみ使用
     private readonly string _volumeName;
     private readonly int _chunkSize;
+    private readonly bool _isE2ee;  // E2EE モードフラグ
 
-    // Level 1: plainName → fileId（スレッドセーフ）
+    // Level 1: plainName → fileId（E2EEのみ）
     private readonly ConcurrentDictionary<string, string> _fileIdCache = new(StringComparer.OrdinalIgnoreCase);
 
-    // Level 2: fileId → FileCache（メタデータ + LRU チャンクキャッシュ）
+    // Level 2: fileId → FileCache（E2EEのみ、メタデータ + LRU チャンクキャッシュ）
     private readonly ConcurrentDictionary<string, FileCache> _cache = new(StringComparer.Ordinal);
 
     // Level 3: ファイル一覧キャッシュ（TTL ベース）
@@ -30,12 +31,24 @@ public sealed class CistaNasFileSystem : IDokanOperations
     private (long UserUsedBytes, long UserQuotaBytes)? _cachedStats;
     private readonly object _statsLock = new();
 
+    /// <summary>E2EE モードでファイルシステムを作成。</summary>
     public CistaNasFileSystem(CistaNasApiClient api, byte[] masterKey, string volumeName, int chunkSize = 1048576)
     {
         _api = api;
         _masterKey = masterKey;
         _volumeName = volumeName;
         _chunkSize = chunkSize;
+        _isE2ee = true;
+    }
+
+    /// <summary>非E2EE モードでファイルシステムを作成。</summary>
+    public CistaNasFileSystem(CistaNasApiClient api, string volumeName)
+    {
+        _api = api;
+        _masterKey = null;
+        _volumeName = volumeName;
+        _chunkSize = 0;
+        _isE2ee = false;
     }
 
     // ---- 内部クラス: ファイルキャッシュ（LRU チャンク驱逐付き） ----
@@ -255,6 +268,14 @@ public sealed class CistaNasFileSystem : IDokanOperations
                 return DokanResult.Success;
             }
 
+            // 非E2EE モード: ファイルパスを設定
+            if (!_isE2ee)
+            {
+                info.Context = plainName;
+                return DokanResult.Success;
+            }
+
+            // E2EE モード: fileId で管理
             var fileId = FindFileId(plainName);
             if (fileId is not null)
             {
@@ -279,6 +300,14 @@ public sealed class CistaNasFileSystem : IDokanOperations
 
         if (mode == FileMode.CreateNew)
         {
+            // 非E2EE モード: 新規作成
+            if (!_isE2ee)
+            {
+                info.Context = new WriteState(plainName, existingFileId: null);
+                return DokanResult.Success;
+            }
+
+            // E2EE モード
             var existing = FindFileId(plainName);
             if (existing is not null)
                 return DokanResult.FileExists;
@@ -289,7 +318,16 @@ public sealed class CistaNasFileSystem : IDokanOperations
 
         if (mode == FileMode.Create)
         {
-            // Create: 既存ファイルを上書き。旧IDを保持して Cleanup で削除。
+            // Create: 既存ファイルを上書き
+
+            // 非E2EE モード
+            if (!_isE2ee)
+            {
+                info.Context = new WriteState(plainName, existingFileId: plainName);
+                return DokanResult.Success;
+            }
+
+            // E2EE モード: 旧IDを保持して Cleanup で削除
             var existing = FindFileId(plainName);
             info.Context = new WriteState(plainName, existingFileId: existing);
             return DokanResult.Success;
@@ -301,6 +339,31 @@ public sealed class CistaNasFileSystem : IDokanOperations
     public NtStatus ReadFile(string fileName, byte[] buffer, out int bytesRead, long offset, IDokanFileInfo info)
     {
         bytesRead = 0;
+
+        // 非E2EE モード: 通常ファイルダウンロード
+        if (!_isE2ee)
+        {
+            if (info.Context is not string filePath)
+                return DokanResult.InvalidParameter;
+
+            try
+            {
+                var data = CistaNasApiClientFiles.DownloadFileAsync(_api, _volumeName, filePath).GetAwaiter().GetResult();
+                if (offset >= data.Length)
+                    return DokanResult.Success;
+
+                int copyCount = Math.Min(buffer.Length, (int)(data.Length - offset));
+                Array.Copy(data, offset, buffer, 0, copyCount);
+                bytesRead = copyCount;
+                return DokanResult.Success;
+            }
+            catch
+            {
+                return DokanResult.InternalError;
+            }
+        }
+
+        // E2EE モード: チャンクダウンロード + 復号化
         if (info.Context is not string fileId)
             return DokanResult.InvalidParameter;
 
@@ -318,7 +381,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
 
                 byte[] salt = new byte[16];
                 Buffer.BlockCopy(encData, 0, salt, 0, 16);
-                cache.FileKey = E2eeCrypto.DeriveFileKey(_masterKey, salt);
+                cache.FileKey = E2eeCrypto.DeriveFileKey(_masterKey!, salt);
 
                 // チャンク 0 もキャッシュしておく（次回の ReadFile で再利用）
                 var chunk = E2eeCrypto.DecryptChunk(encData, cache.FileKey, 0, out _);
@@ -415,6 +478,26 @@ public sealed class CistaNasFileSystem : IDokanOperations
             return DokanResult.Success;
         }
 
+        // 非E2EE モード: ファイルパスから取得
+        if (!_isE2ee)
+        {
+            var filePath = info.Context as string ?? fileName.TrimStart('\\');
+            try
+            {
+                var entries = CistaNasApiClientFiles.ListFilesAsync(_api, _volumeName).GetAwaiter().GetResult();
+                var entry = entries.FirstOrDefault(e => string.Equals(e.Name, filePath, StringComparison.OrdinalIgnoreCase));
+                if (entry is null) return DokanResult.FileNotFound;
+
+                fileInfo.Length = entry.Length;
+                fileInfo.FileName = entry.Name;
+                fileInfo.CreationTime = entry.CreatedAt.DateTime;
+                fileInfo.LastWriteTime = entry.ModifiedAt.DateTime;
+            }
+            catch { return DokanResult.InternalError; }
+            return DokanResult.Success;
+        }
+
+        // E2EE モード: fileId から取得
         var fileId = info.Context as string ?? FindFileId(fileName.TrimStart('\\'));
         if (fileId is null) return DokanResult.FileNotFound;
 
@@ -442,13 +525,39 @@ public sealed class CistaNasFileSystem : IDokanOperations
 
         try
         {
-            var entries = _api.ListFilesAsync(_volumeName).GetAwaiter().GetResult();
-            var listingEntries = new List<(string FileId, string PlainName, FileInformation Info)>();
+            // 非E2EE モード: 通常ファイル API を使用
+            if (!_isE2ee)
+            {
+                var entries = CistaNasApiClientFiles.ListFilesAsync(_api, _volumeName).GetAwaiter().GetResult();
+                var listingEntries = new List<(string FileId, string PlainName, FileInformation Info)>();
 
-            foreach (var entry in entries)
+                foreach (var entry in entries)
+                {
+                    var fi = new FileInformation
+                    {
+                        FileName = entry.Name,
+                        Attributes = FileAttributes.Normal,
+                        Length = entry.Length,
+                        CreationTime = entry.CreatedAt.DateTime,
+                        LastWriteTime = entry.ModifiedAt.DateTime,
+                    };
+
+                    listingEntries.Add((entry.Name, entry.Name, fi));
+                    files.Add(fi);
+                }
+
+                _listingCache.Set(listingEntries);
+                return DokanResult.Success;
+            }
+
+            // E2EE モード: ファイル名復号化
+            var e2eeEntries = _api.ListFilesAsync(_volumeName).GetAwaiter().GetResult();
+            var e2eeListingEntries = new List<(string FileId, string PlainName, FileInformation Info)>();
+
+            foreach (var entry in e2eeEntries)
             {
                 string plainName;
-                try { plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey); }
+                try { plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!); }
                 catch { plainName = $"<{entry.FileId[..8]}...>"; }
 
                 long plainLength = Math.Max(0, entry.EncryptedLength - 16L - (long)entry.ChunkCount * 16);
@@ -462,7 +571,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
                     LastWriteTime = entry.ModifiedAt.DateTime,
                 };
 
-                listingEntries.Add((entry.FileId, plainName, fi));
+                e2eeListingEntries.Add((entry.FileId, plainName, fi));
                 files.Add(fi);
 
                 // 名前キャッシュとファイルキャッシュも更新
@@ -480,7 +589,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
                 }
             }
 
-            _listingCache.Set(listingEntries);
+            _listingCache.Set(e2eeListingEntries);
             return DokanResult.Success;
         }
         catch
@@ -505,6 +614,19 @@ public sealed class CistaNasFileSystem : IDokanOperations
     public NtStatus DeleteFile(string fileName, IDokanFileInfo info)
     {
         string plainName = fileName.TrimStart('\\');
+
+        // 非E2EE モード: ファイルパスで削除
+        if (!_isE2ee)
+        {
+            try { CistaNasApiClientFiles.DeleteFileAsync(_api, _volumeName, plainName).GetAwaiter().GetResult(); }
+            catch (Exception) { return DokanResult.InternalError; }
+
+            _listingCache.Invalidate();
+            lock (_statsLock) { _cachedStats = null; }
+            return DokanResult.Success;
+        }
+
+        // E2EE モード: fileId で削除
         var fileId = FindFileId(plainName);
         if (fileId is null) return DokanResult.FileNotFound;
 
@@ -554,7 +676,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
     public NtStatus GetVolumeInformation(out string volumeName, out FileSystemFeatures features,
         out string fileSystemName, out uint maximumComponentLength, IDokanFileInfo info)
     {
-        volumeName = "CistaNAS E2EE";
+        volumeName = _isE2ee ? "CistaNAS E2EE" : "CistaNAS";
         features = FileSystemFeatures.CasePreservedNames | FileSystemFeatures.SupportsRemoteStorage;
         fileSystemName = "CistaNAS";
         maximumComponentLength = 255;
@@ -604,9 +726,37 @@ public sealed class CistaNasFileSystem : IDokanOperations
         if (plainData.Length == 0 && ws.CurrentSize == 0)
             return;
 
-        string encName = E2eeCrypto.EncryptFilename(ws.PlainName, _masterKey);
+        // 非E2EE モード: 平文アップロード
+        if (!_isE2ee)
+        {
+            try
+            {
+                CistaNasApiClientFiles.UploadFileAsync(_api, _volumeName, ws.PlainName, plainData).GetAwaiter().GetResult();
+
+                // 旧ファイルの削除（上書きの場合）
+                if (ws.ExistingFileId is not null)
+                {
+                    try
+                    {
+                        CistaNasApiClientFiles.DeleteFileAsync(_api, _volumeName, ws.ExistingFileId).GetAwaiter().GetResult();
+                    }
+                    catch { /* ベストエフォート: 孤児は許容 */ }
+                }
+
+                _listingCache.Invalidate();
+                lock (_statsLock) { _cachedStats = null; }
+            }
+            catch
+            {
+                // エラーを無視（Cleanup は void）
+            }
+            return;
+        }
+
+        // E2EE モード: ファイル名暗号化 + チャンク暗号化
+        string encName = E2eeCrypto.EncryptFilename(ws.PlainName, _masterKey!);
         byte[] fileSalt = E2eeCrypto.GenerateFileSalt();
-        byte[] fileKey = E2eeCrypto.DeriveFileKey(_masterKey, fileSalt);
+        byte[] fileKey = E2eeCrypto.DeriveFileKey(_masterKey!, fileSalt);
 
         int plainLength = plainData.Length;
         int chunkCount = plainLength == 0 ? 0 : (plainLength + _chunkSize - 1) / _chunkSize;
@@ -665,7 +815,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
             var entries = _api.ListFilesAsync(_volumeName).GetAwaiter().GetResult();
             foreach (var entry in entries)
             {
-                string decrypted = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey);
+                string decrypted = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!);
                 _fileIdCache.TryAdd(decrypted, entry.FileId);
             }
             return _fileIdCache.TryGetValue(plainName, out var found) ? found : null;
@@ -720,6 +870,15 @@ public sealed class CistaNasFileSystem : IDokanOperations
         {
             if (_cachedStats is not null) return _cachedStats.Value;
 
+            // 非E2EE モード: ディスク容量は無制限
+            if (!_isE2ee)
+            {
+                const long unlimited = 100L * 1024 * 1024 * 1024 * 1024; // 100 TB
+                _cachedStats = (0, unlimited);
+                return _cachedStats.Value;
+            }
+
+            // E2EE モード: API から取得
             try
             {
                 var stats = _api.GetVolumeStatsAsync(_volumeName).GetAwaiter().GetResult();

@@ -15,6 +15,7 @@ public sealed class ChunkedReadStream : Stream
     private readonly string _volumeName;
     private readonly string _objectId;
     private readonly byte[] _masterKey;
+    private readonly CipherAlgorithm _cipherAlgorithm;
     private readonly int _sectorSize;
     private readonly int _chunkSize;
     private readonly IReadOnlyList<int> _chunkSizes;
@@ -31,6 +32,7 @@ public sealed class ChunkedReadStream : Stream
         string volumeName,
         string objectId,
         ReadOnlySpan<byte> masterKey,
+        CipherAlgorithm cipherAlgorithm,
         int sectorSize,
         int chunkSize,
         IReadOnlyList<int> chunkSizes)
@@ -39,6 +41,7 @@ public sealed class ChunkedReadStream : Stream
         _volumeName = volumeName;
         _objectId = objectId;
         _masterKey = masterKey.ToArray();
+        _cipherAlgorithm = cipherAlgorithm;
         _sectorSize = sectorSize;
         _chunkSize = chunkSize;
         _chunkSizes = chunkSizes;
@@ -170,7 +173,7 @@ public sealed class ChunkedReadStream : Stream
 
         int originalLength = chunkIndex < _chunkSizes.Count ? _chunkSizes[chunkIndex] : encrypted.Length;
         byte[] plain = ChunkEncryptor.DecryptChunk(
-            _masterKey, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength);
+            _masterKey, _cipherAlgorithm, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength);
 
         _cachedDecrypted = plain;
         _cachedChunkIndex = chunkIndex;
@@ -190,7 +193,7 @@ public sealed class ChunkedReadStream : Stream
 
         int originalLength = chunkIndex < _chunkSizes.Count ? _chunkSizes[chunkIndex] : encrypted.Length;
         byte[] plain = ChunkEncryptor.DecryptChunk(
-            _masterKey, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength);
+            _masterKey, _cipherAlgorithm, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength);
 
         _cachedDecrypted = plain;
         _cachedChunkIndex = chunkIndex;

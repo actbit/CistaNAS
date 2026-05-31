@@ -161,6 +161,8 @@ public sealed class CistaNasApiClient
                     Name = v.GetProperty("name").GetString()!,
                     Encrypted = v.TryGetProperty("encrypted", out var enc) && enc.GetBoolean(),
                     EncryptionMode = v.TryGetProperty("encryptionMode", out var mode) ? mode.GetString() ?? "server" : "server",
+                    CipherAlgorithm = v.TryGetProperty("cipherAlgorithm", out var cipher) ? cipher.GetString() ?? "aes-256-xts" : "aes-256-xts",
+                    KeySize = v.TryGetProperty("keySize", out var keySize) ? keySize.GetInt32() : 256,
                     IsMounted = v.TryGetProperty("isMounted", out var mnt) && mnt.GetBoolean(),
                     OwnerUser = v.TryGetProperty("ownerUser", out var owner) ? owner.GetString() ?? "" : "",
                 });
@@ -200,6 +202,8 @@ public class VolumeListItem
     public required string Name { get; set; }
     public bool Encrypted { get; set; }
     public string EncryptionMode { get; set; } = "server";
+    public string CipherAlgorithm { get; set; } = "aes-256-xts";
+    public int KeySize { get; set; } = 256;
     public bool IsMounted { get; set; }
     public string OwnerUser { get; set; } = "";
 }

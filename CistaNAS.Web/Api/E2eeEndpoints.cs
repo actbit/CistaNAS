@@ -179,11 +179,11 @@ public static class E2eeEndpoints
         try
         {
             var (stream, length) = await e2eeFs.DownloadChunkAsync(volumeName, fileId, chunkIndex, ctx.RequestAborted);
-            return Results.Stream(stream, "application/octet-stream");
+            return Results.Stream(stream, "application/octet-stream", null, null, enableRangeProcessing: false);
         }
         catch (FileServiceException ex)
         {
-            return Results.BadRequest(new { error = ex.Message });
+            return Results.NotFound(new { error = ex.Message });
         }
     }
 

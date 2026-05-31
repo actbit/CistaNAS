@@ -6,6 +6,7 @@ using CistaNAS.Web.Identity;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -69,12 +70,35 @@ public sealed class VolumeService : IDisposable
     /// <summary>ホームボリューム等、内部用途の作成（home__ プレフィックスを許可）。</summary>
     public async Task<VolumeInfo> CreateInternalAsync(string name, string? username, string? password, bool encrypted = true)
     {
-        if (encrypted) { ArgumentException.ThrowIfNullOrEmpty(username); ArgumentException.ThrowIfNullOrEmpty(password); }
+        // ユーザー設定を取得して暗号化モードとアルゴリズムを決定
+        string cipherAlgorithm = "aes-256-xts";  // デフォルト
+        bool shouldEncrypt = encrypted;
+
+        if (encrypted && !string.IsNullOrEmpty(username))
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var userManager = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+            var user = await userManager.FindByNameAsync(username);
+            if (user is not null)
+            {
+                // ユーザーのデフォルト設定を使用
+                if (!string.IsNullOrEmpty(user.DefaultEncryptionMode))
+                {
+                    shouldEncrypt = user.DefaultEncryptionMode != "server";
+                }
+                if (!string.IsNullOrEmpty(user.DefaultCipherAlgorithm))
+                {
+                    cipherAlgorithm = user.DefaultCipherAlgorithm;
+                }
+            }
+        }
+
+        if (shouldEncrypt) { ArgumentException.ThrowIfNullOrEmpty(username); ArgumentException.ThrowIfNullOrEmpty(password); }
 
         if (await _metaStore.ExistsAsync(name))
             throw new VolumeException($"ボリューム '{name}' は既に存在します。");
 
-        var (header, masterKey) = VolumeHeader.Create(name, username, password, _volOpts.SectorSize, _volOpts.KdfIterations, encrypted);
+        var (header, masterKey) = VolumeHeader.Create(name, username, password, _volOpts.SectorSize, _volOpts.KdfIterations, shouldEncrypt, cipherAlgorithm);
 
         // チャンクモード判定: "auto" かつ S3 プロバイダ使用時
         bool chunkMode = ShouldUseChunkMode();
@@ -691,6 +715,7 @@ public sealed class VolumeService : IDisposable
             : null;
         return new(name, mounted, h.Encrypted, h.OwnerUser, h.CreatedAt,
             h.UserKeys.Keys.ToList(), h.EncryptionMode,
+            h.CipherAlgorithm, h.KeySize,
             h.AuthorizedGroups.ToList(),
             name.StartsWith("home__", StringComparison.Ordinal),
             wrapTypes);

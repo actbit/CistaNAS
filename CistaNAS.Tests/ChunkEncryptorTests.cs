@@ -15,8 +15,8 @@ public class ChunkEncryptorTests
         const int sectorSize = 4096;
         const int chunkSize = 4194304;
 
-        byte[] cipher = ChunkEncryptor.EncryptChunk(key, 0, sectorSize, chunkSize, plain);
-        byte[] dec = ChunkEncryptor.DecryptChunk(key, 0, sectorSize, chunkSize, cipher, plain.Length);
+        byte[] cipher = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, plain);
+        byte[] dec = ChunkEncryptor.DecryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, cipher, plain.Length);
 
         Assert.Equal(plain, dec);
     }
@@ -29,8 +29,8 @@ public class ChunkEncryptorTests
         const int chunkSize = 65536;
         byte[] plain = RandomNumberGenerator.GetBytes(chunkSize - 100); // セクタ境界にまたぐサイズ
 
-        byte[] cipher = ChunkEncryptor.EncryptChunk(key, 0, sectorSize, chunkSize, plain);
-        byte[] dec = ChunkEncryptor.DecryptChunk(key, 0, sectorSize, chunkSize, cipher, plain.Length);
+        byte[] cipher = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, plain);
+        byte[] dec = ChunkEncryptor.DecryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, cipher, plain.Length);
 
         Assert.Equal(plain, dec);
     }
@@ -43,15 +43,15 @@ public class ChunkEncryptorTests
         const int sectorSize = 4096;
         const int chunkSize = 4194304;
 
-        byte[] cipher0 = ChunkEncryptor.EncryptChunk(key, 0, sectorSize, chunkSize, plain);
-        byte[] cipher1 = ChunkEncryptor.EncryptChunk(key, 1, sectorSize, chunkSize, plain);
+        byte[] cipher0 = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, plain);
+        byte[] cipher1 = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 1, sectorSize, chunkSize, plain);
 
         // 異なるチャンクインデックス → 異なる暗号文
         Assert.NotEqual(cipher0, cipher1);
 
         // それぞれ正しく復号できること
-        byte[] dec0 = ChunkEncryptor.DecryptChunk(key, 0, sectorSize, chunkSize, cipher0, plain.Length);
-        byte[] dec1 = ChunkEncryptor.DecryptChunk(key, 1, sectorSize, chunkSize, cipher1, plain.Length);
+        byte[] dec0 = ChunkEncryptor.DecryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, cipher0, plain.Length);
+        byte[] dec1 = ChunkEncryptor.DecryptChunk(key, CipherAlgorithm.Aes256Xts, 1, sectorSize, chunkSize, cipher1, plain.Length);
         Assert.Equal(plain, dec0);
         Assert.Equal(plain, dec1);
     }
@@ -65,8 +65,8 @@ public class ChunkEncryptorTests
         const int sectorSize = 4096;
         const int chunkSize = 4194304;
 
-        byte[] cipher = ChunkEncryptor.EncryptChunk(key1, 0, sectorSize, chunkSize, plain);
-        byte[] dec = ChunkEncryptor.DecryptChunk(key2, 0, sectorSize, chunkSize, cipher, plain.Length);
+        byte[] cipher = ChunkEncryptor.EncryptChunk(key1, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, plain);
+        byte[] dec = ChunkEncryptor.DecryptChunk(key2, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, cipher, plain.Length);
 
         Assert.NotEqual(plain, dec);
     }
@@ -79,12 +79,12 @@ public class ChunkEncryptorTests
         const int sectorSize = 4096;
         const int chunkSize = 4194304;
 
-        byte[] cipher = ChunkEncryptor.EncryptChunk(key, 0, sectorSize, chunkSize, plain);
+        byte[] cipher = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, plain);
 
         // 暗号文の1バイトを改ざん
         cipher[32] ^= 0xFF;
 
-        byte[] dec = ChunkEncryptor.DecryptChunk(key, 0, sectorSize, chunkSize, cipher, plain.Length);
+        byte[] dec = ChunkEncryptor.DecryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, cipher, plain.Length);
         Assert.NotEqual(plain, dec);
     }
 
@@ -120,9 +120,9 @@ public class ChunkEncryptorTests
         const int sectorSize = 4096;
         const int chunkSize = 4194304;
 
-        byte[] c0 = ChunkEncryptor.EncryptChunk(key, 0, sectorSize, chunkSize, plain);
-        byte[] c1 = ChunkEncryptor.EncryptChunk(key, 1, sectorSize, chunkSize, plain);
-        byte[] c2 = ChunkEncryptor.EncryptChunk(key, 2, sectorSize, chunkSize, plain);
+        byte[] c0 = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, plain);
+        byte[] c1 = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 1, sectorSize, chunkSize, plain);
+        byte[] c2 = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 2, sectorSize, chunkSize, plain);
 
         Assert.NotEqual(c0, c1);
         Assert.NotEqual(c1, c2);

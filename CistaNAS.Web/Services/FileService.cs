@@ -22,7 +22,7 @@ internal sealed class AsyncFileGate : IDisposable
     private int _writerWaiting; // ライター待機中フラグ（スタベーション防止）
     private readonly SemaphoreSlim _gate = new(1, 1);
     // ライターに「全リーダー完了」を即時通知する TCS
-    private TaskCompletionSource? _readersCompletedTcs;
+    private TaskCompletionSource<object?>? _readersCompletedTcs;
     private bool _disposed;
 
     /// <summary>読み取りロックを取得。並行読み取り可。戻り値の IDisposable で解放。</summary>
@@ -51,7 +51,7 @@ internal sealed class AsyncFileGate : IDisposable
         while (_readerCount > 0)
         {
             // TCS を作成（gate 保持中）してから二重チェック
-            _readersCompletedTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _readersCompletedTcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
             if (Volatile.Read(ref _readerCount) == 0)
             {
                 // 二重チェック: 待機中に全リーダーが完了 → 即時突破
@@ -61,7 +61,7 @@ internal sealed class AsyncFileGate : IDisposable
             _gate.Release();
             try
             {
-                using var reg = ct.Register(static state => ((TaskCompletionSource)state!).TrySetCanceled(), _readersCompletedTcs);
+                using var reg = ct.Register(static state => ((TaskCompletionSource<object?>)state!).TrySetCanceled(), _readersCompletedTcs);
                 await _readersCompletedTcs.Task;
             }
             catch
@@ -84,7 +84,7 @@ internal sealed class AsyncFileGate : IDisposable
         if (Interlocked.Decrement(ref _readerCount) == 0 && Volatile.Read(ref _writerWaiting) == 1)
         {
             // 最後のリーダーが抜けた → ライターに即時通知
-            _readersCompletedTcs?.TrySetResult();
+            _readersCompletedTcs?.TrySetResult(result: null!);
         }
     }
 
@@ -330,10 +330,15 @@ public sealed class FileService
 
                 byte[] chunkData = buffer[..read].ToArray();
 
-                // 暗号化ボリュームの場合は AES-XTS でチャンク暗号化
+                // 暗号化ボリュームの場合はチャンク暗号化
                 if (header.Encrypted && masterKey is not null)
                 {
-                    chunkData = ChunkEncryptor.EncryptChunk(masterKey, chunkIndex, sectorSize, chunkSize, chunkData);
+                    var cipherAlgorithm = string.IsNullOrEmpty(header.CipherAlgorithm)
+                        ? CipherAlgorithm.Aes256Xts
+                        : CipherAlgorithmExtensions.ParseCipherAlgorithm(header.CipherAlgorithm);
+                    chunkData = ChunkEncryptor.EncryptChunk(
+                        masterKey, cipherAlgorithm,
+                        chunkIndex, sectorSize, chunkSize, chunkData);
                 }
 
                 // S3 にチャンクを保存
@@ -418,8 +423,12 @@ public sealed class FileService
         Stream chunkedStream;
         if (header.Encrypted && masterKey is not null)
         {
+            var cipherAlgorithm = string.IsNullOrEmpty(header.CipherAlgorithm)
+                ? CipherAlgorithm.Aes256Xts
+                : CipherAlgorithmExtensions.ParseCipherAlgorithm(header.CipherAlgorithm);
             chunkedStream = new ChunkedReadStream(
                 _chunkStore, volumeName, fileName, masterKey,
+                cipherAlgorithm,
                 sectorSize, chunkSize, meta.ChunkSizes);
         }
         else
@@ -749,7 +758,7 @@ file sealed class MemoryChunkedStream : Stream
             byte[] data = GetChunk(chunkIdx);
             int available = data.Length - offsetInChunk;
             int toRead = Math.Min(count, available);
-            Buffer.BlockCopy(data, offsetInChunk, buffer, offset + totalRead, toRead);
+            Array.Copy(data, offsetInChunk, buffer, offset + totalRead, toRead);
 
             _position += toRead;
             totalRead += toRead;

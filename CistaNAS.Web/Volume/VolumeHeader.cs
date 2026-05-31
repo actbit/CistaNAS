@@ -28,6 +28,12 @@ public sealed class VolumeHeader
     /// <summary>"server" (サーバー側 AES-XTS) or "e2ee" (クライアント側暗号化)。</summary>
     public string EncryptionMode { get; set; } = "server";
 
+    /// <summary>暗号化アルゴリズム ("aes-256-xts", "aes-256-gcm", "chacha20-poly1305")</summary>
+    public string CipherAlgorithm { get; set; } = "aes-256-xts";
+
+    /// <summary>鍵長（ビット）</summary>
+    public int KeySize { get; set; } = 256;
+
     /// <summary>ストレージモード。"local" (volume.dat) or "chunk" (S3/R2 チャンク分割)。</summary>
     public string StorageMode { get; set; } = "local";
 
@@ -134,7 +140,7 @@ public sealed class VolumeHeader
 
     /// <summary>新しいボリュームの header＋マスター鍵を生成する。</summary>
     public static (VolumeHeader Header, byte[]? MasterKey) Create(
-        string name, string? username, string? password, int sectorSize, int kdfIterations, bool encrypted = true)
+        string name, string? username, string? password, int sectorSize, int kdfIterations, bool encrypted = true, string cipherAlgorithm = "aes-256-xts")
     {
         if (!encrypted)
         {
@@ -145,6 +151,8 @@ public sealed class VolumeHeader
                 Encrypted = false,
                 SectorSize = sectorSize,
                 OwnerUser = username ?? "",
+                CipherAlgorithm = cipherAlgorithm,
+                KeySize = GetKeySize(cipherAlgorithm),
             }, null);
         }
 
@@ -159,10 +167,22 @@ public sealed class VolumeHeader
             Encrypted = true,
             SectorSize = sectorSize,
             OwnerUser = username,
+            CipherAlgorithm = cipherAlgorithm,
+            KeySize = GetKeySize(cipherAlgorithm),
         };
         header.AddUserWrap(username, password, master, kdfIterations);
         return (header, master);
     }
+
+    /// <summary>暗号化アルゴリズムから鍵長を取得。</summary>
+    private static int GetKeySize(string cipherAlgorithm) => cipherAlgorithm switch
+    {
+        "aes-256-xts" => 256,
+        "aes-256-gcm" => 256,
+        "chacha20-xts" => 256,
+        "chacha20-poly1305" => 256,
+        _ => 256,  // デフォルト
+    };
 
     /// <summary>追加ユーザーのためにマスター鍵をラップして登録。</summary>
     public void AddUserWrap(string username, string password, byte[] masterKey, int kdfIterations)

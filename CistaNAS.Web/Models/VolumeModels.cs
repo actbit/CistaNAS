@@ -30,6 +30,8 @@ public sealed record VolumeInfo(
     string Name, bool IsMounted, bool Encrypted, string OwnerUser,
     DateTimeOffset CreatedAt, IReadOnlyList<string> AuthorizedUsers,
     string EncryptionMode = "server",
+    string CipherAlgorithm = "aes-256-xts",
+    int KeySize = 256,
     IReadOnlyList<string> AuthorizedGroups = null!,
     bool IsHome = false,
     Dictionary<string, string>? UserWrapTypes = null);
