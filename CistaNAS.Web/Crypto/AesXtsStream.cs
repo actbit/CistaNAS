@@ -227,6 +227,9 @@ public sealed class AesXtsStream : Stream
 
     public override long Seek(long offset, SeekOrigin origin)
     {
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(AesXtsStream));
+
         long target = origin switch
         {
             SeekOrigin.Begin => offset,
@@ -241,11 +244,31 @@ public sealed class AesXtsStream : Stream
 
     public override void SetLength(long value)
     {
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(AesXtsStream));
+
         ArgumentOutOfRangeException.ThrowIfNegative(value);
         if (!CanWrite) throw new NotSupportedException();
+
+        long oldSectors = (_length + _sectorSize - 1) / _sectorSize;
         _length = value;
-        long sectors = (value + _sectorSize - 1) / _sectorSize;
-        _base.SetLength(sectors * _sectorSize);
+        long newSectors = (value + _sectorSize - 1) / _sectorSize;
+
+        // 拡張時は新しいセクタを暗号化されたゼロで埋める
+        if (newSectors > oldSectors)
+        {
+            _base.SetLength(newSectors * _sectorSize);
+
+            byte[] zeroSector = new byte[_sectorSize];
+            for (long si = oldSectors; si < newSectors; si++)
+            {
+                WriteSectorPlain(si, zeroSector);
+            }
+        }
+        else
+        {
+            _base.SetLength(newSectors * _sectorSize);
+        }
     }
 
     public override void Flush() => _base.Flush();
