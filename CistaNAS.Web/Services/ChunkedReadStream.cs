@@ -22,8 +22,9 @@ public sealed class ChunkedReadStream : Stream
     private readonly long _totalLength;
 
     private long _position;
-    private int _cachedChunkIndex = -1;
+    private volatile int _cachedChunkIndex = -1;
     private byte[]? _cachedDecrypted; // 復号済み平文キャッシュ
+    private bool _disposed;
 
     public ChunkedReadStream(
         IChunkStore chunkStore,
@@ -63,6 +64,7 @@ public sealed class ChunkedReadStream : Stream
         get => _position;
         set
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             ArgumentOutOfRangeException.ThrowIfNegative(value);
             ArgumentOutOfRangeException.ThrowIfGreaterThan(value, _totalLength);
             _position = value;
@@ -72,6 +74,7 @@ public sealed class ChunkedReadStream : Stream
     public override int Read(byte[] buffer, int offset, int count)
     {
         ArgumentNullException.ThrowIfNull(buffer);
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (_position >= _totalLength) return 0;
 
         count = (int)Math.Min(count, _totalLength - _position);
@@ -95,6 +98,7 @@ public sealed class ChunkedReadStream : Stream
 
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (_position >= _totalLength) return 0;
 
         int count = (int)Math.Min(buffer.Length, _totalLength - _position);
@@ -119,6 +123,7 @@ public sealed class ChunkedReadStream : Stream
 
     public override long Seek(long offset, SeekOrigin origin)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         long target = origin switch
         {
             SeekOrigin.Begin => offset,
@@ -155,7 +160,22 @@ public sealed class ChunkedReadStream : Stream
     /// Stream.Read は同期メソッドのため、必要時のみ使用。
     /// </summary>
     private byte[] GetDecryptedChunk(int chunkIndex)
-        => GetDecryptedChunkAsync(chunkIndex).GetAwaiter().GetResult();
+    {
+        if (_cachedChunkIndex == chunkIndex && _cachedDecrypted is not null)
+            return _cachedDecrypted;
+
+        byte[]? encrypted = _chunkStore.ReadChunk(_volumeName, _objectId, chunkIndex);
+        if (encrypted is null)
+            throw new InvalidOperationException($"チャンク {chunkIndex} がストレージに見つかりません。");
+
+        int originalLength = chunkIndex < _chunkSizes.Count ? _chunkSizes[chunkIndex] : encrypted.Length;
+        byte[] plain = ChunkEncryptor.DecryptChunk(
+            _masterKey, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength);
+
+        _cachedDecrypted = plain;
+        _cachedChunkIndex = chunkIndex;
+        return plain;
+    }
 
     /// <summary>チャンクを復号してキャッシュ（非同期版）。ReadAsync で使用。</summary>
     private async Task<byte[]> GetDecryptedChunkAsync(int chunkIndex, CancellationToken ct = default)
@@ -183,11 +203,13 @@ public sealed class ChunkedReadStream : Stream
 
     protected override void Dispose(bool disposing)
     {
+        if (_disposed) return;
         if (disposing)
         {
             _cachedDecrypted = null;
             CryptographicOperations.ZeroMemory(_masterKey);
         }
+        _disposed = true;
         base.Dispose(disposing);
     }
 }

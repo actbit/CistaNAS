@@ -11,6 +11,57 @@ using Microsoft.Extensions.Options;
 namespace CistaNAS.Web.Services;
 
 /// <summary>
+/// async-friendly なファイル単位の読み書きゲート。
+/// 複数の並行読み取りを許可し、書き込みは全読み取りの完了を待機する。
+/// <see cref="ReaderWriterLockSlim"/> と異なりスレッドアフィンではないため、
+/// async/await で別スレッドに継続しても正しく動作する。
+/// </summary>
+internal sealed class AsyncFileGate
+{
+    private int _readerCount;
+    private readonly SemaphoreSlim _gate = new(1, 1);
+
+    /// <summary>読み取りロックを取得。並行読み取り可。戻り値の IDisposable で解放。</summary>
+    public async Task<IDisposable> EnterReadAsync(CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct);
+        Interlocked.Increment(ref _readerCount);
+        _gate.Release();
+        return new ReadReleaser(this);
+    }
+
+    /// <summary>書き込みロックを取得。全読み取りの完了を待機。戻り値の IDisposable で解放。</summary>
+    public async Task<IDisposable> EnterWriteAsync(CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct);
+        // アクティブな読み取りがなくなるまでスピン
+        while (Volatile.Read(ref _readerCount) > 0)
+        {
+            _gate.Release();
+            await Task.Delay(TimeSpan.FromMilliseconds(20), ct);
+            await _gate.WaitAsync(ct);
+        }
+        // _gate を保持したまま返す → ExitWrite で解放
+        return new WriteReleaser(this);
+    }
+
+    private void ExitRead() => Interlocked.Decrement(ref _readerCount);
+    private void ExitWrite() => _gate.Release();
+
+    public void Dispose() => _gate.Dispose();
+
+    private sealed class ReadReleaser(AsyncFileGate gate) : IDisposable
+    {
+        public void Dispose() => gate.ExitRead();
+    }
+
+    private sealed class WriteReleaser(AsyncFileGate gate) : IDisposable
+    {
+        public void Dispose() => gate.ExitWrite();
+    }
+}
+
+/// <summary>
 /// マウント済みボリューム内のファイル読み書き・一覧・削除。Scoped 登録。
 /// VolumeService（Singleton マウント状態）と JournalService に依存。
 /// </summary>
@@ -28,6 +79,9 @@ public sealed class FileService
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _catalogLocks = new(StringComparer.Ordinal);
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _streamLocks = new(StringComparer.Ordinal);
+
+    /// <summary>ファイル単位の読み書きロック。ダウンロード中の上書き・削除を防止する。</summary>
+    private static readonly ConcurrentDictionary<(string Volume, string File), AsyncFileGate> _fileGates = new();
 
     private readonly VolumeService _volumeService;
     private readonly JournalService _journalService;
@@ -73,6 +127,17 @@ public sealed class FileService
         if (IsChunkMode(volumeName))
             return await UploadChunkedAsync(volumeName, fileName, content, contentLength, ct);
 
+        // ロック順序: fileGate → catLock → streamLock（デッドロック防止）
+        var gate = _fileGates.GetOrAdd((volumeName, fileName), _ => new AsyncFileGate());
+        using (await gate.EnterWriteAsync(ct))
+        {
+            return await UploadInternalAsync(volumeName, fileName, content, contentLength, ct);
+        }
+    }
+
+    /// <summary>非チャンクモードのアップロード本体。</summary>
+    private async Task<FileMetadata> UploadInternalAsync(string volumeName, string fileName, Stream content, long contentLength, CancellationToken ct)
+    {
         var (stream, _) = _volumeService.GetMounted(volumeName);
 
         // ジャーナル: 書き込み前
@@ -154,6 +219,17 @@ public sealed class FileService
     /// <summary>チャンクモード: ファイルをチャンク分割して暗号化し S3 に保存。</summary>
     private async Task<FileMetadata> UploadChunkedAsync(string volumeName, string fileName, Stream content, long contentLength, CancellationToken ct = default)
     {
+        // ロック順序: fileGate → catLock（デッドロック防止）
+        var gate = _fileGates.GetOrAdd((volumeName, fileName), _ => new AsyncFileGate());
+        using (await gate.EnterWriteAsync(ct))
+        {
+            return await UploadChunkedInternalAsync(volumeName, fileName, content, contentLength, ct);
+        }
+    }
+
+    /// <summary>チャンクモードのアップロード本体。</summary>
+    private async Task<FileMetadata> UploadChunkedInternalAsync(string volumeName, string fileName, Stream content, long contentLength, CancellationToken ct)
+    {
         var (header, masterKey) = GetVolumeKeys(volumeName);
         int chunkSize = header.ServerChunkSize > 0 ? header.ServerChunkSize : 4194304;
 
@@ -233,33 +309,46 @@ public sealed class FileService
     /// <summary>ファイルをダウンロード。</summary>
     public async Task<FileDownloadResponse> DownloadAsync(string volumeName, string fileName, CancellationToken ct = default)
     {
-        SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
-        await catLock.WaitAsync(ct);
+        // ロック順序: fileGate → catLock（デッドロック防止）
+        var gate = _fileGates.GetOrAdd((volumeName, fileName), _ => new AsyncFileGate());
+        var readLock = await gate.EnterReadAsync(ct);
         try
         {
-            var catalog = await LoadCatalogAsync(volumeName, ct);
-            if (!catalog.Files.TryGetValue(fileName, out var meta))
-                throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
+            SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+            await catLock.WaitAsync(ct);
+            try
+            {
+                var catalog = await LoadCatalogAsync(volumeName, ct);
+                if (!catalog.Files.TryGetValue(fileName, out var meta))
+                    throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
 
-            if (meta.IsChunked && IsChunkMode(volumeName))
-                return await DownloadChunkedAsync(volumeName, fileName, meta, ct);
+                if (meta.IsChunked && IsChunkMode(volumeName))
+                    return DownloadChunkedResponse(volumeName, fileName, meta, readLock);
 
-            // ローカルモード: 従来のストリームベース
-            var (stream, _) = _volumeService.GetMounted(volumeName);
-            long offset = meta.Offset;
-            long length = meta.Length;
-            string name = meta.Name;
-            var streamLock = _streamLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
-            return new FileDownloadResponse(new FileSubStream(stream, offset, length, streamLock), name, length);
+                // ローカルモード: 従来のストリームベース
+                var (stream, _) = _volumeService.GetMounted(volumeName);
+                long offset = meta.Offset;
+                long length = meta.Length;
+                string name = meta.Name;
+                var streamLock = _streamLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+                var inner = new FileSubStream(stream, offset, length, streamLock);
+                return new FileDownloadResponse(new GateReadStream(inner, readLock), name, length);
+            }
+            finally
+            {
+                catLock.Release();
+            }
         }
-        finally
+        catch
         {
-            catLock.Release();
+            // ストリームが正常に返されなかった場合は読み取りゲートを解放
+            readLock.Dispose();
+            throw;
         }
     }
 
     /// <summary>チャンクモード: チャンクを遅延取得して Seekable なストリームで返す。</summary>
-    private Task<FileDownloadResponse> DownloadChunkedAsync(string volumeName, string fileName, FileMetadata meta, CancellationToken ct)
+    private FileDownloadResponse DownloadChunkedResponse(string volumeName, string fileName, FileMetadata meta, IDisposable readLock)
     {
         var (header, masterKey) = GetVolumeKeys(volumeName);
         int sectorSize = header.SectorSize > 0 ? header.SectorSize : 4096;
@@ -278,7 +367,7 @@ public sealed class FileService
             chunkedStream = new MemoryChunkedStream(_chunkStore, volumeName, fileName, meta.ChunkSizes);
         }
 
-        return Task.FromResult(new FileDownloadResponse(chunkedStream, meta.Name, meta.Length));
+        return new FileDownloadResponse(new GateReadStream(chunkedStream, readLock), meta.Name, meta.Length);
     }
 
     /// <summary>ファイルを削除。</summary>
@@ -286,35 +375,44 @@ public sealed class FileService
     {
         bool isChunkMode = IsChunkMode(volumeName);
 
-        await _journalService.RecordAsync(volumeName, new JournalEntry
+        // ロック順序: fileGate → catLock（デッドロック防止）
+        var gate = _fileGates.GetOrAdd((volumeName, fileName), _ => new AsyncFileGate());
+        using (await gate.EnterWriteAsync(ct))
         {
-            Operation = JournalOp.DeleteFile,
-            Path = fileName,
-        }, ct);
+            await _journalService.RecordAsync(volumeName, new JournalEntry
+            {
+                Operation = JournalOp.DeleteFile,
+                Path = fileName,
+            }, ct);
 
-        SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
-        await catLock.WaitAsync(ct);
-        try
-        {
-            var catalog = await LoadCatalogAsync(volumeName, ct);
-            if (!catalog.Files.Remove(fileName))
-                throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
+            SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+            await catLock.WaitAsync(ct);
+            try
+            {
+                var catalog = await LoadCatalogAsync(volumeName, ct);
+                if (!catalog.Files.Remove(fileName))
+                    throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
 
-            await SaveCatalogAsync(volumeName, catalog, ct);
+                await SaveCatalogAsync(volumeName, catalog, ct);
+            }
+            finally
+            {
+                catLock.Release();
+            }
+
+            // チャンクモード: S3 からチャンクを削除
+            if (isChunkMode)
+            {
+                try { await _chunkStore.DeleteChunksAsync(volumeName, fileName, ct); }
+                catch (Exception) { /* ベストエフォート */ }
+            }
+
+            await _journalService.CommitAsync(volumeName, ct);
         }
-        finally
-        {
-            catLock.Release();
-        }
 
-        // チャンクモード: S3 からチャンクを削除
-        if (isChunkMode)
-        {
-            try { await _chunkStore.DeleteChunksAsync(volumeName, fileName, ct); }
-            catch (Exception) { /* ベストエフォート */ }
-        }
-
-        await _journalService.CommitAsync(volumeName, ct);
+        // 削除完了後にファイルゲートをクリーンアップ
+        if (_fileGates.TryRemove((volumeName, fileName), out var removed))
+            removed.Dispose();
     }
 
     /// <summary>クラッシュ復旧：未コミットジャーナルからカタログを修復。</summary>
@@ -363,6 +461,7 @@ public sealed class FileService
     {
         if (_catalogLocks.TryRemove(volumeName, out var gate))
             gate.Dispose();
+        RemoveFileGatesForVolume(volumeName);
     }
 
     /// <summary>ボリューム削除時に対応するストリームロックを破棄。</summary>
@@ -370,6 +469,16 @@ public sealed class FileService
     {
         if (_streamLocks.TryRemove(volumeName, out var gate))
             gate.Dispose();
+    }
+
+    /// <summary>ボリュームに紐づく全ファイルの AsyncFileGate を破棄。</summary>
+    private static void RemoveFileGatesForVolume(string volumeName)
+    {
+        foreach (var key in _fileGates.Keys)
+        {
+            if (key.Volume == volumeName && _fileGates.TryRemove(key, out var g))
+                g.Dispose();
+        }
     }
 
     // ---- カタログ ----
@@ -392,6 +501,48 @@ public sealed class FileService
         JsonSerializer.Serialize(ms, catalog, JsonOptions);
         ms.Position = 0;
         await _storage.WriteAtomicAsync($"{volumeName}/catalog.json", ms, ct);
+    }
+}
+
+/// <summary>
+/// ダウンロード中の読み取りゲートを保持するストリームラッパー。
+/// Dispose 時にファイルゲートの読み取りロックを解放し、アップロード/削除を許可する。
+/// </summary>
+file sealed class GateReadStream(Stream inner, IDisposable gateLock) : Stream
+{
+    public override bool CanRead => inner.CanRead;
+    public override bool CanSeek => inner.CanSeek;
+    public override bool CanWrite => false;
+    public override long Length => inner.Length;
+    public override long Position
+    {
+        get => inner.Position;
+        set => inner.Position = value;
+    }
+
+    public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        => inner.ReadAsync(buffer, cancellationToken);
+    public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
+    public override void Flush() => inner.Flush();
+
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    private bool _lockReleased;
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            inner.Dispose();
+            if (!_lockReleased)
+            {
+                gateLock.Dispose();
+                _lockReleased = true;
+            }
+        }
+        base.Dispose(disposing);
     }
 }
 
@@ -432,7 +583,7 @@ file sealed class FileSubStream(Stream baseStream, long offset, long length, Sem
     {
         if (_position >= length) return 0;
         int toRead = (int)Math.Min(count, length - _position);
-        streamLock.WaitAsync().GetAwaiter().GetResult();
+        streamLock.Wait();
         try
         {
             baseStream.Position = offset + _position;
@@ -482,8 +633,9 @@ file sealed class MemoryChunkedStream : Stream
     private readonly long _totalLength;
 
     private long _position;
-    private int _cachedChunkIndex = -1;
+    private volatile int _cachedChunkIndex = -1;
     private byte[]? _cachedData;
+    private bool _disposed;
 
     public MemoryChunkedStream(
         IChunkStore chunkStore,
@@ -516,6 +668,7 @@ file sealed class MemoryChunkedStream : Stream
         get => _position;
         set
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             ArgumentOutOfRangeException.ThrowIfNegative(value);
             ArgumentOutOfRangeException.ThrowIfGreaterThan(value, _totalLength);
             _position = value;
@@ -524,6 +677,7 @@ file sealed class MemoryChunkedStream : Stream
 
     public override int Read(byte[] buffer, int offset, int count)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (_position >= _totalLength) return 0;
         count = (int)Math.Min(count, _totalLength - _position);
         int totalRead = 0;
@@ -545,6 +699,7 @@ file sealed class MemoryChunkedStream : Stream
 
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (_position >= _totalLength) return 0;
         int count = (int)Math.Min(buffer.Length, _totalLength - _position);
         int totalRead = 0;
@@ -567,6 +722,7 @@ file sealed class MemoryChunkedStream : Stream
 
     public override long Seek(long offset, SeekOrigin origin)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         long target = origin switch
         {
             SeekOrigin.Begin => offset,
@@ -593,7 +749,18 @@ file sealed class MemoryChunkedStream : Stream
     }
 
     private byte[] GetChunk(int chunkIndex)
-        => GetChunkAsync(chunkIndex).GetAwaiter().GetResult();
+    {
+        if (_cachedChunkIndex == chunkIndex && _cachedData is not null)
+            return _cachedData;
+
+        byte[]? data = _chunkStore.ReadChunk(_volumeName, _objectId, chunkIndex);
+        if (data is null)
+            throw new InvalidOperationException($"チャンク {chunkIndex} がストレージに見つかりません。");
+
+        _cachedData = data;
+        _cachedChunkIndex = chunkIndex;
+        return data;
+    }
 
     private async Task<byte[]> GetChunkAsync(int chunkIndex, CancellationToken ct = default)
     {
@@ -612,4 +779,15 @@ file sealed class MemoryChunkedStream : Stream
     public override void Flush() { }
     public override void SetLength(long value) => throw new NotSupportedException();
     public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (_disposed) return;
+        if (disposing)
+        {
+            _cachedData = null;
+        }
+        _disposed = true;
+        base.Dispose(disposing);
+    }
 }
