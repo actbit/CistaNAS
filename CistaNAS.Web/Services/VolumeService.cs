@@ -577,6 +577,10 @@ public sealed class VolumeService : IDisposable
         var header = await LoadHeaderOrThrowAsync(volumeName);
         header.UserQuotas[targetUsername] = maxBytes;
         await _metaStore.SaveAsync(volumeName, header);
+
+        // マウント済みの場合、メモリ上の Header も更新
+        if (_mounted.TryGetValue(volumeName, out var mv))
+            mv.Header.UserQuotas[targetUsername] = maxBytes;
     }
 
     // ---- ボリューム削除 ----

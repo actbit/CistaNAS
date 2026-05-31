@@ -515,7 +515,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
         _cache.TryRemove(fileId, out _);
         _fileIdCache.TryRemove(plainName, out _);
         _listingCache.Invalidate();
-        _cachedStats = null;
+        lock (_statsLock) { _cachedStats = null; }
 
         return DokanResult.Success;
     }
@@ -651,7 +651,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
             PlainLength = plainLength,
         };
         _listingCache.Invalidate();
-        _cachedStats = null; // 使用量が変わったので再取得
+        lock (_statsLock) { _cachedStats = null; } // 使用量が変わったので再取得
     }
 
     private string? FindFileId(string plainName)

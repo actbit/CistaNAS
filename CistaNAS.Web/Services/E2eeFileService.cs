@@ -309,10 +309,10 @@ public sealed class E2eeFileService
         var catalog = await LoadCatalogAsync(volumeName, ct);
         var header = _volumeService.GetMounted(volumeName).Header;
 
-        long totalUsed = catalog.Files.Values.Sum(f => f.EncryptedLength);
+        long totalUsed = catalog.Files.Values.Sum(f => Math.Max(0, f.EncryptedLength - 16L - (long)f.ChunkCount * 16));
         long userUsed = catalog.Files.Values
             .Where(f => f.OwnerUsername == username || string.IsNullOrEmpty(f.OwnerUsername))
-            .Sum(f => f.EncryptedLength);
+            .Sum(f => Math.Max(0, f.EncryptedLength - 16L - (long)f.ChunkCount * 16));
         long quota = header.UserQuotas.TryGetValue(username, out var q) ? q : 0;
         int totalFiles = catalog.Files.Count;
         int userFiles = catalog.Files.Values
