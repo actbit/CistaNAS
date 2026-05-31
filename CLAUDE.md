@@ -6,10 +6,10 @@
 
 | プロジェクト | 役割 |
 |---|---|
-| `CistaNAS.AppHost` | Aspire オーケストレーション（`apiservice` と `webfrontend` を起動・参照） |
-| `CistaNAS.ApiService` | Minimal API。外部クライアント（rclone・RCX 等）向け REST |
-| `CistaNAS.Web` | Blazor（Interactive Server rendering）。WebUI |
+| `CistaNAS.AppHost` | Aspire オーケストレーション（`webfrontend` を起動） |
+| `CistaNAS.Web` | Blazor（Interactive Server rendering）+ REST API（`/api/v1`）。**単一プロセス構成** |
 | `CistaNAS.ServiceDefaults` | Aspire 共通設定（テレメトリ・ヘルスチェック・サービスディスカバリ） |
+| `CistaNAS.Client` | クライアントサイド（Blazor コンポーネント用） |
 | `CistaNAS.Tests` | テスト |
 
 ## アーキテクチャ指針
@@ -46,13 +46,21 @@ Crypto / Volume / Journal
 - Blazor コンポーネントからは Service を直接インジェクトしてよい（API 経由にしなくてよい）。
 - Interactive Server rendering を使用する。
 
-## 現状構成との整合メモ（実装前に要決定）
+## 単一プロセス構成について
 
-Aspire テンプレートは `ApiService` と `Web` が**別プロセス**。一方、指針では
-`VolumeService` を `AddSingleton`（マウント状態を 1 つ保持）とし、かつ Blazor から
-Service を直接インジェクトする。別プロセスのままだと API 側と Blazor 側で
-シングルトンが分離し、マウント状態が共有されない。
+現在、`CistaNAS.Web` プロジェクトに Blazor と REST API（`/api/v1`）の両方を集約した
+**単一プロセス構成**をとっています。
 
-→ Service 層（および `/api/v1`）を `CistaNAS.Web` 側に集約して単一プロセスにするか、
-状態を外部ストア化するか、実装着手時に方針を確定すること。本ファイルは指針の
-記録のみ。コードはまだ変更していない。
+### 理由
+
+- `VolumeService` はマウント状態をインメモリで保持する `AddSingleton` サービス
+- 別プロセス構成（`ApiService` と `Web` が分離）だと、Singleton インスタンスが各プロセスで
+  独立してしまい、マウント状態が共有されない
+- 単一プロセス構成により、Blazor WebUI と REST API クライアント（rclone・RCX 等）が
+  同じ `VolumeService` インスタンスを共有し、マウント状態が正しく同期される
+
+### 実装箇所
+
+- `ServiceCollectionExtensions.cs` L40: `services.AddSingleton<VolumeService>();`
+- `Program.cs` L278-280: `/api/v1` REST API エンドポイントの定義
+- `AppHost.cs`: `webfrontend` のみを登録（単一プロセス構成）
