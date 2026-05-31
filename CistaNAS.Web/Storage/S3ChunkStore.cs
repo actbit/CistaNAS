@@ -23,6 +23,9 @@ public sealed class S3ChunkStore : IChunkStore
     public Task<byte[]?> ReadChunkAsync(string volumeName, string objectId, int chunkIndex, CancellationToken ct = default)
         => _storage.ReadAsync(ChunkKey(volumeName, objectId, chunkIndex), ct);
 
+    public byte[]? ReadChunk(string volumeName, string objectId, int chunkIndex)
+        => ReadChunkAsync(volumeName, objectId, chunkIndex).GetAwaiter().GetResult();
+
     public async Task<IReadOnlyList<int>> ListChunksAsync(string volumeName, string objectId, CancellationToken ct = default)
     {
         string prefix = $"{volumeName}/chunks/{objectId}/";

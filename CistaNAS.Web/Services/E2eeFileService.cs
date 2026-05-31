@@ -143,7 +143,7 @@ public sealed class E2eeFileService
                         int toRead = (int)Math.Min(buffer.Length, remaining);
                         int read = await data.ReadAsync(buffer.AsMemory(0, toRead), ct);
                         if (read == 0) break;
-                        fs.Write(buffer, 0, read);
+                        await fs.WriteAsync(buffer.AsMemory(0, read), ct);
                         written += read;
                         remaining -= read;
                     }
@@ -359,6 +359,15 @@ file sealed class SubStream(Stream baseStream, long length) : Stream
         if (_remaining <= 0) return 0;
         int toRead = (int)Math.Min(count, _remaining);
         int read = baseStream.Read(buffer, offset, toRead);
+        _remaining -= read;
+        return read;
+    }
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        if (_remaining <= 0) return 0;
+        int toRead = (int)Math.Min(buffer.Length, _remaining);
+        int read = await baseStream.ReadAsync(buffer[..toRead], cancellationToken);
         _remaining -= read;
         return read;
     }

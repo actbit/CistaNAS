@@ -13,6 +13,9 @@ public interface IChunkStore
     /// <summary>チャンクを読み込む。存在しない場合は null。</summary>
     Task<byte[]?> ReadChunkAsync(string volumeName, string objectId, int chunkIndex, CancellationToken ct = default);
 
+    /// <summary>チャンクを同期的に読み込む。存在しない場合は null。Stream.Read の同期パスで使用。</summary>
+    byte[]? ReadChunk(string volumeName, string objectId, int chunkIndex);
+
     /// <summary>指定オブジェクトの全チャンクインデックスを列挙する（昇順）。</summary>
     Task<IReadOnlyList<int>> ListChunksAsync(string volumeName, string objectId, CancellationToken ct = default);
 
