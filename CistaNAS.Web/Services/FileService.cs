@@ -19,23 +19,34 @@ namespace CistaNAS.Web.Services;
 internal sealed class AsyncFileGate
 {
     private int _readerCount;
+    private int _writerWaiting; // ライター待機中フラグ（スタベーション防止）
     private readonly SemaphoreSlim _gate = new(1, 1);
 
     /// <summary>読み取りロックを取得。並行読み取り可。戻り値の IDisposable で解放。</summary>
     public async Task<IDisposable> EnterReadAsync(CancellationToken ct)
     {
-        await _gate.WaitAsync(ct);
-        Interlocked.Increment(ref _readerCount);
-        _gate.Release();
-        return new ReadReleaser(this);
+        // ライター待機中は新規リーダーの入場をブロック（スタベーション防止）
+        while (true)
+        {
+            await _gate.WaitAsync(ct);
+            if (Volatile.Read(ref _writerWaiting) == 0)
+            {
+                _readerCount++;
+                _gate.Release();
+                return new ReadReleaser(this);
+            }
+            _gate.Release();
+            await Task.Delay(TimeSpan.FromMilliseconds(10), ct);
+        }
     }
 
     /// <summary>書き込みロックを取得。全読み取りの完了を待機。戻り値の IDisposable で解放。</summary>
     public async Task<IDisposable> EnterWriteAsync(CancellationToken ct)
     {
         await _gate.WaitAsync(ct);
+        Volatile.Write(ref _writerWaiting, 1);
         // アクティブな読み取りがなくなるまでスピン
-        while (Volatile.Read(ref _readerCount) > 0)
+        while (_readerCount > 0)
         {
             _gate.Release();
             await Task.Delay(TimeSpan.FromMilliseconds(20), ct);
@@ -46,7 +57,11 @@ internal sealed class AsyncFileGate
     }
 
     private void ExitRead() => Interlocked.Decrement(ref _readerCount);
-    private void ExitWrite() => _gate.Release();
+    private void ExitWrite()
+    {
+        Volatile.Write(ref _writerWaiting, 0);
+        _gate.Release();
+    }
 
     public void Dispose() => _gate.Dispose();
 
@@ -114,8 +129,17 @@ public sealed class FileService
     /// <summary>ボリューム内の全ファイルを一覧。</summary>
     public async Task<ListFilesResponse> ListAsync(string volumeName, CancellationToken ct = default)
     {
-        var catalog = await LoadCatalogAsync(volumeName, ct);
-        return new ListFilesResponse(catalog.Files.Values.OrderBy(f => f.Name).ToList());
+        SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await catLock.WaitAsync(ct);
+        try
+        {
+            var catalog = await LoadCatalogAsync(volumeName, ct);
+            return new ListFilesResponse(catalog.Files.Values.OrderBy(f => f.Name).ToList());
+        }
+        finally
+        {
+            catLock.Release();
+        }
     }
 
     /// <summary>ファイルをアップロード（新規 or 上書き）。</summary>
@@ -508,7 +532,7 @@ public sealed class FileService
 /// ダウンロード中の読み取りゲートを保持するストリームラッパー。
 /// Dispose 時にファイルゲートの読み取りロックを解放し、アップロード/削除を許可する。
 /// </summary>
-file sealed class GateReadStream(Stream inner, IDisposable gateLock) : Stream
+internal sealed class GateReadStream(Stream inner, IDisposable gateLock) : Stream
 {
     public override bool CanRead => inner.CanRead;
     public override bool CanSeek => inner.CanSeek;
