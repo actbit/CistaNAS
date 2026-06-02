@@ -1,5 +1,5 @@
 using System.Security.Cryptography;
-using CistaNAS.Client.Crypto;
+using CistaNAS.Shared.Crypto;
 
 namespace CistaNAS.Tests;
 
@@ -35,7 +35,9 @@ public class AesXtsStreamTests
 
         public AesXtsStreamImpl(Stream baseStream, byte[] key, int sectorSize, long logicalLength, bool writable, bool leaveOpen = false)
         {
-            _base = AesXtsStream.CreateAesXtsStream(baseStream, key, logicalLength, writable);
+            // CistaNAS.Shared.Crypto.AesXtsStream (旧 Client 側) の static factory CreateAesXtsStream は
+            // 重複実装の整理 (Phase 2) で削除された。Web 側 AesXtsStream のコンストラクタを直接使う。
+            _base = new AesXtsStream(baseStream, key, sectorSize, logicalLength, writable, leaveOpen);
         }
 
         public override bool CanRead => _base.CanRead;

@@ -605,25 +605,44 @@ else
             // KEK 導出 → マスターキー アンラップ
             var header = await VolumeSvc.GetVolumeHeaderAsync(_shareTarget!);
             var myKey = header.UserKeys[CurrentUsername];
-            string kekHandle = await E2ee.DeriveKek(_grantGranterPassword,
-                Convert.ToBase64String(myKey.Kdf.Salt), myKey.Kdf.Iterations);
-            string mkHandle = await E2ee.UnwrapMasterKey(
-                Convert.ToBase64String(myKey.WrappedMasterKey.Nonce),
-                Convert.ToBase64String(myKey.WrappedMasterKey.Ciphertext),
-                Convert.ToBase64String(myKey.WrappedMasterKey.Tag), kekHandle);
-            await E2ee.ClearKey(kekHandle);
+            string? kekHandle = null;
+            string? mkHandle = null;
+            try
+            {
+                kekHandle = await E2ee.DeriveKek(_grantGranterPassword,
+                    Convert.ToBase64String(myKey.Kdf.Salt), myKey.Kdf.Iterations);
+                mkHandle = await E2ee.UnwrapMasterKey(
+                    Convert.ToBase64String(myKey.WrappedMasterKey.Nonce),
+                    Convert.ToBase64String(myKey.WrappedMasterKey.Ciphertext),
+                    Convert.ToBase64String(myKey.WrappedMasterKey.Tag), kekHandle);
+                await E2ee.ClearKey(kekHandle);
+                kekHandle = null;
 
-            // 相手の公開鍵で ECIES ラップ
-            var (ephPubKey, nonce, ct, tag) = await E2ee.EcdhWrap(mkHandle, recipientPubKey);
-            await E2ee.ClearKey(mkHandle);
+                // 相手の公開鍵で ECIES ラップ
+                var (ephPubKey, nonce, ct, tag) = await E2ee.EcdhWrap(mkHandle, recipientPubKey);
+                await E2ee.ClearKey(mkHandle);
+                mkHandle = null;
 
-            var ecdhWrappedKey = BuildEcdhWrappedKey(ephPubKey, nonce, ct, tag);
+                var ecdhWrappedKey = BuildEcdhWrappedKey(ephPubKey, nonce, ct, tag);
 
-            await VolumeSvc.AddE2eeWrappedKeyAsync(_shareTarget!, CurrentUsername, _ecdhUsername.Trim(), ecdhWrappedKey);
-            await RefreshListAsync();
-            vol = _volumes.FirstOrDefault(v => v.Name == _shareTarget);
-            if (vol is not null) _shareUsers = vol.AuthorizedUsers;
-            _ecdhUsername = ""; _grantGranterPassword = ""; _shareError = null;
+                await VolumeSvc.AddE2eeWrappedKeyAsync(_shareTarget!, CurrentUsername, _ecdhUsername.Trim(), ecdhWrappedKey);
+                await RefreshListAsync();
+                vol = _volumes.FirstOrDefault(v => v.Name == _shareTarget);
+                if (vol is not null) _shareUsers = vol.AuthorizedUsers;
+                _ecdhUsername = ""; _grantGranterPassword = ""; _shareError = null;
+            }
+            finally
+            {
+                // 異常系で残った鍵ハンドルを必ずクリア（鍵残留によるエクスポート攻撃を防ぐ）
+                if (kekHandle is not null)
+                {
+                    try { await E2ee.ClearKey(kekHandle); } catch { /* 握りつぶし */ }
+                }
+                if (mkHandle is not null)
+                {
+                    try { await E2ee.ClearKey(mkHandle); } catch { /* 握りつぶし */ }
+                }
+            }
         }
         catch (Exception ex) { _shareError = ex.Message; }
     }

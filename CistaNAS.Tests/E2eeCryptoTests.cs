@@ -1,6 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
-using CistaNAS.Client.Crypto;
+using CistaNAS.Shared.Crypto;
 
 namespace CistaNAS.Tests;
 

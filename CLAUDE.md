@@ -64,3 +64,29 @@ Crypto / Volume / Journal
 - `ServiceCollectionExtensions.cs` L40: `services.AddSingleton<VolumeService>();`
 - `Program.cs` L278-280: `/api/v1` REST API エンドポイントの定義
 - `AppHost.cs`: `webfrontend` のみを登録（単一プロセス構成）
+
+## 共有プロジェクト CistaNAS.Shared
+
+暗号化プリミティブ（AES-XTS, ChaCha20-Poly1305, E2EE, HKDF）は `CistaNAS.Shared` プロジェクト
+（net10.0 クラスライブラリ）に集約。Web (Blazor/Server) と Client (Avalonia/Dokan) 双方から
+参照され、重複実装を排除。
+
+- `CistaNAS.Shared/Crypto/`: CipherAlgorithm, KeyDerivation, AesXtsStream, AesXtsTransform,
+  ChunkEncryptor, ChaCha20Poly1305, E2eeCrypto
+- `CistaNAS.Web/Crypto/`: PasswordHasher のみ（Identity 専用、サーバー側のみ）
+
+## CistaNAS.Client の役割
+
+`CistaNAS.Client` は Avalonia 12 + DokanNet を使った **Windows 用 Dokan マウントクライアント**。
+サーバー上のボリュームを Windows のドライブ文字にマウントし、ローカルファイルシステムとして
+利用可能にする。E2EE モード / 非 E2EE モード両対応。
+
+- ターゲット: `net10.0-windows`, `WinExe`
+- DokanNet: CistaNasFileSystem (IDokanOperations 実装) でボリュームをマウント
+- Crypto: 共有プロジェクトの `E2eeCrypto` を使用
+
+## 重要なセキュリティ・整合性の修正履歴
+
+- **2026-06-02 Phase 1**: ChaCha20 ノンス ECB 化修正 (HKDF)、パストラバーサル修正、E2EE 鍵残留修正、AesXtsStream async I/O、起動時 Journal 復旧、E2EE 暗号化長計算共有化
+- **2026-06-02 Phase 2**: CistaNAS.Shared への Crypto コード集約、重複削除
+- **2026-06-02 Phase 3-4**: AsyncFileGate キャンセルバグ修正、E2EE チャンク範囲チェック、AddWrappedKey 認可、SetUserQuota 競合、Rewrap ロールバック、CistaAuthorizationHandler タイミング均一化、PBKDF2 DoS 対策

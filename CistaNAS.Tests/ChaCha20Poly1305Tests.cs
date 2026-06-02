@@ -1,5 +1,5 @@
 using System.Security.Cryptography;
-using ClientChaCha20 = CistaNAS.Client.Crypto.ChaCha20Poly1305;
+using ClientChaCha20 = CistaNAS.Shared.Crypto.ChaCha20Poly1305;
 
 namespace CistaNAS.Tests;
 

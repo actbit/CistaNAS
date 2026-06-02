@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CistaNAS.ServiceDefaults\CistaNAS.ServiceDefaults.csproj" />
+    <ProjectReference Include="..\CistaNAS.Shared\CistaNAS.Shared.csproj" />
   </ItemGroup>
 
   <ItemGroup>

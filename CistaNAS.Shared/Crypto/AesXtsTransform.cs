@@ -1,7 +1,7 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 
-namespace CistaNAS.Web.Crypto;
+namespace CistaNAS.Shared.Crypto;
 
 /// <summary>
 /// AES-XTS の低レベル変換クラス。

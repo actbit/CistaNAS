@@ -98,6 +98,13 @@ public sealed class AuthOptions
     /// <summary>ログインパスワードハッシュの PBKDF2 反復回数。</summary>
     [Range(600_000, 10_000_000)]
     public int Pbkdf2Iterations { get; set; } = 600_000;
+
+    /// <summary>
+    /// WebDAV Basic 認証のダミーハッシュ用 PBKDF2 反復回数。
+    /// メイン認証 (Pbkdf2Iterations) より低めに設定し、DoS リスクを軽減 (H-9)。
+    /// </summary>
+    [Range(10_000, 600_000)]
+    public int WebDavPbkdf2Iterations { get; set; } = 100_000;
 }
 
 public sealed class VolumeOptions

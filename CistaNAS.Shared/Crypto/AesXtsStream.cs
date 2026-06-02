@@ -1,7 +1,7 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 
-namespace CistaNAS.Web.Crypto;
+namespace CistaNAS.Shared.Crypto;
 
 /// <summary>
 /// IEEE 1619 / NIST SP 800-38E の XTS-AES によるシーク可能な暗号化ストリーム。
@@ -137,6 +137,29 @@ public sealed class AesXtsStream : Stream
 
     // ---- セクタ I/O ----
 
+    private async Task ReadSectorPlainAsync(long sectorIndex, Memory<byte> sector, CancellationToken ct)
+    {
+        long pos = sectorIndex * _sectorSize;
+        if (pos >= _base.Length)
+        {
+            sector.Span.Clear();
+            return;
+        }
+
+        _base.Position = pos;
+        int read = 0;
+        byte[] buf = new byte[_sectorSize];
+        while (read < _sectorSize)
+        {
+            int n = await _base.ReadAsync(buf.AsMemory(read, _sectorSize - read), ct);
+            if (n == 0) break;
+            read += n;
+        }
+        if (read < _sectorSize) Array.Clear(buf, read, _sectorSize - read);
+        buf.CopyTo(sector.Span);
+        TransformSector(sectorIndex, sector.Span, encrypt: false);
+    }
+
     private void ReadSectorPlain(long sectorIndex, Span<byte> sector)
     {
         long pos = sectorIndex * _sectorSize;
@@ -158,6 +181,14 @@ public sealed class AesXtsStream : Stream
         if (read < _sectorSize) Array.Clear(buf, read, _sectorSize - read);
         buf.CopyTo(sector);
         TransformSector(sectorIndex, sector, encrypt: false);
+    }
+
+    private async Task WriteSectorPlainAsync(long sectorIndex, ReadOnlyMemory<byte> plain, CancellationToken ct)
+    {
+        byte[] enc = plain.ToArray();
+        TransformSector(sectorIndex, enc, encrypt: true);
+        _base.Position = sectorIndex * _sectorSize;
+        await _base.WriteAsync(enc.AsMemory(0, enc.Length), ct);
     }
 
     private void WriteSectorPlain(long sectorIndex, Span<byte> plain)
@@ -195,6 +226,30 @@ public sealed class AesXtsStream : Stream
         return total;
     }
 
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (_position >= _length) return 0;
+        int count = (int)Math.Min(buffer.Length, _length - _position);
+        int total = 0;
+
+        while (count > 0)
+        {
+            long si = _position / _sectorSize;
+            int sOff = (int)(_position % _sectorSize);
+            byte[] sector = new byte[_sectorSize];
+            await ReadSectorPlainAsync(si, sector.AsMemory(), cancellationToken);
+            int n = Math.Min(count, _sectorSize - sOff);
+            sector.AsSpan(sOff, n).CopyTo(buffer.Span);
+            buffer = buffer[n..];
+            _position += n;
+            total += n;
+            count -= n;
+        }
+        return total;
+    }
+
     public override void Write(byte[] buffer, int offset, int count)
     {
         ArgumentNullException.ThrowIfNull(buffer);
@@ -218,6 +273,35 @@ public sealed class AesXtsStream : Stream
 
             src[..n].CopyTo(sector.AsSpan(sOff));
             WriteSectorPlain(si, sector);
+
+            _position += n;
+            if (_position > _length) _length = _position;
+            src = src[n..];
+        }
+    }
+
+    public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!CanWrite) throw new NotSupportedException("読み取り専用ストリーム。");
+
+        ReadOnlyMemory<byte> src = buffer;
+        byte[] sector = new byte[_sectorSize];
+
+        while (!src.IsEmpty)
+        {
+            long si = _position / _sectorSize;
+            int sOff = (int)(_position % _sectorSize);
+            int n = Math.Min(src.Length, _sectorSize - sOff);
+            bool full = sOff == 0 && n == _sectorSize;
+
+            if (full)
+                Array.Clear(sector);
+            else
+                await ReadSectorPlainAsync(si, sector.AsMemory(), cancellationToken); // RMW: 既存セクタを復号して部分更新
+
+            src.Span[..n].CopyTo(sector.AsSpan(sOff));
+            await WriteSectorPlainAsync(si, sector.AsMemory(0, _sectorSize), cancellationToken);
 
             _position += n;
             if (_position > _length) _length = _position;

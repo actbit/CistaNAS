@@ -2,7 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using CistaNAS.Client.Api;
-using CistaNAS.Client.Crypto;
+using CistaNAS.Shared.Crypto;
 
 namespace CistaNAS.Tests;
 

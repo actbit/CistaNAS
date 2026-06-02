@@ -50,6 +50,9 @@ public static class ServiceCollectionExtensions
         // メディアストリーミング（BackgroundService）
         services.AddSingleton<StreamingTokenService>();
 
+        // 暗号化設定の永続化（appsettings.json 直書きを廃止し DB ファイルへ）(H-6)
+        services.AddSingleton<EncryptionSettingsService>();
+
         return services;
     }
 

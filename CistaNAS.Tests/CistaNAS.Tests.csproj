@@ -21,6 +21,7 @@
   <ItemGroup>
     <ProjectReference Include="..\CistaNAS.AppHost\CistaNAS.AppHost.csproj" />
     <ProjectReference Include="..\CistaNAS.Client\CistaNAS.Client.csproj" />
+    <ProjectReference Include="..\CistaNAS.Shared\CistaNAS.Shared.csproj" />
     <ProjectReference Include="..\CistaNAS.Web\CistaNAS.Web.csproj" />
   </ItemGroup>
 

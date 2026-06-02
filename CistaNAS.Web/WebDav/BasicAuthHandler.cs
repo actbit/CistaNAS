@@ -27,7 +27,8 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
         : base(options, logger, encoder)
     {
         _authService = authService;
-        _iterations = cistaOptions.Value.Auth.Pbkdf2Iterations;
+        // WebDAV Basic 認証は DoS リスク軽減のため、WebDavPbkdf2Iterations を使用 (H-9)
+        _iterations = cistaOptions.Value.Auth.WebDavPbkdf2Iterations;
     }
 
     protected override async Task<AuthenticateResult> HandleAuthenticateAsync()

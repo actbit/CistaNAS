@@ -1,6 +1,6 @@
 using System.Security.Cryptography;
 
-namespace CistaNAS.Web.Crypto;
+namespace CistaNAS.Shared.Crypto;
 
 /// <summary>
 /// ボリュームパスワードからの鍵導出（PBKDF2-SHA256）。

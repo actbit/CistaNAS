@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
 using System.Security.AccessControl;
 using CistaNAS.Client.Api;
-using CistaNAS.Client.Crypto;
+using CistaNAS.Shared.Crypto;
 using DokanNet;
 
 namespace CistaNAS.Client;
@@ -60,12 +60,36 @@ public sealed class CistaNasFileSystem : IDokanOperations
         public int ChunkCount;
         public long EncryptedLength;
         public long PlainLength;
-        public byte[]? FileKey;
 
+        private byte[]? _fileKey;
+        private readonly object _fileKeyLock = new();
         private readonly Dictionary<int, byte[]> _chunks = new();
         private readonly LinkedList<int> _lru = new();
         private readonly object _chunkLock = new();
         private const int MaxChunks = 16; // 1MB × 16 = 16MB/file 上限
+
+        /// <summary>FileKey をスレッドセーフに取得または設定する。</summary>
+        public byte[]? FileKey => _fileKey;
+
+        /// <summary>FileKey をスレッドセーフに設定する。</summary>
+        public void SetFileKey(byte[] key)
+        {
+            lock (_fileKeyLock)
+            {
+                if (_fileKey is null)
+                    _fileKey = key;
+            }
+        }
+
+        /// <summary>FileKey が設定されているか確認し、設定されていれば返す。</summary>
+        public bool TryGetFileKey(out byte[]? key)
+        {
+            lock (_fileKeyLock)
+            {
+                key = _fileKey;
+                return _fileKey is not null;
+            }
+        }
 
         public bool TryGetChunk(int index, out byte[]? chunk)
         {
@@ -340,7 +364,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
     {
         bytesRead = 0;
 
-        // 非E2EE モード: 通常ファイルダウンロード
+        // 非E2EE モード: Range リクエストで必要な部分のみダウンロード
         if (!_isE2ee)
         {
             if (info.Context is not string filePath)
@@ -348,13 +372,15 @@ public sealed class CistaNasFileSystem : IDokanOperations
 
             try
             {
-                var data = CistaNasApiClientFiles.DownloadFileAsync(_api, _volumeName, filePath).GetAwaiter().GetResult();
-                if (offset >= data.Length)
-                    return DokanResult.Success;
+                // Task.Run で別スレッドで非同期実行し、結果を待機
+                var data = Task.Run(async () =>
+                {
+                    return await CistaNasApiClientFiles.DownloadFileRangeAsync(
+                        _api, _volumeName, filePath, offset, buffer.Length);
+                }).GetAwaiter().GetResult();
 
-                int copyCount = Math.Min(buffer.Length, (int)(data.Length - offset));
-                Array.Copy(data, offset, buffer, 0, copyCount);
-                bytesRead = copyCount;
+                Array.Copy(data, 0, buffer, 0, data.Length);
+                bytesRead = data.Length;
                 return DokanResult.Success;
             }
             catch
@@ -367,79 +393,83 @@ public sealed class CistaNasFileSystem : IDokanOperations
         if (info.Context is not string fileId)
             return DokanResult.InvalidParameter;
 
-        var cache = GetOrCreateCache(fileId);
-        if (cache is null) return DokanResult.FileNotFound;
-
-        // チャンク 0 から salt を抽出して fileKey を確定
-        if (cache.FileKey is null)
+        try
         {
-            try
+            // Task.Run で別スレッドで非同期実行し、結果を待機
+            var result = Task.Run(async () =>
             {
-                var encData = _api.DownloadChunkAsync(_volumeName, fileId, 0).GetAwaiter().GetResult();
-                if (encData.Length <= 16)
-                    return DokanResult.InternalError;
+                int localBytesRead = 0;
+                var cache = GetOrCreateCache(fileId);
+                if (cache is null) return (DokanResult.FileNotFound, 0);
 
-                byte[] salt = new byte[16];
-                Buffer.BlockCopy(encData, 0, salt, 0, 16);
-                cache.FileKey = E2eeCrypto.DeriveFileKey(_masterKey!, salt);
+                // チャンク 0 から salt を抽出して fileKey を確定
+                if (!cache.TryGetFileKey(out var fileKey))
+                {
+                    var encData = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
+                    if (encData.Length <= 16)
+                        return (DokanResult.InternalError, 0);
 
-                // チャンク 0 もキャッシュしておく（次回の ReadFile で再利用）
-                var chunk = E2eeCrypto.DecryptChunk(encData, cache.FileKey, 0, out _);
-                cache.PutChunk(0, chunk);
-            }
-            catch
-            {
-                return DokanResult.InternalError;
-            }
+                    byte[] salt = new byte[16];
+                    Buffer.BlockCopy(encData, 0, salt, 0, 16);
+                    var derivedKey = E2eeCrypto.DeriveFileKey(_masterKey!, salt);
+
+                    // チャンク 0 もキャッシュしておく（次回の ReadFile で再利用）
+                    var chunk = E2eeCrypto.DecryptChunk(encData, derivedKey, 0, out _);
+                    cache.PutChunk(0, chunk);
+
+                    // FileKey を設定（他スレッドから見えるように）
+                    cache.SetFileKey(derivedKey);
+                    fileKey = derivedKey;
+                }
+
+                // シーク最適化: offset から開始チャンクを計算
+                int startChunk = cache.ChunkCount > 0
+                    ? Math.Min((int)(offset / _chunkSize), cache.ChunkCount - 1)
+                    : 0;
+                long fileOffset = (long)startChunk * _chunkSize;
+
+                for (int i = startChunk; i < cache.ChunkCount && localBytesRead < buffer.Length; i++)
+                {
+                    if (offset + localBytesRead >= cache.PlainLength)
+                        break;
+
+                    if (!cache.TryGetChunk(i, out var chunk))
+                    {
+                        var encData = await _api.DownloadChunkAsync(_volumeName, fileId, i);
+                        chunk = E2eeCrypto.DecryptChunk(encData, fileKey!, i, out _);
+                        cache.PutChunk(i, chunk);
+                    }
+
+                    long chunkStart = fileOffset;
+                    long chunkEnd = chunkStart + chunk!.Length;
+
+                    if (offset < chunkEnd)
+                    {
+                        int copyOffset = (int)Math.Max(0, offset - chunkStart);
+                        int maxCopy = Math.Min(chunk.Length - copyOffset, buffer.Length - localBytesRead);
+                        if (offset + localBytesRead + maxCopy > cache.PlainLength)
+                            maxCopy = (int)Math.Max(0, cache.PlainLength - offset - localBytesRead);
+                        if (maxCopy > 0)
+                        {
+                            Buffer.BlockCopy(chunk, copyOffset, buffer, localBytesRead, maxCopy);
+                            localBytesRead += maxCopy;
+                        }
+                    }
+
+                    fileOffset += chunk.Length;
+                }
+
+                return (DokanResult.Success, localBytesRead);
+            }).GetAwaiter().GetResult();
+
+            bytesRead = result.Item2;
+            return result.Item1;
         }
-
-        byte[] fileKey = cache.FileKey;
-
-        // シーク最適化: offset から開始チャンクを計算
-        int startChunk = cache.ChunkCount > 0
-            ? Math.Min((int)(offset / _chunkSize), cache.ChunkCount - 1)
-            : 0;
-        long fileOffset = (long)startChunk * _chunkSize;
-
-        for (int i = startChunk; i < cache.ChunkCount && bytesRead < buffer.Length; i++)
+        catch
         {
-            if (offset + bytesRead >= cache.PlainLength)
-                break;
-
-            if (!cache.TryGetChunk(i, out var chunk))
-            {
-                try
-                {
-                    var encData = _api.DownloadChunkAsync(_volumeName, fileId, i).GetAwaiter().GetResult();
-                    chunk = E2eeCrypto.DecryptChunk(encData, fileKey, i, out _);
-                    cache.PutChunk(i, chunk);
-                }
-                catch
-                {
-                    return DokanResult.InternalError;
-                }
-            }
-
-            long chunkStart = fileOffset;
-            long chunkEnd = chunkStart + chunk!.Length;
-
-            if (offset < chunkEnd)
-            {
-                int copyOffset = (int)Math.Max(0, offset - chunkStart);
-                int maxCopy = Math.Min(chunk.Length - copyOffset, buffer.Length - bytesRead);
-                if (offset + bytesRead + maxCopy > cache.PlainLength)
-                    maxCopy = (int)Math.Max(0, cache.PlainLength - offset - bytesRead);
-                if (maxCopy > 0)
-                {
-                    Buffer.BlockCopy(chunk, copyOffset, buffer, bytesRead, maxCopy);
-                    bytesRead += maxCopy;
-                }
-            }
-
-            fileOffset += chunk.Length;
+            bytesRead = 0;
+            return DokanResult.InternalError;
         }
-
-        return DokanResult.Success;
     }
 
     public NtStatus WriteFile(string fileName, byte[] buffer, out int bytesWritten, long offset, IDokanFileInfo info)
@@ -827,16 +857,19 @@ public sealed class CistaNasFileSystem : IDokanOperations
 
     private FileCache? GetOrCreateCache(string fileId)
     {
+        // TryGetValue のみ使用 - 見つからなければ null を返す
         if (_cache.TryGetValue(fileId, out var c)) return c;
 
-        try
+        // 見つからない場合のみ作成を試みる - GetOrAdd で競合を回避
+        return _cache.GetOrAdd(fileId, id =>
         {
-            var entries = _api.ListFilesAsync(_volumeName).GetAwaiter().GetResult();
-            foreach (var entry in entries)
+            try
             {
-                if (entry.FileId == fileId)
+                var entries = _api.ListFilesAsync(_volumeName).GetAwaiter().GetResult();
+                var entry = entries.FirstOrDefault(e => e.FileId == id);
+                if (entry is not null)
                 {
-                    string plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey);
+                    string plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!);
                     long plainLength = Math.Max(0, entry.EncryptedLength - 16L - (long)entry.ChunkCount * 16);
                     var cache = new FileCache
                     {
@@ -846,15 +879,14 @@ public sealed class CistaNasFileSystem : IDokanOperations
                         EncryptedLength = entry.EncryptedLength,
                         PlainLength = plainLength,
                     };
-                    _cache[fileId] = cache;
                     _fileIdCache[plainName] = fileId;
                     return cache;
                 }
             }
-        }
-        catch { }
+            catch { }
 
-        return null;
+            return null!;
+        });
     }
 
     private static bool IsMatch(string name, string pattern)

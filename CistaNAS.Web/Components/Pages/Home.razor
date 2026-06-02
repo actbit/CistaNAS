@@ -2,14 +2,28 @@
 
 <PageTitle>CistaNAS</PageTitle>
 
-<h1>CistaNAS</h1>
+<h1>CistaNAS へようこそ</h1>
 
 <div class="form-narrow mb-4">
-<p>暗号化 NAS。ボリュームをマウントしてファイルを安全に保管します。</p>
+<p>暗号化ネットワーク接続ストレージ (NAS) ソリューション</p>
 
+<h2>主な機能</h2>
 <ul>
-    <li>ボリューム：AES-XTS による暗号化（作成・マウント・ロック）</li>
-    <li>ジャーナリング：書き込みの記録とクラッシュ復旧</li>
-    <li>外部クライアント：<code>/api/v1</code>（rclone・RCX 等）</li>
+    <li><strong>ボリューム暗号化</strong>: AES-256-XTS (IEEE 1619) / ChaCha20 による透過的なボリューム暗号化</li>
+    <li><strong>エンドツーエンド暗号化 (E2EE)</strong>: クライアント側で鍵を保持し、サーバーも平文を閲覧できない完全 E2EE モード。ECDH 鍵交換で安全に他ユーザーへ共有可能。</li>
+    <li><strong>ジャーナリング</strong>: クラッシュ復旧用の先行書き込みログ</li>
+    <li><strong>WebDAV</strong>: rclone / Cyberduck / Windows エクスプローラーから直接マウント可能 (<code>/dav/{volumeName}</code>、Basic 認証対応)</li>
+    <li><strong>Dokan マウントクライアント</strong>: Windows 用 Avalonia デスクトップアプリ (<code>CistaNAS.Client</code>) でボリュームをドライブ文字にマウント</li>
+    <li><strong>REST API</strong>: 外部クライアント (rclone / RCX 等) 向け <code>/api/v1</code></li>
+    <li><strong>ASP.NET Core Identity</strong>: PBKDF2-SHA256 による安全なパスワード保存</li>
+    <li><strong>複数ストレージプロバイダ</strong>: ローカル / S3 / Azure Blob / GCS</li>
 </ul>
+
+<h2>はじめに</h2>
+<ol>
+    <li><a href="/setup">初回セットアップ</a> で管理者アカウントを作成</li>
+    <li><a href="/login">ログイン</a></li>
+    <li><a href="/volumes">ボリューム管理</a> で新規ボリュームを作成 (サーバー暗号化 / E2EE / グループ E2EE)</li>
+    <li><a href="/files">ファイルブラウザ</a> でファイルを操作</li>
+</ol>
 </div>

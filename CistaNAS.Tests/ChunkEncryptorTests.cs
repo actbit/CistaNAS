@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
-using CistaNAS.Web.Crypto;
+using CistaNAS.Shared.Crypto;
+using CistaNAS.Web.Services;
 
 namespace CistaNAS.Tests;
 
@@ -127,5 +128,58 @@ public class ChunkEncryptorTests
         Assert.NotEqual(c0, c1);
         Assert.NotEqual(c1, c2);
         Assert.NotEqual(c0, c2);
+    }
+
+    // ---- ChaCha20 ノンス/カウンタ修正の回帰防止 (C-1) ----
+
+    [Fact]
+    public void ChaCha20_DifferentChunkIndex_DifferentCiphertext()
+    {
+        // 修正前: ノンスがマスター鍵から固定 → 全チャンク同一暗号文
+        // 修正後: HKDF で sectorIndex からノンス派生 → 各チャンクで異なる暗号文
+        byte[] key = MasterKey();
+        byte[] plain = RandomNumberGenerator.GetBytes(64); // 4 セクタ分
+        const int sectorSize = 4096;
+        const int chunkSize = 4194304;
+
+        byte[] c0 = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.ChaCha20, 0, sectorSize, chunkSize, plain);
+        byte[] c1 = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.ChaCha20, 1, sectorSize, chunkSize, plain);
+
+        Assert.NotEqual(c0, c1);
+    }
+
+    [Fact]
+    public void ChaCha20_NonceIsUniquePerSector()
+    {
+        // 同じ平文・同じ鍵で sectorIndex のみ異なる → 暗号文が異なる（ECB 化していないこと）
+        byte[] key = MasterKey();
+        byte[] plain = new byte[16]; // 1 セクタ
+        const int sectorSize = 4096;
+        const int chunkSize = 4194304;
+
+        byte[] c0 = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.ChaCha20, 0, sectorSize, chunkSize, plain);
+        byte[] c1 = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.ChaCha20, 0, sectorSize, chunkSize, plain);
+
+        // 同じ sectorIndex + 同じ平文 → 同じ暗号文（決定論的）
+        Assert.Equal(c0, c1);
+
+        // sectorIndex を変えると暗号文も変わる
+        byte[] c2 = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.ChaCha20, 1, sectorSize, chunkSize, plain);
+        Assert.NotEqual(c0, c2);
+    }
+
+    [Fact]
+    public void ChaCha20_DecryptRecoversPlaintext()
+    {
+        // 暗号化したものを復号して元に戻ることを確認
+        byte[] key = MasterKey();
+        byte[] plain = RandomNumberGenerator.GetBytes(64);
+        const int sectorSize = 4096;
+        const int chunkSize = 4194304;
+
+        byte[] cipher = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.ChaCha20, 0, sectorSize, chunkSize, plain);
+        byte[] dec = ChunkEncryptor.DecryptChunk(key, CipherAlgorithm.ChaCha20, 0, sectorSize, chunkSize, cipher, plain.Length);
+
+        Assert.Equal(plain, dec);
     }
 }

@@ -97,7 +97,36 @@ public sealed class LocalStorageProvider : IStorageProvider
         // ファイルベースロックは IDisposable で自動解放されるため、ここでは何もしない
     }
 
-    private string ToFullPath(string blobPath) => Path.Combine(_basePath, blobPath.Replace('/', Path.DirectorySeparatorChar));
+    /// <summary>
+    /// blobPath を <see cref="_basePath"/> 配下に解決する。
+    /// パストラバーサルを防ぐため、絶対パス・".." セグメント・ベース外パスを拒否する。
+    /// </summary>
+    private string ToFullPath(string blobPath)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(blobPath);
+
+        // 1. 絶対パスや ".." を含むパスを拒否（Path.Combine の第二引数絶対パス上書き攻撃を防ぐ）
+        if (Path.IsPathRooted(blobPath))
+            throw new UnauthorizedAccessException("絶対パスは使用できません。");
+        if (blobPath.Contains("..", StringComparison.Ordinal))
+            throw new UnauthorizedAccessException("相対親参照 (..) は使用できません。");
+
+        // 2. 正規化してベース配下であることを確認
+        var normalized = Path.GetFullPath(
+            Path.Combine(_basePath, blobPath.Replace('/', Path.DirectorySeparatorChar)));
+        var baseFull = Path.GetFullPath(_basePath)
+            .TrimEnd(Path.DirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        var normalizedNoSep = normalized.TrimEnd(Path.DirectorySeparatorChar);
+        var baseFullNoSep = Path.GetFullPath(_basePath).TrimEnd(Path.DirectorySeparatorChar);
+
+        if (!normalized.StartsWith(baseFull, StringComparison.Ordinal)
+            && !string.Equals(normalizedNoSep, baseFullNoSep, StringComparison.Ordinal))
+        {
+            throw new UnauthorizedAccessException("パスがベースディレクトリ外です。");
+        }
+        return normalized;
+    }
 
     private static void ListRecursive(string dir, string basePath, List<string> results)
     {

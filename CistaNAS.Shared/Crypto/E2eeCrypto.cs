@@ -1,7 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 
-namespace CistaNAS.Client.Crypto;
+namespace CistaNAS.Shared.Crypto;
 
 /// <summary>
 /// E2EE チャンク暗号化。AES-256-GCM および ChaCha20-Poly1305 をサポート。

@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using CistaNAS.Web.Configuration;
-using CistaNAS.Web.Crypto;
+using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Identity;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Storage;
@@ -506,7 +506,7 @@ public sealed class VolumeService : IDisposable
             if (!group.Members.Any(m => string.Equals(m.Username, ownerUsername, StringComparison.Ordinal)))
                 throw new VolumeException($"ユーザー '{ownerUsername}' はグループ '{groupName}' のメンバーではありません。");
 
-            string volName = $"group__{groupName}";
+            string volName = $"{VolumeHeader.GroupPrefix}{groupName}";
             if (await _metaStore.ExistsAsync(volName))
                 throw new VolumeException($"グループボリューム '{volName}' は既に存在します。");
 
@@ -529,7 +529,7 @@ public sealed class VolumeService : IDisposable
     public async Task<IReadOnlyList<VolumeInfo>> GetGroupE2eeVolumesAsync(string groupName)
     {
         var result = new List<VolumeInfo>();
-        string prefix = $"group__{groupName}";
+        string prefix = $"{VolumeHeader.GroupPrefix}{groupName}";
         var volumeNames = await _metaStore.ListVolumeNamesAsync();
 
         foreach (var name in volumeNames)
@@ -553,7 +553,7 @@ public sealed class VolumeService : IDisposable
             throw new VolumeException("E2EE ボリュームではありません。");
 
         // group__ プレフィックスからグループ名を抽出
-        string groupName = volumeName.StartsWith("group__", StringComparison.Ordinal)
+        string groupName = volumeName.StartsWith(VolumeHeader.GroupPrefix, StringComparison.Ordinal)
             ? volumeName[7..] : "";
         if (string.IsNullOrEmpty(groupName))
             throw new VolumeException("グループボリュームではありません。");
@@ -598,13 +598,22 @@ public sealed class VolumeService : IDisposable
     /// <summary>ユーザーのクオータを設定する（ボリュームオーナーのみ）。</summary>
     public async Task SetUserQuotaAsync(string volumeName, string targetUsername, long maxBytes)
     {
-        var header = await LoadHeaderOrThrowAsync(volumeName);
-        header.UserQuotas[targetUsername] = maxBytes;
-        await _metaStore.SaveAsync(volumeName, header);
+        // _mountGate で並行 MountAsync / ヘッダ更新との競合を防ぐ (H-4)
+        await _mountGate.WaitAsync();
+        try
+        {
+            var header = await LoadHeaderOrThrowAsync(volumeName);
+            header.UserQuotas[targetUsername] = maxBytes;
+            await _metaStore.SaveAsync(volumeName, header);
 
-        // マウント済みの場合、メモリ上の Header も更新
-        if (_mounted.TryGetValue(volumeName, out var mv))
-            mv.Header.UserQuotas[targetUsername] = maxBytes;
+            // マウント済みの場合、メモリ上の Header も更新
+            if (_mounted.TryGetValue(volumeName, out var mv))
+                mv.Header.UserQuotas[targetUsername] = maxBytes;
+        }
+        finally
+        {
+            _mountGate.Release();
+        }
     }
 
     // ---- ボリューム削除 ----
@@ -717,7 +726,7 @@ public sealed class VolumeService : IDisposable
             h.UserKeys.Keys.ToList(), h.EncryptionMode,
             h.CipherAlgorithm, h.KeySize,
             h.AuthorizedGroups.ToList(),
-            name.StartsWith("home__", StringComparison.Ordinal),
+            name.StartsWith(VolumeHeader.HomePrefix, StringComparison.Ordinal),
             wrapTypes);
     }
 
@@ -756,9 +765,9 @@ public sealed class VolumeService : IDisposable
     private static void ValidateName(string name)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
-        if (name.StartsWith("home__", StringComparison.Ordinal))
+        if (name.StartsWith(VolumeHeader.HomePrefix, StringComparison.Ordinal))
             throw new VolumeException("'home__' で始まる名前は予約されています。");
-        if (name.StartsWith("group__", StringComparison.Ordinal))
+        if (name.StartsWith(VolumeHeader.GroupPrefix, StringComparison.Ordinal))
             throw new VolumeException("'group__' で始まる名前は予約されています。グループボリュームは別途作成してください。");
         if (name.Length > 64)
             throw new VolumeException("ボリューム名は 64 文字以内にしてください。");

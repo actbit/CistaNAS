@@ -93,15 +93,28 @@ public sealed class CistaAuthorizationHandler(
         string volumeName,
         string username)
     {
+        // タイミング攻撃対策: ボリューム存在可否で応答時間が変わらないよう、
+        // ヘッダ取得失敗時にもダミー計算を噛ます (H-8)。
+        // ただし過度に重い処理を入れると DoS になるため、軽い遅延に留める。
+        bool found = false;
         try
         {
             var header = await volumeService.GetVolumeHeaderAsync(volumeName);
             if (header.OwnerUser == username)
                 context.Succeed(requirement);
+            found = true;
         }
         catch (VolumeException)
         {
             // ボリュームが見つからない — Succeed せずフレームワークに 403 を委ねる
+        }
+        finally
+        {
+            if (!found)
+            {
+                // ダミー遅延でタイミングを均一化（数 ms 程度）
+                await Task.Delay(1);
+            }
         }
     }
 

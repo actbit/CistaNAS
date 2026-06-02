@@ -15,7 +15,25 @@ namespace CistaNAS.Web.Services;
 /// </summary>
 public sealed class E2eeFileService
 {
+    /// <summary>チャンク先頭に付与される salt のサイズ（バイト）。</summary>
+    public const int SaltSize = 16;
+    /// <summary>AES-GCM 認証タグのサイズ（バイト）。</summary>
+    public const int TagSize = 16;
+
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+
+    /// <summary>
+    /// E2EE 暗号化後のサイズを計算する pure 関数。
+    /// 構造: [salt(16)] + [チャンク 0..n-1: 平文 + tag(16)]
+    /// </summary>
+    public static long ComputeEncryptedLength(long plainSize, int chunkSize)
+    {
+        if (plainSize < 0) throw new ArgumentOutOfRangeException(nameof(plainSize));
+        if (chunkSize <= 0) throw new ArgumentOutOfRangeException(nameof(chunkSize));
+        if (plainSize == 0) return SaltSize + TagSize;
+        long chunks = (plainSize + chunkSize - 1) / chunkSize;
+        return SaltSize + plainSize + chunks * TagSize;
+    }
 
     private readonly VolumeService _volumeService;
     private readonly IStorageProvider _storage;
@@ -107,9 +125,11 @@ public sealed class E2eeFileService
             if (chunkIndex < 0 || chunkIndex >= entry.ChunkCount)
                 throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です（0-{entry.ChunkCount - 1}）。");
 
-            // 順不同アップロードの検出: 前のチャンクが未完了なら拒否
-            if (chunkIndex > 0 && entry.ChunkSizes.Count < chunkIndex)
-                throw new FileServiceException($"チャンク {chunkIndex - 1} が未アップロードです。順番にアップロードしてください。");
+            // 順不同アップロードの厳密検出: 現在のチャンクインデックスが、
+            // これまでにアップロード済みのチャンク数と一致しない場合は拒否。
+            // 同じ chunkIndex の二重アップロードもここで弾く。
+            if (entry.ChunkSizes.Count != chunkIndex)
+                throw new FileServiceException($"チャンク {chunkIndex} は順番にアップロードしてください（期待インデックス: {entry.ChunkSizes.Count}）。");
 
             if (IsChunkMode(volumeName))
             {
@@ -170,6 +190,7 @@ public sealed class E2eeFileService
 
         var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
         var readLock = await gate.EnterReadAsync(ct);
+
         try
         {
             var catalog = await LoadCatalogAsync(volumeName, ct);
@@ -198,16 +219,8 @@ public sealed class E2eeFileService
 
             string dataPath = GetDataPath(volumeName);
             var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            try
-            {
-                fs.Seek(chunkOffset, SeekOrigin.Begin);
-                return (new GateReadStream(new SubStream(fs, chunkLength), readLock), chunkLength);
-            }
-            catch
-            {
-                fs.Dispose();
-                throw;
-            }
+            fs.Seek(chunkOffset, SeekOrigin.Begin);
+            return (new GateReadStream(new SubStream(fs, chunkLength), readLock), chunkLength);
         }
         catch
         {
@@ -306,10 +319,19 @@ public sealed class E2eeFileService
         var catalog = await LoadCatalogAsync(volumeName, ct);
         var header = _volumeService.GetMounted(volumeName).Header;
 
-        long totalUsed = catalog.Files.Values.Sum(f => Math.Max(0, f.EncryptedLength - 16L - (long)f.ChunkCount * 16));
+        long totalUsed = catalog.Files.Values.Sum(f =>
+        {
+            // 平文サイズ = 暗号化長 - (salt + chunk数*tag) で逆算
+            long plain = f.EncryptedLength - (long)E2eeFileService.SaltSize - (long)f.ChunkCount * E2eeFileService.TagSize;
+            return Math.Max(0, plain);
+        });
         long userUsed = catalog.Files.Values
             .Where(f => f.OwnerUsername == username || string.IsNullOrEmpty(f.OwnerUsername))
-            .Sum(f => Math.Max(0, f.EncryptedLength - 16L - (long)f.ChunkCount * 16));
+            .Sum(f =>
+            {
+                long plain = f.EncryptedLength - (long)E2eeFileService.SaltSize - (long)f.ChunkCount * E2eeFileService.TagSize;
+                return Math.Max(0, plain);
+            });
         long quota = header.UserQuotas.TryGetValue(username, out var q) ? q : 0;
         int totalFiles = catalog.Files.Count;
         int userFiles = catalog.Files.Values

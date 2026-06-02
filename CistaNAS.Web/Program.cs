@@ -203,6 +203,37 @@ using (var initScope = app.Services.CreateAsyncScope())
     var storage = initScope.ServiceProvider.GetRequiredService<IStorageProvider>();
     var logger = initScope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("DataMigration");
     await DataMigrationService.MigrateIfNeededAsync(storage, db, logger);
+
+    // 暗号化設定（VolumeOptions / AuthOptions）を DataRoot/cista-settings.json から読み込み
+    // 旧: Pages/Settings.razor が appsettings.json を直接書き換えていた
+    // 新: 専用ファイルで永続化、起動時に自動ロード (H-6)
+    var settingsSvc = initScope.ServiceProvider.GetRequiredService<EncryptionSettingsService>();
+    settingsSvc.LoadFromDiskIfExists();
+
+    // ジャーナル復旧: 前回クラッシュで未コミットになったエントリを警告ログ出力
+    var journalService = initScope.ServiceProvider.GetRequiredService<JournalService>();
+    var journalLogger = initScope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("JournalRecovery");
+    try
+    {
+        var metaStore = initScope.ServiceProvider.GetRequiredService<VolumeMetadataStore>();
+        var volumeNames = await metaStore.ListVolumeNamesAsync();
+        foreach (var volName in volumeNames)
+        {
+            if (await journalService.HasPendingAsync(volName))
+            {
+                var pending = await journalService.RecoverAsync(volName);
+                journalLogger.LogWarning(
+                    "ボリューム '{Volume}' に未コミットジャーナル {Count} 件を検出。前回クラッシュの可能性があります。",
+                    volName, pending.Count);
+                // 復旧は該当ボリュームの FileService 経路で再試行されるべきだが、
+                // ここでは警告ログ出力のみ（破損データの上書きを防ぐため自動再構築はしない）
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        journalLogger.LogError(ex, "ジャーナル復旧に失敗しました。");
+    }
 }
 
 // ---- シャットダウン時に CloudSqliteSync をアップロード ----

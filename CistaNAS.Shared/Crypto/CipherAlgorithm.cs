@@ -1,4 +1,4 @@
-namespace CistaNAS.Web.Crypto;
+namespace CistaNAS.Shared.Crypto;
 
 /// <summary>暗号化アルゴリズム。</summary>
 public enum CipherAlgorithm

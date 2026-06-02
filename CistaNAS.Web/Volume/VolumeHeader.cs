@@ -1,7 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using CistaNAS.Web.Crypto;
+using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Models;
 
 namespace CistaNAS.Web.Volume;
@@ -17,6 +17,11 @@ public sealed class VolumeHeader
     private const int GcmTagSize = 16;
     private const int GcmNonceSize = 12;
     private const int KekSize = 32;
+
+    /// <summary>ホームボリューム名のプレフィックス。例: "home__alice"。</summary>
+    public const string HomePrefix = "home__";
+    /// <summary>グループボリューム名のプレフィックス。例: "group__engineering"。</summary>
+    public const string GroupPrefix = "group__";
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 

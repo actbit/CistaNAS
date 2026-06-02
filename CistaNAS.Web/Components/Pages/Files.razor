@@ -456,6 +456,7 @@ else
     private async Task HandleE2eeUnlock()
     {
         _e2eeUnlocking = true; _e2eeError = null;
+        string? kekHandle = null;
         try
         {
             var (_, header) = VolumeSvc.GetMounted(VolumeName);
@@ -467,13 +468,15 @@ else
             }
 
             string saltB64 = Convert.ToBase64String(userKey.Kdf.Salt);
-            string kekHandle = await E2ee.DeriveKek(_e2eePassword, saltB64, userKey.Kdf.Iterations);
+            kekHandle = await E2ee.DeriveKek(_e2eePassword, saltB64, userKey.Kdf.Iterations);
             string nonceB64 = Convert.ToBase64String(userKey.WrappedMasterKey.Nonce);
             string ctB64 = Convert.ToBase64String(userKey.WrappedMasterKey.Ciphertext);
             string tagB64 = Convert.ToBase64String(userKey.WrappedMasterKey.Tag);
 
             _masterKeyHandle = await E2ee.UnwrapMasterKey(nonceB64, ctB64, tagB64, kekHandle);
+            // アンラップ成功後に KEK をクリアし、変数を null にして finally での再試行を防ぐ
             await E2ee.ClearKey(kekHandle);
+            kekHandle = null;
 
             _e2eeUnlocked = true;
             _e2eePassword = "";
@@ -482,8 +485,22 @@ else
         catch (Exception ex)
         {
             _e2eeError = $"ロック解除失敗: {ex.Message}";
+            // 失敗時はマスターキーハンドルも必ず破棄
+            if (_masterKeyHandle is not null)
+            {
+                try { await E2ee.ClearKey(_masterKeyHandle); } catch { /* 握りつぶし */ }
+                _masterKeyHandle = null;
+            }
         }
-        _e2eeUnlocking = false;
+        finally
+        {
+            // 異常系で残った KEK ハンドルを必ずクリア（鍵残留によるエクスポート攻撃を防ぐ）
+            if (kekHandle is not null)
+            {
+                try { await E2ee.ClearKey(kekHandle); } catch { /* 握りつぶし */ }
+            }
+            _e2eeUnlocking = false;
+        }
     }
 
     // ---- E2EE ファイル一覧 ----
@@ -547,7 +564,8 @@ else
             int totalChunks = (int)((totalSize + chunkSize - 1) / chunkSize);
             if (totalChunks == 0) totalChunks = 1;
 
-            long estimatedLength = 16 + (long)totalChunks * (chunkSize + 16);
+            // E2eeFileService.ComputeEncryptedLength で一元管理された計算式を使う（salt + chunk ごとの tag）
+            long estimatedLength = E2eeComputeEncryptedLength(totalSize, chunkSize);
             var entry = await E2eeFileSvc.CreateFileAsync(VolumeName, new E2eeCreateFileRequest(encName, estimatedLength, totalChunks), CurrentUsername);
 
             long bytesRemaining = totalSize;
@@ -583,19 +601,30 @@ else
 
     private async Task HandleE2eeDownload(E2eeFileViewItem item)
     {
+        // ファイルサイズ推定（チャンク数 × 1MB - オーバーヘッド）
+        long estimatedSize = (long)item.Entry.ChunkCount * 1048576L;
+        const int LargeFileThreshold = 50 * 1024 * 1024; // 50MB
+
+        if (estimatedSize > LargeFileThreshold)
+        {
+            _operationError = $"ファイルサイズが大きいためブラウザでのダウンロードが制限されています（推定{FormatSize(estimatedSize)}）。Dokanクライアントを使用してください。";
+            return;
+        }
+
         item.Downloading = true;
         try
         {
             var entry = item.Entry;
-            using var ms = new MemoryStream();
+            var decryptedChunks = new List<byte[]>(item.Entry.ChunkCount);
             string? fileSaltB64 = null;
 
             for (int i = 0; i < entry.ChunkCount; i++)
             {
                 var (chunkStream, chunkLen) = await E2eeFileSvc.DownloadChunkAsync(VolumeName, entry.FileId, i);
-                byte[] encData = new byte[chunkLen];
+                byte[] encData = null!;
                 using (chunkStream)
                 {
+                    encData = new byte[chunkLen];
                     int read = 0;
                     while (read < chunkLen)
                     {
@@ -613,11 +642,29 @@ else
                 }
 
                 string encB64 = Convert.ToBase64String(encData);
+                // encData はもう不要なので GC に解放を促す
+                Array.Clear(encData, 0, encData.Length);
+
                 byte[] plainBytes = await E2ee.DecryptChunk(encB64, _masterKeyHandle!, i, fileSaltB64 ?? "");
-                await ms.WriteAsync(plainBytes);
+                decryptedChunks.Add(plainBytes);
             }
 
-            var base64 = Convert.ToBase64String(ms.ToArray());
+            // すべてのチャンクを結合して一度だけBase64化
+            int totalLength = 0;
+            foreach (var chunk in decryptedChunks)
+                totalLength += chunk.Length;
+
+            byte[] combined = new byte[totalLength];
+            int offset = 0;
+            foreach (var chunk in decryptedChunks)
+            {
+                Buffer.BlockCopy(chunk, 0, combined, offset, chunk.Length);
+                offset += chunk.Length;
+                // チャンクを解放してメモリを節約
+                Array.Clear(chunk, 0, chunk.Length);
+            }
+
+            var base64 = Convert.ToBase64String(combined);
             await JS.InvokeVoidAsync("cistaDownload", item.PlainName, base64, "application/octet-stream");
         }
         catch (Exception ex)
@@ -677,6 +724,10 @@ else
         < 1024 * 1024 * 1024 => $"{bytes / (1024.0 * 1024):F1} MB",
         _ => $"{bytes / (1024.0 * 1024 * 1024):F2} GB",
     };
+
+    /// <summary>E2EE 暗号化後のサイズを E2eeFileService.ComputeEncryptedLength に委譲（計算式の一元管理）。</summary>
+    private static long E2eeComputeEncryptedLength(long plainSize, int chunkSize)
+        => E2eeFileService.ComputeEncryptedLength(plainSize, chunkSize);
 
     private class E2eeFileViewItem
     {

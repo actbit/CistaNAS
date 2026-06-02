@@ -3,7 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 
-namespace CistaNAS.Client.Crypto;
+namespace CistaNAS.Shared.Crypto;
 
 /// <summary>
 /// ChaCha20-Poly1305 AEAD 暗号化アルゴリズム実装。

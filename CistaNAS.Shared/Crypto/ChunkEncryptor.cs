@@ -1,7 +1,8 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
+using System.Text;
 
-namespace CistaNAS.Web.Crypto;
+namespace CistaNAS.Shared.Crypto;
 
 /// <summary>
 /// チャンク単位の暗号化ヘルパー。
@@ -121,25 +122,35 @@ public static class ChunkEncryptor
     }
 
     /// <summary>ChaCha20 暗号化（サーバー側実装）。</summary>
+    /// <remarks>
+    /// ノンスは HKDF で sectorIndex から導出する（ボリューム内・ボリューム間で衝突しない）。
+    /// カウンタは 0 固定（各セクタは 16 バイト = ChaCha20 ブロック 1 個分）。
+    /// </remarks>
     private static void ChaCha20Encrypt(ReadOnlySpan<byte> masterKey, long firstSector, byte[] data, int sectorSize)
     {
         const int SectorSize = 16;
-        const int BlockSize = 64;
         const int NonceSize = 12;
-
-        // ノンス生成（マスターキーから派生）
-        byte[] nonce = new byte[NonceSize];
-        Buffer.BlockCopy(masterKey.ToArray(), 0, nonce, 0, Math.Min(NonceSize, masterKey.Length));
+        const string NonceInfo = "cista-chacha20-nonce/v1";
 
         int sectorCount = data.Length / SectorSize;
+        if (sectorCount == 0) return;
+
+        byte[] keyArr = masterKey.ToArray();
+        byte[] sectorIndexBytes = new byte[8];
+        byte[] nonce = new byte[NonceSize];
+        byte[] infoBytes = Encoding.ASCII.GetBytes(NonceInfo);
+
         for (int s = 0; s < sectorCount; s++)
         {
             long sectorIndex = firstSector + s;
             int sectorOffset = s * SectorSize;
 
-            // ChaCha20 暗号化（セクタインデックスをカウンタとして使用）
-            uint counter = (uint)(sectorIndex * (SectorSize / BlockSize));
-            ChaCha20EncryptCore(masterKey.ToArray(), nonce, counter, data.AsSpan(sectorOffset, SectorSize));
+            // HKDF(masterKey, salt=sectorIndex) → 12 バイトノンス
+            BinaryPrimitives.WriteInt64LittleEndian(sectorIndexBytes, sectorIndex);
+            // 注: HKDF.DeriveKey の引数順は (ikm, output, salt, info)
+            HKDF.DeriveKey(HashAlgorithmName.SHA256, keyArr, nonce, sectorIndexBytes, infoBytes);
+
+            ChaCha20EncryptCore(keyArr, nonce, counter: 0, data.AsSpan(sectorOffset, SectorSize));
         }
     }
 

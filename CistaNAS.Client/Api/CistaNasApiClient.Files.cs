@@ -92,6 +92,20 @@ public static class CistaNasApiClientFiles
         res.EnsureSuccessStatusCode();
     }
 
+    /// <summary>ファイルの一部をダウンロードする（Range リクエスト対応）。</summary>
+    public static async Task<byte[]> DownloadFileRangeAsync(this CistaNasApiClient client, string volumeName, string filePath, long offset, int count)
+    {
+        var http = GetHttp(client);
+        using var request = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Get,
+            $"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(filePath)}");
+        request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(offset, offset + count - 1);
+        var res = await http.SendAsync(request, System.Net.Http.HttpCompletionOption.ResponseContentRead);
+        if (res.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
+            return Array.Empty<byte>();
+        res.EnsureSuccessStatusCode();
+        return await res.Content.ReadAsByteArrayAsync();
+    }
+
     private static HttpClient GetHttp(CistaNasApiClient client)
     {
         var field = typeof(CistaNasApiClient).GetField("_http", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)

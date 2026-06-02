@@ -1,5 +1,5 @@
 using System.Security.Cryptography;
-using CistaNAS.Web.Crypto;
+using CistaNAS.Shared.Crypto;
 
 namespace CistaNAS.Tests;
 

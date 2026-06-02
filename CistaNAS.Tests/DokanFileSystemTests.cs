@@ -263,4 +263,81 @@ public class DokanFileSystemTests
         long encLength = 16L + plainLength + chunkCount * 16;
         Assert.Equal(16 + 2500000 + 48, encLength);
     }
+
+    // ====================================================================
+    // FileCache スレッド安全性テスト
+    // ====================================================================
+
+    [Fact]
+    public void FileCache_SetFileKey_ThreadSafe()
+    {
+        var cache = new CistaNasFileSystem.FileCache();
+        byte[] key1 = { 1, 2, 3, 4 };
+        byte[] key2 = { 5, 6, 7, 8 };
+
+        // 複数スレッドから同時に SetFileKey を呼び出す
+        Parallel.For(0, 100, i =>
+        {
+            byte[] key = i % 2 == 0 ? key1 : key2;
+            cache.SetFileKey(key);
+        });
+
+        // 最初に設定されたキーが保持されているはず（二重設定は無視される）
+        Assert.True(cache.TryGetFileKey(out var retrievedKey));
+        Assert.Equal(key1, retrievedKey);
+    }
+
+    [Fact]
+    public void FileCache_TryGetFileKey_ThreadSafe()
+    {
+        var cache = new CistaNasFileSystem.FileCache();
+        byte[] key = { 1, 2, 3, 4 };
+
+        // 複数スレッドから同時に TryGetFileKey を呼び出す
+        var results = new ConcurrentBag<bool>();
+        Parallel.For(0, 100, i =>
+        {
+            if (i == 50)
+                cache.SetFileKey(key);
+            bool hasKey = cache.TryGetFileKey(out _);
+            results.Add(hasKey);
+        });
+
+        // SetFileKey 前は false、後は true が混在しているはず
+        Assert.True(results.Contains(true));
+        Assert.True(results.Contains(false));
+    }
+
+    [Fact]
+    public void FileCache_ParallelChunkAccess_ThreadSafe()
+    {
+        var cache = new CistaNasFileSystem.FileCache();
+        byte[] key = { 1, 2, 3, 4 };
+        cache.SetFileKey(key);
+
+        var exceptions = new ConcurrentBag<Exception>();
+
+        // 複数スレッドから同時にチャンク操作を行う
+        Parallel.For(0, 100, i =>
+        {
+            try
+            {
+                // チャンクを書き込み
+                byte[] data = { (byte)i };
+                cache.PutChunk(i % 20, data);
+
+                // チャンクを読み込み
+                cache.TryGetChunk(i % 20, out _);
+
+                // FileKey を読み込み
+                cache.TryGetFileKey(out _);
+            }
+            catch (Exception ex)
+            {
+                exceptions.Add(ex);
+            }
+        });
+
+        Assert.Empty(exceptions);
+    }
 }

@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using CistaNAS.Client.Api;
-using CistaNAS.Client.Crypto;
+using CistaNAS.Shared.Crypto;
 using DokanNet;
 
 namespace CistaNAS.Client.Services;

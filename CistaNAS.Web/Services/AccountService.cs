@@ -1,4 +1,5 @@
 using CistaNAS.Web.Identity;
+using CistaNAS.Web.Volume;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -67,7 +68,7 @@ public sealed class AccountService(
         {
             await using var scope = scopeFactory.CreateAsyncScope();
             var volumeService = scope.ServiceProvider.GetRequiredService<VolumeService>();
-            string homeName = $"home__{username}";
+            string homeName = $"{VolumeHeader.HomePrefix}{username}";
             await volumeService.CreateInternalAsync(homeName, username, password: null, encrypted: false);
         }
         catch (Exception ex)
@@ -100,7 +101,7 @@ public sealed class AccountService(
         {
             await using var scope = scopeFactory.CreateAsyncScope();
             var volumeService = scope.ServiceProvider.GetRequiredService<VolumeService>();
-            await volumeService.DeleteVolumeAsync($"home__{username}", username: null);
+            await volumeService.DeleteVolumeAsync($"{VolumeHeader.HomePrefix}{username}", username: null);
         }
         catch (Exception ex)
         {
@@ -192,7 +193,7 @@ public sealed class AccountService(
         if (!result.Succeeded)
             return false;
 
-        // KEK 再ラップ（スコープ外で実行）
+        // KEK 再ラップ（失敗時は Identity 側のパスワードを旧値にロールバック）(H-5)
         try
         {
             await using var scope = scopeFactory.CreateAsyncScope();
@@ -201,7 +202,26 @@ public sealed class AccountService(
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "パスワード変更後の KEK 再ラップに失敗しました（ユーザー: {Username}）。", username);
+            logger.LogError(ex, "パスワード変更後の KEK 再ラップに失敗しました（ユーザー: {Username}）。Identity パスワードを旧値にロールバックします。", username);
+            try
+            {
+                // 一部ボリュームは新パスワードでしかアンラップできない状態になっている可能性があるため、
+                // Identity 側のパスワードを旧値に戻し、ユーザーが再ログインして整合を取れるようにする。
+                // ただし既に新パスワードで変更されたボリュームは旧値では開けない旨をログで明示。
+                var rollbackResult = await userManager.ChangePasswordAsync(user, newPassword, oldPassword);
+                if (!rollbackResult.Succeeded)
+                {
+                    logger.LogCritical(
+                        "Identity パスワードのロールバックにも失敗しました（ユーザー: {Username}）。手動復旧が必要です: {Errors}",
+                        username, string.Join(", ", rollbackResult.Errors));
+                }
+            }
+            catch (Exception rollbackEx)
+            {
+                logger.LogCritical(rollbackEx,
+                    "Identity パスワードのロールバック中に例外（ユーザー: {Username}）。手動復旧が必要です。", username);
+            }
+            return false;  // 一貫性が壊れている可能性があるため失敗を返す
         }
 
         return true;

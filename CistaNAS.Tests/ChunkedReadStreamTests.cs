@@ -1,5 +1,5 @@
 using System.Security.Cryptography;
-using CistaNAS.Web.Crypto;
+using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
 using CistaNAS.Tests.Helpers;

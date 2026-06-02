@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using CistaNAS.Web.Configuration;
-using CistaNAS.Web.Crypto;
+using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Journal;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Storage;
@@ -46,37 +46,56 @@ internal sealed class AsyncFileGate : IDisposable
     /// <summary>書き込みロックを取得。全読み取りの完了を即時通知で待機。戻り値の IDisposable で解放。</summary>
     public async Task<IDisposable> EnterWriteAsync(CancellationToken ct)
     {
-        await _gate.WaitAsync(ct);
-        Volatile.Write(ref _writerWaiting, 1);
-        while (_readerCount > 0)
+        // 入口でキャンセル要求をチェックし、_writerWaiting を残さないように。
+        // 戻り時の例外パスでも _writerWaiting を必ず 0 に戻す。
+        bool writerWaitingSet = false;
+        try
         {
-            // TCS を作成（gate 保持中）してから二重チェック
-            _readersCompletedTcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
-            if (Volatile.Read(ref _readerCount) == 0)
-            {
-                // 二重チェック: 待機中に全リーダーが完了 → 即時突破
-                _readersCompletedTcs = null;
-                break;
-            }
-            _gate.Release();
-            try
-            {
-                using var reg = ct.Register(static state => ((TaskCompletionSource<object?>)state!).TrySetCanceled(), _readersCompletedTcs);
-                await _readersCompletedTcs.Task;
-            }
-            catch
-            {
-                // キャンセル時は _writerWaiting をリセット
-                // 注: gate は既に while ループ内で Release 済み。再 Release しないこと。
-                Volatile.Write(ref _writerWaiting, 0);
-                _readersCompletedTcs = null;
-                throw;
-            }
             await _gate.WaitAsync(ct);
+            Volatile.Write(ref _writerWaiting, 1);
+            writerWaitingSet = true;
+            while (_readerCount > 0)
+            {
+                // TCS を作成（gate 保持中）してから二重チェック
+                _readersCompletedTcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (Volatile.Read(ref _readerCount) == 0)
+                {
+                    // 二重チェック: 待機中に全リーダーが完了 → 即時突破
+                    _readersCompletedTcs = null;
+                    break;
+                }
+                _gate.Release();
+                try
+                {
+                    using var reg = ct.Register(static state => ((TaskCompletionSource<object?>)state!).TrySetCanceled(), _readersCompletedTcs);
+                    await _readersCompletedTcs.Task;
+                }
+                catch
+                {
+                    // キャンセル時は _writerWaiting をリセット
+                    // 注: gate は既に while ループ内で Release 済み。再 Release しないこと。
+                    Volatile.Write(ref _writerWaiting, 0);
+                    writerWaitingSet = false;
+                    _readersCompletedTcs = null;
+                    throw;
+                }
+                await _gate.WaitAsync(ct);
+            }
+            _readersCompletedTcs = null;
+            // _gate を保持したまま返す → ExitWrite で解放
+            return new WriteReleaser(this);
         }
-        _readersCompletedTcs = null;
-        // _gate を保持したまま返す → ExitWrite で解放
-        return new WriteReleaser(this);
+        catch
+        {
+            // 外側のリトライ中の _gate.WaitAsync(ct) がキャンセルされた場合や
+            // 入口で即時キャンセルされた場合に _writerWaiting を必ずリセットする。
+            if (writerWaitingSet)
+            {
+                Volatile.Write(ref _writerWaiting, 0);
+                writerWaitingSet = false;
+            }
+            throw;
+        }
     }
 
     private void ExitRead()
@@ -129,6 +148,11 @@ internal sealed class AsyncFileGate : IDisposable
 public sealed class FileService
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    // 注: 以下の static フィールドは意図的にプロセス全体で共有。
+    // FileService は Scoped 登録だが、Singleton な VolumeService と相互作用し、
+    // Scoped の寿命が終わっても別リクエストから参照される可能性があるため、
+    // 状態 (catalog lock / stream lock / file gate) は static に保持する。
+    // メモリリーク防止のため、DeleteVolumeAsync / CleanupVolumeGates で明示的に解放する。
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _catalogLocks = new(StringComparer.Ordinal);
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _streamLocks = new(StringComparer.Ordinal);
 
