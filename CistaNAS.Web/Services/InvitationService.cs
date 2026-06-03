@@ -46,7 +46,7 @@ public sealed class InvitationService : BackgroundService
         return record;
     }
 
-    /// <summary>招待の受諾データを保存。</summary>
+    /// <summary>招待の受諾データを保存（1 回限り）。再利用を防止。</summary>
     public void SetAcceptedData(string invitationId, string encryptedPublicKey, string nonce)
     {
         ArgumentException.ThrowIfNullOrEmpty(invitationId);
@@ -54,6 +54,8 @@ public sealed class InvitationService : BackgroundService
         ArgumentException.ThrowIfNullOrEmpty(nonce);
         if (!_invitations.TryGetValue(invitationId.ToLowerInvariant(), out var record))
             throw new InvalidOperationException("招待が見つかりません。");
+        if (record.AcceptedAt.HasValue)
+            throw new InvalidOperationException("この招待は既に使用されています。");
         record.EncryptedPublicKey = encryptedPublicKey;
         record.Nonce = nonce;
         record.AcceptedAt = DateTimeOffset.UtcNow;

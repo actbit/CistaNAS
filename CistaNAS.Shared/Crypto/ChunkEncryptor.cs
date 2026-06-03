@@ -253,13 +253,13 @@ public static class ChunkEncryptor
         return workingState;
     }
 
-    /// <summary>QuarterRound 関数。</summary>
+    /// <summary>QuarterRound 関数（RFC 7539 §2.1.1 準拠）。</summary>
     private static void QuarterRound(uint[] x, int a, int b, int c, int d)
     {
-        x[a] += x[d]; x[b] = RotateLeft(x[b] ^ x[a], 16);
-        x[c] += x[b]; x[d] = RotateLeft(x[d] ^ x[c], 12);
-        x[a] += x[d]; x[b] = RotateLeft(x[b] ^ x[a], 8);
-        x[c] += x[b]; x[d] = RotateLeft(x[d] ^ x[c], 7);
+        x[a] += x[b]; x[d] = RotateLeft(x[d] ^ x[a], 16);
+        x[c] += x[d]; x[b] = RotateLeft(x[b] ^ x[c], 12);
+        x[a] += x[b]; x[d] = RotateLeft(x[d] ^ x[a], 8);
+        x[c] += x[d]; x[b] = RotateLeft(x[b] ^ x[c], 7);
     }
 
     /// <summary>左ローテート。</summary>

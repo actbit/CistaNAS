@@ -296,16 +296,11 @@ public static class ChaCha20Poly1305
 
     /// <summary>
     /// Poly1305 コア: 16 バイトブロック単位で (h + c) * r mod (2^130 - 5) を計算。
-    /// c4 = 1 &lt;&lt; 24 = 2^24 が limb 表現での 2^128 ビットの役割（5 リム 130-bit）。
-    /// 最終 partial ブロックは 16 バイトにゼロパディングし末尾に 0x01 を置く。
-    /// </summary>
-    /// <summary>
-    /// Poly1305 コア: 16 バイトブロック単位で (h + c) * r mod (2^130 - 5) を計算。
     /// poly1305-donna と同じ 5 リム 26-bit limbs 表現。
     /// <para>
-    /// 重要な仕様 (poly1305-donna / RFC 7539 §2.5):
+    /// 重要な仕様 (poly1305-donna / RFC 8439 §2.5):
     /// ・非最終ブロック: 16 バイトのデータ + 2^128 (HIBIT) を加算
-    /// ・最終ブロック (partial): データ + 0x01 パディング + 0、2^128 は **加算しない**
+    /// ・最終ブロック (partial): データ + 0x01 パディング + 0、2^128 は加算しない
     /// </para>
     /// </summary>
     private static (uint h0, uint h1, uint h2, uint h3, uint h4) Poly1305Core(
@@ -359,8 +354,10 @@ public static class ChaCha20Poly1305
             uint c1 = (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(3, 4)) >> 2) & BIT_26;
             uint c2 = (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(6, 4)) >> 4) & BIT_26;
             uint c3 = (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(9, 4)) >> 6) & BIT_26;
+            // poly1305-donna 準拠: 非最終ブロックのみ HIBIT (2^128) をセット。
+            // 最終ブロックは 0x01 パディングのみ（RFC 8439 §2.5 の poly1305-donna 実装に従う）。
             uint c4 = isFinalBlock
-                ? (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(12, 4)) >> 8)  // hibit なし
+                ? (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(12, 4)) >> 8)
                 : (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(12, 4)) >> 8) | HIBIT;
 
             offset += blockSize;

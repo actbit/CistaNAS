@@ -133,12 +133,19 @@ public sealed class CistaAuthorizationHandler(
         try
         {
             var header = await volumeService.GetVolumeHeaderAsync(volumeName);
-            if (header.OwnerUser == username)
+            // タイミング攻撃対策: FixedTimeEquals を使用
+            bool match = CryptographicOperations.FixedTimeEquals(
+                Encoding.UTF8.GetBytes(header.OwnerUser ?? ""),
+                Encoding.UTF8.GetBytes(username));
+            if (match)
                 context.Succeed(requirement);
         }
         catch (VolumeException)
         {
             // ボリュームが見つからない
+            CryptographicOperations.FixedTimeEquals(
+                Encoding.UTF8.GetBytes(""),
+                Encoding.UTF8.GetBytes(username));
         }
     }
 

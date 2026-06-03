@@ -312,7 +312,8 @@ app.MapCistaNasApi(api);
 
 // ---- /dav : WebDAV ----
 var dav = app.MapGroup("/dav/{volumeName}")
-    .RequireAuthorization("AnyAuth");
+    .RequireAuthorization("AnyAuth")
+    .RequireRateLimiting("auth");
 
 dav.MapMethods("", ["OPTIONS"], (WebDavHandler h, HttpContext ctx) => h.OptionsAsync(ctx));
 dav.MapMethods("{*path}", ["PROPFIND"],

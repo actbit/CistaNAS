@@ -56,20 +56,19 @@ public sealed class VolumeService : IDisposable
     public async Task<VolumeInfo> CreateAsync(string name, string? username, string? password, bool encrypted = true)
     {
         ValidateName(name);
-        await _mountGate.WaitAsync();
-        try
-        {
-            return await CreateInternalAsync(name, username, password, encrypted);
-        }
-        finally
-        {
-            _mountGate.Release();
-        }
+        // CreateInternalAsync 内部で _mountGate を取得するため、ここでは取得しない
+        return await CreateInternalAsync(name, username, password, encrypted);
     }
 
     /// <summary>ホームボリューム等、内部用途の作成（home__ プレフィックスを許可）。</summary>
     public async Task<VolumeInfo> CreateInternalAsync(string name, string? username, string? password, bool encrypted = true)
     {
+        // 内部呼び出し（CreateUserAsync 等）では ValidateName をスキップ。
+        // home__ / group__ プレフィックスや長さ制限を許可する。
+        // CreateAsync 経由の場合は事前に ValidateName が呼ばれている。
+        await _mountGate.WaitAsync();
+        try
+        {
         // ユーザー設定を取得して暗号化モードとアルゴリズムを決定
         string cipherAlgorithm = "aes-256-xts";  // デフォルト
         bool shouldEncrypt = encrypted;
@@ -123,6 +122,11 @@ public sealed class VolumeService : IDisposable
         }
 
         return ToInfo(name, header, true);
+        }
+        finally
+        {
+            _mountGate.Release();
+        }
     }
 
     /// <summary>E2EE ボリュームを作成（クライアントから wrappedMasterKey を受け取る）。</summary>
@@ -304,6 +308,8 @@ public sealed class VolumeService : IDisposable
     {
         if (!_mounted.TryGetValue(name, out var mv))
             throw new VolumeException($"ボリューム '{name}' はマウントされていません。");
+        // スナップショットを返す: LockAsync で mv.Stream が Dispose されても
+        // 呼び出し側が使用中のストリームは安全に動作する。
         return (mv.Stream, mv.Header);
     }
 
@@ -606,9 +612,9 @@ public sealed class VolumeService : IDisposable
             header.UserQuotas[targetUsername] = maxBytes;
             await _metaStore.SaveAsync(volumeName, header);
 
-            // マウント済みの場合、メモリ上の Header も更新
-            if (_mounted.TryGetValue(volumeName, out var mv))
-                mv.Header.UserQuotas[targetUsername] = maxBytes;
+            // マウント済みの場合、RefreshMountedHeader で全体を置換して
+            // 他のスレッドからの読み取りとの競合を防ぐ
+            RefreshMountedHeader(volumeName, header);
         }
         finally
         {

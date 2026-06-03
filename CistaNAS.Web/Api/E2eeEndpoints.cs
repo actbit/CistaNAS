@@ -357,6 +357,8 @@ public static class E2eeEndpoints
         try
         {
             invSvc.SetAcceptedData(invitationId, req.EncryptedPublicKey, req.Nonce);
+            // 受諾完了後に招待を削除（再利用防止）
+            invSvc.Remove(invitationId);
             return Results.Ok();
         }
         catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }

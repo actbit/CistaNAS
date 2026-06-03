@@ -20,7 +20,10 @@ public static class KeyDerivation
     {
         ArgumentException.ThrowIfNullOrEmpty(password);
         ArgumentNullException.ThrowIfNull(salt);
-        if (iterations < 1) throw new ArgumentOutOfRangeException(nameof(iterations));
+        // OWASP 推奨: PBKDF2-SHA256 は最低 600,000 回。
+        // 極端に低い反復回数はブルートフォース脆弱性を生むため、100,000 回を下限とする。
+        const int MinIterations = 100_000;
+        if (iterations < MinIterations) throw new ArgumentOutOfRangeException(nameof(iterations), $"PBKDF2 反復回数は {MinIterations} 以上である必要があります。");
         if (length < 1) throw new ArgumentOutOfRangeException(nameof(length));
 
         return Rfc2898DeriveBytes.Pbkdf2(password, salt, iterations, HashAlgorithmName.SHA256, length);

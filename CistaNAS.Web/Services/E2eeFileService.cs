@@ -25,6 +25,7 @@ public sealed class E2eeFileService
     /// <summary>
     /// E2EE 暗号化後のサイズを計算する pure 関数。
     /// 構造: [salt(16)] + [チャンク 0..n-1: 平文 + tag(16)]
+    /// 空ファイルでも salt + tag のみで構成される（暗号化時にタグが生成されるため）。
     /// </summary>
     public static long ComputeEncryptedLength(long plainSize, int chunkSize)
     {

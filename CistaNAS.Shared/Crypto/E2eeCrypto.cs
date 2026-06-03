@@ -125,7 +125,8 @@ public static class E2eeCrypto
     private static byte[] EncryptChunkAesGcm(byte[] plaintext, byte[] fileKey, int chunkIndex, byte[] fileSalt, bool isFirstChunk)
     {
         byte[] nonce = DeriveChunkNonce(fileKey, chunkIndex);
-        byte[] aad = BitConverter.GetBytes(chunkIndex);
+        byte[] aad = new byte[4];
+        BinaryPrimitives.WriteInt32LittleEndian(aad, chunkIndex);
         byte[] ct = new byte[plaintext.Length];
         byte[] tag = new byte[GcmTagSize];
         using var gcm = new AesGcm(fileKey, GcmTagSize);
@@ -149,7 +150,8 @@ public static class E2eeCrypto
     private static byte[] EncryptChunkChaCha20(byte[] plaintext, byte[] fileKey, int chunkIndex, byte[] fileSalt, bool isFirstChunk)
     {
         byte[] nonce = DeriveChunkNonce(fileKey, chunkIndex);
-        byte[] aad = BitConverter.GetBytes(chunkIndex);
+        byte[] aad = new byte[4];
+        BinaryPrimitives.WriteInt32LittleEndian(aad, chunkIndex);
 
         // ChaCha20 で平文を暗号化し、(key, nonce) ペアから Poly1305 ワンタイム鍵 (r, s) を導出する。
         // Poly1305 のワンタイム鍵は counter=0 の ChaCha20 ブロックから導出されるため、
@@ -207,6 +209,8 @@ public static class E2eeCrypto
     /// <summary>AES-256-GCM でチャンクを復号。</summary>
     private static byte[] DecryptChunkAesGcm(byte[] encData, byte[] fileKey, int chunkIndex, int offset)
     {
+        if (encData.Length < offset + GcmTagSize)
+            throw new CryptographicException("暗号化データが短すぎます。");
         int ctLen = encData.Length - offset - GcmTagSize;
         byte[] ct = new byte[ctLen];
         byte[] tag = new byte[GcmTagSize];
@@ -214,7 +218,8 @@ public static class E2eeCrypto
         Buffer.BlockCopy(encData, offset + ctLen, tag, 0, GcmTagSize);
 
         byte[] nonce = DeriveChunkNonce(fileKey, chunkIndex);
-        byte[] aad = BitConverter.GetBytes(chunkIndex);
+        byte[] aad = new byte[4];
+        BinaryPrimitives.WriteInt32LittleEndian(aad, chunkIndex);
         byte[] plain = new byte[ctLen];
         using var gcm = new AesGcm(fileKey, GcmTagSize);
         gcm.Decrypt(nonce, ct, tag, plain, aad);
@@ -224,6 +229,8 @@ public static class E2eeCrypto
     /// <summary>ChaCha20-Poly1305 でチャンクを復号。</summary>
     private static byte[] DecryptChunkChaCha20(byte[] encData, byte[] fileKey, int chunkIndex, int offset)
     {
+        if (encData.Length < offset + GcmTagSize)
+            throw new CryptographicException("暗号化データが短すぎます。");
         int ctLen = encData.Length - offset - GcmTagSize;
         byte[] ct = new byte[ctLen];
         byte[] tag = new byte[GcmTagSize];
@@ -231,7 +238,8 @@ public static class E2eeCrypto
         Buffer.BlockCopy(encData, offset + ctLen, tag, 0, GcmTagSize);
 
         byte[] nonce = DeriveChunkNonce(fileKey, chunkIndex);
-        byte[] aad = BitConverter.GetBytes(chunkIndex);
+        byte[] aad = new byte[4];
+        BinaryPrimitives.WriteInt32LittleEndian(aad, chunkIndex);
 
         // Poly1305 タグ検証（AAD 付き、RFC 7539 §2.8 形式の mac_data）
         if (!Poly1305VerifyTagWithAad(fileKey, nonce, ct, tag, aad))
@@ -317,7 +325,8 @@ public static class E2eeCrypto
 
     private static byte[] DeriveChunkNonce(byte[] fileKey, int chunkIndex)
     {
-        byte[] indexBytes = BitConverter.GetBytes(chunkIndex);
+        byte[] indexBytes = new byte[4];
+        BinaryPrimitives.WriteInt32LittleEndian(indexBytes, chunkIndex);
         byte[] mac = HMACSHA256.HashData(fileKey, indexBytes);
         return mac[..GcmNonceSize];
     }
