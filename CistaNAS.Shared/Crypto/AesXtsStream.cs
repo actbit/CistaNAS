@@ -103,13 +103,12 @@ public sealed class AesXtsStream : Stream
 
     private void ComputeTweak(long sectorIndex, Span<byte> tweak)
     {
-        Span<byte> du = stackalloc byte[BlockSize];
-        du.Clear();
-        BinaryPrimitives.WriteUInt64LittleEndian(du, (ulong)sectorIndex);
-        byte[] inBuf = du.ToArray();
+        // TransformBlock requires byte[], so use direct byte[] instead of stackalloc+ToArray
+        byte[] inBuf = new byte[BlockSize];
         byte[] outBuf = new byte[BlockSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(inBuf, (ulong)sectorIndex);
         _tweakEnc.TransformBlock(inBuf, 0, BlockSize, outBuf, 0);
-        outBuf.CopyTo(tweak);
+        ((Span<byte>)outBuf).CopyTo(tweak);
     }
 
     /// <summary>セクタ（=データユニット）を in-place で暗号化/復号する。</summary>

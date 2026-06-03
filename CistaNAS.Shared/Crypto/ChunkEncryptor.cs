@@ -148,10 +148,10 @@ public static class ChunkEncryptor
             long sectorIndex = firstSector + s;
             int sectorOffset = s * sectorSize;
 
-            // HKDF(masterKey, salt=sectorIndex) → 12 バイトノンス
+            // HKDF-SHA256: salt=sectorIndex, info=NonceInfo → 12 バイトノンス
             BinaryPrimitives.WriteInt64LittleEndian(sectorIndexBytes, sectorIndex);
-            // 注: HKDF.DeriveKey の引数順は (ikm, output, salt, info)
-            HKDF.DeriveKey(HashAlgorithmName.SHA256, keyArr, nonce, sectorIndexBytes, infoBytes);
+            // HKDF.DeriveKey(hash, ikm, salt, info, output)
+            HKDF.DeriveKey(HashAlgorithmName.SHA256, keyArr, sectorIndexBytes, infoBytes, nonce);
 
             ChaCha20EncryptCore(keyArr, nonce, counter: 0, data.AsSpan(sectorOffset, sectorSize));
         }

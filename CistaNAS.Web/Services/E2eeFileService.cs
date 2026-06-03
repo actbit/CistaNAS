@@ -93,14 +93,18 @@ public sealed class E2eeFileService
             //    volume.dat の Offset から連続して書き込まれる。
             //  - チャンクモード (IsChunkMode=true): チャンクは IChunkStore に格納され
             //    volume.dat は使用されない (Offset 値はメタデータとしてのみ保持)。
+            //
+            // 注: ChunkSizes はアップロード後に actual written bytes で更新されるが、
+            // CreateFileAsync 段階では EncryptedLength を基数とする。
+            // ローカルモードで EncryptedLength が実際の暗号化サイズと一致しない場合は
+            // オフセットがずれる可能性がある（UploadChunkAsync 呼び出し前に確定するため）。
             long offset = 0;
             if (!IsChunkMode(volumeName))
             {
                 foreach (var existing in catalog.Files.Values)
                 {
-                    long end = existing.Offset;
-                    for (int i = 0; i < existing.ChunkSizes.Count; i++)
-                        end += existing.ChunkSizes[i];
+                    // EncryptedLength を基数としてオフセットを算出（EncryptedLength はチャンク总数+tags）
+                    long end = existing.Offset + existing.EncryptedLength;
                     if (end > offset) offset = end;
                 }
             }
@@ -354,6 +358,16 @@ public sealed class E2eeFileService
         return new E2eeMountResponse(header.ChunkSize, header.EncryptionMode);
     }
 
+    /// <summary>平文サイズを計算する（E2EE 暗号化フォーマット対応）。</summary>
+    private static long ComputePlainSize(long encryptedLength, int chunkCount)
+    {
+        // フォーマット: salt(16) + [chunk0: ciphertext + tag(16) | ... | chunkN-1: ciphertext + tag(16)]
+        // ciphertext = チャンクサイズ（最後のチャンクは実際のサイズ）
+        // 平文 = encrypted - salt - chunkCount * tag
+        long plain = encryptedLength - (long)SaltSize - (long)chunkCount * (long)TagSize;
+        return Math.Max(0, plain);
+    }
+
     /// <summary>ボリュームの使用量統計を返す。</summary>
     public async Task<E2eeVolumeStats> GetStatsAsync(string volumeName, string username, CancellationToken ct = default)
     {
@@ -361,19 +375,10 @@ public sealed class E2eeFileService
         var catalog = await LoadCatalogAsync(volumeName, ct);
         var header = _volumeService.GetMounted(volumeName).Header;
 
-        long totalUsed = catalog.Files.Values.Sum(f =>
-        {
-            // 平文サイズ = 暗号化長 - (salt + chunk数*tag) で逆算
-            long plain = f.EncryptedLength - (long)E2eeFileService.SaltSize - (long)f.ChunkCount * E2eeFileService.TagSize;
-            return Math.Max(0, plain);
-        });
+        long totalUsed = catalog.Files.Values.Sum(f => ComputePlainSize(f.EncryptedLength, f.ChunkCount));
         long userUsed = catalog.Files.Values
             .Where(f => f.OwnerUsername == username || string.IsNullOrEmpty(f.OwnerUsername))
-            .Sum(f =>
-            {
-                long plain = f.EncryptedLength - (long)E2eeFileService.SaltSize - (long)f.ChunkCount * E2eeFileService.TagSize;
-                return Math.Max(0, plain);
-            });
+            .Sum(f => ComputePlainSize(f.EncryptedLength, f.ChunkCount));
         long quota = header.UserQuotas.TryGetValue(username, out var q) ? q : 0;
         int totalFiles = catalog.Files.Count;
         int userFiles = catalog.Files.Values

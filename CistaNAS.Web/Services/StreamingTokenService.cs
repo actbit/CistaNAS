@@ -39,7 +39,7 @@ public sealed class StreamingTokenService : BackgroundService
     {
         if (!_tokens.TryGetValue(token, out var t)) return null;
         // ClockSkew 窓内では有効と見なす（eager に削除しない）
-        if (t.ExpiresAt < DateTimeOffset.UtcNow && t.ExpiresAt + ClockSkew < DateTimeOffset.UtcNow)
+        if (t.ExpiresAt + ClockSkew < DateTimeOffset.UtcNow)
         {
             _tokens.TryRemove(token, out _);
             return null;
