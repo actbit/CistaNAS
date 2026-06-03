@@ -137,8 +137,9 @@ public class ChunkEncryptorTests
     {
         // 修正前: ノンスがマスター鍵から固定 → 全チャンク同一暗号文
         // 修正後: HKDF で sectorIndex からノンス派生 → 各チャンクで異なる暗号文
+        // sectorSize=4096 のため、最低 1 セクタ (4096B) 以上の平文が必要。
         byte[] key = MasterKey();
-        byte[] plain = RandomNumberGenerator.GetBytes(64); // 4 セクタ分
+        byte[] plain = RandomNumberGenerator.GetBytes(4096 * 2); // 2 セクタ分
         const int sectorSize = 4096;
         const int chunkSize = 4194304;
 
@@ -152,8 +153,9 @@ public class ChunkEncryptorTests
     public void ChaCha20_NonceIsUniquePerSector()
     {
         // 同じ平文・同じ鍵で sectorIndex のみ異なる → 暗号文が異なる（ECB 化していないこと）
+        // sectorSize=4096 のため、最低 1 セクタ分の 4096 バイトの平文が必要。
         byte[] key = MasterKey();
-        byte[] plain = new byte[16]; // 1 セクタ
+        byte[] plain = RandomNumberGenerator.GetBytes(4096); // 1 セクタ
         const int sectorSize = 4096;
         const int chunkSize = 4194304;
 

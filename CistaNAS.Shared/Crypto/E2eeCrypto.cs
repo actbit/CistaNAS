@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -150,11 +151,18 @@ public static class E2eeCrypto
         byte[] nonce = DeriveChunkNonce(fileKey, chunkIndex);
         byte[] aad = BitConverter.GetBytes(chunkIndex);
 
-        // ChaCha20-Poly1305 暗号化（AAD なし、AAD は Poly1305 のみ）
-        var (encNonce, ciphertext, tag) = ChaCha20Poly1305.Encrypt(plaintext, fileKey, nonce);
+        // ChaCha20 で平文を暗号化し、(key, nonce) ペアから Poly1305 ワンタイム鍵 (r, s) を導出する。
+        // Poly1305 のワンタイム鍵は counter=0 の ChaCha20 ブロックから導出されるため、
+        // (key, nonce) は暗号鍵と nonce 導出で 1 回ずつ別 ChaCha20 呼び出しで使われるだけで
+        // 同じ (r, s) を 2 回再導出するわけではない。
+        // 注: ChaCha20Poly1305.Encrypt 内部の Poly1305 鍵導出は counter=0 で行われ、
+        // 暗号化は counter=1 で行われるため、(r, s) と暗号化キーストリームは別ブロック。
+        var (encNonce, ciphertext, _) = ChaCha20Poly1305.Encrypt(plaintext, fileKey, nonce);
 
-        // AAD を含めて Poly1305 タグを再計算
-        tag = Poly1305ComputeTagWithAad(fileKey, nonce, ciphertext, aad);
+        // AAD を含めて Poly1305 タグを計算 (RFC 7539 §2.8:
+        //   mac_data = aad || pad16(aad) || ciphertext || pad16(ciphertext) || le64(len(aad)) || le64(len(ct))
+        // )
+        byte[] tag = Poly1305ComputeTagWithAad(fileKey, nonce, ciphertext, aad);
 
         // フォーマット: [fileSalt (first chunk)] || [ciphertext] || [tag]
         int totalLen = (isFirstChunk ? SaltSize : 0) + ciphertext.Length + tag.Length;
@@ -225,12 +233,17 @@ public static class E2eeCrypto
         byte[] nonce = DeriveChunkNonce(fileKey, chunkIndex);
         byte[] aad = BitConverter.GetBytes(chunkIndex);
 
-        // Poly1305 タグ検証（AAD 付き）
+        // Poly1305 タグ検証（AAD 付き、RFC 7539 §2.8 形式の mac_data）
         if (!Poly1305VerifyTagWithAad(fileKey, nonce, ct, tag, aad))
             throw new CryptographicException("ChaCha20-Poly1305 タグ検証失敗。");
 
-        // ChaCha20 復号化
-        return ChaCha20Poly1305.Decrypt(ct, tag, nonce, fileKey);
+        // タグ検証 OK → ChaCha20 で復号。
+        // 注: ここではタグ検証は自前で行っているため、Decrypt 側の再検証は冗長だが
+        // ChaCha20Poly1305.Decrypt は暗号文復号専用 API なので、内部で再検証しない
+        // （検証スキップで復号だけ行う）ラッパーを用意する。
+        byte[] plaintext = new byte[ctLen];
+        ChaCha20Poly1305.ChaCha20Decrypt(fileKey, nonce, counter: 1, ct, plaintext);
+        return plaintext;
     }
 
     // ---- ファイル名暗号化 ----
@@ -332,33 +345,47 @@ public static class E2eeCrypto
         return result;
     }
 
-    /// <summary>Poly1305 タグ生成（AAD 付き）。</summary>
+    /// <summary>
+    /// Poly1305 タグ生成（AAD 付き、RFC 7539 §2.8 準拠）。
+    /// mac_data = aad || pad16(aad) || ciphertext || pad16(ciphertext) || le64(len(aad)) || le64(len(ct))
+    /// Poly1305 ワンタイム鍵 (r, s) は (key, nonce) ペアから 1 回だけ導出する。
+    /// </summary>
     private static byte[] Poly1305ComputeTagWithAad(byte[] key, byte[] nonce, byte[] ciphertext, byte[] aad)
     {
-        // AAD || Ciphertext で Poly1305 タグ生成
-        byte[] combined = new byte[aad.Length + ciphertext.Length];
-        Buffer.BlockCopy(aad, 0, combined, 0, aad.Length);
-        Buffer.BlockCopy(ciphertext, 0, combined, aad.Length, ciphertext.Length);
-
-        var (_, _, tag) = ChaCha20Poly1305.Encrypt(combined, key, nonce);
-        return tag;
+        byte[] macData = BuildPoly1305MacData(aad, ciphertext);
+        return ChaCha20Poly1305.ComputePoly1305Tag(key, nonce, macData);
     }
 
-    /// <summary>Poly1305 タグ検証（AAD 付き）。</summary>
+    /// <summary>
+    /// Poly1305 タグ検証（AAD 付き、RFC 7539 §2.8 準拠、定数時間比較）。
+    /// </summary>
     private static bool Poly1305VerifyTagWithAad(byte[] key, byte[] nonce, byte[] ciphertext, byte[] tag, byte[] aad)
     {
-        byte[] combined = new byte[aad.Length + ciphertext.Length];
-        Buffer.BlockCopy(aad, 0, combined, 0, aad.Length);
-        Buffer.BlockCopy(ciphertext, 0, combined, aad.Length, ciphertext.Length);
+        byte[] macData = BuildPoly1305MacData(aad, ciphertext);
+        return ChaCha20Poly1305.VerifyPoly1305Tag(key, nonce, macData, tag);
+    }
 
-        var (_, _, computedTag) = ChaCha20Poly1305.Encrypt(combined, key, nonce);
+    /// <summary>
+    /// RFC 7539 §2.8 形式の Poly1305 入力データを構築。
+    /// </summary>
+    private static byte[] BuildPoly1305MacData(byte[] aad, byte[] ciphertext)
+    {
+        // pad16(x) = 16 バイト境界までのゼロパディング
+        int aadPad = (16 - (aad.Length % 16)) % 16;
+        int ctPad = (16 - (ciphertext.Length % 16)) % 16;
+        int totalLen = aad.Length + aadPad + ciphertext.Length + ctPad + 16; // +16 for two le64 lengths
 
-        // 定数時間比較
-        int result = 0;
-        for (int i = 0; i < tag.Length; i++)
-        {
-            result |= computedTag[i] ^ tag[i];
-        }
-        return result == 0;
+        byte[] data = new byte[totalLen];
+        int pos = 0;
+        Buffer.BlockCopy(aad, 0, data, pos, aad.Length);
+        pos += aad.Length + aadPad;  // aadPad 分のゼロは初期化済み
+        Buffer.BlockCopy(ciphertext, 0, data, pos, ciphertext.Length);
+        pos += ciphertext.Length + ctPad;
+        // le64(aad.Length)
+        BinaryPrimitives.WriteInt64LittleEndian(data.AsSpan(pos, 8), aad.Length);
+        pos += 8;
+        // le64(ciphertext.Length)
+        BinaryPrimitives.WriteInt64LittleEndian(data.AsSpan(pos, 8), ciphertext.Length);
+        return data;
     }
 }

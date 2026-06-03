@@ -173,38 +173,80 @@ public static class ChaCha20Poly1305
     private static uint RotateLeft(uint value, int count)
         => (value << count) | (value >> (32 - count));
 
-    /// <summary>Poly1305 タグ生成（RFC 7539 §2.5）。</summary>
+    /// <summary>Poly1305 タグ生成（RFC 7539 §2.5 準拠、poly1305-donna 5-limb 26-bit 実装）。</summary>
     private static byte[] Poly1305ComputeTag(byte[] key, byte[] nonce, byte[] ciphertext)
     {
-        // Poly1305 1-time key: ChaCha20(カウンタ=0) の最初の 32 バイト
+        // Poly1305 1-time key: ChaCha20(counter=0) の最初の 32 バイト
         byte[] polyKey = new byte[32];
         ChaCha20Encrypt(key, nonce, 0, polyKey, polyKey);
 
-        // r と s を抽出（RFC 7539 §2.5 でクランピング）
-        // r[0-3]: b[0]下位2ビットクリア + b[3]上位4ビットクリア → & 0x0FFFFFFF
-        // r[4-7]: b[0]下位4ビットクリア + b[3]上位4ビットクリア → & 0x0FFFFFFC
-        // r[8-11]: b[3]上位4ビットのみクリア → & 0x0FFFFFFF
-        // r[12-15]: b[0]下位4ビットクリア + b[3]上位4ビットクリア → & 0x0FFFFFFC
-        uint r0 = BinaryPrimitives.ReadUInt32LittleEndian(polyKey) & 0x0FFFFFFF;
-        uint r1 = BinaryPrimitives.ReadUInt32LittleEndian(polyKey[4..]) & 0x0FFFFFFC;
-        uint r2 = BinaryPrimitives.ReadUInt32LittleEndian(polyKey[8..]) & 0x0FFFFFFF;
-        uint r3 = BinaryPrimitives.ReadUInt32LittleEndian(polyKey[12..]) & 0x0FFFFFFC;
-        uint r4 = 0;
+        // r の抽出（poly1305-donna クランピング: r &= 0xffffffc0ffffffc0ffffffc0fffffff）
+        uint r0 = BinaryPrimitives.ReadUInt32LittleEndian(polyKey.AsSpan(0)) & 0x03FFFFFF;
+        uint r1 = (BinaryPrimitives.ReadUInt32LittleEndian(polyKey.AsSpan(3)) >> 2) & 0x03FFFF03;
+        uint r2 = (BinaryPrimitives.ReadUInt32LittleEndian(polyKey.AsSpan(6)) >> 4) & 0x03FFC0FF;
+        uint r3 = (BinaryPrimitives.ReadUInt32LittleEndian(polyKey.AsSpan(9)) >> 6) & 0x03F03FFF;
+        uint r4 = (BinaryPrimitives.ReadUInt32LittleEndian(polyKey.AsSpan(12)) >> 8) & 0x000FFFFF;
 
-        // s（最終的な加算）
-        uint s0 = BinaryPrimitives.ReadUInt32LittleEndian(polyKey[16..]);
-        uint s1 = BinaryPrimitives.ReadUInt32LittleEndian(polyKey[20..]);
-        uint s2 = BinaryPrimitives.ReadUInt32LittleEndian(polyKey[24..]);
-        uint s3 = BinaryPrimitives.ReadUInt32LittleEndian(polyKey[28..]);
+        // s (32 バイトのうち r 以降の 16 バイト)
+        uint s0 = BinaryPrimitives.ReadUInt32LittleEndian(polyKey.AsSpan(16));
+        uint s1 = BinaryPrimitives.ReadUInt32LittleEndian(polyKey.AsSpan(20));
+        uint s2 = BinaryPrimitives.ReadUInt32LittleEndian(polyKey.AsSpan(24));
+        uint s3 = BinaryPrimitives.ReadUInt32LittleEndian(polyKey.AsSpan(28));
 
-        // Poly1305 計算
-        (uint h0, uint h1, uint h2, uint h3) = Poly1305Core(ciphertext, r0, r1, r2, r3, r4);
+        // Poly1305 コア (5 リム 130-bit)
+        (uint h0, uint h1, uint h2, uint h3, uint h4) = Poly1305Core(ciphertext, r0, r1, r2, r3, r4);
 
-        // 最終加算とモジュラス
-        h0 += s0; h1 += s1; h2 += s2; h3 += s3;
-        (h0, h1, h2, h3) = Reduce1305(h0, h1, h2, h3);
+        // 最終キャリー (h を完全正規化: 各 limb 26-bit)
+        uint carry = h1 >> 26; h1 &= 0x03FFFFFF;
+        h2 += carry;        carry = h2 >> 26; h2 &= 0x03FFFFFF;
+        h3 += carry;        carry = h3 >> 26; h3 &= 0x03FFFFFF;
+        h4 += carry;        carry = h4 >> 26; h4 &= 0x03FFFFFF;
+        h0 += carry * 5;    carry = h0 >> 26; h0 &= 0x03FFFFFF;
+        h1 += carry;
 
-        // タグ生成（RFC 7539 §2.5.1: (h0 | (h1 << 32), h2 | (h3 << 32))）
+        // mod 2^130-5: h >= 2^130-5 なら h - (2^130-5) = h + 5 - 2^130 を使う。
+        // h + 5 を計算し、h4 のオーバーフローで元の h が 2^130-5 以上だったかを判定。
+        uint g0 = h0 + 5;
+        carry = g0 >> 26; g0 &= 0x03FFFFFF;
+        uint g1 = h1 + carry;
+        carry = g1 >> 26; g1 &= 0x03FFFFFF;
+        uint g2 = h2 + carry;
+        carry = g2 >> 26; g2 &= 0x03FFFFFF;
+        uint g3 = h3 + carry;
+        carry = g3 >> 26; g3 &= 0x03FFFFFF;
+        uint g4 = h4 + carry - (1u << 26);
+
+        // g4 の最上位ビットで g を使うか h を使うかを判定（タイミング攻撃回避）。
+        // g4 high bit = 0 → h < p → g を使う
+        // g4 high bit = 1 → h >= p → h を使う
+        uint g4HighBit = g4 >> 31;  // 0 or 1
+        uint mask = g4HighBit - 1u;  // 0xFFFFFFFF if h < p, 0 if h >= p
+        h0 = (h0 & ~mask) | (g0 & mask);
+        h1 = (h1 & ~mask) | (g1 & mask);
+        h2 = (h2 & ~mask) | (g2 & mask);
+        h3 = (h3 & ~mask) | (g3 & mask);
+        // h4 も同様に選択 (donna-32 準拠、後段の repack で h4 << 8 が h3 の high バイトに伝播するため)
+        h4 = (h4 & ~mask) | ((g4 + (1u << 26)) & mask);  // g4 = h4 - 2^26 だったので元に戻す
+
+        // 5 リム 26-bit を 4 リム 32-bit に repack (poly1305-donna と同じ)
+        //   h0_32 = h0 | (h1 << 26)         ; h1 は 26-bit なので (h1 << 26) の下位 32 bit = h1 の下位 6 bit
+        //   h1_32 = (h1 >> 6) | (h2 << 20)
+        //   h2_32 = (h2 >> 12) | (h3 << 14)
+        //   h3_32 = (h3 >> 18) | (h4 << 8)
+        h0 = (h0 | (h1 << 26)) & 0xFFFFFFFF;
+        h1 = ((h1 >> 6) | (h2 << 20)) & 0xFFFFFFFF;
+        h2 = ((h2 >> 12) | (h3 << 14)) & 0xFFFFFFFF;
+        h3 = ((h3 >> 18) | (h4 << 8)) & 0xFFFFFFFF;
+
+        // s を加算 (mod 2^128)
+        ulong f = (ulong)h0 + s0;             h0 = (uint)f;
+        f = ((ulong)h1 + s1) + (f >> 32);    h1 = (uint)f;
+        f = ((ulong)h2 + s2) + (f >> 32);    h2 = (uint)f;
+        f = ((ulong)h3 + s3) + (f >> 32);    h3 = (uint)f;
+        // h4 のオーバーフロー（もしあれば）は 2^130 ≡ 5 で 2^128 mod 2^130-5 側に折り畳まれるが、
+        // タグは下位 128 bit だけなので捨てる。
+
+        // タグ生成（リトルエンディアン 16 バイト）
         byte[] tag = new byte[TagSize];
         BinaryPrimitives.WriteUInt32LittleEndian(tag.AsSpan(0), h0);
         BinaryPrimitives.WriteUInt32LittleEndian(tag.AsSpan(4), h1);
@@ -228,109 +270,129 @@ public static class ChaCha20Poly1305
         return result == 0;
     }
 
-    /// <summary>Poly1305 コアアルゴリズム（RFC 7539 §2.5.1）。</summary>
-    private static (uint h0, uint h1, uint h2, uint h3) Poly1305Core(
+    /// <summary>
+    /// 任意バイト列に対する Poly1305 タグ計算（公開）。
+    /// E2eeCrypto.EncryptChunkChaCha20 等で AAD を含む mac_data のタグ計算に使用する。
+    /// </summary>
+    internal static byte[] ComputePoly1305Tag(byte[] key, byte[] nonce, byte[] data)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        ArgumentNullException.ThrowIfNull(nonce);
+        ArgumentNullException.ThrowIfNull(data);
+        return Poly1305ComputeTag(key, nonce, data);
+    }
+
+    /// <summary>
+    /// 任意バイト列に対する Poly1305 タグ検証（公開、定数時間比較）。
+    /// </summary>
+    internal static bool VerifyPoly1305Tag(byte[] key, byte[] nonce, byte[] data, byte[] tag)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        ArgumentNullException.ThrowIfNull(nonce);
+        ArgumentNullException.ThrowIfNull(data);
+        ArgumentNullException.ThrowIfNull(tag);
+        return Poly1305VerifyTag(key, nonce, data, tag);
+    }
+
+    /// <summary>
+    /// Poly1305 コア: 16 バイトブロック単位で (h + c) * r mod (2^130 - 5) を計算。
+    /// c4 = 1 &lt;&lt; 24 = 2^24 が limb 表現での 2^128 ビットの役割（5 リム 130-bit）。
+    /// 最終 partial ブロックは 16 バイトにゼロパディングし末尾に 0x01 を置く。
+    /// </summary>
+    /// <summary>
+    /// Poly1305 コア: 16 バイトブロック単位で (h + c) * r mod (2^130 - 5) を計算。
+    /// poly1305-donna と同じ 5 リム 26-bit limbs 表現。
+    /// <para>
+    /// 重要な仕様 (poly1305-donna / RFC 7539 §2.5):
+    /// ・非最終ブロック: 16 バイトのデータ + 2^128 (HIBIT) を加算
+    /// ・最終ブロック (partial): データ + 0x01 パディング + 0、2^128 は **加算しない**
+    /// </para>
+    /// </summary>
+    private static (uint h0, uint h1, uint h2, uint h3, uint h4) Poly1305Core(
         byte[] data, uint r0, uint r1, uint r2, uint r3, uint r4)
     {
-        // 26ビット制約定数
-        const uint BIT_26 = 0x03FFFFFF; // 26ビットマスク
+        const uint BIT_26 = 0x03FFFFFF;
+        const uint HIBIT  = 1u << 24;  // 5 リム目への 2^128 マーカー（非最終ブロックのみ）
+        const int PolyBlock = 16;
 
-        uint h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+        uint h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0;
+
+        // 事前計算: s_i = r_i * 5（mod (2^130 - 5) 還元の効率化）
+        uint s1 = r1 * 5;
+        uint s2 = r2 * 5;
+        uint s3 = r3 * 5;
+        uint s4 = r4 * 5;
+
         int offset = 0;
         int length = data.Length;
 
+        // ループ外の固定サイズバッファで stackalloc を一度だけ行う
+        Span<byte> block = stackalloc byte[PolyBlock];
+
         while (length > 0)
         {
-            int blockSize = Math.Min(BlockSize, length);
+            int blockSize = Math.Min(PolyBlock, length);
+            bool isFinalBlock = (blockSize == length);  // 最後のブロックかどうか
 
-            // データブロック読み取り（リトルエンディアン）
-            uint c0 = 1; // 最下位ビットに1
-            uint c1 = 0, c2 = 0, c3 = 0;
+            // 16 バイトブロックを構築
+            block.Clear();
+            data.AsSpan(offset, blockSize).CopyTo(block);
 
-            for (int i = 0; i < blockSize; i++)
+            if (isFinalBlock)
             {
-                int bytePos = i * 8;
-                uint byteVal = data[offset + i];
-
-                if (bytePos < 32) {
-                    c0 |= byteVal << bytePos;
-                } else if (bytePos < 64) {
-                    c1 |= byteVal << (bytePos - 32);
-                } else if (bytePos < 96) {
-                    c2 |= byteVal << (bytePos - 64);
-                } else {
-                    c3 |= byteVal << (bytePos - 96);
+                // 最終ブロック: 末尾に 0x01 を追加（partial の場合のみ）、
+                // hibit (2^128) は **加算しない**
+                if (blockSize < PolyBlock)
+                {
+                    block[blockSize] = 0x01;
                 }
+                // else: blockSize == 16 で full 最終ブロック → そのまま 16 バイト + hibit=0
             }
+            else
+            {
+                // 非最終ブロック: 16 バイトのデータ + hibit (2^128) を加算
+                // c4 = (m[12..16] >> 8) | HIBIT
+            }
+
+            // リトルエンディアン 5 リム 26-bit (poly1305-donna の bit 配置と一致)
+            uint c0 = BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(0, 4)) & BIT_26;
+            uint c1 = (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(3, 4)) >> 2) & BIT_26;
+            uint c2 = (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(6, 4)) >> 4) & BIT_26;
+            uint c3 = (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(9, 4)) >> 6) & BIT_26;
+            uint c4 = isFinalBlock
+                ? (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(12, 4)) >> 8)  // hibit なし
+                : (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(12, 4)) >> 8) | HIBIT;
+
             offset += blockSize;
             length -= blockSize;
 
-            // 積和: h = (h + c) * r mod (2^130 - 5)
-            // 各項を26ビットに制約
-            ulong h0_c = (h0 & BIT_26) + (c0 & BIT_26);
-            ulong carry = h0_c >> 26;
-            h0_c &= BIT_26;
+            // h += c
+            h0 += c0; h1 += c1; h2 += c2; h3 += c3; h4 += c4;
 
-            ulong h1_c = (h1 & BIT_26) + (c1 & BIT_26) + carry;
-            carry = h1_c >> 26;
-            h1_c &= BIT_26;
+            // h *= r（poly1305-donna 方式: s_i = r_i * 5 で 2^130 ≡ 5 の還元を組み込む）
+            ulong d0 = (ulong)h0 * r0 + (ulong)h1 * s4 + (ulong)h2 * s3 + (ulong)h3 * s2 + (ulong)h4 * s1;
+            ulong d1 = (ulong)h0 * r1 + (ulong)h1 * r0 + (ulong)h2 * s4 + (ulong)h3 * s3 + (ulong)h4 * s2;
+            ulong d2 = (ulong)h0 * r2 + (ulong)h1 * r1 + (ulong)h2 * r0 + (ulong)h3 * s4 + (ulong)h4 * s3;
+            ulong d3 = (ulong)h0 * r3 + (ulong)h1 * r2 + (ulong)h2 * r1 + (ulong)h3 * r0 + (ulong)h4 * s4;
+            ulong d4 = (ulong)h0 * r4 + (ulong)h1 * r3 + (ulong)h2 * r2 + (ulong)h3 * r1 + (ulong)h4 * r0;
 
-            ulong h2_c = (h2 & BIT_26) + (c2 & BIT_26) + carry;
-            carry = h2_c >> 26;
-            h2_c &= BIT_26;
+            // 部分還元 (各 limb 26-bit に)
+            uint c = (uint)(d0 >> 26); h0 = (uint)(d0 & BIT_26);
+            d1 += c;        c = (uint)(d1 >> 26); h1 = (uint)(d1 & BIT_26);
+            d2 += c;        c = (uint)(d2 >> 26); h2 = (uint)(d2 & BIT_26);
+            d3 += c;        c = (uint)(d3 >> 26); h3 = (uint)(d3 & BIT_26);
+            d4 += c;        c = (uint)(d4 >> 26); h4 = (uint)(d4 & BIT_26);
 
-            ulong h3_c = (h3 & BIT_26) + (c3 & BIT_26) + carry;
-            h3_c &= BIT_26;
-
-            // 乗算: (h_c) * r
-            // 各係数を26ビットに制約
-            ulong d0 = (r0 & BIT_26) * h0_c;
-            ulong d1 = (r0 & BIT_26) * h1_c + (r1 & BIT_26) * h0_c;
-            ulong d2 = (r0 & BIT_26) * h2_c + (r1 & BIT_26) * h1_c + (r2 & BIT_26) * h0_c;
-            ulong d3 = (r0 & BIT_26) * h3_c + (r1 & BIT_26) * h2_c + (r2 & BIT_26) * h1_c + (r3 & BIT_26) * h0_c;
-            ulong d4 = (r1 & BIT_26) * h3_c + (r2 & BIT_26) * h2_c + (r3 & BIT_26) * h1_c + (r4 & BIT_26) * h0_c;
-
-            // 剰余計算: h = d mod (2^130 - 5)
-            ulong s0 = d0;
-            ulong s1 = d1 + (d0 >> 26);
-            ulong s2 = d2 + (d1 >> 26) + (d0 >> 52);
-            ulong s3 = d3 + (d2 >> 26) + (d1 >> 52) + (d0 >> 78);
-            ulong s4 = d4 + (d3 >> 26) + (d2 >> 52) + (d1 >> 78);
-
-            // モジュラス簡約
-            (h0, h1, h2, h3) = Reduce1305(s0, s1, s2, s3, s4);
+            // 2^130 ≡ 5 (mod 2^130 - 5) 還元の最終段
+            h0 += c * 5;
+            c = h0 >> 26; h0 &= BIT_26;
+            h1 += c;       c = h1 >> 26; h1 &= BIT_26;
+            h2 += c;       c = h2 >> 26; h2 &= BIT_26;
+            h3 += c;       c = h3 >> 26; h3 &= BIT_26;
+            h4 += c;
         }
 
-        return (h0, h1, h2, h3);
-    }
-
-    /// <summary>2^130 - 5 での簡約。</summary>
-    private static (uint, uint, uint, uint) Reduce1305(
-        ulong a0, ulong a1, ulong a2, ulong a3, ulong a4 = 0)
-    {
-        // 26ビット制約定数
-        const uint BIT_26 = 0x03FFFFFF; // 26ビットマスク
-
-        ulong c = a0 >> 26;
-        a0 &= BIT_26;
-
-        ulong a0_plus = a0 + (c * 5);
-        ulong carry = a0_plus >> 26;
-        a0 = a0_plus & BIT_26;
-
-        a1 += carry; carry = a1 >> 26; a1 &= BIT_26;
-        a2 += carry; carry = a2 >> 26; a2 &= BIT_26;
-        a3 += carry + a4; carry = a3 >> 26; a3 &= BIT_26;
-
-        if (carry != 0)
-        {
-            a0 += 5;
-            carry = a0 >> 26;
-            a0 &= BIT_26;
-            a1 += carry;
-        }
-
-        return ((uint)a0, (uint)a1, (uint)a2, (uint)a3);
+        return (h0, h1, h2, h3, h4);
     }
 }
 
@@ -544,9 +606,13 @@ internal sealed class ChaCha20XtsStream : Stream
         ChaCha20Poly1305.ChaCha20Encrypt(_k2, tweakNonce, 0, encryptedTweak, encryptedTweak);
 
         // データ暗号化（K1でChaCha20）
+        // 注: dataNonce は 96-bit = 12 バイトだが blockIndex は long (64-bit)。
+        //     下位 8 バイトを little-endian で書き込み、上位 4 バイトはゼロ固定
+        //     （ドメインベクタとして 0xc1a5 を入れることで、tweak 側との衝突を防ぐ）。
         Span<byte> encryptedData = stackalloc byte[BlockSize];
         byte[] dataNonce = new byte[NonceSize];
-        BinaryPrimitives.WriteInt32LittleEndian(dataNonce, (int)blockIndex);
+        BinaryPrimitives.WriteInt64LittleEndian(dataNonce.AsSpan(0, 8), blockIndex);
+        BinaryPrimitives.WriteUInt16LittleEndian(dataNonce.AsSpan(8, 2), 0xc1a5);  // ドメイン分離タグ
         ChaCha20Poly1305.ChaCha20Encrypt(_k1, dataNonce, 0, encryptedData, block.AsSpan(0, BlockSize));
 
         // XTS: EncryptedData ⊕ Tweak
@@ -577,8 +643,10 @@ internal sealed class ChaCha20XtsStream : Stream
         }
 
         // データ復号化（K1でChaCha20）
+        // 注: EncryptXtsBlock と対称: blockIndex の全 64 ビットを使用し、ドメインベクタも同一。
         byte[] dataNonce = new byte[NonceSize];
-        BinaryPrimitives.WriteInt32LittleEndian(dataNonce, (int)blockIndex);
+        BinaryPrimitives.WriteInt64LittleEndian(dataNonce.AsSpan(0, 8), blockIndex);
+        BinaryPrimitives.WriteUInt16LittleEndian(dataNonce.AsSpan(8, 2), 0xc1a5);  // ドメイン分離タグ
         ChaCha20Poly1305.ChaCha20Decrypt(_k1, dataNonce, 0, xoredBlock, block.AsSpan(0, BlockSize));
     }
 }

@@ -81,8 +81,28 @@ public sealed class E2eeFileService
             var catalog = await LoadCatalogAsync(volumeName, ct);
 
             string fileId = Guid.NewGuid().ToString("N");
-            string dataPath = GetDataPath(volumeName);
-            long offset = new FileInfo(dataPath).Length;
+
+            // 次のオフセットはカタログから算出する。
+            // 旧実装は new FileInfo(dataPath).Length を使っていたが、
+            // ボリュームゲート解放後は物理ファイルがまだ空のため
+            // 並行 CreateFileAsync で同じ offset が割り当てられて衝突していた。
+            //
+            // E2EE ボリュームでは:
+            //  - ローカルモード (IsChunkMode=false): 各ファイルのチャンクが
+            //    volume.dat の Offset から連続して書き込まれる。
+            //  - チャンクモード (IsChunkMode=true): チャンクは IChunkStore に格納され
+            //    volume.dat は使用されない (Offset 値はメタデータとしてのみ保持)。
+            long offset = 0;
+            if (!IsChunkMode(volumeName))
+            {
+                foreach (var existing in catalog.Files.Values)
+                {
+                    long end = existing.Offset;
+                    for (int i = 0; i < existing.ChunkSizes.Count; i++)
+                        end += existing.ChunkSizes[i];
+                    if (end > offset) offset = end;
+                }
+            }
 
             var entry = new E2eeFileEntry
             {
@@ -114,48 +134,49 @@ public sealed class E2eeFileService
     {
         GetE2eeHeader(volumeName);
 
-        var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
-        using (await gate.EnterWriteAsync(ct))
+        // ボリュームゲート: カタログ R-M-W (catalog-e2ee.json の Load→Modify→Save) を直列化。
+        // 旧実装は per-file gate のみで catalog を更新しており、異なる fileId 間の
+        // 並行アップロードで catalog 更新が後勝ちで消える競合があった (H-9)。
+        var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await volGate.WaitAsync(ct);
+        try
         {
-            var catalog = await LoadCatalogAsync(volumeName, ct);
-
-            if (!catalog.Files.TryGetValue(fileId, out var entry))
-                throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
-
-            if (chunkIndex < 0 || chunkIndex >= entry.ChunkCount)
-                throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です（0-{entry.ChunkCount - 1}）。");
-
-            // 順不同アップロードの厳密検出: 現在のチャンクインデックスが、
-            // これまでにアップロード済みのチャンク数と一致しない場合は拒否。
-            // 同じ chunkIndex の二重アップロードもここで弾く。
-            if (entry.ChunkSizes.Count != chunkIndex)
-                throw new FileServiceException($"チャンク {chunkIndex} は順番にアップロードしてください（期待インデックス: {entry.ChunkSizes.Count}）。");
-
-            if (IsChunkMode(volumeName))
+            var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
+            using (await gate.EnterWriteAsync(ct))
             {
-                await _chunkStore.WriteChunkAsync(volumeName, fileId, chunkIndex, data, ct);
+                var catalog = await LoadCatalogAsync(volumeName, ct);
 
-                while (entry.ChunkSizes.Count <= chunkIndex)
-                    entry.ChunkSizes.Add(0);
-                entry.ChunkSizes[chunkIndex] = (int)dataLength;
-            }
-            else
-            {
-                long chunkOffset = entry.Offset;
-                for (int i = 0; i < chunkIndex; i++)
-                    chunkOffset += entry.ChunkSizes[i];
+                if (!catalog.Files.TryGetValue(fileId, out var entry))
+                    throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
 
-                // ボリュームゲートで volume.dat への書き込みを直列化
-                var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
-                await volGate.WaitAsync(ct);
-                long written;
-                try
+                if (chunkIndex < 0 || chunkIndex >= entry.ChunkCount)
+                    throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です（0-{entry.ChunkCount - 1}）。");
+
+                // 順不同アップロードの厳密検出: 現在のチャンクインデックスが、
+                // これまでにアップロード済みのチャンク数と一致しない場合は拒否。
+                // 同じ chunkIndex の二重アップロードもここで弾く。
+                if (entry.ChunkSizes.Count != chunkIndex)
+                    throw new FileServiceException($"チャンク {chunkIndex} は順番にアップロードしてください（期待インデックス: {entry.ChunkSizes.Count}）。");
+
+                if (IsChunkMode(volumeName))
                 {
+                    await _chunkStore.WriteChunkAsync(volumeName, fileId, chunkIndex, data, ct);
+
+                    while (entry.ChunkSizes.Count <= chunkIndex)
+                        entry.ChunkSizes.Add(0);
+                    entry.ChunkSizes[chunkIndex] = (int)dataLength;
+                }
+                else
+                {
+                    long chunkOffset = entry.Offset;
+                    for (int i = 0; i < chunkIndex; i++)
+                        chunkOffset += entry.ChunkSizes[i];
+
                     string dataPath = GetDataPath(volumeName);
                     using var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
                     fs.Seek(chunkOffset, SeekOrigin.Begin);
 
-                    written = 0;
+                    long written = 0;
                     byte[] buffer = new byte[81920];
                     long remaining = dataLength;
                     while (remaining > 0)
@@ -168,18 +189,18 @@ public sealed class E2eeFileService
                         remaining -= read;
                     }
                     fs.Flush();
-                }
-                finally
-                {
-                    volGate.Release();
+
+                    while (entry.ChunkSizes.Count <= chunkIndex)
+                        entry.ChunkSizes.Add(0);
+                    entry.ChunkSizes[chunkIndex] = (int)written;
                 }
 
-                while (entry.ChunkSizes.Count <= chunkIndex)
-                    entry.ChunkSizes.Add(0);
-                entry.ChunkSizes[chunkIndex] = (int)written;
+                await SaveCatalogAsync(volumeName, catalog, ct);
             }
-
-            await SaveCatalogAsync(volumeName, catalog, ct);
+        }
+        finally
+        {
+            volGate.Release();
         }
     }
 
@@ -233,15 +254,25 @@ public sealed class E2eeFileService
     public async Task FinalizeFileAsync(string volumeName, string fileId, E2eeFinalizeFileRequest request, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
-        var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
-        using (await gate.EnterWriteAsync(ct))
+        // ボリュームゲートでカタログ R-M-W を直列化 (H-9)
+        var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await volGate.WaitAsync(ct);
+        try
         {
-            var catalog = await LoadCatalogAsync(volumeName, ct);
-            if (!catalog.Files.TryGetValue(fileId, out var entry))
-                throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
-            entry.EncryptedLength = request.ActualEncryptedLength;
-            entry.ModifiedAt = DateTimeOffset.UtcNow;
-            await SaveCatalogAsync(volumeName, catalog, ct);
+            var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
+            using (await gate.EnterWriteAsync(ct))
+            {
+                var catalog = await LoadCatalogAsync(volumeName, ct);
+                if (!catalog.Files.TryGetValue(fileId, out var entry))
+                    throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+                entry.EncryptedLength = request.ActualEncryptedLength;
+                entry.ModifiedAt = DateTimeOffset.UtcNow;
+                await SaveCatalogAsync(volumeName, catalog, ct);
+            }
+        }
+        finally
+        {
+            volGate.Release();
         }
     }
 
@@ -268,13 +299,23 @@ public sealed class E2eeFileService
     {
         GetE2eeHeader(volumeName);
         bool isChunkMode = IsChunkMode(volumeName);
-        var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
-        using (await gate.EnterWriteAsync(ct))
+        // ボリュームゲートでカタログ R-M-W を直列化 (H-9)
+        var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await volGate.WaitAsync(ct);
+        try
         {
-            var catalog = await LoadCatalogAsync(volumeName, ct);
-            if (!catalog.Files.Remove(fileId))
-                throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
-            await SaveCatalogAsync(volumeName, catalog, ct);
+            var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
+            using (await gate.EnterWriteAsync(ct))
+            {
+                var catalog = await LoadCatalogAsync(volumeName, ct);
+                if (!catalog.Files.Remove(fileId))
+                    throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+                await SaveCatalogAsync(volumeName, catalog, ct);
+            }
+        }
+        finally
+        {
+            volGate.Release();
         }
 
         // チャンクモード: S3 からチャンクを削除

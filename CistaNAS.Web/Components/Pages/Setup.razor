@@ -93,22 +93,7 @@ else
                 return;
             }
 
-            if (_model.Password.Length < 12)
-            {
-                _error = "パスワードは12文字以上必要です。";
-                return;
-            }
-            if (!_model.Password.Any(char.IsLower))
-            {
-                _error = "パスワードには小文字を含める必要があります。";
-                return;
-            }
-            if (!_model.Password.Any(char.IsDigit))
-            {
-                _error = "パスワードには数字を含める必要があります。";
-                return;
-            }
-
+            // パスワードバリデーションは Identity (IdentityOptions.Password) に委譲
             await AccountSvc.CreateInitialAdminAsync(_model.Username, _model.Password);
 
             if (_model.CreateVolume && !string.IsNullOrWhiteSpace(_model.VolumeName))

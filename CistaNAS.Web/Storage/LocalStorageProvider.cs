@@ -105,13 +105,24 @@ public sealed class LocalStorageProvider : IStorageProvider
     {
         ArgumentException.ThrowIfNullOrEmpty(blobPath);
 
-        // 1. 絶対パスや ".." を含むパスを拒否（Path.Combine の第二引数絶対パス上書き攻撃を防ぐ）
+        // 1. 絶対パスを拒否（Path.Combine の第二引数絶対パス上書き攻撃を防ぐ）
         if (Path.IsPathRooted(blobPath))
             throw new UnauthorizedAccessException("絶対パスは使用できません。");
-        if (blobPath.Contains("..", StringComparison.Ordinal))
-            throw new UnauthorizedAccessException("相対親参照 (..) は使用できません。");
 
-        // 2. 正規化してベース配下であることを確認
+        // 2. セグメント単位のチェック: ".." および "." を拒否。
+        // 部分文字列一致（例: "version..1.0"）ではなく、パス区切りで分割して検査することで
+        // 正当なボリューム名（.. を含む）でも動作するようにする。
+        string normalizedSeparators = blobPath.Replace('/', Path.DirectorySeparatorChar)
+                                             .Replace('\\', Path.DirectorySeparatorChar);
+        foreach (var segment in normalizedSeparators.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (segment == "..")
+                throw new UnauthorizedAccessException("相対親参照 (..) は使用できません。");
+            if (segment == ".")
+                throw new UnauthorizedAccessException("相対カレント参照 (.) は使用できません。");
+        }
+
+        // 3. 正規化してベース配下であることを確認
         var normalized = Path.GetFullPath(
             Path.Combine(_basePath, blobPath.Replace('/', Path.DirectorySeparatorChar)));
         var baseFull = Path.GetFullPath(_basePath)

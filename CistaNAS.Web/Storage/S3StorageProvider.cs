@@ -131,9 +131,10 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
         _locks.TryRemove(lockPath, out _);
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         _client.Dispose();
+        return default;
     }
 
     private sealed class LockReleaser(SemaphoreSlim semaphore) : IDisposable

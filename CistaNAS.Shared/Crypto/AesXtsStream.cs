@@ -151,7 +151,7 @@ public sealed class AesXtsStream : Stream
         byte[] buf = new byte[_sectorSize];
         while (read < _sectorSize)
         {
-            int n = await _base.ReadAsync(buf.AsMemory(read, _sectorSize - read), ct);
+            int n = await _base.ReadAsync(buf.AsMemory(read, _sectorSize - read), ct).ConfigureAwait(false);
             if (n == 0) break;
             read += n;
         }
@@ -188,7 +188,7 @@ public sealed class AesXtsStream : Stream
         byte[] enc = plain.ToArray();
         TransformSector(sectorIndex, enc, encrypt: true);
         _base.Position = sectorIndex * _sectorSize;
-        await _base.WriteAsync(enc.AsMemory(0, enc.Length), ct);
+        await _base.WriteAsync(enc.AsMemory(0, enc.Length), ct).ConfigureAwait(false);
     }
 
     private void WriteSectorPlain(long sectorIndex, Span<byte> plain)
@@ -239,7 +239,7 @@ public sealed class AesXtsStream : Stream
             long si = _position / _sectorSize;
             int sOff = (int)(_position % _sectorSize);
             byte[] sector = new byte[_sectorSize];
-            await ReadSectorPlainAsync(si, sector.AsMemory(), cancellationToken);
+            await ReadSectorPlainAsync(si, sector.AsMemory(), cancellationToken).ConfigureAwait(false);
             int n = Math.Min(count, _sectorSize - sOff);
             sector.AsSpan(sOff, n).CopyTo(buffer.Span);
             buffer = buffer[n..];
@@ -298,10 +298,10 @@ public sealed class AesXtsStream : Stream
             if (full)
                 Array.Clear(sector);
             else
-                await ReadSectorPlainAsync(si, sector.AsMemory(), cancellationToken); // RMW: 既存セクタを復号して部分更新
+                await ReadSectorPlainAsync(si, sector.AsMemory(), cancellationToken).ConfigureAwait(false); // RMW: 既存セクタを復号して部分更新
 
             src.Span[..n].CopyTo(sector.AsSpan(sOff));
-            await WriteSectorPlainAsync(si, sector.AsMemory(0, _sectorSize), cancellationToken);
+            await WriteSectorPlainAsync(si, sector.AsMemory(0, _sectorSize), cancellationToken).ConfigureAwait(false);
 
             _position += n;
             if (_position > _length) _length = _position;

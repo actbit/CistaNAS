@@ -12,6 +12,7 @@
 @inject E2eeInterop E2ee
 @inject IJSRuntime JS
 @inject NavigationManager Nav
+@inject EncryptionSettingsService EncSettings
 
 <PageTitle>設定 - CistaNAS</PageTitle>
 
@@ -497,26 +498,13 @@ else
 
     private void LoadEncryptionSettings()
     {
-        // appsettings.json から直接読み込み（DI 経由だと読み取り専用のため）
         try
         {
-            string path = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
-            if (!File.Exists(path)) return;
-            using var fs = File.OpenRead(path);
-            var doc = System.Text.Json.JsonDocument.Parse(fs);
-            var nas = doc.RootElement.GetProperty("CistaNas");
-
-            if (nas.TryGetProperty("Volume", out var vol))
-            {
-                if (vol.TryGetProperty("DefaultEncryptionMode", out var mode))
-                    _encSettings.DefaultEncryptionMode = mode.GetString() ?? "server";
-                if (vol.TryGetProperty("E2eeChunkSize", out var cs))
-                    _encSettings.E2eeChunkSize = cs.GetInt32();
-                if (vol.TryGetProperty("KdfIterations", out var ki))
-                    _encSettings.KdfIterations = ki.GetInt32();
-                if (vol.TryGetProperty("SectorSize", out var ss))
-                    _encSettings.SectorSize = ss.GetInt32();
-            }
+            var vol = EncSettings.CurrentVolumeOptions();
+            _encSettings.DefaultEncryptionMode = vol.DefaultEncryptionMode ?? "server";
+            _encSettings.E2eeChunkSize = vol.E2eeChunkSize > 0 ? vol.E2eeChunkSize : 1048576;
+            _encSettings.KdfIterations = vol.KdfIterations > 0 ? vol.KdfIterations : 310_000;
+            _encSettings.SectorSize = vol.SectorSize > 0 ? vol.SectorSize : 4096;
         }
         catch { }
     }
@@ -526,56 +514,21 @@ else
         _encSaveSuccess = false; _encError = null;
         try
         {
-            string path = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
-            System.Text.Json.JsonElement root;
-            if (File.Exists(path))
+            var current = EncSettings.CurrentVolumeOptions();
+            var updated = new VolumeOptions
             {
-                using (var fs = File.OpenRead(path))
-                    root = System.Text.Json.JsonDocument.Parse(fs).RootElement.Clone();
-            }
-            else
-            {
-                root = System.Text.Json.JsonDocument.Parse("{}").RootElement.Clone();
-            }
-
-            // JSON を構築して保存
-            var dict = new Dictionary<string, object>();
-            foreach (var prop in root.EnumerateObject())
-                dict[prop.Name] = DeserializeElement(prop.Value);
-
-            if (!dict.ContainsKey("CistaNas"))
-                dict["CistaNas"] = new Dictionary<string, object>();
-
-            var nasDict = (Dictionary<string, object>)dict["CistaNas"];
-            if (!nasDict.ContainsKey("Volume"))
-                nasDict["Volume"] = new Dictionary<string, object>();
-
-            var volDict = (Dictionary<string, object>)nasDict["Volume"];
-            volDict["DefaultEncryptionMode"] = _encSettings.DefaultEncryptionMode;
-            volDict["E2eeChunkSize"] = _encSettings.E2eeChunkSize;
-            volDict["KdfIterations"] = _encSettings.KdfIterations;
-            volDict["SectorSize"] = _encSettings.SectorSize;
-
-            var options = new System.Text.Json.JsonSerializerOptions { WriteIndented = true };
-            string json = System.Text.Json.JsonSerializer.Serialize(dict, options);
-            File.WriteAllText(path, json);
-
+                SectorSize = _encSettings.SectorSize,
+                KdfIterations = _encSettings.KdfIterations,
+                DefaultEncryptionMode = _encSettings.DefaultEncryptionMode,
+                E2eeChunkSize = _encSettings.E2eeChunkSize,
+                ChunkStorage = current.ChunkStorage,
+                ServerChunkSize = current.ServerChunkSize,
+            };
+            EncSettings.SaveVolumeOptions(updated);
             _encSaveSuccess = true;
         }
         catch (Exception ex) { _encError = $"保存エラー: {ex.Message}"; }
     }
-
-    private static object DeserializeElement(System.Text.Json.JsonElement el) => el.ValueKind switch
-    {
-        System.Text.Json.JsonValueKind.Object => el.EnumerateObject()
-            .ToDictionary(p => p.Name, p => DeserializeElement(p.Value)),
-        System.Text.Json.JsonValueKind.Array => el.EnumerateArray().Select(DeserializeElement).ToList(),
-        System.Text.Json.JsonValueKind.String => el.GetString()!,
-        System.Text.Json.JsonValueKind.Number => el.TryGetInt32(out var i) ? i : el.GetDouble(),
-        System.Text.Json.JsonValueKind.True => true,
-        System.Text.Json.JsonValueKind.False => false,
-        _ => "",
-    };
 
     // ---- E2EE 鍵ペア管理 ----
 

@@ -601,8 +601,10 @@ else
 
     private async Task HandleE2eeDownload(E2eeFileViewItem item)
     {
-        // ファイルサイズ推定（チャンク数 × 1MB - オーバーヘッド）
-        long estimatedSize = (long)item.Entry.ChunkCount * 1048576L;
+        // ファイルサイズ推定: E2eeFileEntry.EncryptedLength は暗号文 + タグの合計バイト数なので
+        // そのままサイズしきい値の比較に使える。ChunkCount × 1MB の近似（旧実装）は
+        // 実際の ChunkSize (64 KiB〜16 MiB) と乖離するため廃止。
+        long estimatedSize = item.Entry.EncryptedLength;
         const int LargeFileThreshold = 50 * 1024 * 1024; // 50MB
 
         if (estimatedSize > LargeFileThreshold)

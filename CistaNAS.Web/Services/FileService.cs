@@ -677,7 +677,9 @@ file sealed class FileSubStream(Stream baseStream, long offset, long length, Sem
     {
         if (_position >= length) return 0;
         int toRead = (int)Math.Min(count, length - _position);
-        streamLock.Wait();
+        // 同期パスだが Dokan コールバック等の制約上 GetAwaiter().GetResult() を使用。
+        // streamLock はボリューム単位で共有されるが、通常は短時間で解放されるためデッドロックリスクは低い。
+        streamLock.WaitAsync(CancellationToken.None).GetAwaiter().GetResult();
         try
         {
             baseStream.Position = offset + _position;

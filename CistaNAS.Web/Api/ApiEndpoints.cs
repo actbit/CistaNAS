@@ -74,6 +74,7 @@ public static class ApiEndpoints
             bool ok = await auth.ChangePasswordAsync(username, req.OldPassword, req.NewPassword);
             return ok ? Results.Ok() : Results.BadRequest(new { error = "認証に失敗しました。" });
         })
+        .RequireRateLimiting("auth")
         .WithName("ChangePassword");
 
         // ---- ボリューム ----
@@ -104,6 +105,7 @@ public static class ApiEndpoints
             catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
         .RequireAuthorization("VolumeAccessByName")
+        .RequireRateLimiting("auth")
         .WithName("MountVolume");
 
         volumes.MapPost("/{name}/lock", async (string name, VolumeService vs, HttpContext ctx) =>

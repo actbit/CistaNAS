@@ -124,15 +124,18 @@ public static class ChunkEncryptor
     /// <summary>ChaCha20 暗号化（サーバー側実装）。</summary>
     /// <remarks>
     /// ノンスは HKDF で sectorIndex から導出する（ボリューム内・ボリューム間で衝突しない）。
-    /// カウンタは 0 固定（各セクタは 16 バイト = ChaCha20 ブロック 1 個分）。
+    /// 1 セクタ = <paramref name="sectorSize"/> バイト。sectorSize にはボリュームの
+    /// SectorSize プロパティ（既定 4096）が渡される想定。
     /// </remarks>
     private static void ChaCha20Encrypt(ReadOnlySpan<byte> masterKey, long firstSector, byte[] data, int sectorSize)
     {
-        const int SectorSize = 16;
+        if (sectorSize <= 0 || sectorSize % 16 != 0)
+            throw new ArgumentException("セクタサイズは 16 の倍数であること。", nameof(sectorSize));
+
         const int NonceSize = 12;
         const string NonceInfo = "cista-chacha20-nonce/v1";
 
-        int sectorCount = data.Length / SectorSize;
+        int sectorCount = data.Length / sectorSize;
         if (sectorCount == 0) return;
 
         byte[] keyArr = masterKey.ToArray();
@@ -143,14 +146,14 @@ public static class ChunkEncryptor
         for (int s = 0; s < sectorCount; s++)
         {
             long sectorIndex = firstSector + s;
-            int sectorOffset = s * SectorSize;
+            int sectorOffset = s * sectorSize;
 
             // HKDF(masterKey, salt=sectorIndex) → 12 バイトノンス
             BinaryPrimitives.WriteInt64LittleEndian(sectorIndexBytes, sectorIndex);
             // 注: HKDF.DeriveKey の引数順は (ikm, output, salt, info)
             HKDF.DeriveKey(HashAlgorithmName.SHA256, keyArr, nonce, sectorIndexBytes, infoBytes);
 
-            ChaCha20EncryptCore(keyArr, nonce, counter: 0, data.AsSpan(sectorOffset, SectorSize));
+            ChaCha20EncryptCore(keyArr, nonce, counter: 0, data.AsSpan(sectorOffset, sectorSize));
         }
     }
 

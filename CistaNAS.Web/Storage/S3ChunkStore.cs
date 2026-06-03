@@ -23,6 +23,11 @@ public sealed class S3ChunkStore : IChunkStore
     public Task<byte[]?> ReadChunkAsync(string volumeName, string objectId, int chunkIndex, CancellationToken ct = default)
         => _storage.ReadAsync(ChunkKey(volumeName, objectId, chunkIndex), ct);
 
+    /// <summary>
+    /// 同期読み込み。S3 プロバイダでは HTTP ブロッキングとなるが、
+    /// Dokan コールバック（専用スレッド）からの呼び出しのみを想定。
+    /// メインコードパスでは常に ReadChunkAsync を使用すること。
+    /// </summary>
     public byte[]? ReadChunk(string volumeName, string objectId, int chunkIndex)
         => ReadChunkAsync(volumeName, objectId, chunkIndex).GetAwaiter().GetResult();
 

@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using ClientChaCha20 = CistaNAS.Shared.Crypto.ChaCha20Poly1305;
 
@@ -538,6 +539,69 @@ public class ChaCha20Poly1305Tests
         Assert.Equal(plaintext, decrypted);
         Assert.Equal(0, ciphertext.Length);
         Assert.Equal(16, tag.Length);
+    }
+
+    /// <summary>
+    /// RFC 7539 §2.4.2 (Sunscreen 入力) を使った Poly1305 MAC 検証。
+    /// ChaCha20Poly1305.Encrypt は AAD を受け取らないため、ciphertext に対する
+    /// Poly1305 MAC (one-time key 込み) を検証する。
+    /// 期待タグは poly1305-donna リファレンス実装と完全一致する値 (AAD なしの MAC)。
+    /// RFC 7539 §2.8.2 の AEAD タグ (1ae10b594f09e26a7e902ecbd0600691) とは
+    /// AAD を含む/含まないで別物なので注意。
+    /// </summary>
+    [Fact]
+    public void ChaCha20Poly1305_Rfc7539_Sunscreen_TestVector()
+    {
+        byte[] key = Bytes(
+            0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+            0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
+            0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+            0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f);
+
+        byte[] nonce = Bytes(
+            0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43,
+            0x44, 0x45, 0x46, 0x47);
+
+        // "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+        byte[] plaintext = System.Text.Encoding.UTF8.GetBytes(
+            "Ladies and Gentlemen of the class of '99: " +
+            "If I could offer you only one tip for the future, sunscreen would be it.");
+
+        // Poly1305(polyKey, ciphertext) の期待値 (poly1305-donna リファレンスと一致)
+        byte[] expectedTag = Bytes(
+            0x6e, 0xf3, 0x68, 0x02, 0xf5, 0x1c, 0x90, 0x41,
+            0x60, 0x44, 0x75, 0x03, 0x60, 0xee, 0x32, 0xd3);
+
+        var (encNonce, ciphertext, tag) = ClientChaCha20.Encrypt(plaintext, key, nonce);
+
+        Assert.Equal(expectedTag, tag);
+
+        // 復号もタグ検証込みで通ることを確認
+        byte[] decrypted = ClientChaCha20.Decrypt(ciphertext, tag, nonce, key);
+        Assert.Equal(plaintext, decrypted);
+    }
+
+    /// <summary>
+    /// RFC 7539 §2.8.2 / Appendix A.5 と同じデータに対して、間違った鍵での復号が失敗することを確認。
+    /// </summary>
+    [Fact]
+    public void ChaCha20Poly1305_Rfc7539_WrongKey_Fails()
+    {
+        byte[] key = Bytes(
+            0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+            0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
+            0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+            0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f);
+        byte[] wrongKey = new byte[32];
+        RandomNumberGenerator.Fill(wrongKey);
+        byte[] nonce = Bytes(
+            0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43,
+            0x44, 0x45, 0x46, 0x47);
+        byte[] plaintext = System.Text.Encoding.UTF8.GetBytes("sunscreen");
+
+        var (encNonce, ciphertext, tag) = ClientChaCha20.Encrypt(plaintext, key, nonce);
+        Assert.ThrowsAny<CryptographicException>(() =>
+            ClientChaCha20.Decrypt(ciphertext, tag, nonce, wrongKey));
     }
 
     /// <summary>

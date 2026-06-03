@@ -232,11 +232,9 @@ public static class E2eeEndpoints
         if (string.IsNullOrEmpty(granter))
             return Results.Unauthorized();
 
-        // 認可ポリシー VolumeOwner は granter がボリュームオーナーであることを保証するが、
-        // granter 自身ではない別の username に対する wrapped key 追加を防ぐため、
-        // ここで明示的にチェックする (H-3)。
-        if (!string.Equals(granter, req.Username, StringComparison.Ordinal))
-            return Results.Forbid();
+        // 認可ポリシー VolumeOwner は granter がボリュームオーナーであることを保証する。
+        // サービス層 (VolumeService.AddE2eeWrappedKeyAsync) で granter == OwnerUser を再確認しているため、
+        // ここでは granter と req.Username が一致する必要はない (共有フロー: オーナーが他人宛にラップ鍵を追加する)。
 
         try
         {
