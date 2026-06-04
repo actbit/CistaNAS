@@ -359,7 +359,7 @@ public sealed class E2eeFileService
     }
 
     /// <summary>平文サイズを計算する（E2EE 暗号化フォーマット対応）。</summary>
-    private static long ComputePlainSize(long encryptedLength, int chunkCount)
+    public static long ComputePlainSize(long encryptedLength, int chunkCount)
     {
         // フォーマット: salt(16) + [chunk0: ciphertext + tag(16) | ... | chunkN-1: ciphertext + tag(16)]
         // ciphertext = チャンクサイズ（最後のチャンクは実際のサイズ）

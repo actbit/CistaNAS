@@ -150,8 +150,8 @@ public static class ChunkEncryptor
 
             // HKDF-SHA256: salt=sectorIndex, info=NonceInfo → 12 バイトノンス
             BinaryPrimitives.WriteInt64LittleEndian(sectorIndexBytes, sectorIndex);
-            // HKDF.DeriveKey(hash, ikm, salt, info, output)
-            HKDF.DeriveKey(HashAlgorithmName.SHA256, keyArr, sectorIndexBytes, infoBytes, nonce);
+            // Use Span-based overload which properly writes to output
+            HKDF.DeriveKey(HashAlgorithmName.SHA256, keyArr.AsSpan(), nonce, sectorIndexBytes, infoBytes);
 
             ChaCha20EncryptCore(keyArr, nonce, counter: 0, data.AsSpan(sectorOffset, sectorSize));
         }
