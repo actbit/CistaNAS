@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 
@@ -18,6 +19,7 @@ public sealed class AesXtsTransform : IDisposable
     private readonly Aes _dataAes;
     private readonly Aes _tweakAes;
     private bool _disposed;
+    private readonly object _disposeLock = new();
 
     /// <param name="key">K1||K2 の 64 バイト。</param>
     /// <param name="sectorSize">セクタサイズ（16 の倍数）。</param>
@@ -63,9 +65,16 @@ public sealed class AesXtsTransform : IDisposable
         du.Clear();
         BinaryPrimitives.WriteUInt64LittleEndian(du, (ulong)sectorIndex);
         byte[] inBuf = du.ToArray();
-        byte[] outBuf = new byte[BlockSize];
-        _tweakEnc.TransformBlock(inBuf, 0, BlockSize, outBuf, 0);
-        outBuf.CopyTo(tweak);
+        byte[] outBuf = ArrayPool<byte>.Shared.Rent(BlockSize);
+        try
+        {
+            _tweakEnc.TransformBlock(inBuf, 0, BlockSize, outBuf, 0);
+            outBuf.AsSpan(0, BlockSize).CopyTo(tweak);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(outBuf);
+        }
     }
 
     /// <summary>
@@ -84,16 +93,23 @@ public sealed class AesXtsTransform : IDisposable
         ComputeTweak(firstSectorIndex, t);
 
         ICryptoTransform cipher = encrypt ? _dataEnc : _dataDec;
-        byte[] tmpIn = new byte[BlockSize];
-        byte[] tmpOut = new byte[BlockSize];
-
-        for (int off = 0; off < data.Length; off += BlockSize)
+        byte[] tmpIn = ArrayPool<byte>.Shared.Rent(BlockSize);
+        byte[] tmpOut = ArrayPool<byte>.Shared.Rent(BlockSize);
+        try
         {
-            Span<byte> blk = data.Slice(off, BlockSize);
-            for (int i = 0; i < BlockSize; i++) tmpIn[i] = (byte)(blk[i] ^ t[i]);
-            cipher.TransformBlock(tmpIn, 0, BlockSize, tmpOut, 0);
-            for (int i = 0; i < BlockSize; i++) blk[i] = (byte)(tmpOut[i] ^ t[i]);
-            MultiplyAlpha(t);
+            for (int off = 0; off < data.Length; off += BlockSize)
+            {
+                Span<byte> blk = data.Slice(off, BlockSize);
+                for (int i = 0; i < BlockSize; i++) tmpIn[i] = (byte)(blk[i] ^ t[i]);
+                cipher.TransformBlock(tmpIn, 0, BlockSize, tmpOut, 0);
+                for (int i = 0; i < BlockSize; i++) blk[i] = (byte)(tmpOut[i] ^ t[i]);
+                MultiplyAlpha(t);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(tmpIn);
+            ArrayPool<byte>.Shared.Return(tmpOut);
         }
     }
 
@@ -117,14 +133,17 @@ public sealed class AesXtsTransform : IDisposable
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        _dataEnc.Dispose();
-        _dataDec.Dispose();
-        _tweakEnc.Dispose();
-        CryptographicOperations.ZeroMemory(_dataAes.Key);
-        CryptographicOperations.ZeroMemory(_tweakAes.Key);
-        _dataAes.Dispose();
-        _tweakAes.Dispose();
+        lock (_disposeLock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _dataEnc.Dispose();
+            _dataDec.Dispose();
+            _tweakEnc.Dispose();
+            CryptographicOperations.ZeroMemory(_dataAes.Key);
+            CryptographicOperations.ZeroMemory(_tweakAes.Key);
+            _dataAes.Dispose();
+            _tweakAes.Dispose();
+        }
     }
 }

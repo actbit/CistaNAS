@@ -18,7 +18,7 @@ namespace CistaNAS.Web.Services;
 /// メタデータは VolumeMetadataStore（IStorageProvider）経由で保存し、
 /// volume.dat はローカルファイルシステムに配置。
 /// </summary>
-public sealed class VolumeService : IDisposable
+public sealed class VolumeService : IAsyncDisposable
 {
     private int _disposed;
     private readonly IOptions<CistaNasOptions> _options;
@@ -816,16 +816,25 @@ public sealed class VolumeService : IDisposable
             throw new VolumeException("ボリューム名に使用できない文字が含まれています。");
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
 
+        // すべてのマウント済みボリュームの I/O 完了を待機
+        var tasks = new List<Task>(_mounted.Count);
         foreach (var kvp in _mounted)
         {
-            kvp.Value.Stream.Dispose();
-            if (kvp.Value.MasterKey is not null)
-                CryptographicOperations.ZeroMemory(kvp.Value.MasterKey);
+            var mv = kvp.Value;
+            tasks.Add(Task.Run(async () =>
+            {
+                await mv.IoTracker.WaitForZeroAsync();
+                mv.Stream.Dispose();
+                if (mv.MasterKey is not null)
+                    CryptographicOperations.ZeroMemory(mv.MasterKey);
+            }));
         }
+        await Task.WhenAll(tasks);
+
         _mounted.Clear();
         _mountGate.Dispose();
     }
@@ -864,14 +873,20 @@ public sealed class VolumeService : IDisposable
         /// <summary>アクティブ I/O がゼロになるまで待機する。</summary>
         public async Task WaitForZeroAsync()
         {
-            // _activeCount のチェックと _zeroTcs の設定をアトミックに行う
+            TaskCompletionSource<object?>? tcs;
             lock (_gate)
             {
                 if (_activeCount == 0)
                     return;
-                _zeroTcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                // 既存の TCS があれば再利用し、なければ新規作成
+                tcs = _zeroTcs;
+                if (tcs is null)
+                {
+                    tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _zeroTcs = tcs;
+                }
             }
-            await _zeroTcs.Task;
+            await tcs.Task;
         }
 
         private void Exit()

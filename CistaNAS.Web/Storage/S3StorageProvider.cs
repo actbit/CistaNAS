@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Threading;
 using Amazon.S3;
 using Amazon.S3.Model;
+using System.Globalization;
 
 namespace CistaNAS.Web.Storage;
 
@@ -73,8 +74,10 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
     public async Task WriteAtomicAsync(string blobPath, Stream content, CancellationToken ct = default)
     {
         // 一時パスに書き込み → コピー → 一時削除（LocalStorageProvider の rename パターンに相当）
-        string tempPath = FullPath(blobPath) + ".tmp";
-        if (content.CanSeek && content.Position != 0 && content.Length > 0)
+        // GUID を付与して同時実行時の衝突を防止
+        string tempPath = FullPath(blobPath) + ".tmp-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
+        // ストリームの位置を先頭にリセット（Seek 可能な場合）
+        if (content.CanSeek && content.Position != 0)
             content.Position = 0;
         var tempRequest = new PutObjectRequest
         {
