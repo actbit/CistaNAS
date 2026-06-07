@@ -23,11 +23,14 @@ public sealed class JournalService
     }
 
     /// <summary>ジャーナルにエントリを追記する。書き込み前（pre-commit）に呼ぶ。</summary>
-    public async Task RecordAsync(string volumeName, JournalEntry entry, CancellationToken ct = default)
+    /// <returns>操作 ID（CommitAsync に渡す）。</returns>
+    public async Task<string> RecordAsync(string volumeName, JournalEntry entry, CancellationToken ct = default)
     {
+        string operationId = Guid.NewGuid().ToString("N");
         string journalPath = $"{volumeName}/volume{JournalFile.Suffix}";
         string lockPath = $"{volumeName}/volume{JournalFile.Suffix}.lock";
         entry.Timestamp = DateTimeOffset.UtcNow;
+        entry.OperationId = operationId;
 
         using (await _storage.AcquireLockAsync(lockPath, ct))
         {
@@ -42,10 +45,37 @@ public sealed class JournalService
             ms.Position = 0;
             await _storage.WriteAtomicAsync(journalPath, ms, ct);
         }
+
+        return operationId;
     }
 
-    /// <summary>書き込み完了後にジャーナルをクリアする（コミット）。</summary>
-    public async Task CommitAsync(string volumeName, CancellationToken ct = default)
+    /// <summary>指定操作 ID のエントリをジャーナルから削除する（コミット）。</summary>
+    public async Task CommitAsync(string volumeName, string operationId, CancellationToken ct = default)
+    {
+        string journalPath = $"{volumeName}/volume{JournalFile.Suffix}";
+        string lockPath = $"{volumeName}/volume{JournalFile.Suffix}.lock";
+
+        if (!await _storage.ExistsAsync(journalPath, ct)) return;
+
+        using (await _storage.AcquireLockAsync(lockPath, ct))
+        {
+            byte[]? existing = await _storage.ReadAsync(journalPath, ct);
+            var journal = existing is not null
+                ? JsonSerializer.Deserialize<JournalFile>(existing, JsonOptions) ?? new JournalFile()
+                : new JournalFile();
+            int removed = journal.Pending.RemoveAll(e => e.OperationId == operationId);
+
+            if (removed == 0) return;
+
+            using var ms = new MemoryStream();
+            JsonSerializer.Serialize(ms, journal, JsonOptions);
+            ms.Position = 0;
+            await _storage.WriteAtomicAsync(journalPath, ms, ct);
+        }
+    }
+
+    /// <summary>ジャーナルの全エントリをクリアする（クラッシュ復旧後の一括コミット用）。</summary>
+    public async Task CommitAllAsync(string volumeName, CancellationToken ct = default)
     {
         string journalPath = $"{volumeName}/volume{JournalFile.Suffix}";
         string lockPath = $"{volumeName}/volume{JournalFile.Suffix}.lock";
@@ -64,7 +94,7 @@ public sealed class JournalService
 
     /// <summary>
     /// 未コミットのジャーナルがあればエントリを返す（クラッシュ復旧用）。
-    /// 復旧後は <see cref="CommitAsync"/> を呼ぶこと。
+    /// 復旧後は <see cref="CommitAllAsync"/> を呼ぶこと。
     /// </summary>
     public async Task<IReadOnlyList<JournalEntry>> RecoverAsync(string volumeName, CancellationToken ct = default)
     {

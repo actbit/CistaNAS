@@ -223,10 +223,12 @@ public sealed class FileService
     /// <summary>非チャンクモードのアップロード本体。</summary>
     private async Task<FileMetadata> UploadInternalAsync(string volumeName, string fileName, Stream content, long contentLength, CancellationToken ct)
     {
-        var (stream, _) = _volumeService.GetMounted(volumeName);
+        var (ioGuard, stream, _) = await _volumeService.GetMountedForIoAsync(volumeName, ct);
+        try
+        {
 
         // ジャーナル: 書き込み前
-        await _journalService.RecordAsync(volumeName, new JournalEntry
+        string opId = await _journalService.RecordAsync(volumeName, new JournalEntry
         {
             Operation = JournalOp.WriteFile,
             Path = fileName,
@@ -296,9 +298,14 @@ public sealed class FileService
         }
 
         // ジャーナル: コミット
-        await _journalService.CommitAsync(volumeName, ct);
+        await _journalService.CommitAsync(volumeName, opId, ct);
 
         return meta;
+        }
+        finally
+        {
+            ioGuard.Dispose();
+        }
     }
 
     /// <summary>チャンクモード: ファイルをチャンク分割して暗号化し S3 に保存。</summary>
@@ -319,7 +326,7 @@ public sealed class FileService
         int chunkSize = header.ServerChunkSize > 0 ? header.ServerChunkSize : 4194304;
 
         // ジャーナル: 書き込み前
-        await _journalService.RecordAsync(volumeName, new JournalEntry
+        string opId = await _journalService.RecordAsync(volumeName, new JournalEntry
         {
             Operation = JournalOp.WriteFile,
             Path = fileName,
@@ -387,7 +394,7 @@ public sealed class FileService
             catalog.Files[fileName] = meta;
             await SaveCatalogAsync(volumeName, catalog, ct);
 
-            await _journalService.CommitAsync(volumeName, ct);
+            await _journalService.CommitAsync(volumeName, opId, ct);
             return meta;
         }
         finally
@@ -416,13 +423,13 @@ public sealed class FileService
                     return DownloadChunkedResponse(volumeName, fileName, meta, readLock);
 
                 // ローカルモード: 従来のストリームベース
-                var (stream, _) = _volumeService.GetMounted(volumeName);
+                var (ioGuard, stream, _) = await _volumeService.GetMountedForIoAsync(volumeName, ct);
                 long offset = meta.Offset;
                 long length = meta.Length;
                 string name = meta.Name;
                 var streamLock = _streamLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
                 var inner = new FileSubStream(stream, offset, length, streamLock);
-                return new FileDownloadResponse(new GateReadStream(inner, readLock), name, length);
+                return new FileDownloadResponse(new IoGuardReadStream(new GateReadStream(inner, readLock), ioGuard), name, length);
             }
             finally
             {
@@ -473,7 +480,7 @@ public sealed class FileService
         var gate = _fileGates.GetOrAdd((volumeName, fileName), _ => new AsyncFileGate());
         using (await gate.EnterWriteAsync(ct))
         {
-            await _journalService.RecordAsync(volumeName, new JournalEntry
+            string opId = await _journalService.RecordAsync(volumeName, new JournalEntry
             {
                 Operation = JournalOp.DeleteFile,
                 Path = fileName,
@@ -501,7 +508,7 @@ public sealed class FileService
                 catch (Exception) { /* ベストエフォート */ }
             }
 
-            await _journalService.CommitAsync(volumeName, ct);
+            await _journalService.CommitAsync(volumeName, opId, ct);
         }
 
         // 削除完了後にファイルゲートをクリーンアップ
@@ -547,7 +554,7 @@ public sealed class FileService
         }
 
         await SaveCatalogAsync(volumeName, catalog, ct);
-        await _journalService.CommitAsync(volumeName, ct);
+        await _journalService.CommitAllAsync(volumeName, ct);
     }
 
     /// <summary>ボリューム削除時に対応するカタログロックを破棄。</summary>
@@ -635,6 +642,38 @@ internal sealed class GateReadStream(Stream inner, IDisposable gateLock) : Strea
                 gateLock.Dispose();
                 _lockReleased = true;
             }
+        }
+        base.Dispose(disposing);
+    }
+}
+
+/// <summary>ボリューム I/O ガードをストリーム Dispose 時に解放するラッパー。</summary>
+internal sealed class IoGuardReadStream(Stream inner, IDisposable ioGuard) : Stream
+{
+    public override bool CanRead => inner.CanRead;
+    public override bool CanSeek => inner.CanSeek;
+    public override bool CanWrite => false;
+    public override long Length => inner.Length;
+    public override long Position { get => inner.Position; set => inner.Position = value; }
+
+    public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        => inner.ReadAsync(buffer, cancellationToken);
+    public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
+    public override void Flush() => inner.Flush();
+
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    private bool _disposed;
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && !_disposed)
+        {
+            _disposed = true;
+            inner.Dispose();
+            ioGuard.Dispose();
         }
         base.Dispose(disposing);
     }

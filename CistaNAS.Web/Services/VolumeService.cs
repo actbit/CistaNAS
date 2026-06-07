@@ -21,9 +21,8 @@ namespace CistaNAS.Web.Services;
 public sealed class VolumeService : IDisposable
 {
     private int _disposed;
+    private readonly IOptions<CistaNasOptions> _options;
     private readonly string _volumeDataPath;
-    private readonly VolumeOptions _volOpts;
-    private readonly string _storageProvider;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly VolumeMetadataStore _metaStore;
     private readonly IChunkStore _chunkStore;
@@ -32,6 +31,9 @@ public sealed class VolumeService : IDisposable
     private readonly ConcurrentDictionary<string, MountedVolume> _mounted = new();
     private readonly SemaphoreSlim _mountGate = new(1, 1);
 
+    private VolumeOptions VolOpts => _options.Value.Volume;
+    private string StorageProvider => _options.Value.Storage.Provider.ToLowerInvariant();
+
     public VolumeService(
         IOptions<CistaNasOptions> options,
         IServiceScopeFactory scopeFactory,
@@ -39,9 +41,8 @@ public sealed class VolumeService : IDisposable
         IChunkStore chunkStore,
         ILogger<VolumeService> logger)
     {
+        _options = options;
         _volumeDataPath = options.Value.Storage.VolumeDataPath ?? options.Value.DataRoot;
-        _volOpts = options.Value.Volume;
-        _storageProvider = options.Value.Storage.Provider.ToLowerInvariant();
         _scopeFactory = scopeFactory;
         _metaStore = metaStore;
         _chunkStore = chunkStore;
@@ -51,7 +52,7 @@ public sealed class VolumeService : IDisposable
 
     /// <summary>"auto" 設定時に、S3 プロバイダ使用中ならチャンクモードにするかを判定。</summary>
     private bool ShouldUseChunkMode() =>
-        _volOpts.ChunkStorage == "auto" && _storageProvider != "local";
+        VolOpts.ChunkStorage == "auto" && StorageProvider != "local";
 
     public async Task<VolumeInfo> CreateAsync(string name, string? username, string? password, bool encrypted = true)
     {
@@ -97,14 +98,14 @@ public sealed class VolumeService : IDisposable
         if (await _metaStore.ExistsAsync(name))
             throw new VolumeException($"ボリューム '{name}' は既に存在します。");
 
-        var (header, masterKey) = VolumeHeader.Create(name, username, password, _volOpts.SectorSize, _volOpts.KdfIterations, shouldEncrypt, cipherAlgorithm);
+        var (header, masterKey) = VolumeHeader.Create(name, username, password, VolOpts.SectorSize, VolOpts.KdfIterations, shouldEncrypt, cipherAlgorithm);
 
         // チャンクモード判定: "auto" かつ S3 プロバイダ使用時
         bool chunkMode = ShouldUseChunkMode();
         if (chunkMode)
         {
             header.StorageMode = "chunk";
-            header.ServerChunkSize = _volOpts.ServerChunkSize;
+            header.ServerChunkSize = VolOpts.ServerChunkSize;
         }
 
         Directory.CreateDirectory(VolumeDir(name));
@@ -145,8 +146,15 @@ public sealed class VolumeService : IDisposable
 
             Directory.CreateDirectory(VolumeDir(name));
             await _metaStore.SaveAsync(name, header);
-            File.Create(GetDataPath(name)).Dispose();
-            MountInternal(name, header, masterKey: null);
+
+            bool chunkMode = ShouldUseChunkMode();
+            if (chunkMode)
+                MountInternalChunked(name, header, masterKey: null);
+            else
+            {
+                File.Create(GetDataPath(name)).Dispose();
+                MountInternal(name, header, masterKey: null);
+            }
 
             return ToInfo(name, header, true);
         }
@@ -250,6 +258,8 @@ public sealed class VolumeService : IDisposable
                 throw new VolumeException("オーナーのみがボリュームをロックできます。");
 
             _mounted.TryRemove(name, out _);
+            // アクティブなファイルI/Oの完了を待機してからストリームを破棄
+            await mv.IoTracker.WaitForZeroAsync();
             mv.Stream.Dispose();
             if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
         }
@@ -304,13 +314,25 @@ public sealed class VolumeService : IDisposable
         return result;
     }
 
-    public (Stream Stream, VolumeHeader Header) GetMounted(string name)
+    /// <summary>
+    /// マウント済みボリュームの Stream と Header を I/O 用に取得。
+    /// 返された <see cref="IDisposable"/> は I/O 完了後に必ず Dispose すること。
+    /// LockAsync はアクティブな I/O ガードがすべて解放されるまで待機する。
+    /// </summary>
+    public async Task<(IDisposable IoGuard, Stream Stream, VolumeHeader Header)> GetMountedForIoAsync(string name, CancellationToken ct = default)
     {
         if (!_mounted.TryGetValue(name, out var mv))
             throw new VolumeException($"ボリューム '{name}' はマウントされていません。");
-        // スナップショットを返す: LockAsync で mv.Stream が Dispose されても
-        // 呼び出し側が使用中のストリームは安全に動作する。
-        return (mv.Stream, mv.Header);
+        var guard = await mv.IoTracker.EnterAsync(ct);
+        return (guard, mv.Stream, mv.Header);
+    }
+
+    /// <summary>マウント済みボリュームの Header のみ取得（Stream 不要・I/O 追跡なし）。</summary>
+    public (VolumeHeader Header, Stream Stream) GetMounted(string name)
+    {
+        if (!_mounted.TryGetValue(name, out var mv))
+            throw new VolumeException($"ボリューム '{name}' はマウントされていません。");
+        return (mv.Header, mv.Stream);
     }
 
     /// <summary>マウント済みボリュームの Header と MasterKey を取得（Stream は不要なケース用）。</summary>
@@ -364,7 +386,7 @@ public sealed class VolumeService : IDisposable
 
             try
             {
-                header.AddUserWrap(targetUsername, targetPassword, masterKey, _volOpts.KdfIterations);
+                header.AddUserWrap(targetUsername, targetPassword, masterKey, VolOpts.KdfIterations);
                 await _metaStore.SaveAsync(volumeName, header);
                 RefreshMountedHeader(volumeName, header);
             }
@@ -414,7 +436,7 @@ public sealed class VolumeService : IDisposable
                 var header = await LoadHeaderIfExistsAsync(name);
                 if (header is null || !header.HasUserAccess(username)) continue;
 
-                header.RewrapUser(username, oldPassword, newPassword, _volOpts.KdfIterations);
+                header.RewrapUser(username, oldPassword, newPassword, VolOpts.KdfIterations);
                 await _metaStore.SaveAsync(name, header);
                 RefreshMountedHeader(name, header);
             }
@@ -520,8 +542,15 @@ public sealed class VolumeService : IDisposable
 
             Directory.CreateDirectory(VolumeDir(volName));
             await _metaStore.SaveAsync(volName, header);
-            File.Create(GetDataPath(volName)).Dispose();
-            MountInternal(volName, header, masterKey: null);
+
+            bool chunkMode = ShouldUseChunkMode();
+            if (chunkMode)
+                MountInternalChunked(volName, header, masterKey: null);
+            else
+            {
+                File.Create(GetDataPath(volName)).Dispose();
+                MountInternal(volName, header, masterKey: null);
+            }
 
             return ToInfo(volName, header, true);
         }
@@ -639,6 +668,7 @@ public sealed class VolumeService : IDisposable
             }
             if (_mounted.TryRemove(name, out var mv))
             {
+                await mv.IoTracker.WaitForZeroAsync();
                 mv.Stream.Dispose();
                 if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
             }
@@ -806,6 +836,60 @@ public sealed class VolumeService : IDisposable
         public VolumeHeader Header { get => _header; private set => _header = value; }
         public byte[]? MasterKey { get; } = masterKey;
         public Stream Stream { get; } = stream;
+        public ActiveIoTracker IoTracker { get; } = new();
         public void UpdateHeader(VolumeHeader h) => Header = h;
+    }
+
+    /// <summary>
+    /// マウント済みボリュームのアクティブ I/O 数を追跡し、
+    /// <see cref="LockAsync"/> がすべての I/O 完了を待機できるようにする。
+    /// </summary>
+    private sealed class ActiveIoTracker
+    {
+        private int _activeCount;
+        private readonly object _gate = new();
+        private TaskCompletionSource<object?>? _zeroTcs;
+
+        public Task<IDisposable> EnterAsync(CancellationToken ct)
+        {
+            // 同期ロックで _activeCount をインクリメント
+            // （非同期ロールバックの心配はないため lock で十分）
+            lock (_gate)
+            {
+                _activeCount++;
+            }
+            return Task.FromResult<IDisposable>(new Releaser(this));
+        }
+
+        /// <summary>アクティブ I/O がゼロになるまで待機する。</summary>
+        public async Task WaitForZeroAsync()
+        {
+            // _activeCount のチェックと _zeroTcs の設定をアトミックに行う
+            lock (_gate)
+            {
+                if (_activeCount == 0)
+                    return;
+                _zeroTcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            }
+            await _zeroTcs.Task;
+        }
+
+        private void Exit()
+        {
+            // lock 内で _activeCount をデクリメントし、ゼロになったら _zeroTcs を完了
+            bool shouldSignal;
+            lock (_gate)
+            {
+                _activeCount--;
+                shouldSignal = _activeCount == 0;
+                if (shouldSignal)
+                    _zeroTcs?.TrySetResult(null);
+            }
+        }
+
+        private sealed class Releaser(ActiveIoTracker tracker) : IDisposable
+        {
+            public void Dispose() => tracker.Exit();
+        }
     }
 }

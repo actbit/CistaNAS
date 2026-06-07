@@ -54,8 +54,17 @@ public sealed class AzureBlobStorageProvider : IStorageProvider
         await client.UploadAsync(content, overwrite: true, ct);
     }
 
-    public Task WriteAtomicAsync(string blobPath, Stream content, CancellationToken ct = default)
-        => WriteAsync(blobPath, content, ct);
+    public async Task WriteAtomicAsync(string blobPath, Stream content, CancellationToken ct = default)
+    {
+        await _init;
+        string tempPath = FullPath(blobPath) + ".tmp";
+        var tempClient = _container.GetBlobClient(tempPath);
+        await tempClient.UploadAsync(content, overwrite: true, ct);
+        var finalClient = _container.GetBlobClient(FullPath(blobPath));
+        await finalClient.SyncCopyFromUriAsync(tempClient.Uri, cancellationToken: ct);
+        try { await tempClient.DeleteAsync(cancellationToken: ct); }
+        catch (RequestFailedException) { /* ベストエフォート */ }
+    }
 
     public async Task DeleteAsync(string blobPath, CancellationToken ct = default)
     {
@@ -100,10 +109,10 @@ public sealed class AzureBlobStorageProvider : IStorageProvider
         return new LockReleaser(semaphore);
     }
 
-    /// <summary>ロックを辞書から解除（セマフォは最後の LockReleaser が解放後に GC される）。</summary>
+    /// <summary>ロックを辞書から解除。保持中のセマフォ削除によるデッドロックを防ぐため no-op。</summary>
     public void RemoveLock(string lockPath)
     {
-        _locks.TryRemove(lockPath, out _);
+        // セマフォはプロセス存続期間中辞書に残る。
     }
 
     private sealed class LockReleaser(SemaphoreSlim semaphore) : IDisposable

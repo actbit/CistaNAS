@@ -30,7 +30,7 @@ public sealed class WebDavHandler
         if (!_volumeService.IsMounted(volumeName)) return AccessResult.Forbidden;
         try
         {
-            var (_, header) = _volumeService.GetMounted(volumeName);
+            var (header, _) = _volumeService.GetMounted(volumeName);
             if (header.IsE2ee) return AccessResult.E2eeUnsupported;
         }
         catch

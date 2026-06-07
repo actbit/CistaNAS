@@ -127,8 +127,11 @@ public sealed class EncryptionSettingsService
                 return JsonSerializer.Deserialize<PersistedSettings>(File.ReadAllText(SettingsPath), JsonOptions)
                     ?? new PersistedSettings();
             }
-            catch
+            catch (JsonException ex)
             {
+                _logger.LogWarning(ex, "cista-settings.json が破損しています。バックアップ後にリセットします。");
+                try { File.Move(SettingsPath, SettingsPath + ".bak", overwrite: true); }
+                catch (Exception moveEx) { _logger.LogWarning(moveEx, "破損設定ファイルのバックアップに失敗。"); }
                 return new PersistedSettings();
             }
         }

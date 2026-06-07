@@ -55,8 +55,16 @@ public sealed class GcsStorageProvider : IStorageProvider, IAsyncDisposable
             cancellationToken: ct);
     }
 
-    public Task WriteAtomicAsync(string blobPath, Stream content, CancellationToken ct = default)
-        => WriteAsync(blobPath, content, ct);
+    public async Task WriteAtomicAsync(string blobPath, Stream content, CancellationToken ct = default)
+    {
+        string tempPath = FullPath(blobPath) + ".tmp";
+        await _client.UploadObjectAsync(_bucket, tempPath, null, content, cancellationToken: ct);
+        // CopyObjectAsync は内部で Rewrite API を使用し、コピー完了までポーリングする。
+        await _client.CopyObjectAsync(_bucket, tempPath, _bucket, FullPath(blobPath),
+            cancellationToken: ct);
+        try { await _client.DeleteObjectAsync(_bucket, tempPath, cancellationToken: ct); }
+        catch (GoogleApiException) { /* ベストエフォート */ }
+    }
 
     public async Task DeleteAsync(string blobPath, CancellationToken ct = default)
     {
@@ -99,10 +107,10 @@ public sealed class GcsStorageProvider : IStorageProvider, IAsyncDisposable
         return new LockReleaser(semaphore);
     }
 
-    /// <summary>ロックを辞書から解除（セマフォは最後の LockReleaser が解放後に GC される）。</summary>
+    /// <summary>ロックを辞書から解除。保持中のセマフォ削除によるデッドロックを防ぐため no-op。</summary>
     public void RemoveLock(string lockPath)
     {
-        _locks.TryRemove(lockPath, out _);
+        // セマフォはプロセス存続期間中辞書に残る。
     }
 
     public async ValueTask DisposeAsync()

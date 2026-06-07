@@ -15,6 +15,8 @@ public enum JournalOp
 public sealed class JournalEntry
 {
     public long Id { get; set; }
+    /// <summary>操作ごとに一意な ID。RecordAsync で自動設定される。</summary>
+    public string? OperationId { get; set; }
     public JournalOp Operation { get; set; }
     public string Path { get; set; } = "";
     public long Offset { get; set; }

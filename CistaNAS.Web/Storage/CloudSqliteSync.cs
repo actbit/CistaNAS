@@ -1,4 +1,5 @@
 using CistaNAS.Web.Configuration;
+using Microsoft.Extensions.Hosting;
 
 namespace CistaNAS.Web.Storage;
 
@@ -8,8 +9,9 @@ namespace CistaNAS.Web.Storage;
 /// ローカル DB は VolumeDataPath 配下に保存し、コンテナ再起動後も
 /// 次回 DownloadAsync で復旧可能にする。
 /// VolumeDataPath が未設定の場合はテンポラリファイルにフォールバック。
+/// IHostedService を実装し、シャットダウン時に非同期でアップロードする。
 /// </summary>
-public sealed class CloudSqliteSync : IDisposable
+public sealed class CloudSqliteSync : IHostedService, IDisposable
 {
     private readonly IStorageProvider _storage;
     private readonly string _blobKey;
@@ -63,10 +65,35 @@ public sealed class CloudSqliteSync : IDisposable
         await _storage.WriteAtomicAsync(_blobKey, fs, ct);
     }
 
+    private int _disposed;
+
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
         // テンポラリパスのみ削除。VolumeDataPath 配下のファイルは永続データとして保持。
         if (_isTemp)
             try { File.Delete(_localPath); } catch (IOException) { }
+    }
+
+    public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
+
+    public async Task StopAsync(CancellationToken ct)
+    {
+        bool uploadSucceeded = false;
+        try
+        {
+            await UploadIfDirtyAsync().WaitAsync(TimeSpan.FromSeconds(10), ct);
+            uploadSucceeded = true;
+        }
+        catch (TimeoutException)
+        {
+            Console.Error.WriteLine("[Warning] Cloud sync upload timed out during shutdown.");
+        }
+        catch (Exception) { /* シャットダウン中の競合は無視 */ }
+
+        // アップロード失敗時はテンポラリファイルを保持（次回起動時に復旧可能）。
+        // 成功時またはテンポラリでない場合は安全に Dispose できる。
+        if (uploadSucceeded || !_isTemp)
+            Dispose();
     }
 }

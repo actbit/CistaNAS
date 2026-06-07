@@ -417,6 +417,11 @@ public static class ChaCha20Xts
     /// <summary>HKDF-SHA256 鍵導出。</summary>
     private static byte[] HkdfSha256(byte[] ikm, byte[] salt, byte[] info, int outputLength)
     {
+        const int HashLength = 32; // SHA-256
+        if (outputLength > 255 * HashLength)
+            throw new ArgumentOutOfRangeException(nameof(outputLength),
+                $"HKDF 出力長は {255 * HashLength} バイト以下である必要があります。");
+
         // HKDF-Extract
         byte[] prk = HMACSHA256.HashData(salt, ikm);
 

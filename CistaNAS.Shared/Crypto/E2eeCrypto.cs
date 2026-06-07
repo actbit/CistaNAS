@@ -153,17 +153,14 @@ public static class E2eeCrypto
         byte[] aad = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(aad, chunkIndex);
 
-        // ChaCha20 で平文を暗号化し、(key, nonce) ペアから Poly1305 ワンタイム鍵 (r, s) を導出する。
-        // Poly1305 のワンタイム鍵は counter=0 の ChaCha20 ブロックから導出されるため、
-        // (key, nonce) は暗号鍵と nonce 導出で 1 回ずつ別 ChaCha20 呼び出しで使われるだけで
-        // 同じ (r, s) を 2 回再導出するわけではない。
-        // 注: ChaCha20Poly1305.Encrypt 内部の Poly1305 鍵導出は counter=0 で行われ、
-        // 暗号化は counter=1 で行われるため、(r, s) と暗号化キーストリームは別ブロック。
-        var (encNonce, ciphertext, _) = ChaCha20Poly1305.Encrypt(plaintext, fileKey, nonce);
+        // ChaCha20 で暗号化（counter=1）。Poly1305 タグ計算は行わない。
+        // その後、AAD 付きで Poly1305 タグを 1 回だけ計算する。
+        // これにより、同じ (key, nonce) から Poly1305 ワンタイム鍵 (r, s) を
+        // 1 回だけ導出する（RFC 7539 準拠）。
+        byte[] ciphertext = new byte[plaintext.Length];
+        ChaCha20Poly1305.ChaCha20Encrypt(fileKey, nonce, 1, ciphertext, plaintext);
 
-        // AAD を含めて Poly1305 タグを計算 (RFC 7539 §2.8:
-        //   mac_data = aad || pad16(aad) || ciphertext || pad16(ciphertext) || le64(len(aad)) || le64(len(ct))
-        // )
+        // AAD を含めて Poly1305 タグを計算 (RFC 7539 §2.8)
         byte[] tag = Poly1305ComputeTagWithAad(fileKey, nonce, ciphertext, aad);
 
         // フォーマット: [fileSalt (first chunk)] || [ciphertext] || [tag]
@@ -333,6 +330,11 @@ public static class E2eeCrypto
 
     private static byte[] HkdfSha256(byte[] ikm, byte[] salt, byte[] info, int outputLength)
     {
+        const int HashLength = 32; // SHA-256
+        if (outputLength > 255 * HashLength)
+            throw new ArgumentOutOfRangeException(nameof(outputLength),
+                $"HKDF 出力長は {255 * HashLength} バイト以下である必要があります。");
+
         // HKDF-Extract
         byte[] prk = HMACSHA256.HashData(salt, ikm);
 

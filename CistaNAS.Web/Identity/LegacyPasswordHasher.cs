@@ -32,7 +32,11 @@ public sealed class LegacyPasswordHasher : IPasswordHasher<ApplicationUser>
                     ? PasswordVerificationResult.SuccessRehashNeeded
                     : PasswordVerificationResult.Failed;
             }
-            catch
+            catch (FormatException)
+            {
+                return PasswordVerificationResult.Failed;
+            }
+            catch (CryptographicException)
             {
                 return PasswordVerificationResult.Failed;
             }

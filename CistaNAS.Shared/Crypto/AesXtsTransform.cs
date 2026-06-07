@@ -17,6 +17,7 @@ public sealed class AesXtsTransform : IDisposable
     private readonly ICryptoTransform _tweakEnc;
     private readonly Aes _dataAes;
     private readonly Aes _tweakAes;
+    private bool _disposed;
 
     /// <param name="key">K1||K2 の 64 バイト。</param>
     /// <param name="sectorSize">セクタサイズ（16 の倍数）。</param>
@@ -116,6 +117,8 @@ public sealed class AesXtsTransform : IDisposable
 
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
         _dataEnc.Dispose();
         _dataDec.Dispose();
         _tweakEnc.Dispose();

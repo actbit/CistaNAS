@@ -79,7 +79,8 @@ public static class ApiEndpoints
 
         // ---- ボリューム ----
         var volumes = api.MapGroup("/volumes")
-            .RequireAuthorization();
+            .RequireAuthorization()
+            .RequireRateLimiting("api");
 
         volumes.MapPost("/", async (CreateVolumeRequest req, VolumeService vs, HttpContext ctx) =>
         {
@@ -176,7 +177,8 @@ public static class ApiEndpoints
 
         // ---- ファイル ----
         var files = api.MapGroup("/files/{volumeName}")
-            .RequireAuthorization(CistaAuthorities.VolumeAccess);
+            .RequireAuthorization(CistaAuthorities.VolumeAccess)
+            .RequireRateLimiting("api");
 
         files.MapGet("/", async (string volumeName, FileService fs, HttpContext ctx) =>
         {
@@ -276,7 +278,8 @@ public static class ApiEndpoints
 
         // ---- グループ ----
         var groups = api.MapGroup("/groups")
-            .RequireAuthorization();
+            .RequireAuthorization()
+            .RequireRateLimiting("api");
 
         groups.MapGet("/", async (GroupService gs, HttpContext ctx) =>
         {

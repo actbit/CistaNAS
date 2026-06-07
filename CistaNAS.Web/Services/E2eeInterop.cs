@@ -7,7 +7,7 @@ namespace CistaNAS.Web.Services;
 /// Blazor から JavaScript の E2EE モジュールを呼び出すインタープロ。
 /// JS 側で CryptoKey を Map にキャッシュし、文字列ハンドルで参照する。
 /// </summary>
-public sealed class E2eeInterop(IJSRuntime js)
+public sealed class E2eeInterop(IJSRuntime js) : IAsyncDisposable
 {
     private IJSObjectReference? _module;
 
@@ -100,6 +100,15 @@ public sealed class E2eeInterop(IJSRuntime js)
     {
         var mod = await GetModule();
         return await mod.InvokeAsync<string>("generateFileSalt");
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_module is not null)
+        {
+            await _module.DisposeAsync();
+            _module = null;
+        }
     }
 
     // ---- ECDH key pair management ----

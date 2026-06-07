@@ -70,8 +70,23 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
         await _client.PutObjectAsync(request, ct);
     }
 
-    public Task WriteAtomicAsync(string blobPath, Stream content, CancellationToken ct = default)
-        => WriteAsync(blobPath, content, ct);
+    public async Task WriteAtomicAsync(string blobPath, Stream content, CancellationToken ct = default)
+    {
+        // 一時パスに書き込み → コピー → 一時削除（LocalStorageProvider の rename パターンに相当）
+        string tempPath = FullPath(blobPath) + ".tmp";
+        if (content.CanSeek && content.Position != 0 && content.Length > 0)
+            content.Position = 0;
+        var tempRequest = new PutObjectRequest
+        {
+            BucketName = _bucket,
+            Key = tempPath,
+            InputStream = content,
+        };
+        await _client.PutObjectAsync(tempRequest, ct);
+        await _client.CopyObjectAsync(_bucket, tempPath, _bucket, FullPath(blobPath), ct);
+        try { await _client.DeleteObjectAsync(_bucket, tempPath, ct); }
+        catch (AmazonS3Exception) { /* ベストエフォート */ }
+    }
 
     public async Task DeleteAsync(string blobPath, CancellationToken ct = default)
     {
@@ -125,10 +140,12 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
         return new LockReleaser(semaphore);
     }
 
-    /// <summary>ロックを辞書から解除（セマフォは最後の LockReleaser が解放後に GC される）。</summary>
+    /// <summary>ロックを辞書から解除。保持中のセマフォ削除によるデッドロックを防ぐため no-op。</summary>
     public void RemoveLock(string lockPath)
     {
-        _locks.TryRemove(lockPath, out _);
+        // セマフォはプロセス存続期間中辞書に残る。
+        // 保持中に TryRemove すると次の AcquireLockAsync が新しいセマフォを作成し、
+        // 古い保持者の Release が新しいセマフォに伝わらずデッドロックするため削除しない。
     }
 
     public ValueTask DisposeAsync()

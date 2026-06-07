@@ -247,7 +247,7 @@ else
     {
         try
         {
-            var (_, header) = VolumeSvc.GetMounted(VolumeName);
+            var (header, _) = VolumeSvc.GetMounted(VolumeName);
             return header.EncryptionMode;
         }
         catch { return "server"; }
@@ -459,7 +459,7 @@ else
         string? kekHandle = null;
         try
         {
-            var (_, header) = VolumeSvc.GetMounted(VolumeName);
+            var (header, _) = VolumeSvc.GetMounted(VolumeName);
             var userKey = header.UserKeys.GetValueOrDefault(CurrentUsername);
             if (userKey is null)
             {

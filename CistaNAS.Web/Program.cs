@@ -236,23 +236,8 @@ using (var initScope = app.Services.CreateAsyncScope())
     }
 }
 
-// ---- シャットダウン時に CloudSqliteSync をアップロード ----
-var lifetimeCloudSync = app.Services.GetService<CloudSqliteSync>();
-if (lifetimeCloudSync is not null)
-{
-    var appLifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
-    appLifetime.ApplicationStopping.Register(() =>
-    {
-        try
-        {
-            var uploadTask = lifetimeCloudSync.UploadIfDirtyAsync();
-            if (!uploadTask.Wait(TimeSpan.FromSeconds(10)))
-                Console.Error.WriteLine("[Warning] Cloud sync upload timed out during shutdown.");
-        }
-        catch { /* シャットダウン中の競合は無視 */ }
-        lifetimeCloudSync.Dispose();
-    });
-}
+// ---- CloudSqliteSync のシャットダウン処理は IHostedService.StopAsync で実行 ----
+// （旧実装の .Wait() はデッドロックリスクがあったため IHostedService に移行）
 
 if (app.Environment.IsDevelopment())
 {

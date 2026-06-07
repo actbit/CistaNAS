@@ -124,8 +124,8 @@ public static class ChunkEncryptor
     /// <summary>ChaCha20 暗号化（サーバー側実装）。</summary>
     /// <remarks>
     /// ノンスは HKDF で sectorIndex から導出する（ボリューム内・ボリューム間で衝突しない）。
-    /// 1 セクタ = <paramref name="sectorSize"/> バイト。sectorSize にはボリュームの
-    /// SectorSize プロパティ（既定 4096）が渡される想定。
+    /// サーバー側暗号化のため認証タグは付与しない（サーバーが信頼できる前提）。
+    /// E2EE モードでのデータ完全性保証には ChaCha20-Poly1305 を使用すること。
     /// </remarks>
     private static void ChaCha20Encrypt(ReadOnlySpan<byte> masterKey, long firstSector, byte[] data, int sectorSize)
     {
@@ -139,21 +139,27 @@ public static class ChunkEncryptor
         if (sectorCount == 0) return;
 
         byte[] keyArr = masterKey.ToArray();
-        byte[] sectorIndexBytes = new byte[8];
-        byte[] nonce = new byte[NonceSize];
-        byte[] infoBytes = Encoding.ASCII.GetBytes(NonceInfo);
-
-        for (int s = 0; s < sectorCount; s++)
+        try
         {
-            long sectorIndex = firstSector + s;
-            int sectorOffset = s * sectorSize;
+            byte[] sectorIndexBytes = new byte[8];
+            byte[] nonce = new byte[NonceSize];
+            byte[] infoBytes = Encoding.ASCII.GetBytes(NonceInfo);
 
-            // HKDF-SHA256: salt=sectorIndex, info=NonceInfo → 12 バイトノンス
-            BinaryPrimitives.WriteInt64LittleEndian(sectorIndexBytes, sectorIndex);
-            // Use Span-based overload which properly writes to output
-            HKDF.DeriveKey(HashAlgorithmName.SHA256, keyArr.AsSpan(), nonce, sectorIndexBytes, infoBytes);
+            for (int s = 0; s < sectorCount; s++)
+            {
+                long sectorIndex = firstSector + s;
+                int sectorOffset = s * sectorSize;
 
-            ChaCha20EncryptCore(keyArr, nonce, counter: 0, data.AsSpan(sectorOffset, sectorSize));
+                // HKDF-SHA256: salt=sectorIndex, info=NonceInfo → 12 バイトノンス
+                BinaryPrimitives.WriteInt64LittleEndian(sectorIndexBytes, sectorIndex);
+                HKDF.DeriveKey(HashAlgorithmName.SHA256, keyArr.AsSpan(), nonce, sectorIndexBytes, infoBytes);
+
+                ChaCha20EncryptCore(keyArr, nonce, counter: 0, data.AsSpan(sectorOffset, sectorSize));
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(keyArr);
         }
     }
 

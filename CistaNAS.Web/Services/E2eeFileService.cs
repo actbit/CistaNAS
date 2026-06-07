@@ -245,8 +245,16 @@ public sealed class E2eeFileService
 
             string dataPath = GetDataPath(volumeName);
             var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            fs.Seek(chunkOffset, SeekOrigin.Begin);
-            return (new GateReadStream(new SubStream(fs, chunkLength), readLock), chunkLength);
+            try
+            {
+                fs.Seek(chunkOffset, SeekOrigin.Begin);
+                return (new GateReadStream(new SubStream(fs, chunkLength), readLock), chunkLength);
+            }
+            catch
+            {
+                fs.Dispose();
+                throw;
+            }
         }
         catch
         {
@@ -373,7 +381,7 @@ public sealed class E2eeFileService
     {
         GetE2eeHeader(volumeName);
         var catalog = await LoadCatalogAsync(volumeName, ct);
-        var header = _volumeService.GetMounted(volumeName).Header;
+        var (header, _) = _volumeService.GetMounted(volumeName);
 
         long totalUsed = catalog.Files.Values.Sum(f => ComputePlainSize(f.EncryptedLength, f.ChunkCount));
         long userUsed = catalog.Files.Values

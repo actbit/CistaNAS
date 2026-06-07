@@ -4,6 +4,7 @@ using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Hosting;
 
 namespace CistaNAS.Web.Configuration;
 
@@ -75,6 +76,7 @@ public static class ServiceCollectionExtensions
             {
                 var sync = new CloudSqliteSync(storage, cista.Storage, db);
                 services.AddSingleton(sync);
+                services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<CloudSqliteSync>());
                 services.AddDbContext<AppDbContext>(o =>
                 o.UseSqlite($"Data Source={sync.LocalDbPath};Mode=ReadWriteCreate;Cache=Shared"));
                 break;
