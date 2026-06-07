@@ -321,10 +321,16 @@ public class ApiClientTests(AspireFixture fixture)
         for (int i = 0; i < 3; i++)
             await Api.UploadChunkAsync(volName, fileId, i, encChunks[i]);
 
-        for (int i = 0; i < 3; i++)
+        // チャンク0からfileSaltを取得
+        byte[] downloaded0 = await Api.DownloadChunkAsync(volName, fileId, 0);
+        byte[] decrypted0 = E2eeCrypto.DecryptChunk(downloaded0, fileKey, 0, out var salt0);
+        Assert.Equal(plainChunks[0], decrypted0);
+
+        // 残りのチャンクを復号（fileSaltを再利用）
+        for (int i = 1; i < 3; i++)
         {
             byte[] downloaded = await Api.DownloadChunkAsync(volName, fileId, i);
-            byte[] decrypted = E2eeCrypto.DecryptChunk(downloaded, fileKey, i, out _);
+            byte[] decrypted = E2eeCrypto.DecryptChunk(downloaded, fileKey, i, salt0);
             Assert.Equal(plainChunks[i], decrypted);
         }
 

@@ -95,6 +95,7 @@ public sealed class VolumeHeader
             CreatedAt = DateTimeOffset.UtcNow,
             Encrypted = true,
             EncryptionMode = "e2ee",
+            StorageMode = "chunk", // E2EEはチャンクモード必須
             ChunkSize = chunkSize,
             SectorSize = 0,
             OwnerUser = username,

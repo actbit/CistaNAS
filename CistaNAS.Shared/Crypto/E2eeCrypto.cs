@@ -184,6 +184,24 @@ public static class E2eeCrypto
         return result;
     }
 
+    /// <summary>チャンクを復号する（fileSaltを指定）。</summary>
+    public static byte[] DecryptChunk(byte[] encData, byte[] fileKey, int chunkIndex, byte[] fileSalt, string algorithm = "aes-256-gcm")
+    {
+        int offset = chunkIndex == 0 && fileSalt.Length > 0 ? SaltSize : 0;
+
+        switch (algorithm.ToLowerInvariant())
+        {
+            case "aes-256-gcm":
+                return DecryptChunkAesGcm(encData, fileKey, chunkIndex, fileSalt, offset);
+
+            case "chacha20-poly1305":
+                return DecryptChunkChaCha20(encData, fileKey, chunkIndex, fileSalt, offset);
+
+            default:
+                throw new ArgumentException($"サポートされていないチャンク暗号化アルゴリズム: {algorithm}");
+        }
+    }
+
     /// <summary>チャンクを復号する。</summary>
     public static byte[] DecryptChunk(byte[] encData, byte[] fileKey, int chunkIndex, out byte[] fileSalt, string algorithm = "aes-256-gcm")
     {
