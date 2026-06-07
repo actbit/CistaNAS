@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Storage;
@@ -16,9 +17,11 @@ namespace CistaNAS.Web.Services;
 public sealed class E2eeFileService
 {
     /// <summary>チャンク先頭に付与される salt のサイズ（バイト）。</summary>
-    public const int SaltSize = 16;
+    public const int SaltSize = E2eeCrypto.SaltSize;
+
     /// <summary>AES-GCM 認証タグのサイズ（バイト）。</summary>
-    public const int TagSize = 16;
+    public const int TagSize = E2eeCrypto.GcmTagSize;
+
     /// <summary>最大プレーンテキストサイズ（1PB）。整数オーバーフロー防止。</summary>
     public const long MaxPlainSize = 1L << 50; // 1PB = 1,125,899,906,842,624 bytes
 

@@ -581,7 +581,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
                 try { plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!); }
                 catch { plainName = $"<{entry.FileId[..8]}...>"; }
 
-                long plainLength = Math.Max(0, entry.EncryptedLength - 16L - (long)entry.ChunkCount * 16);
+                long plainLength = Math.Max(0, entry.EncryptedLength - E2eeCrypto.SaltSize - (long)entry.ChunkCount * E2eeCrypto.GcmTagSize);
 
                 var fi = new FileInformation
                 {
@@ -920,7 +920,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
             if (entry is null) return null;
 
             string plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!);
-            long plainLength = Math.Max(0, entry.EncryptedLength - 16L - (long)entry.ChunkCount * 16);
+            long plainLength = Math.Max(0, entry.EncryptedLength - E2eeCrypto.SaltSize - (long)entry.ChunkCount * E2eeCrypto.GcmTagSize);
             var cache = new FileCache
             {
                 PlainName = plainName,

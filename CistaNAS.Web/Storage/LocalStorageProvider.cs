@@ -32,7 +32,8 @@ public sealed class LocalStorageProvider : IStorageProvider
     {
         string fullPath = ToFullPath(blobPath);
         Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-        string tmpPath = fullPath + ".tmp";
+        // GUID を付与して同時実行時の衝突を防止（他プロバイダーとの整合性）
+        string tmpPath = fullPath + ".tmp-" + Guid.NewGuid().ToString("N");
         using (var fs = File.Create(tmpPath))
             await content.CopyToAsync(fs, ct);
         File.Move(tmpPath, fullPath, overwrite: true);

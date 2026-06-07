@@ -57,7 +57,8 @@ public sealed class GcsStorageProvider : IStorageProvider, IAsyncDisposable
 
     public async Task WriteAtomicAsync(string blobPath, Stream content, CancellationToken ct = default)
     {
-        string tempPath = FullPath(blobPath) + ".tmp";
+        // GUID を付与して同時実行時の衝突を防止（S3/Azure 実装との整合性）
+        string tempPath = FullPath(blobPath) + ".tmp-" + Guid.NewGuid().ToString("N");
         await _client.UploadObjectAsync(_bucket, tempPath, null, content, cancellationToken: ct);
         // CopyObjectAsync は内部で Rewrite API を使用し、コピー完了までポーリングする。
         await _client.CopyObjectAsync(_bucket, tempPath, _bucket, FullPath(blobPath),

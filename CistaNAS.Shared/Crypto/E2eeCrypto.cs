@@ -9,10 +9,17 @@ namespace CistaNAS.Shared.Crypto;
 /// </summary>
 public static class E2eeCrypto
 {
-    private const int GcmNonceSize = 12;
-    private const int GcmTagSize = 16;
-    private const int SaltSize = 16;
-    private const int MasterKeySize = 32;
+    /// <summary>AES-GCM ノンスサイズ（バイト）。</summary>
+    public const int GcmNonceSize = 12;
+
+    /// <summary>認証タグサイズ（バイト）。</summary>
+    public const int GcmTagSize = 16;
+
+    /// <summary>ファイル Salt サイズ（バイト）。</summary>
+    public const int SaltSize = 16;
+
+    /// <summary>マスターキーサイズ（バイト）。</summary>
+    public const int MasterKeySize = 32;
 
     // ---- 鍵導出 ----
 

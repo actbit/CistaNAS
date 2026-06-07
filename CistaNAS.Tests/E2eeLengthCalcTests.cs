@@ -57,4 +57,33 @@ public class E2eeLengthCalcTests
         Assert.Throws<ArgumentOutOfRangeException>(
             () => E2eeFileService.ComputeEncryptedLength(100, 0));
     }
+
+    [Fact]
+    public void ComputeEncryptedLength_OnePB_Exactly()
+    {
+        // 1PB = 2^50 bytes は許容される
+        long onePB = 1L << 50; // 1,125,899,906,842,624 bytes
+        long len = E2eeFileService.ComputeEncryptedLength(onePB, 1048576);
+        // 計算がオーバーフローせずに完了することを確認
+        Assert.True(len > onePB);
+    }
+
+    [Fact]
+    public void ComputeEncryptedLength_JustUnderOnePB()
+    {
+        // 1PB - 1 バイトは許容される
+        long justUnder = (1L << 50) - 1;
+        long len = E2eeFileService.ComputeEncryptedLength(justUnder, 1048576);
+        Assert.True(len > justUnder);
+    }
+
+    [Fact]
+    public void ComputeEncryptedLength_OverOnePB_Throws()
+    {
+        // 1PB + 1 バイトは例外
+        long over = (1L << 50) + 1;
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(
+            () => E2eeFileService.ComputeEncryptedLength(over, 1048576));
+        Assert.Contains("1PB", ex.Message);
+    }
 }

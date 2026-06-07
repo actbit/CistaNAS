@@ -288,9 +288,11 @@ public class DokanFileSystemTests
             cache.SetFileKey(key);
         });
 
-        // 最初に設定されたキーが保持されているはず（二重設定は無視される）
+        // SetFileKey は上書き可能（他クライアントの上書きで salt が変わった場合に再導出が必要）
+        // いずれかのキーが保持されていることを確認
         Assert.True(cache.TryGetFileKey(out var retrievedKey));
-        Assert.Equal(key1, retrievedKey);
+        Assert.True(retrievedKey == key1 || retrievedKey == key2,
+            $"キーは key1 または key2 のいずれかである必要があります。実際: {BitConverter.ToString(retrievedKey)}");
     }
 
     [Fact]

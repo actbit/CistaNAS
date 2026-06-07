@@ -57,7 +57,8 @@ public sealed class AzureBlobStorageProvider : IStorageProvider
     public async Task WriteAtomicAsync(string blobPath, Stream content, CancellationToken ct = default)
     {
         await _init;
-        string tempPath = FullPath(blobPath) + ".tmp";
+        // GUID を付与して同時実行時の衝突を防止（S3/GCS 実装との整合性）
+        string tempPath = FullPath(blobPath) + ".tmp-" + Guid.NewGuid().ToString("N");
         var tempClient = _container.GetBlobClient(tempPath);
         await tempClient.UploadAsync(content, overwrite: true, ct);
         var finalClient = _container.GetBlobClient(FullPath(blobPath));
