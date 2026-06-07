@@ -372,6 +372,44 @@ public sealed class CistaNasFileSystem : IDokanOperations
                     fileKey = derivedKey;
                 }
 
+                // 他クライアント上書き検出のため、チャンク0のハッシュ検証を最初に行う
+                // salt が変わった場合は fileKey を再導出する必要がある
+                byte[]? fileKeyToUse = fileKey;
+                var chunk0Cached = TryGetChunkFromPool(fileId, 0);
+                if (chunk0Cached.HasValue)
+                {
+                    string? serverHash = null;
+                    try
+                    {
+                        serverHash = await _api.GetChunkHashAsync(_volumeName, fileId, 0);
+                    }
+                    catch { /* 通信失敗時は後で再ダウンロード */ }
+
+                    if (serverHash is null || serverHash != chunk0Cached.Value.EncryptedHash)
+                    {
+                        // チャンク0が変わっている可能性があるため、再ダウンロードして salt を確認
+                        var chunk0Data = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
+                        if (chunk0Data.Length > E2eeCrypto.SaltSize)
+                        {
+                            byte[] newSalt = new byte[E2eeCrypto.SaltSize];
+                            Buffer.BlockCopy(chunk0Data, 0, newSalt, 0, E2eeCrypto.SaltSize);
+                            var newKey = E2eeCrypto.DeriveFileKey(_masterKey!, newSalt);
+
+                            // fileKey が変わった場合はキャッシュをクリアして再構築
+                            if (newKey != fileKey)
+                            {
+                                cache.SetFileKey(newKey);
+                                fileKeyToUse = newKey;
+                                RemoveFileChunksFromPool(fileId);
+
+                                // チャンク0を復号してキャッシュ
+                                var chunk0 = E2eeCrypto.DecryptChunk(chunk0Data, newKey, 0, out _);
+                                PutChunkToPool(fileId, 0, chunk0, ComputeHashHex(chunk0Data));
+                            }
+                        }
+                    }
+                }
+
                 // シーク最適化: offset から開始チャンクを計算
                 int startChunk = cache.ChunkCount > 0
                     ? Math.Min((int)(offset / _chunkSize), cache.ChunkCount - 1)
@@ -408,18 +446,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
                         {
                             // ハッシュ不一致 or ハッシュなし or 通信失敗 → 再ダウンロード
                             var encData = await _api.DownloadChunkAsync(_volumeName, fileId, i);
-
-                            // チャンク0の salt が変わった場合は fileKey を再導出
-                            if (i == 0 && encData.Length > 16)
-                            {
-                                byte[] newSalt = new byte[16];
-                                Buffer.BlockCopy(encData, 0, newSalt, 0, 16);
-                                var newKey = E2eeCrypto.DeriveFileKey(_masterKey!, newSalt);
-                                cache.SetFileKey(newKey);
-                                fileKey = newKey;
-                            }
-
-                            chunk = E2eeCrypto.DecryptChunk(encData, fileKey!, i, out _);
+                            chunk = E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, out _);
                             PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));
                         }
                     }
@@ -427,7 +454,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
                     {
                         // キャッシュミス: ダウンロード + 復号 + キャッシュ保存
                         var encData = await _api.DownloadChunkAsync(_volumeName, fileId, i);
-                        chunk = E2eeCrypto.DecryptChunk(encData, fileKey!, i, out _);
+                        chunk = E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, out _);
                         PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));
                     }
 
