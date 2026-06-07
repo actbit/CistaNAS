@@ -37,6 +37,13 @@ builder.Services.AddScoped(sp =>
 // Service 登録
 builder.Services.AddSingleton<ClientVolumeMountService>();
 builder.Services.AddScoped<AuthApiClient>();
+builder.Services.AddScoped<VolumeApiClient>();
+builder.Services.AddScoped<FileApiClient>();
+builder.Services.AddScoped<E2eeApiClient>();
+builder.Services.AddScoped<AccountApiClient>();
+builder.Services.AddScoped<GroupApiClient>();
+builder.Services.AddScoped<EncryptionSettingsClient>();
+builder.Services.AddScoped<E2eeInterop>();
 
 var host = builder.Build();
 
