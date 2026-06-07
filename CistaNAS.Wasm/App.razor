@@ -1,0 +1,11 @@
+<Router AppAssembly="@typeof(App).Assembly">
+    <Found Context="routeData">
+        <RouteView RouteData="@routeData" DefaultLayout="@typeof(MainLayout)"/>
+        <FocusOnNavigate RouteData="@routeData" Selector="h1" />
+    </Found>
+    <NotFound>
+        <PageTitle>Not found</PageTitle>
+        <h1>ページが見つかりません</h1>
+        <p><a href="/">ホームに戻る</a></p>
+    </NotFound>
+</Router>

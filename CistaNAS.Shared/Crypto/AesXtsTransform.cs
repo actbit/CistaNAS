@@ -1,6 +1,5 @@
 using System.Buffers;
 using System.Buffers.Binary;
-using System.Security.Cryptography;
 
 namespace CistaNAS.Shared.Crypto;
 
@@ -13,13 +12,10 @@ public sealed class AesXtsTransform : IDisposable
 {
     private const int BlockSize = 16;
 
-    private readonly ICryptoTransform _dataEnc;
-    private readonly ICryptoTransform _dataDec;
-    private readonly ICryptoTransform _tweakEnc;
-    private readonly Aes _dataAes;
-    private readonly Aes _tweakAes;
+    private readonly IAesEcb _dataEnc;
+    private readonly IAesEcb _dataDec;
+    private readonly IAesEcb _tweakEnc;
     private bool _disposed;
-    private readonly object _disposeLock = new();
 
     /// <param name="key">K1||K2 の 64 バイト。</param>
     /// <param name="sectorSize">セクタサイズ（16 の倍数）。</param>
@@ -30,19 +26,10 @@ public sealed class AesXtsTransform : IDisposable
         if (sectorSize <= 0 || sectorSize % BlockSize != 0)
             throw new ArgumentException("セクタサイズは 16 の倍数であること。", nameof(sectorSize));
 
-        _dataAes = Aes.Create();
-        _dataAes.Mode = CipherMode.ECB;
-        _dataAes.Padding = PaddingMode.None;
-        _dataAes.Key = key[..32].ToArray();
-
-        _tweakAes = Aes.Create();
-        _tweakAes.Mode = CipherMode.ECB;
-        _tweakAes.Padding = PaddingMode.None;
-        _tweakAes.Key = key[32..].ToArray();
-
-        _dataEnc = _dataAes.CreateEncryptor();
-        _dataDec = _dataAes.CreateDecryptor();
-        _tweakEnc = _tweakAes.CreateEncryptor();
+        // WASM / ネイティブ自動切替
+        _dataEnc = AesEcbFactory.CreateEncryptor(key[..32]);
+        _dataDec = AesEcbFactory.CreateFull(key[..32]);  // 復号にも使用
+        _tweakEnc = AesEcbFactory.CreateEncryptor(key[32..]);
     }
 
     /// <summary>GF(2^128) での α 倍（多項式 x^128+x^7+x^2+x+1, リトルエンディアン）。</summary>
@@ -64,17 +51,7 @@ public sealed class AesXtsTransform : IDisposable
         Span<byte> du = stackalloc byte[BlockSize];
         du.Clear();
         BinaryPrimitives.WriteUInt64LittleEndian(du, (ulong)sectorIndex);
-        byte[] inBuf = du.ToArray();
-        byte[] outBuf = ArrayPool<byte>.Shared.Rent(BlockSize);
-        try
-        {
-            _tweakEnc.TransformBlock(inBuf, 0, BlockSize, outBuf, 0);
-            outBuf.AsSpan(0, BlockSize).CopyTo(tweak);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(outBuf);
-        }
+        _tweakEnc.EncryptBlock(du, tweak);
     }
 
     /// <summary>
@@ -92,24 +69,19 @@ public sealed class AesXtsTransform : IDisposable
         Span<byte> t = stackalloc byte[BlockSize];
         ComputeTweak(firstSectorIndex, t);
 
-        ICryptoTransform cipher = encrypt ? _dataEnc : _dataDec;
-        byte[] tmpIn = ArrayPool<byte>.Shared.Rent(BlockSize);
-        byte[] tmpOut = ArrayPool<byte>.Shared.Rent(BlockSize);
-        try
+        Span<byte> tmpIn = stackalloc byte[BlockSize];
+        Span<byte> tmpOut = stackalloc byte[BlockSize];
+
+        for (int off = 0; off < data.Length; off += BlockSize)
         {
-            for (int off = 0; off < data.Length; off += BlockSize)
-            {
-                Span<byte> blk = data.Slice(off, BlockSize);
-                for (int i = 0; i < BlockSize; i++) tmpIn[i] = (byte)(blk[i] ^ t[i]);
-                cipher.TransformBlock(tmpIn, 0, BlockSize, tmpOut, 0);
-                for (int i = 0; i < BlockSize; i++) blk[i] = (byte)(tmpOut[i] ^ t[i]);
-                MultiplyAlpha(t);
-            }
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(tmpIn);
-            ArrayPool<byte>.Shared.Return(tmpOut);
+            Span<byte> blk = data.Slice(off, BlockSize);
+            for (int i = 0; i < BlockSize; i++) tmpIn[i] = (byte)(blk[i] ^ t[i]);
+            if (encrypt)
+                _dataEnc.EncryptBlock(tmpIn, tmpOut);
+            else
+                _dataDec.DecryptBlock(tmpIn, tmpOut);
+            for (int i = 0; i < BlockSize; i++) blk[i] = (byte)(tmpOut[i] ^ t[i]);
+            MultiplyAlpha(t);
         }
     }
 
@@ -133,17 +105,10 @@ public sealed class AesXtsTransform : IDisposable
 
     public void Dispose()
     {
-        lock (_disposeLock)
-        {
-            if (_disposed) return;
-            _disposed = true;
-            _dataEnc.Dispose();
-            _dataDec.Dispose();
-            _tweakEnc.Dispose();
-            CryptographicOperations.ZeroMemory(_dataAes.Key);
-            CryptographicOperations.ZeroMemory(_tweakAes.Key);
-            _dataAes.Dispose();
-            _tweakAes.Dispose();
-        }
+        if (_disposed) return;
+        _disposed = true;
+        _dataEnc.Dispose();
+        _dataDec.Dispose();
+        _tweakEnc.Dispose();
     }
 }
