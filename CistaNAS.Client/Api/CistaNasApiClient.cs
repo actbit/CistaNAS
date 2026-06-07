@@ -111,6 +111,17 @@ public sealed class CistaNasApiClient
         return await res.Content.ReadAsByteArrayAsync();
     }
 
+    /// <summary>チャンクの事前計算ハッシュを取得する（軽量エンドポイント）。ハッシュなしの場合は null。</summary>
+    public async Task<string?> GetChunkHashAsync(string volumeName, string fileId, int chunkIndex)
+    {
+        var res = await _http.GetAsync($"/api/v1/e2ee/{volumeName}/chunk-hash/{fileId}/{chunkIndex}");
+        if (res.StatusCode == System.Net.HttpStatusCode.NotFound)
+            return null;
+        res.EnsureSuccessStatusCode();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        return json.TryGetProperty("hash", out var h) ? h.GetString() : null;
+    }
+
     public async Task FinalizeFileAsync(string volumeName, string fileId, long actualLength)
     {
         var req = new { actualEncryptedLength = actualLength };

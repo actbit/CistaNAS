@@ -48,6 +48,10 @@ public sealed class E2eeFileEntry
     public long EncryptedLength { get; set; }
     public int ChunkCount { get; set; }
     public List<int> ChunkSizes { get; set; } = [];
+
+    /// <summary>各チャンクの暗号化データの SHA-256 ハッシュ（16進数文字列）。アップロード時に計算。</summary>
+    public List<string> ChunkHashes { get; set; } = [];
+
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset ModifiedAt { get; set; }
 

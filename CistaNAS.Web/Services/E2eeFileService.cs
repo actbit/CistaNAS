@@ -19,6 +19,8 @@ public sealed class E2eeFileService
     public const int SaltSize = 16;
     /// <summary>AES-GCM 認証タグのサイズ（バイト）。</summary>
     public const int TagSize = 16;
+    /// <summary>最大プレーンテキストサイズ（1PB）。整数オーバーフロー防止。</summary>
+    public const long MaxPlainSize = 1L << 50; // 1PB = 1,125,899,906,842,624 bytes
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
@@ -30,6 +32,7 @@ public sealed class E2eeFileService
     public static long ComputeEncryptedLength(long plainSize, int chunkSize)
     {
         if (plainSize < 0) throw new ArgumentOutOfRangeException(nameof(plainSize));
+        if (plainSize > MaxPlainSize) throw new ArgumentOutOfRangeException(nameof(plainSize), $"ファイルサイズは1PB以下である必要があります。");
         if (chunkSize <= 0) throw new ArgumentOutOfRangeException(nameof(chunkSize));
         if (plainSize == 0) return SaltSize + TagSize;
         long chunks = (plainSize + chunkSize - 1) / chunkSize;
@@ -163,13 +166,28 @@ public sealed class E2eeFileService
                 if (entry.ChunkSizes.Count != chunkIndex)
                     throw new FileServiceException($"チャンク {chunkIndex} は順番にアップロードしてください（期待インデックス: {entry.ChunkSizes.Count}）。");
 
+                // 暗号化チャンクの SHA-256 ハッシュをアップロードと同時に計算
+                using var sha = System.Security.Cryptography.IncrementalHash.CreateHash(
+                    System.Security.Cryptography.HashAlgorithmName.SHA256);
+
                 if (IsChunkMode(volumeName))
                 {
-                    await _chunkStore.WriteChunkAsync(volumeName, fileId, chunkIndex, data, ct);
+                    // チャンクモード: データを全て読み込んでから書き込み
+                    byte[] chunkData = new byte[dataLength];
+                    int totalRead = 0;
+                    while (totalRead < dataLength)
+                    {
+                        int read = await data.ReadAsync(chunkData.AsMemory(totalRead, (int)dataLength - totalRead), ct);
+                        if (read == 0) break;
+                        totalRead += read;
+                    }
+
+                    sha.AppendData(chunkData, 0, totalRead);
+                    await _chunkStore.WriteChunkAsync(volumeName, fileId, chunkIndex, new MemoryStream(chunkData, 0, totalRead), ct);
 
                     while (entry.ChunkSizes.Count <= chunkIndex)
                         entry.ChunkSizes.Add(0);
-                    entry.ChunkSizes[chunkIndex] = (int)dataLength;
+                    entry.ChunkSizes[chunkIndex] = totalRead;
                 }
                 else
                 {
@@ -189,6 +207,7 @@ public sealed class E2eeFileService
                         int toRead = (int)Math.Min(buffer.Length, remaining);
                         int read = await data.ReadAsync(buffer.AsMemory(0, toRead), ct);
                         if (read == 0) break;
+                        sha.AppendData(buffer, 0, read);
                         await fs.WriteAsync(buffer.AsMemory(0, read), ct);
                         written += read;
                         remaining -= read;
@@ -199,6 +218,12 @@ public sealed class E2eeFileService
                         entry.ChunkSizes.Add(0);
                     entry.ChunkSizes[chunkIndex] = (int)written;
                 }
+
+                // ハッシュをカタログに保存
+                string hashHex = Convert.ToHexString(sha.GetHashAndReset());
+                while (entry.ChunkHashes.Count <= chunkIndex)
+                    entry.ChunkHashes.Add("");
+                entry.ChunkHashes[chunkIndex] = hashHex;
 
                 await SaveCatalogAsync(volumeName, catalog, ct);
             }
@@ -261,6 +286,23 @@ public sealed class E2eeFileService
             readLock.Dispose();
             throw;
         }
+    }
+
+    /// <summary>チャンクの事前計算ハッシュを返す（カタログ参照のみ、データ読み取りなし）。</summary>
+    public async Task<string?> GetChunkHashAsync(string volumeName, string fileId, int chunkIndex, CancellationToken ct = default)
+    {
+        GetE2eeHeader(volumeName);
+
+        var catalog = await LoadCatalogAsync(volumeName, ct);
+
+        if (!catalog.Files.TryGetValue(fileId, out var entry))
+            return null;
+
+        if (chunkIndex < 0 || chunkIndex >= entry.ChunkHashes.Count)
+            return null;
+
+        string hash = entry.ChunkHashes[chunkIndex];
+        return string.IsNullOrEmpty(hash) ? null : hash;
     }
 
     /// <summary>アップロード完了を確定。</summary>

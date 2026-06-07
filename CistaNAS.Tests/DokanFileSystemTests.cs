@@ -80,77 +80,83 @@ public class DokanFileSystemTests
     }
 
     // ====================================================================
-    // FileCache LRU テスト
+    // グローバルチャンクプール テスト
     // ====================================================================
 
+    private static CistaNasFileSystem CreateTestFs()
+        => new(new CistaNAS.Client.Api.CistaNasApiClient(new HttpClient()), "test-volume");
+
     [Fact]
-    public void FileCache_PutAndGet_Roundtrip()
+    public void ChunkPool_PutAndGet_Roundtrip()
     {
-        var cache = new CistaNasFileSystem.FileCache();
+        var fs = CreateTestFs();
         byte[] data = { 1, 2, 3 };
+        string hash = "ABC123";
 
-        cache.PutChunk(0, data);
-        Assert.True(cache.TryGetChunk(0, out var chunk));
-        Assert.Equal(data, chunk);
+        fs.PutChunkToPool("file1", 0, data, hash);
+        var result = fs.TryGetChunkFromPool("file1", 0);
+
+        Assert.True(result.HasValue);
+        Assert.Equal(data, result.Value.Data);
+        Assert.Equal(hash, result.Value.EncryptedHash);
     }
 
     [Fact]
-    public void FileCache_GetMissingChunk_ReturnsFalse()
+    public void ChunkPool_GetMissing_ReturnsNull()
     {
-        var cache = new CistaNasFileSystem.FileCache();
-        Assert.False(cache.TryGetChunk(99, out _));
+        var fs = CreateTestFs();
+        Assert.Null(fs.TryGetChunkFromPool("nonexistent", 99));
     }
 
     [Fact]
-    public void FileCache_LRU_EvictsOldest()
+    public void ChunkPool_LRU_EvictsOldest()
     {
-        // MaxChunks = 16 のうち最初の4つを入れてから MaxChunks+1 個目を追加
-        var cache = new CistaNasFileSystem.FileCache();
+        // MaxGlobalChunks = 20。21個追加 → 最初のが退避される
+        var fs = CreateTestFs();
         byte[] dummy = { 0 };
 
-        // 17 チャンク追加 → チャンク 0 が驱逐されるはず
-        for (int i = 0; i < 17; i++)
-            cache.PutChunk(i, dummy);
+        for (int i = 0; i < 21; i++)
+            fs.PutChunkToPool("file1", i, dummy, $"hash{i}");
 
-        Assert.False(cache.TryGetChunk(0, out _)); // 最古 = 驱逐
-        Assert.True(cache.TryGetChunk(1, out _));  // 残存
-        Assert.True(cache.TryGetChunk(16, out _)); // 最新
+        Assert.Null(fs.TryGetChunkFromPool("file1", 0));  // 最古 = 退避
+        Assert.NotNull(fs.TryGetChunkFromPool("file1", 1));   // 残存
+        Assert.NotNull(fs.TryGetChunkFromPool("file1", 20));  // 最新
     }
 
     [Fact]
-    public void FileCache_LRU_AccessRefreshes()
+    public void ChunkPool_LRU_AccessRefreshes()
     {
-        var cache = new CistaNasFileSystem.FileCache();
+        var fs = CreateTestFs();
         byte[] dummy = { 0 };
 
-        // チャンク 0..15 を追加（MaxChunks = 16 なので全て収まる）
-        for (int i = 0; i < 16; i++)
-            cache.PutChunk(i, dummy);
+        // チャンク 0..19 を追加（MaxGlobalChunks = 20 なので全て収まる）
+        for (int i = 0; i < 20; i++)
+            fs.PutChunkToPool("file1", i, dummy, $"hash{i}");
 
         // チャンク 0 にアクセス → LRU 先頭に移動
-        cache.TryGetChunk(0, out _);
+        fs.TryGetChunkFromPool("file1", 0);
 
-        // チャンク 16 を追加 → チャンク 1 が驱逐されるはず（0 は先頭にいるので）
-        cache.PutChunk(16, dummy);
+        // チャンク 20 を追加 → チャンク 1 が退避されるはず（0 は先頭にいるので）
+        fs.PutChunkToPool("file1", 20, dummy, "hash20");
 
-        Assert.True(cache.TryGetChunk(0, out _));   // アクセス済み → 生存
-        Assert.False(cache.TryGetChunk(1, out _));  // 最古 → 驱逐
-        Assert.True(cache.TryGetChunk(16, out _));  // 最新 → 生存
+        Assert.NotNull(fs.TryGetChunkFromPool("file1", 0));   // アクセス済み → 生存
+        Assert.Null(fs.TryGetChunkFromPool("file1", 1));     // 最古 → 退避
+        Assert.NotNull(fs.TryGetChunkFromPool("file1", 20));  // 最新 → 生存
     }
 
     [Fact]
-    public void FileCache_ClearChunks_RemovesAll()
+    public void ChunkPool_RemoveFileChunks()
     {
-        var cache = new CistaNasFileSystem.FileCache();
+        var fs = CreateTestFs();
         byte[] dummy = { 0 };
 
         for (int i = 0; i < 5; i++)
-            cache.PutChunk(i, dummy);
+            fs.PutChunkToPool("file1", i, dummy, $"hash{i}");
 
-        cache.ClearChunks();
+        fs.RemoveFileChunksFromPool("file1");
 
         for (int i = 0; i < 5; i++)
-            Assert.False(cache.TryGetChunk(i, out _));
+            Assert.Null(fs.TryGetChunkFromPool("file1", i));
     }
 
     // ====================================================================
@@ -309,11 +315,9 @@ public class DokanFileSystemTests
     }
 
     [Fact]
-    public void FileCache_ParallelChunkAccess_ThreadSafe()
+    public void ChunkPool_ParallelAccess_ThreadSafe()
     {
-        var cache = new CistaNasFileSystem.FileCache();
-        byte[] key = { 1, 2, 3, 4 };
-        cache.SetFileKey(key);
+        var fs = CreateTestFs();
 
         var exceptions = new ConcurrentBag<Exception>();
 
@@ -322,15 +326,12 @@ public class DokanFileSystemTests
         {
             try
             {
-                // チャンクを書き込み
                 byte[] data = { (byte)i };
-                cache.PutChunk(i % 20, data);
+                string fileId = $"file{i % 5}";
+                int chunkIndex = i % 20;
 
-                // チャンクを読み込み
-                cache.TryGetChunk(i % 20, out _);
-
-                // FileKey を読み込み
-                cache.TryGetFileKey(out _);
+                fs.PutChunkToPool(fileId, chunkIndex, data, $"hash{i}");
+                fs.TryGetChunkFromPool(fileId, chunkIndex);
             }
             catch (Exception ex)
             {

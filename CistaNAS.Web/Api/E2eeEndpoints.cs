@@ -27,6 +27,8 @@ public static class E2eeEndpoints
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
         e2ee.MapGet("/{volumeName}/download-chunk/{fileId}/{chunkIndex}", DownloadChunk)
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapGet("/{volumeName}/chunk-hash/{fileId}/{chunkIndex}", GetChunkHash)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
         e2ee.MapPatch("/{volumeName}/finalize-file/{fileId}", FinalizeFile)
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
         e2ee.MapDelete("/{volumeName}/files/{fileId}", DeleteFile)
@@ -185,6 +187,14 @@ public static class E2eeEndpoints
         {
             return Results.NotFound(new { error = ex.Message });
         }
+    }
+
+    private static async Task<IResult> GetChunkHash(string volumeName, string fileId, int chunkIndex, HttpContext ctx, E2eeFileService e2eeFs)
+    {
+        var hash = await e2eeFs.GetChunkHashAsync(volumeName, fileId, chunkIndex, ctx.RequestAborted);
+        return hash is not null
+            ? Results.Ok(new { hash })
+            : Results.NotFound(new { error = "チャンクハッシュが見つかりません。" });
     }
 
     private static async Task<IResult> FinalizeFile(string volumeName, string fileId, E2eeFinalizeFileRequest req, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)

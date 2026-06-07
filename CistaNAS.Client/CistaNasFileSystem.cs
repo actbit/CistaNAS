@@ -21,8 +21,14 @@ public sealed class CistaNasFileSystem : IDokanOperations
     // Level 1: plainName → fileId（E2EEのみ）
     private readonly ConcurrentDictionary<string, string> _fileIdCache = new(StringComparer.OrdinalIgnoreCase);
 
-    // Level 2: fileId → FileCache（E2EEのみ、メタデータ + LRU チャンクキャッシュ）
+    // Level 2: fileId → FileCache（E2EEのみ、メタデータ + fileKey）
     private readonly ConcurrentDictionary<string, FileCache> _cache = new(StringComparer.Ordinal);
+
+    // グローバルチャンクプール: 全ファイル合計20チャンク上限（ハッシュ検証付き）
+    private readonly Dictionary<(string FileId, int ChunkIndex), (byte[] Data, string EncryptedHash)> _chunkPool = new();
+    private readonly LinkedList<(string FileId, int ChunkIndex)> _chunkLru = new();
+    private readonly object _chunkPoolLock = new();
+    private const int MaxGlobalChunks = 20;
 
     // Level 3: ファイル一覧キャッシュ（TTL ベース）
     private readonly ListingCache _listingCache = new();
@@ -51,27 +57,19 @@ public sealed class CistaNasFileSystem : IDokanOperations
         _isE2ee = false;
     }
 
-    // ---- 内部クラス: ファイルキャッシュ（LRU チャンク驱逐付き） ----
+    // ---- 内部クラス: ファイルキャッシュ（メタデータ + fileKey のみ。チャンクはグローバルプールで管理） ----
 
     internal sealed class FileCache
     {
         public string PlainName = "";
         public string FileId = "";
         public int ChunkCount;
-        public long EncryptedLength;
         public long PlainLength;
 
         private byte[]? _fileKey;
         private readonly object _fileKeyLock = new();
-        private readonly Dictionary<int, byte[]> _chunks = new();
-        private readonly LinkedList<int> _lru = new();
-        private readonly object _chunkLock = new();
-        private const int MaxChunks = 16; // 1MB × 16 = 16MB/file 上限
 
-        /// <summary>FileKey をスレッドセーフに取得または設定する。</summary>
-        public byte[]? FileKey => _fileKey;
-
-        /// <summary>FileKey をスレッドセーフに設定する。</summary>
+        /// <summary>FileKey をスレッドセーフに設定する（一度だけ）。</summary>
         public void SetFileKey(byte[] key)
         {
             lock (_fileKeyLock)
@@ -88,52 +86,6 @@ public sealed class CistaNasFileSystem : IDokanOperations
             {
                 key = _fileKey;
                 return _fileKey is not null;
-            }
-        }
-
-        public bool TryGetChunk(int index, out byte[]? chunk)
-        {
-            lock (_chunkLock)
-            {
-                if (_chunks.TryGetValue(index, out chunk))
-                {
-                    _lru.Remove(index);
-                    _lru.AddFirst(index);
-                    return true;
-                }
-                return false;
-            }
-        }
-
-        public void PutChunk(int index, byte[] data)
-        {
-            lock (_chunkLock)
-            {
-                if (_chunks.ContainsKey(index))
-                {
-                    _lru.Remove(index);
-                    _lru.AddFirst(index);
-                    return;
-                }
-
-                _chunks[index] = data;
-                _lru.AddFirst(index);
-
-                while (_chunks.Count > MaxChunks)
-                {
-                    int evict = _lru.Last!.Value;
-                    _lru.RemoveLast();
-                    _chunks.Remove(evict);
-                }
-            }
-        }
-
-        public void ClearChunks()
-        {
-            lock (_chunkLock)
-            {
-                _chunks.Clear();
-                _lru.Clear();
             }
         }
     }
@@ -389,7 +341,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
             }
         }
 
-        // E2EE モード: チャンクダウンロード + 復号化
+        // E2EE モード: チャンクダウンロード + 復号化（ハッシュ検証付きキャッシュ）
         if (info.Context is not string fileId)
             return DokanResult.InvalidParameter;
 
@@ -413,11 +365,10 @@ public sealed class CistaNasFileSystem : IDokanOperations
                     Buffer.BlockCopy(encData, 0, salt, 0, 16);
                     var derivedKey = E2eeCrypto.DeriveFileKey(_masterKey!, salt);
 
-                    // チャンク 0 もキャッシュしておく（次回の ReadFile で再利用）
+                    // チャンク 0 を復号してキャッシュ
                     var chunk = E2eeCrypto.DecryptChunk(encData, derivedKey, 0, out _);
-                    cache.PutChunk(0, chunk);
+                    PutChunkToPool(fileId, 0, chunk, ComputeHashHex(encData));
 
-                    // FileKey を設定（他スレッドから見えるように）
                     cache.SetFileKey(derivedKey);
                     fileKey = derivedKey;
                 }
@@ -433,15 +384,37 @@ public sealed class CistaNasFileSystem : IDokanOperations
                     if (offset + localBytesRead >= cache.PlainLength)
                         break;
 
-                    if (!cache.TryGetChunk(i, out var chunk))
+                    byte[] chunk;
+
+                    // キャッシュヒット: ハッシュ検証で鮮度確認
+                    var cached = TryGetChunkFromPool(fileId, i);
+                    if (cached.HasValue)
                     {
+                        var serverHash = await _api.GetChunkHashAsync(_volumeName, fileId, i);
+
+                        if (serverHash is not null && serverHash == cached.Value.EncryptedHash)
+                        {
+                            // ハッシュ一致 → キャッシュ利用
+                            chunk = cached.Value.Data;
+                        }
+                        else
+                        {
+                            // ハッシュ不一致 or ハッシュなし → 再ダウンロード
+                            var encData = await _api.DownloadChunkAsync(_volumeName, fileId, i);
+                            chunk = E2eeCrypto.DecryptChunk(encData, fileKey!, i, out _);
+                            PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));
+                        }
+                    }
+                    else
+                    {
+                        // キャッシュミス: ダウンロード + 復号 + キャッシュ保存
                         var encData = await _api.DownloadChunkAsync(_volumeName, fileId, i);
                         chunk = E2eeCrypto.DecryptChunk(encData, fileKey!, i, out _);
-                        cache.PutChunk(i, chunk);
+                        PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));
                     }
 
                     long chunkStart = fileOffset;
-                    long chunkEnd = chunkStart + chunk!.Length;
+                    long chunkEnd = chunkStart + chunk.Length;
 
                     if (offset < chunkEnd)
                     {
@@ -613,7 +586,6 @@ public sealed class CistaNasFileSystem : IDokanOperations
                         PlainName = plainName,
                         FileId = entry.FileId,
                         ChunkCount = entry.ChunkCount,
-                        EncryptedLength = entry.EncryptedLength,
                         PlainLength = plainLength,
                     });
                 }
@@ -665,6 +637,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
 
         // 全レベルのキャッシュを無効化
         _cache.TryRemove(fileId, out _);
+        RemoveFileChunksFromPool(fileId);
         _fileIdCache.TryRemove(plainName, out _);
         _listingCache.Invalidate();
         lock (_statsLock) { _cachedStats = null; }
@@ -816,6 +789,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
             {
                 _api.DeleteFileAsync(_volumeName, ws.ExistingFileId).GetAwaiter().GetResult();
                 _cache.TryRemove(ws.ExistingFileId, out _);
+                RemoveFileChunksFromPool(ws.ExistingFileId);
             }
             catch { /* ベストエフォート: 孤児は許容 */ }
         }
@@ -827,12 +801,72 @@ public sealed class CistaNasFileSystem : IDokanOperations
             PlainName = ws.PlainName,
             FileId = fileId,
             ChunkCount = chunkCount,
-            EncryptedLength = encLength,
             PlainLength = plainLength,
         };
         _listingCache.Invalidate();
         lock (_statsLock) { _cachedStats = null; } // 使用量が変わったので再取得
     }
+
+    // ---- チャンクプール操作（グローバル20チャンク上限、ハッシュ検証付き） ----
+
+    /// <summary>チャンクをグローバルプールから取得（LRU 昇格付き）。なければ null。</summary>
+    internal (byte[] Data, string EncryptedHash)? TryGetChunkFromPool(string fileId, int chunkIndex)
+    {
+        lock (_chunkPoolLock)
+        {
+            var key = (fileId, chunkIndex);
+            if (_chunkPool.TryGetValue(key, out var entry))
+            {
+                _chunkLru.Remove(key);
+                _chunkLru.AddFirst(key);
+                return entry;
+            }
+            return null;
+        }
+    }
+
+    /// <summary>チャンクをグローバルプールに保存（LRU 退避付き）。</summary>
+    internal void PutChunkToPool(string fileId, int chunkIndex, byte[] data, string encryptedHash)
+    {
+        lock (_chunkPoolLock)
+        {
+            var key = (fileId, chunkIndex);
+            if (_chunkPool.ContainsKey(key))
+            {
+                _chunkLru.Remove(key);
+                _chunkLru.AddFirst(key);
+                _chunkPool[key] = (data, encryptedHash);
+                return;
+            }
+
+            _chunkPool[key] = (data, encryptedHash);
+            _chunkLru.AddFirst(key);
+
+            while (_chunkPool.Count > MaxGlobalChunks)
+            {
+                var evict = _chunkLru.Last!.Value;
+                _chunkLru.RemoveLast();
+                _chunkPool.Remove(evict);
+            }
+        }
+    }
+
+    /// <summary>指定ファイルのチャンクを全てプールから除去。</summary>
+    internal void RemoveFileChunksFromPool(string fileId)
+    {
+        lock (_chunkPoolLock)
+        {
+            var toRemove = _chunkPool.Keys.Where(k => k.FileId == fileId).ToList();
+            foreach (var k in toRemove)
+            {
+                _chunkPool.Remove(k);
+                _chunkLru.Remove(k);
+            }
+        }
+    }
+
+    private static string ComputeHashHex(byte[] data)
+        => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(data));
 
     private string? FindFileId(string plainName)
     {
@@ -876,7 +910,6 @@ public sealed class CistaNasFileSystem : IDokanOperations
                         PlainName = plainName,
                         FileId = fileId,
                         ChunkCount = entry.ChunkCount,
-                        EncryptedLength = entry.EncryptedLength,
                         PlainLength = plainLength,
                     };
                     _fileIdCache[plainName] = fileId;
