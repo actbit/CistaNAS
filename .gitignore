@@ -368,4 +368,9 @@ FodyWeavers.xsd
 # WASM build artifacts
 publish-wasm-temp/
 **/publish-wasm*/
-**/wwwroot/_framework/
+**/wasm/_framework/
+**/wwwroot/wasm/_framework/
+**/wasm/*.br
+**/wasm/*.gz
+**/wwwroot/wasm/*.br
+**/wwwroot/wasm/*.gz
