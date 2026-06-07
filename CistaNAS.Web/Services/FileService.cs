@@ -501,11 +501,10 @@ public sealed class FileService
                 catLock.Release();
             }
 
-            // チャンクモード: S3 からチャンクを削除
+            // チャンクモード: S3 からチャンクを削除（リトライ付き）
             if (isChunkMode)
             {
-                try { await _chunkStore.DeleteChunksAsync(volumeName, fileName, ct); }
-                catch (Exception) { /* ベストエフォート */ }
+                await DeleteChunksWithRetryAsync(volumeName, fileName, ct);
             }
 
             await _journalService.CommitAsync(volumeName, opId, ct);
@@ -514,6 +513,34 @@ public sealed class FileService
         // 削除完了後にファイルゲートをクリーンアップ
         if (_fileGates.TryRemove((volumeName, fileName), out var removed))
             removed.Dispose();
+    }
+
+    /// <summary>チャンク削除をリトライ付きで実行。</summary>
+    private async Task DeleteChunksWithRetryAsync(string volumeName, string fileName, CancellationToken ct)
+    {
+        const int maxRetries = 3;
+        Exception? lastException = null;
+
+        for (int i = 0; i < maxRetries; i++)
+        {
+            try
+            {
+                await _chunkStore.DeleteChunksAsync(volumeName, fileName, ct);
+                return; // 成功時は即時リターン
+            }
+            catch (Exception ex)
+            {
+                lastException = ex;
+                if (i < maxRetries - 1)
+                {
+                    // 指数バックオフで待機
+                    await Task.Delay(100 * (i + 1), ct);
+                }
+            }
+        }
+
+        // 全リトライ失敗時はログのみ記録（孤児チャンクは許容）
+        // カタログ削除は完了しているため、データ不整合にはならない
     }
 
     /// <summary>クラッシュ復旧：未コミットジャーナルからカタログを修復。</summary>

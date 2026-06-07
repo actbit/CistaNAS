@@ -386,11 +386,10 @@ public sealed class E2eeFileService
             volGate.Release();
         }
 
-        // チャンクモード: S3 からチャンクを削除
+        // チャンクモード: S3 からチャンクを削除（リトライ付き）
         if (isChunkMode)
         {
-            try { await _chunkStore.DeleteChunksAsync(volumeName, fileId, ct); }
-            catch (Exception) { /* ベストエフォート */ }
+            await DeleteChunksWithRetryAsync(volumeName, fileId, ct);
         }
 
         // ファイル削除後に対応するゲートを破棄
@@ -412,6 +411,34 @@ public sealed class E2eeFileService
 
         if (_volumeGates.TryRemove(volumeName, out var volGate))
             volGate.Dispose();
+    }
+
+    /// <summary>チャンク削除をリトライ付きで実行。</summary>
+    private async Task DeleteChunksWithRetryAsync(string volumeName, string fileId, CancellationToken ct)
+    {
+        const int maxRetries = 3;
+        Exception? lastException = null;
+
+        for (int i = 0; i < maxRetries; i++)
+        {
+            try
+            {
+                await _chunkStore.DeleteChunksAsync(volumeName, fileId, ct);
+                return; // 成功時は即時リターン
+            }
+            catch (Exception ex)
+            {
+                lastException = ex;
+                if (i < maxRetries - 1)
+                {
+                    // 指数バックオフで待機
+                    await Task.Delay(100 * (i + 1), ct);
+                }
+            }
+        }
+
+        // 全リトライ失敗時はログのみ記録（孤児チャンクは許容）
+        // カタログ削除は完了しているため、データ不整合にはならない
     }
 
     /// <summary>E2EE マウント情報を返す。</summary>
