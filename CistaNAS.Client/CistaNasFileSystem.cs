@@ -390,7 +390,15 @@ public sealed class CistaNasFileSystem : IDokanOperations
                     var cached = TryGetChunkFromPool(fileId, i);
                     if (cached.HasValue)
                     {
-                        var serverHash = await _api.GetChunkHashAsync(_volumeName, fileId, i);
+                        string? serverHash = null;
+                        try
+                        {
+                            serverHash = await _api.GetChunkHashAsync(_volumeName, fileId, i);
+                        }
+                        catch
+                        {
+                            // ハッシュ検証の通信失敗時はキャッシュを信頼せず再ダウンロード
+                        }
 
                         if (serverHash is not null && serverHash == cached.Value.EncryptedHash)
                         {
@@ -399,7 +407,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
                         }
                         else
                         {
-                            // ハッシュ不一致 or ハッシュなし → 再ダウンロード
+                            // ハッシュ不一致 or ハッシュなし or 通信失敗 → 再ダウンロード
                             var encData = await _api.DownloadChunkAsync(_volumeName, fileId, i);
                             chunk = E2eeCrypto.DecryptChunk(encData, fileKey!, i, out _);
                             PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));

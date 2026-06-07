@@ -293,16 +293,26 @@ public sealed class E2eeFileService
     {
         GetE2eeHeader(volumeName);
 
-        var catalog = await LoadCatalogAsync(volumeName, ct);
+        // ボリュームゲートでカタログ読み取りの整合性を保証
+        var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await volGate.WaitAsync(ct);
+        try
+        {
+            var catalog = await LoadCatalogAsync(volumeName, ct);
 
-        if (!catalog.Files.TryGetValue(fileId, out var entry))
-            return null;
+            if (!catalog.Files.TryGetValue(fileId, out var entry))
+                return null;
 
-        if (chunkIndex < 0 || chunkIndex >= entry.ChunkHashes.Count)
-            return null;
+            if (chunkIndex < 0 || chunkIndex >= entry.ChunkHashes.Count)
+                return null;
 
-        string hash = entry.ChunkHashes[chunkIndex];
-        return string.IsNullOrEmpty(hash) ? null : hash;
+            string hash = entry.ChunkHashes[chunkIndex];
+            return string.IsNullOrEmpty(hash) ? null : hash;
+        }
+        finally
+        {
+            volGate.Release();
+        }
     }
 
     /// <summary>アップロード完了を確定。</summary>
