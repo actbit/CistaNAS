@@ -288,8 +288,14 @@ app.UseAuthorization();
 app.UseAntiforgery();
 
 app.MapStaticAssets();
-app.MapRazorComponents<App>()
-    .AddInteractiveServerRenderMode();
+
+// ---- WASM SPA フォールバック ----
+// API・WebDAVリクエスト以外を index.html にフォールバック
+app.MapFallbackToFile("index.html");
+
+// Server-side BlazorはWASM統合により無効化
+// app.MapRazorComponents<App>()
+//     .AddInteractiveServerRenderMode();
 
 // ---- /api/v1 : REST API ----
 var api = app.MapGroup("/api/v1");

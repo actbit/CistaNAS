@@ -364,3 +364,8 @@ FodyWeavers.xsd
 
 # CistaNAS runtime data (volumes, users, journals)
 **/data/
+
+# WASM build artifacts
+publish-wasm-temp/
+**/publish-wasm*/
+**/wwwroot/_framework/
