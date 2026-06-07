@@ -69,13 +69,12 @@ public sealed class CistaNasFileSystem : IDokanOperations
         private byte[]? _fileKey;
         private readonly object _fileKeyLock = new();
 
-        /// <summary>FileKey をスレッドセーフに設定する（一度だけ）。</summary>
+        /// <summary>FileKey をスレッドセーフに設定する。上書き可能（他クライアントの上書きで salt が変わった場合に再導出が必要）。</summary>
         public void SetFileKey(byte[] key)
         {
             lock (_fileKeyLock)
             {
-                if (_fileKey is null)
-                    _fileKey = key;
+                _fileKey = key;
             }
         }
 
@@ -409,6 +408,17 @@ public sealed class CistaNasFileSystem : IDokanOperations
                         {
                             // ハッシュ不一致 or ハッシュなし or 通信失敗 → 再ダウンロード
                             var encData = await _api.DownloadChunkAsync(_volumeName, fileId, i);
+
+                            // チャンク0の salt が変わった場合は fileKey を再導出
+                            if (i == 0 && encData.Length > 16)
+                            {
+                                byte[] newSalt = new byte[16];
+                                Buffer.BlockCopy(encData, 0, newSalt, 0, 16);
+                                var newKey = E2eeCrypto.DeriveFileKey(_masterKey!, newSalt);
+                                cache.SetFileKey(newKey);
+                                fileKey = newKey;
+                            }
+
                             chunk = E2eeCrypto.DecryptChunk(encData, fileKey!, i, out _);
                             PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));
                         }
@@ -902,32 +912,30 @@ public sealed class CistaNasFileSystem : IDokanOperations
         // TryGetValue のみ使用 - 見つからなければ null を返す
         if (_cache.TryGetValue(fileId, out var c)) return c;
 
-        // 見つからない場合のみ作成を試みる - GetOrAdd で競合を回避
-        return _cache.GetOrAdd(fileId, id =>
+        // 見つからない場合のみ作成を試みる - API 失敗時は null を返す（キャッシュに保存しない）
+        try
         {
-            try
-            {
-                var entries = _api.ListFilesAsync(_volumeName).GetAwaiter().GetResult();
-                var entry = entries.FirstOrDefault(e => e.FileId == id);
-                if (entry is not null)
-                {
-                    string plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!);
-                    long plainLength = Math.Max(0, entry.EncryptedLength - 16L - (long)entry.ChunkCount * 16);
-                    var cache = new FileCache
-                    {
-                        PlainName = plainName,
-                        FileId = fileId,
-                        ChunkCount = entry.ChunkCount,
-                        PlainLength = plainLength,
-                    };
-                    _fileIdCache[plainName] = fileId;
-                    return cache;
-                }
-            }
-            catch { }
+            var entries = _api.ListFilesAsync(_volumeName).GetAwaiter().GetResult();
+            var entry = entries.FirstOrDefault(e => e.FileId == fileId);
+            if (entry is null) return null;
 
-            return null!;
-        });
+            string plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!);
+            long plainLength = Math.Max(0, entry.EncryptedLength - 16L - (long)entry.ChunkCount * 16);
+            var cache = new FileCache
+            {
+                PlainName = plainName,
+                FileId = fileId,
+                ChunkCount = entry.ChunkCount,
+                PlainLength = plainLength,
+            };
+            _fileIdCache[plainName] = fileId;
+            _cache.TryAdd(fileId, cache);
+            return cache;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static bool IsMatch(string name, string pattern)
