@@ -8,15 +8,6 @@ public static class CistaNasApiClientAuth
 {
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
-    /// <summary>初期セットアップを実行する（初回のみ実行可能）。</summary>
-    public static async Task SetupAsync(this CistaNasApiClient client, string username, string password)
-    {
-        var http = GetHttp(client);
-        var req = new { username, password };
-        var res = await http.PostAsJsonAsync("/api/v1/auth/setup", req, JsonOpts);
-        res.EnsureSuccessStatusCode();
-    }
-
     /// <summary>パスワードを変更する。</summary>
     public static async Task ChangePasswordAsync(this CistaNasApiClient client, string oldPassword, string newPassword)
     {

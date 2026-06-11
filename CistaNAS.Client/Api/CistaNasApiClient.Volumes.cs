@@ -35,8 +35,53 @@ public static class CistaNasApiClientVolumes
     public static async Task LockVolumeAsync(this CistaNasApiClient client, string name)
     {
         var http = GetHttp(client);
-        var res = await http.PostAsJsonAsync($"/api/v1/volumes/{Uri.EscapeDataString(name)}/lock", new { }, JsonOpts);
+        var res = await http.PostAsync($"/api/v1/volumes/{Uri.EscapeDataString(name)}/lock", null);
         res.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>ボリューム一覧（詳細情報付き）を取得する。</summary>
+    public static async Task<List<VolumeDetail>> ListVolumesDetailAsync(this CistaNasApiClient client)
+    {
+        var http = GetHttp(client);
+        var res = await http.GetAsync("/api/v1/volumes");
+        res.EnsureSuccessStatusCode();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var result = new List<VolumeDetail>();
+        if (json.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var v in json.EnumerateArray())
+            {
+                var authorizedUsers = new List<string>();
+                if (v.TryGetProperty("authorizedUsers", out var usersEl))
+                {
+                    foreach (var u in usersEl.EnumerateArray())
+                        authorizedUsers.Add(u.GetString() ?? "");
+                }
+
+                var authorizedGroups = new List<string>();
+                if (v.TryGetProperty("authorizedGroups", out var groupsEl))
+                {
+                    foreach (var g in groupsEl.EnumerateArray())
+                        authorizedGroups.Add(g.GetString() ?? "");
+                }
+
+                result.Add(new VolumeDetail
+                {
+                    Name = v.GetProperty("name").GetString()!,
+                    Encrypted = v.TryGetProperty("encrypted", out var enc) && enc.GetBoolean(),
+                    EncryptionMode = v.TryGetProperty("encryptionMode", out var mode) ? mode.GetString() ?? "server" : "server",
+                    CipherAlgorithm = v.TryGetProperty("cipherAlgorithm", out var cipher) ? cipher.GetString() ?? "aes-256-xts" : "aes-256-xts",
+                    KeySize = v.TryGetProperty("keySize", out var keySize) ? keySize.GetInt32() : 256,
+                    IsMounted = v.TryGetProperty("isMounted", out var mnt) && mnt.GetBoolean(),
+                    OwnerUser = v.TryGetProperty("ownerUser", out var owner) ? owner.GetString() ?? "" : "",
+                    CreatedAt = v.TryGetProperty("createdAt", out var cat) ? cat.GetDateTimeOffset() : DateTimeOffset.MinValue,
+                    AuthorizedUsers = authorizedUsers,
+                    AuthorizedGroups = authorizedGroups,
+                    IsHome = v.TryGetProperty("isHome", out var home) && home.GetBoolean(),
+                });
+            }
+        }
+        return result;
     }
 
     /// <summary>ボリュームを削除する。</summary>
@@ -120,4 +165,13 @@ public class VolumeInfo
     public int KeySize { get; set; } = 256;
     public bool IsMounted { get; set; }
     public string OwnerUser { get; set; } = "";
+}
+
+/// <summary>ボリューム詳細情報（一覧表示用）。</summary>
+public class VolumeDetail : VolumeInfo
+{
+    public DateTimeOffset CreatedAt { get; set; }
+    public List<string> AuthorizedUsers { get; set; } = [];
+    public List<string> AuthorizedGroups { get; set; } = [];
+    public bool IsHome { get; set; }
 }

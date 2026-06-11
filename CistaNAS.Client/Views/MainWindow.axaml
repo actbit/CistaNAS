@@ -4,56 +4,402 @@
         x:Class="CistaNAS.Client.Views.MainWindow"
         x:DataType="vm:MainViewModel"
         Title="CistaNAS Client"
-        Width="520" Height="480"
+        Width="700" Height="620"
         WindowStartupLocation="CenterScreen">
 
     <Grid Margin="16" RowDefinitions="Auto,*,Auto">
 
-        <!-- ログインパネル -->
+        <!-- ============================================================ -->
+        <!-- セットアップパネル（未ログイン + ユーザーなし時） -->
+        <!-- ============================================================ -->
         <StackPanel Grid.Row="0" IsVisible="{Binding !IsLoggedIn}" Spacing="8">
             <TextBlock Text="CistaNAS Client" FontSize="24" FontWeight="Bold" Margin="0,0,0,8"/>
             <TextBox Text="{Binding ServerUrl}" PlaceholderText="サーバー URL" />
-            <TextBox Text="{Binding Username}" PlaceholderText="ユーザー名" />
-            <TextBox Text="{Binding Password}" PlaceholderText="パスワード" PasswordChar="*" />
-            <Button Content="ログイン" Command="{Binding LoginCommand}"
-                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
-                    IsEnabled="{Binding !IsBusy}" />
+            <Button Content="接続確認" Command="{Binding InitializeCommand}" HorizontalAlignment="Left" />
+
+            <!-- セットアップ -->
+            <StackPanel IsVisible="{Binding !HasUsers}" Spacing="8" Margin="0,8,0,0">
+                <TextBlock Text="初期セットアップ" FontSize="16" FontWeight="SemiBold"/>
+                <TextBox Text="{Binding SetupUsername}" PlaceholderText="ユーザー名" />
+                <TextBox Text="{Binding SetupPassword}" PlaceholderText="パスワード" PasswordChar="*" />
+                <TextBox Text="{Binding SetupConfirmPassword}" PlaceholderText="パスワード（確認）" PasswordChar="*" />
+                <Button Content="セットアップ" Command="{Binding SetupCommand}"
+                        HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                        IsEnabled="{Binding !IsBusy}" />
+            </StackPanel>
+
+            <!-- ログイン -->
+            <StackPanel IsVisible="{Binding HasUsers}" Spacing="8" Margin="0,8,0,0">
+                <TextBlock Text="ログイン" FontSize="16" FontWeight="SemiBold"/>
+                <TextBox Text="{Binding Username}" PlaceholderText="ユーザー名" />
+                <TextBox Text="{Binding Password}" PlaceholderText="パスワード" PasswordChar="*" />
+                <Button Content="ログイン" Command="{Binding LoginCommand}"
+                        HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                        IsEnabled="{Binding !IsBusy}" />
+            </StackPanel>
         </StackPanel>
 
-        <!-- ボリューム一覧パネル -->
-        <Grid Grid.Row="1" IsVisible="{Binding IsLoggedIn}" RowDefinitions="Auto,*,Auto" Margin="0,8,0,0">
-            <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="8" Margin="0,0,0,8">
-                <TextBlock Text="ボリューム一覧" FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                <Button Content="更新" Command="{Binding RefreshVolumesCommand}" />
+        <!-- ============================================================ -->
+        <!-- メインコンテンツ（ログイン済み） -->
+        <!-- ============================================================ -->
+        <DockPanel Grid.Row="1" IsVisible="{Binding IsLoggedIn}">
+            <!-- ヘッダー -->
+            <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="8" Margin="0,0,0,8">
+                <TextBlock Text="CistaNAS Client" FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                <TextBlock Text="{Binding Username, StringFormat='{}{0} としてログイン中'}"
+                           FontSize="12" Foreground="Gray" VerticalAlignment="Center"/>
+                <Button Content="ログアウト" Command="{Binding LogoutCommand}" Margin="8,0,0,0" />
             </StackPanel>
 
-            <ListBox Grid.Row="1" ItemsSource="{Binding Volumes}"
-                     SelectedItem="{Binding SelectedVolume}"
-                     DoubleTapped="VolumeList_DoubleTapped">
-                <ListBox.ItemTemplate>
-                    <DataTemplate>
-                        <StackPanel Margin="0,4">
-                            <TextBlock Text="{Binding Name}" FontWeight="SemiBold"/>
-                            <StackPanel Orientation="Horizontal" Spacing="12">
-                                <TextBlock Text="{Binding EncryptionText}" FontSize="12" Foreground="Gray"/>
-                                <TextBlock Text="{Binding StatusText}" FontSize="12" Foreground="Gray"/>
+            <!-- タブ -->
+            <TabControl SelectedIndex="{Binding SelectedTabIndex}">
+                <!-- ===== タブ: ボリューム ===== -->
+                <TabItem Header="ボリューム">
+                    <Grid RowDefinitions="Auto,Auto,*,Auto" Margin="4">
+
+                        <!-- 作成フォーム -->
+                        <Border Grid.Row="0" BorderBrush="{DynamicResource SystemControlForegroundBaseMediumLowBrush}"
+                                BorderThickness="1" CornerRadius="4" Padding="8" Margin="0,0,0,8">
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="ボリューム作成" FontWeight="SemiBold"/>
+                                <TextBox Text="{Binding CreateVolName}" PlaceholderText="ボリューム名" />
+                                <CheckBox Content="暗号化する" IsChecked="{Binding CreateVolEncrypted}" />
+                                <StackPanel IsVisible="{Binding CreateVolEncrypted}" Spacing="4">
+                                    <ComboBox SelectedIndex="0" SelectedItem="{Binding CreateVolEncMode}">
+                                        <ComboBoxItem Content="server" />
+                                        <ComboBoxItem Content="e2ee" />
+                                        <ComboBoxItem Content="group-e2ee" />
+                                    </ComboBox>
+                                    <TextBox Text="{Binding CreateVolPassword}" PlaceholderText="パスワード" PasswordChar="*" />
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <Button Content="作成" Command="{Binding CreateVolumeCommand}" IsEnabled="{Binding !IsBusy}" />
+                                    <Button Content="削除" Command="{Binding DeleteVolumeCommand}" IsEnabled="{Binding SelectedVolume, Converter={x:Static ObjectConverters.IsNotNull}}" />
+                                    <Button Content="共有" Command="{Binding ShowShareCommand}" IsEnabled="{Binding SelectedVolume, Converter={x:Static ObjectConverters.IsNotNull}}" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- フィルタ/更新 -->
+                        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" Margin="0,0,0,4">
+                            <TextBlock Text="ボリューム一覧" FontSize="14" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                            <Button Content="更新" Command="{Binding RefreshVolumesCommand}" />
+                        </StackPanel>
+
+                        <!-- 一覧 -->
+                        <ListBox Grid.Row="2" ItemsSource="{Binding Volumes}"
+                                 SelectedItem="{Binding SelectedVolume}"
+                                 DoubleTapped="VolumeList_DoubleTapped">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Margin="0,4">
+                                        <StackPanel Orientation="Horizontal" Spacing="8">
+                                            <TextBlock Text="{Binding Name}" FontWeight="SemiBold"/>
+                                            <TextBlock Text="{Binding EncryptionText}" FontSize="11" Foreground="Gray"/>
+                                            <TextBlock Text="{Binding StatusText}" FontSize="11" Foreground="Gray"/>
+                                        </StackPanel>
+                                        <TextBlock FontSize="11" Foreground="Gray">
+                                            <TextBlock.Text>
+                                                <MultiBinding StringFormat="{}オーナー: {0}">
+                                                    <Binding Path="OwnerUser" />
+                                                </MultiBinding>
+                                            </TextBlock.Text>
+                                        </TextBlock>
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+
+                        <!-- 操作 -->
+                        <StackPanel Grid.Row="3" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" Margin="0,8,0,0">
+                            <Button Content="マウント" Command="{Binding ShowMountCommand}"
+                                    IsEnabled="{Binding SelectedVolume, Converter={x:Static ObjectConverters.IsNotNull}}" />
+                            <Button Content="アンマウント" Command="{Binding UnmountCommand}"
+                                    IsEnabled="{Binding SelectedVolume.IsMounted}" />
+                        </StackPanel>
+                    </Grid>
+                </TabItem>
+
+                <!-- ===== タブ: グループ ===== -->
+                <TabItem Header="グループ">
+                    <Grid RowDefinitions="Auto,*,Auto" Margin="4">
+                        <!-- 作成 -->
+                        <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="8" Margin="0,0,0,8">
+                            <TextBox Text="{Binding NewGroupName}" PlaceholderText="グループ名" Width="200" />
+                            <Button Content="作成" Command="{Binding CreateGroupCommand}" />
+                            <Button Content="更新" Command="{Binding RefreshGroupsCommand}" />
+                        </StackPanel>
+
+                        <!-- 一覧 -->
+                        <ListBox Grid.Row="1" ItemsSource="{Binding Groups}" SelectedItem="{Binding SelectedGroup}">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Margin="0,4">
+                                        <StackPanel Orientation="Horizontal" Spacing="8">
+                                            <TextBlock Text="{Binding GroupName}" FontWeight="SemiBold"/>
+                                            <TextBlock Text="{Binding Owner, StringFormat='{}オーナー: {0}'}" FontSize="12" Foreground="Gray"/>
+                                        </StackPanel>
+                                        <TextBlock Text="{Binding Members, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"
+                                                   FontSize="11" Foreground="Gray" />
+                                        <ItemsControl ItemsSource="{Binding Members}">
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate>
+                                                    <TextBlock Text="{Binding}" FontSize="12" Margin="0,0,8,0" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+                                        <Button Content="×" FontSize="10" Padding="4,0" VerticalAlignment="Top"
+                                                Command="{Binding $parent[ListBox].((vm:MainViewModel)DataContext).DeleteGroupCommand}"
+                                                CommandParameter="{Binding GroupName}" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+
+                        <!-- メンバー管理 -->
+                        <StackPanel Grid.Row="2" Spacing="4" Margin="0,8,0,0">
+                            <TextBlock Text="{Binding SelectedGroup.GroupName, StringFormat='{}メンバー管理: {0}'}"
+                                       FontWeight="SemiBold" IsVisible="{Binding SelectedGroup, Converter={x:Static ObjectConverters.IsNotNull}}" />
+                            <StackPanel Orientation="Horizontal" Spacing="8"
+                                        IsVisible="{Binding SelectedGroup, Converter={x:Static ObjectConverters.IsNotNull}}">
+                                <TextBox Text="{Binding AddMemberName}" PlaceholderText="ユーザー名" Width="200" />
+                                <Button Content="追加" Command="{Binding AddMemberCommand}" />
                             </StackPanel>
                         </StackPanel>
-                    </DataTemplate>
-                </ListBox.ItemTemplate>
-            </ListBox>
+                    </Grid>
+                </TabItem>
 
-            <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" Margin="0,8,0,0">
-                <Button Content="マウント" Command="{Binding ShowMountCommand}"
-                        IsEnabled="{Binding SelectedVolume, Converter={x:Static ObjectConverters.IsNotNull}}"
-                        />
-                <Button Content="アンマウント" Command="{Binding UnmountCommand}"
-                        IsEnabled="{Binding SelectedVolume.IsMounted}"
-                        />
-            </StackPanel>
-        </Grid>
+                <!-- ===== タブ: ユーザー (admin) ===== -->
+                <TabItem Header="ユーザー" IsVisible="{Binding IsAdmin}">
+                    <Grid RowDefinitions="Auto,*,Auto" Margin="4">
+                        <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="8" Margin="0,0,0,8">
+                            <TextBlock Text="ユーザー管理 (admin)" FontSize="14" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                            <Button Content="更新" Command="{Binding RefreshUsersCommand}" />
+                        </StackPanel>
 
+                        <ListBox Grid.Row="1" ItemsSource="{Binding Users}">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <Grid ColumnDefinitions="*,Auto,Auto">
+                                        <TextBlock Grid.Column="0" Text="{Binding UserName}" VerticalAlignment="Center"/>
+                                        <TextBlock Grid.Column="1" Text="{Binding RoleText}" FontSize="12"
+                                                   Foreground="Gray" VerticalAlignment="Center" Margin="8,0"/>
+                                        <Button Grid.Column="2" Content="削除" FontSize="12"
+                                                Command="{Binding $parent[TabItem].((vm:MainViewModel)DataContext).DeleteUserCommand}"
+                                                CommandParameter="{Binding UserName}" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+
+                        <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="8" Margin="0,8,0,0">
+                            <TextBox Text="{Binding NewUserUsername}" PlaceholderText="ユーザー名" Width="150" />
+                            <TextBox Text="{Binding NewUserPassword}" PlaceholderText="パスワード" PasswordChar="*" Width="150" />
+                            <ComboBox SelectedItem="{Binding NewUserRole}" Width="100">
+                                <ComboBoxItem Content="user" />
+                                <ComboBoxItem Content="admin" />
+                            </ComboBox>
+                            <Button Content="追加" Command="{Binding CreateUserCommand}" />
+                        </StackPanel>
+                    </Grid>
+                </TabItem>
+
+                <!-- ===== タブ: 設定 ===== -->
+                <TabItem Header="設定">
+                    <ScrollViewer Margin="4">
+                        <StackPanel Spacing="16">
+                            <!-- パスワード変更 -->
+                            <Border BorderBrush="{DynamicResource SystemControlForegroundBaseMediumLowBrush}"
+                                    BorderThickness="1" CornerRadius="4" Padding="12">
+                                <StackPanel Spacing="8">
+                                    <TextBlock Text="パスワード変更" FontWeight="SemiBold" FontSize="14"/>
+                                    <TextBox Text="{Binding CurrentPw}" PasswordChar="*" PlaceholderText="現在のパスワード" />
+                                    <TextBox Text="{Binding NewPw}" PasswordChar="*" PlaceholderText="新しいパスワード" />
+                                    <TextBox Text="{Binding ConfirmPw}" PasswordChar="*" PlaceholderText="新しいパスワード（確認）" />
+                                    <Button Content="変更" Command="{Binding ChangePasswordCommand}" HorizontalAlignment="Left" />
+                                </StackPanel>
+                            </Border>
+
+                            <!-- 暗号化設定 -->
+                            <Border BorderBrush="{DynamicResource SystemControlForegroundBaseMediumLowBrush}"
+                                    BorderThickness="1" CornerRadius="4" Padding="12">
+                                <StackPanel Spacing="8">
+                                    <TextBlock Text="暗号化設定" FontWeight="SemiBold" FontSize="14"/>
+                                    <StackPanel Orientation="Horizontal" Spacing="8">
+                                        <TextBlock Text="デフォルト暗号化モード" VerticalAlignment="Center" Width="160"/>
+                                        <ComboBox SelectedItem="{Binding EncDefaultMode}" Width="200">
+                                            <ComboBoxItem Content="server" />
+                                            <ComboBoxItem Content="e2ee" />
+                                            <ComboBoxItem Content="none" />
+                                        </ComboBox>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Spacing="8">
+                                        <TextBlock Text="E2EE チャンクサイズ" VerticalAlignment="Center" Width="160"/>
+                                        <ComboBox SelectedIndex="0" SelectedItem="{Binding EncChunkSize}" Width="200">
+                                            <ComboBoxItem Content="262144" />
+                                            <ComboBoxItem Content="524288" />
+                                            <ComboBoxItem Content="1048576" />
+                                            <ComboBoxItem Content="4194304" />
+                                        </ComboBox>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Spacing="8">
+                                        <TextBlock Text="PBKDF2 反復回数" VerticalAlignment="Center" Width="160"/>
+                                        <NumericUpDown Value="{Binding EncKdfIterations}" Minimum="10000" Maximum="10000000"
+                                                       Increment="100000" Width="200" />
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Spacing="8">
+                                        <TextBlock Text="セクタサイズ (AES-XTS)" VerticalAlignment="Center" Width="160"/>
+                                        <ComboBox SelectedItem="{Binding EncSectorSize}" Width="200">
+                                            <ComboBoxItem Content="512" />
+                                            <ComboBoxItem Content="4096" />
+                                        </ComboBox>
+                                    </StackPanel>
+                                    <Button Content="保存" Command="{Binding SaveEncryptionSettingsCommand}" HorizontalAlignment="Left" />
+                                </StackPanel>
+                            </Border>
+
+                            <!-- E2EE 鍵ペア管理 -->
+                            <Border BorderBrush="{DynamicResource SystemControlForegroundBaseMediumLowBrush}"
+                                    BorderThickness="1" CornerRadius="4" Padding="12">
+                                <StackPanel Spacing="8">
+                                    <TextBlock Text="E2EE 鍵ペア管理" FontWeight="SemiBold" FontSize="14"/>
+                                    <TextBlock Text="公開鍵登録済み" Foreground="Green" FontSize="12"
+                                               IsVisible="{Binding HasPublicKey}" />
+                                    <TextBlock Text="公開鍵未登録" Foreground="Orange" FontSize="12"
+                                               IsVisible="{Binding !HasPublicKey}" />
+                                    <StackPanel Orientation="Horizontal" Spacing="8">
+                                        <TextBox Text="{Binding KeyPairPassword}" PasswordChar="*"
+                                                 PlaceholderText="パスワード（秘密鍵暗号化用）" Width="250" />
+                                        <Button Content="鍵ペア生成・登録" Command="{Binding GenerateKeyPairCommand}"
+                                                IsEnabled="{Binding !IsBusy}" />
+                                    </StackPanel>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- 招待 -->
+                            <Border BorderBrush="{DynamicResource SystemControlForegroundBaseMediumLowBrush}"
+                                    BorderThickness="1" CornerRadius="4" Padding="12">
+                                <StackPanel Spacing="8">
+                                    <TextBlock Text="招待" FontWeight="SemiBold" FontSize="14"/>
+                                    <StackPanel Orientation="Horizontal" Spacing="8">
+                                        <TextBox Text="{Binding InviteTargetUsername}" PlaceholderText="招待対象ユーザー名" Width="250" />
+                                        <Button Content="招待作成" Command="{Binding CreateInvitationCommand}" />
+                                    </StackPanel>
+                                    <TextBlock Text="{Binding InvitationResult}" FontSize="12" Foreground="Blue"
+                                               IsVisible="{Binding InvitationResult, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </ScrollViewer>
+                </TabItem>
+            </TabControl>
+        </DockPanel>
+
+        <!-- ============================================================ -->
+        <!-- マウントダイアログ -->
+        <!-- ============================================================ -->
+        <Panel Grid.Row="1" IsVisible="{Binding ShowMountDialog}">
+            <Border Background="#80000000" />
+            <Border Background="{DynamicResource SystemControlBackgroundAltHighBrush}"
+                    CornerRadius="8" Padding="16" Width="400" HorizontalAlignment="Center" VerticalAlignment="Center">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="{Binding SelectedVolume.Name, StringFormat='{}マウント: {0}'}"
+                               FontSize="16" FontWeight="SemiBold"/>
+                    <TextBlock Text="{Binding SelectedVolume.EncryptionText, StringFormat='{}暗号化: {0}'}" FontSize="12" Foreground="Gray"/>
+
+                    <StackPanel IsVisible="{Binding SelectedVolume.Encrypted}">
+                        <TextBlock Text="パスワード" FontSize="12" />
+                        <TextBox Text="{Binding VolumePassword}" PasswordChar="*" />
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <TextBlock Text="ドライブレター" VerticalAlignment="Center" />
+                        <ComboBox ItemsSource="{Binding AvailableDrives}" SelectedItem="{Binding SelectedDriveLetter}" Width="80" />
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                        <Button Content="キャンセル" Click="CloseMountDialog" />
+                        <Button Content="マウント" Command="{Binding MountCommand}" IsEnabled="{Binding !IsBusy}" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Panel>
+
+        <!-- ============================================================ -->
+        <!-- 共有ダイアログ -->
+        <!-- ============================================================ -->
+        <Panel Grid.Row="1" IsVisible="{Binding ShowShareDialog}">
+            <Border Background="#80000000" />
+            <Border Background="{DynamicResource SystemControlBackgroundAltHighBrush}"
+                    CornerRadius="8" Padding="16" Width="500" HorizontalAlignment="Center" VerticalAlignment="Center"
+                    MaxHeight="500">
+                <ScrollViewer>
+                    <StackPanel Spacing="12">
+                        <TextBlock Text="{Binding SelectedVolume.Name, StringFormat='{}共有: {0}'}"
+                                   FontSize="16" FontWeight="SemiBold"/>
+
+                        <!-- アクセス権のあるユーザー -->
+                        <TextBlock Text="アクセス権のあるユーザー" FontWeight="SemiBold" />
+                        <ItemsControl ItemsSource="{Binding AuthorizedUsers}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Orientation="Horizontal" Spacing="4">
+                                        <TextBlock Text="{Binding}" VerticalAlignment="Center" />
+                                        <Button Content="削除" FontSize="11" Padding="4,2"
+                                                Command="{Binding $parent[Window].((vm:MainViewModel)DataContext).RevokeAccessCommand}"
+                                                CommandParameter="{Binding}" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
+                        <Separator />
+
+                        <!-- ユーザー追加（非E2EE） -->
+                        <StackPanel>
+                            <TextBlock Text="ユーザーを追加" FontWeight="SemiBold" />
+                            <TextBox Text="{Binding GrantUsername}" PlaceholderText="ユーザー名" Margin="0,4" />
+                            <TextBox Text="{Binding GrantPassword}" PasswordChar="*" PlaceholderText="対象ユーザーのパスワード" Margin="0,4" />
+                            <TextBox Text="{Binding GrantGranterPassword}" PasswordChar="*" PlaceholderText="自分のパスワード" Margin="0,4" />
+                            <Button Content="アクセス権付与" Command="{Binding GrantAccessCommand}" Margin="0,4" />
+
+                            <Separator Margin="0,8" />
+                            <TextBlock Text="グループアクセス" FontWeight="SemiBold" />
+                            <ItemsControl ItemsSource="{Binding AuthorizedGroups}" Margin="0,4">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <StackPanel Orientation="Horizontal" Spacing="4">
+                                            <TextBlock Text="{Binding}" VerticalAlignment="Center"/>
+                                            <Button Content="削除" FontSize="11" Padding="4,2"
+                                                    Command="{Binding $parent[Window].((vm:MainViewModel)DataContext).RevokeGroupCommand}"
+                                                    CommandParameter="{Binding}" />
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                            <ComboBox ItemsSource="{Binding AvailableGroups}" SelectedItem="{Binding GrantGroupName}"
+                                      DisplayMemberBinding="{Binding GroupName}" Width="200" Margin="0,4" />
+                            <Button Content="グループ追加" Command="{Binding GrantGroupCommand}" Margin="0,4" />
+                        </StackPanel>
+
+                        <!-- ECDH共有（E2EE） -->
+                        <StackPanel>
+                            <TextBlock Text="ECDH メンバー追加" FontWeight="SemiBold" />
+                            <TextBlock Text="相手ユーザーが公開鍵を登録している場合、ECDH でマスターキーを共有します。" FontSize="11" Foreground="Gray" TextWrapping="Wrap" />
+                            <TextBox Text="{Binding EcdhUsername}" PlaceholderText="ユーザー名" Margin="0,4" />
+                            <TextBox Text="{Binding GrantGranterPassword}" PasswordChar="*" PlaceholderText="自分のパスワード" Margin="0,4" />
+                            <Button Content="ECDH 共有" Command="{Binding EcdhGrantCommand}" Margin="0,4" />
+                        </StackPanel>
+
+                        <Button Content="閉じる" Click="CloseShareDialog" HorizontalAlignment="Right" />
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+        </Panel>
+
+        <!-- ============================================================ -->
         <!-- ステータスバー -->
+        <!-- ============================================================ -->
         <Border Grid.Row="2" Background="{DynamicResource SystemControlBackgroundAltHighBrush}"
                 Padding="8,4" CornerRadius="4" Margin="0,8,0,0">
             <TextBlock Text="{Binding StatusMessage}" FontSize="12" />

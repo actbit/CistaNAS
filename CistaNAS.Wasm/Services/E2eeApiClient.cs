@@ -100,5 +100,16 @@ public sealed class E2eeApiClient
         response.EnsureSuccessStatusCode();
     }
 
+    /// <summary>招待を作成する。</summary>
+    public async Task<string> CreateInvitationAsync(string targetUsername)
+    {
+        var response = await _http.PostAsJsonAsync("/api/v1/e2ee/invitations",
+            new CreateInvitationRequest(targetUsername));
+        response.EnsureSuccessStatusCode();
+        var result = await response.Content.ReadFromJsonAsync<InvitationIdResponse>();
+        return result?.InvitationId ?? "";
+    }
+
     private sealed record HashResponse(string Hash);
+    private sealed record InvitationIdResponse(string InvitationId);
 }

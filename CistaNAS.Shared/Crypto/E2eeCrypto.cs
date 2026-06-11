@@ -343,6 +343,42 @@ public static class E2eeCrypto
         return Encoding.UTF8.GetString(plain);
     }
 
+    // ---- ECDH 鍵交換 (P-256) ----
+
+    /// <summary>ECDH P-256 鍵ペアを生成し、(publicKey, privateKey) を返す。</summary>
+    public static (byte[] PublicKey, byte[] PrivateKey) GenerateEcdhKeyPair()
+    {
+        using var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
+        var pubKey = ecdh.PublicKey.ExportSubjectPublicKeyInfo();
+        var privKey = ecdh.ExportECPrivateKey();
+        return (pubKey, privKey);
+    }
+
+    /// <summary>ECIES ラップ: 相手の公開鍵でマスターキーを共有鍵暗号化する。</summary>
+    public static (byte[] EphemeralPublicKey, byte[] Nonce, byte[] Ciphertext, byte[] Tag) EcdhWrap(
+        byte[] masterKey, byte[] recipientPublicKeyDer)
+    {
+        using var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
+        // 相手の公開鍵をインポート
+        using var recipientEcdh = ECDiffieHellman.Create();
+        recipientEcdh.ImportSubjectPublicKeyInfo(recipientPublicKeyDer, out _);
+
+        // 共有秘密を導出
+        var sharedSecret = ecdh.DeriveKeyFromHash(recipientEcdh.PublicKey, HashAlgorithmName.SHA256,
+            new byte[GcmNonceSize], Encoding.UTF8.GetBytes("cista-ecies"));
+
+        // AES-256-GCM でマスターキーを暗号化
+        byte[] nonce = RandomNumberGenerator.GetBytes(GcmNonceSize);
+        byte[] ct = new byte[masterKey.Length];
+        byte[] tag = new byte[GcmTagSize];
+        using var gcm = new AesGcm(sharedSecret, GcmTagSize);
+        gcm.Encrypt(nonce, masterKey, ct, tag);
+
+        // 一時公開鍵をエクスポート
+        var ephemeralPubKey = ecdh.PublicKey.ExportSubjectPublicKeyInfo();
+        return (ephemeralPubKey, nonce, ct, tag);
+    }
+
     // ---- 内部ヘルパー ----
 
     /// <summary>

@@ -5,6 +5,7 @@
 @implements IDisposable
 @inject VolumeApiClient VolumeApi
 @inject AccountApiClient AccountApi
+@inject E2eeApiClient E2eeApi
 @inject GroupApiClient GroupApi
 @inject E2eeInterop E2ee
 @inject ClientVolumeMountService MountService
@@ -121,6 +122,7 @@ else
                         <th class="d-none d-md-table-cell">所有ユーザー</th>
                         <th class="d-none d-md-table-cell">共有</th>
                         <th>状態</th>
+                        <th class="d-none d-md-table-cell">使用量</th>
                         <th class="d-none d-lg-table-cell">作成日</th>
                         <th class="text-nowrap">操作</th>
                     </tr>
@@ -160,6 +162,20 @@ else
                                 else
                                 {
                                     <span class="badge bg-secondary">未マウント</span>
+                                }
+                            </td>
+                            <td class="d-none d-md-table-cell">
+                                @if (_volumeStats.TryGetValue(v.Name, out var stats))
+                                {
+                                    <span class="text-muted small">@FormatFileSize(stats.UserUsedBytes) / @(stats.UserQuotaBytes > 0 ? FormatFileSize(stats.UserQuotaBytes) : "∞")</span>
+                                }
+                                else if (v.EncryptionMode == "e2ee" || v.EncryptionMode == "group-e2ee")
+                                {
+                                    <span class="text-muted small">-</span>
+                                }
+                                else
+                                {
+                                    <span class="text-muted small">-</span>
                                 }
                             </td>
                             <td class="d-none d-lg-table-cell">@v.CreatedAt.ToLocalTime().ToString("yyyy/MM/dd HH:mm")</td>
@@ -352,6 +368,7 @@ else
     private IReadOnlyList<VolumeInfo>? _volumes;
     private bool _isLoading = true;
     private string? _error;
+    private Dictionary<string, E2eeVolumeStats> _volumeStats = new();
 
     // 作成フォーム
     private CreateModel _createModel = new() { Encrypted = true };
@@ -400,7 +417,24 @@ else
         if (!Auth.IsLoggedIn) { _isLoading = false; return; }
         _isLoading = true;
 
-        try { _volumes = await VolumeApi.ListAsync(); }
+        try
+        {
+            _volumes = await VolumeApi.ListAsync();
+            // E2EE ボリュームの使用量を取得
+            _volumeStats.Clear();
+            foreach (var v in _volumes)
+            {
+                if (v.EncryptionMode == "e2ee" || v.EncryptionMode == "group-e2ee")
+                {
+                    try
+                    {
+                        var stats = await E2eeApi.GetStatsAsync(v.Name);
+                        _volumeStats[v.Name] = stats;
+                    }
+                    catch { /* 使用量取得失敗は無視 */ }
+                }
+            }
+        }
         catch (Exception ex) { _error = $"エラー: {ex.Message}"; }
         finally { _isLoading = false; }
     }
@@ -765,6 +799,14 @@ else
     {
         StateHasChanged();
         if (Auth.IsLoggedIn && _volumes is null) await LoadVolumesAsync();
+    }
+
+    private static string FormatFileSize(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024:F1} KB";
+        if (bytes < 1024 * 1024 * 1024) return $"{bytes / (1024.0 * 1024.0):F1} MB";
+        return $"{bytes / (1024.0 * 1024.0 * 1024.0):F1} GB";
     }
 
     public void Dispose() => Auth.StateChanged -= OnAuthStateChanged;
