@@ -24,7 +24,7 @@ public sealed class FileMetadata
 
 public sealed record ListFilesResponse(IReadOnlyList<FileMetadata> Files);
 public sealed record FileUploadRequest(string VolumeName, string FileName, Stream Content, long ContentLength);
-public sealed record FileDownloadResponse(Stream Stream, string FileName, long Length);
+public sealed record FileDownloadResponse(Stream Stream, string FileName, long Length, string? ContentType = null);
 
 /// <summary>ファイル操作の業務エラー。</summary>
 public sealed class FileServiceException(string message) : Exception(message);
@@ -109,3 +109,16 @@ public sealed record InvitationResponse(string InvitationId, string InviterUsern
 public sealed record StreamTokenRequest(
     [Required] string VolumeName,
     [Required] string FileName);
+
+/// <summary>ユーザー作成リクエスト (WASM 用)。</summary>
+public sealed record CreateUserRequest(
+    [Required] string Username,
+    [Required] string Password,
+    string? Role = "user");
+
+/// <summary>暗号化設定更新リクエスト (WASM 用)。</summary>
+public sealed record UpdateEncryptionSettingsRequest(
+    string DefaultEncryptionMode = "server",
+    int E2eeChunkSize = 1048576,
+    int KdfIterations = 310_000,
+    int SectorSize = 4096);

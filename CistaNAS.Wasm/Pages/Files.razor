@@ -1,0 +1,636 @@
+@page "/files/{VolumeName}"
+@using CistaNAS.Wasm.Auth
+@using CistaNAS.Wasm.Services
+@using CistaNAS.Wasm.Helpers
+@using CistaNAS.Wasm.Models
+@implements IDisposable
+@implements IAsyncDisposable
+@inject VolumeApiClient VolumeApi
+@inject FileApiClient FileApi
+@inject E2eeApiClient E2eeApi
+@inject ClientVolumeMountService VolumeMountService
+@inject E2eeInterop E2ee
+@inject WasmAuthStateProvider Auth
+@inject HttpClient Http
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+
+<PageTitle>@VolumeName - Files</PageTitle>
+
+@if (!Auth.IsLoggedIn)
+{
+    <div class="alert alert-warning">ログインしてください。</div>
+    <a href="/login" class="btn btn-primary">ログイン</a>
+}
+else if (_isLoading)
+{
+    <p>読み込み中...</p>
+}
+else if (_errorMessage != null)
+{
+    <div class="alert alert-danger">@_errorMessage</div>
+    <a href="/volumes" class="btn btn-secondary">ボリューム一覧に戻る</a>
+}
+else if (_isE2ee && !_e2eeUnlocked)
+{
+    <h1>@VolumeName</h1>
+    <a href="/volumes" class="btn btn-outline-secondary mb-3">ボリューム一覧に戻る</a>
+
+    <div class="card">
+        <div class="card-header">E2EE ボリューム — パスワード入力</div>
+        <div class="card-body">
+            <div class="alert alert-info">
+                このボリュームはエンドツーエンド暗号化されています。
+                パスワードを入力してマスターキーを導出してください。
+            </div>
+            <div class="mb-3">
+                <label class="form-label">パスワード</label>
+                <input type="password" class="form-control" @bind="_e2eePassword" />
+            </div>
+            @if (_e2eeError is not null)
+            {
+                <div class="alert alert-danger">@_e2eeError</div>
+            }
+            <button class="btn btn-primary" disabled="@_e2eeUnlocking" @onclick="HandleE2eeUnlock">
+                @(_e2eeUnlocking ? "導出中..." : "ロック解除")
+            </button>
+        </div>
+    </div>
+}
+else
+{
+    <h1>@VolumeName</h1>
+    <a href="/volumes" class="btn btn-outline-secondary mb-3">ボリューム一覧に戻る</a>
+
+    @if (_isE2ee)
+    {
+        <div class="alert alert-success mb-3">
+            E2EE ボリューム — クライアント側暗号化有効
+        </div>
+    }
+
+    <!-- アップロード -->
+    <div class="card mb-4">
+        <div class="card-header">ファイルアップロード</div>
+        <div class="card-body">
+            <InputFile OnChange="HandleUpload" accept="@_uploadAcceptFilter" />
+            @if (_uploading)
+            {
+                <span class="text-muted ms-2">アップロード中...</span>
+            }
+            @if (_uploadError is not null)
+            {
+                <div class="alert alert-danger mt-2">@_uploadError</div>
+            }
+        </div>
+    </div>
+
+    @if (_operationError is not null)
+    {
+        <div class="alert alert-danger">@_operationError</div>
+    }
+
+    <!-- E2EE ファイル一覧 -->
+    @if (_isE2ee)
+    {
+        <h2>E2EE ファイル一覧</h2>
+        @if (_e2eeFiles.Count == 0)
+        {
+            <p>ファイルがありません。</p>
+        }
+        else
+        {
+            <div class="table-responsive">
+                <table class="table table-striped table-hover">
+                    <thead>
+                        <tr>
+                            <th>ファイル名</th>
+                            <th class="d-none d-md-table-cell">チャンク数</th>
+                            <th class="text-nowrap">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var f in _e2eeFiles)
+                        {
+                            <tr>
+                                <td>@f.PlainName</td>
+                                <td class="d-none d-md-table-cell">@f.Entry.ChunkCount</td>
+                                <td>
+                                    @if (MediaHelper.GetMediaType(f.PlainName) != MediaHelper.MediaType.None)
+                                    {
+                                        <button class="btn btn-sm btn-outline-success me-1"
+                                                disabled="@f.Downloading"
+                                                @onclick="() => PreviewMedia(f.PlainName)">プレビュー</button>
+                                    }
+                                    <button class="btn btn-sm btn-outline-primary me-1"
+                                            disabled="@f.Downloading"
+                                            @onclick="() => HandleE2eeDownload(f)">
+                                        @(f.Downloading ? "DL中..." : "DL")
+                                    </button>
+                                    <button class="btn btn-sm btn-outline-danger"
+                                            @onclick="() => HandleE2eeDelete(f.Entry.FileId)">削除</button>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        }
+    }
+    <!-- 通常ファイル一覧 -->
+    else if (_files != null && _files.Count > 0)
+    {
+        <h2>ファイル一覧</h2>
+        <div class="table-responsive">
+            <table class="table table-striped table-hover">
+                <thead>
+                    <tr>
+                        <th>ファイル名</th>
+                        <th class="d-none d-md-table-cell">サイズ</th>
+                        <th class="d-none d-lg-table-cell">更新日時</th>
+                        <th class="text-nowrap">操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var file in _files)
+                    {
+                        var mediaType = MediaHelper.GetMediaType(file.Name);
+                        <tr>
+                            <td>@file.Name</td>
+                            <td class="d-none d-md-table-cell">@FormatFileSize(file.Length)</td>
+                            <td class="d-none d-lg-table-cell">@file.ModifiedAt.ToLocalTime().ToString("yyyy/MM/dd HH:mm")</td>
+                            <td>
+                                @if (mediaType != MediaHelper.MediaType.None)
+                                {
+                                    <button class="btn btn-sm btn-outline-success me-1"
+                                            @onclick="() => PreviewMedia(file.Name)">プレビュー</button>
+                                }
+                                <button class="btn btn-sm btn-outline-primary me-1" @onclick="() => DownloadFile(file)">DL</button>
+                                <button class="btn btn-sm btn-outline-danger" @onclick="() => DeleteFile(file)">削除</button>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    }
+    else
+    {
+        <h2>ファイル一覧</h2>
+        <p>ファイルがありません。</p>
+    }
+
+    <!-- メディアプレビュー -->
+    @if (_selectedFile != null)
+    {
+        <div class="media-preview">
+            <div class="preview-header">
+                <h2>@_selectedFile</h2>
+                <button @onclick="ClosePreview">×</button>
+            </div>
+            <div class="preview-content">
+                @if (MediaHelper.GetMediaType(_selectedFile) == MediaHelper.MediaType.Image)
+                {
+                    <img id="@(_previewElementId)" class="media-player" alt="@_selectedFile" />
+                }
+                else
+                {
+                    <video id="@(_previewElementId)" controls class="media-player" preload="metadata"></video>
+                }
+            </div>
+        </div>
+    }
+}
+
+@code {
+    [Parameter] public string VolumeName { get; set; } = string.Empty;
+
+    // 通常ボリューム
+    private List<FileMetadata>? _files;
+    private bool _isLoading = true;
+    private string? _errorMessage;
+    private bool _isE2ee;
+
+    // アップロード
+    private bool _uploading;
+    private string? _uploadError;
+    private string? _operationError;
+    private const string _uploadAcceptFilter = "*/*";
+
+    // E2EE 状態
+    private bool _e2eeUnlocked;
+    private bool _e2eeUnlocking;
+    private string _e2eePassword = "";
+    private string? _e2eeError;
+    private string? _masterKeyHandle;
+    private int _e2eeChunkSize = 1048576;
+    private List<E2eeFileViewItem> _e2eeFiles = [];
+
+    // メディアプレビュー
+    private string? _selectedFile;
+    private string _previewElementId = "";
+
+    protected override async Task OnInitializedAsync()
+    {
+        Auth.StateChanged += OnAuthStateChanged;
+        await InitializeAsync();
+    }
+
+    private async Task InitializeAsync()
+    {
+        if (!Auth.IsLoggedIn) { _isLoading = false; return; }
+
+        _isLoading = true;
+        _errorMessage = null;
+
+        try
+        {
+            var volumes = await VolumeApi.ListAsync();
+            var volInfo = volumes.FirstOrDefault(v => v.Name == VolumeName);
+            _isE2ee = volInfo?.EncryptionMode == "e2ee" || volInfo?.EncryptionMode == "group-e2ee";
+
+            if (_isE2ee)
+            {
+                // E2EE ボリューム: マウント状態をチェック
+                var (mounted, _) = VolumeMountService.GetMountStatus(VolumeName);
+                if (mounted)
+                {
+                    // 既にマウント済み（Volumes ページでマウントした場合）
+                    var handle = VolumeMountService.GetE2eeKeyHandle(VolumeName);
+                    if (!string.IsNullOrEmpty(handle))
+                    {
+                        _masterKeyHandle = handle;
+                        _e2eeUnlocked = true;
+                        await RefreshE2eeList();
+                    }
+                }
+                // 未マウント/未ロック解除 → パスワード入力画面を表示
+            }
+            else
+            {
+                // 通常ボリューム
+                var response = await FileApi.ListAsync(VolumeName);
+                _files = response.Files.ToList();
+            }
+        }
+        catch (Exception ex) { _errorMessage = $"エラー: {ex.Message}"; }
+        finally { _isLoading = false; }
+    }
+
+    // ---- E2EE ロック解除 ----
+
+    private async Task HandleE2eeUnlock()
+    {
+        _e2eeUnlocking = true;
+        _e2eeError = null;
+        string? kekHandle = null;
+
+        try
+        {
+            // wrapped key を取得してアンラップ
+            var wrappedKeyResp = await VolumeApi.GetWrappedKeyAsync(VolumeName, Auth.CurrentUsername);
+            if (wrappedKeyResp is null)
+            {
+                _e2eeError = "このユーザーの鍵情報が見つかりません。";
+                return;
+            }
+
+            _e2eeChunkSize = wrappedKeyResp.ChunkSize;
+
+            kekHandle = await E2ee.DeriveKek(_e2eePassword, wrappedKeyResp.Kdf.Salt, wrappedKeyResp.Kdf.Iterations, Auth.CurrentUsername);
+
+            _masterKeyHandle = await E2ee.UnwrapMasterKey(
+                wrappedKeyResp.WrappedMasterKey.Nonce,
+                wrappedKeyResp.WrappedMasterKey.Ciphertext,
+                wrappedKeyResp.WrappedMasterKey.Tag,
+                kekHandle);
+
+            await E2ee.ClearKey(kekHandle);
+            kekHandle = null;
+
+            _e2eeUnlocked = true;
+            _e2eePassword = "";
+
+            // ClientVolumeMountService にも登録
+            VolumeMountService.MountE2ee(VolumeName, _masterKeyHandle, _e2eeChunkSize, "e2ee");
+
+            await RefreshE2eeList();
+        }
+        catch (Exception ex)
+        {
+            _e2eeError = $"ロック解除失敗: {ex.Message}";
+            if (_masterKeyHandle is not null)
+            {
+                try { await E2ee.ClearKey(_masterKeyHandle); } catch { }
+                _masterKeyHandle = null;
+            }
+        }
+        finally
+        {
+            if (kekHandle is not null)
+            {
+                try { await E2ee.ClearKey(kekHandle); } catch { }
+            }
+            _e2eeUnlocking = false;
+        }
+    }
+
+    // ---- E2EE ファイル一覧 ----
+
+    private async Task RefreshE2eeList()
+    {
+        try
+        {
+            var response = await E2eeApi.ListFilesAsync(VolumeName);
+            _e2eeFiles = [];
+            foreach (var entry in response.Files)
+            {
+                string plainName;
+                try { plainName = await E2ee.DecryptFilename(entry.EncryptedName, _masterKeyHandle!); }
+                catch { plainName = $"<{entry.FileId[..Math.Min(8, entry.FileId.Length)]}...>"; }
+                _e2eeFiles.Add(new() { Entry = entry, PlainName = plainName });
+            }
+        }
+        catch { _e2eeFiles = []; }
+    }
+
+    // ---- E2EE アップロード ----
+
+    private async Task HandleUpload(InputFileChangeEventArgs e)
+    {
+        if (_uploading || e.FileCount == 0) return;
+        _uploading = true;
+        _uploadError = null;
+        _operationError = null;
+
+        try
+        {
+            if (_isE2ee && _e2eeUnlocked)
+            {
+                await HandleE2eeUpload(e);
+            }
+            else
+            {
+                foreach (var file in e.GetMultipleFiles())
+                {
+                    await using var stream = file.OpenReadStream(maxAllowedSize: 10L * 1024 * 1024 * 1024);
+                    await FileApi.UploadAsync(VolumeName, file.Name, stream, file.Size);
+                }
+                // 通常ボリュームのリスト更新
+                var response = await FileApi.ListAsync(VolumeName);
+                _files = response.Files.ToList();
+            }
+        }
+        catch (Exception ex) { _uploadError = $"アップロードエラー: {ex.Message}"; }
+        finally { _uploading = false; }
+    }
+
+    private async Task HandleE2eeUpload(InputFileChangeEventArgs e)
+    {
+        foreach (var file in e.GetMultipleFiles())
+        {
+            string encName = await E2ee.EncryptFilename(file.Name, _masterKeyHandle!);
+            string fileSaltB64 = await E2ee.GenerateFileSalt();
+
+            await using var stream = file.OpenReadStream(maxAllowedSize: 10L * 1024 * 1024 * 1024);
+            long totalSize = file.Size;
+            int totalChunks = (int)((totalSize + _e2eeChunkSize - 1) / _e2eeChunkSize);
+            if (totalChunks == 0) totalChunks = 1;
+
+            // 暗号化後サイズの推定 (salt 16 bytes + chunk ごとに tag 16 bytes)
+            long estimatedLength = ComputeEncryptedLength(totalSize, _e2eeChunkSize);
+
+            var entry = await E2eeApi.CreateFileAsync(VolumeName, encName, estimatedLength, totalChunks);
+
+            long bytesRemaining = totalSize;
+            for (int i = 0; i < totalChunks; i++)
+            {
+                int readLen = (int)Math.Min(_e2eeChunkSize, bytesRemaining);
+                byte[] buffer = new byte[readLen];
+                int read = 0;
+                while (read < readLen)
+                {
+                    int n = await stream.ReadAsync(buffer, read, readLen - read);
+                    if (n == 0) break;
+                    read += n;
+                }
+                if (read < buffer.Length) buffer = buffer[..read];
+
+                string encB64 = await E2ee.EncryptChunk(buffer, _masterKeyHandle!, i, fileSaltB64, isFirstChunk: i == 0);
+                byte[] encBytes = Convert.FromBase64String(encB64);
+
+                await E2eeApi.UploadChunkAsync(VolumeName, entry.FileId, i, encBytes);
+                bytesRemaining -= read;
+            }
+
+            // actual encrypted length
+            long actualLength = 16 + (totalChunks > 1 ? ((long)(totalChunks - 1) * (_e2eeChunkSize + 16)) : 0)
+                + (totalSize - (totalChunks > 1 ? (long)(totalChunks - 1) * _e2eeChunkSize : 0)) + 16;
+            await E2eeApi.FinalizeFileAsync(VolumeName, entry.FileId, actualLength);
+        }
+
+        await RefreshE2eeList();
+    }
+
+    // ---- E2EE ダウンロード ----
+
+    private async Task HandleE2eeDownload(E2eeFileViewItem item)
+    {
+        item.Downloading = true;
+        _operationError = null;
+
+        try
+        {
+            var entry = item.Entry;
+            var decryptedChunks = new List<byte[]>(entry.ChunkCount);
+            string? fileSaltB64 = null;
+
+            for (int i = 0; i < entry.ChunkCount; i++)
+            {
+                var encData = await E2eeApi.DownloadChunkAsync(VolumeName, entry.FileId, i);
+
+                if (i == 0 && fileSaltB64 is null)
+                {
+                    byte[] salt = new byte[16];
+                    Buffer.BlockCopy(encData, 0, salt, 0, 16);
+                    fileSaltB64 = Convert.ToBase64String(salt);
+                }
+
+                string encB64 = Convert.ToBase64String(encData);
+                byte[] plainBytes = await E2ee.DecryptChunk(encB64, _masterKeyHandle!, i, fileSaltB64 ?? "");
+                decryptedChunks.Add(plainBytes);
+            }
+
+            // チャンク結合
+            int totalLength = 0;
+            foreach (var chunk in decryptedChunks) totalLength += chunk.Length;
+
+            byte[] combined = new byte[totalLength];
+            int offset = 0;
+            foreach (var chunk in decryptedChunks)
+            {
+                Buffer.BlockCopy(chunk, 0, combined, offset, chunk.Length);
+                offset += chunk.Length;
+            }
+
+            var base64 = Convert.ToBase64String(combined);
+            await JS.InvokeVoidAsync("cistaDownload", item.PlainName, base64, "application/octet-stream");
+        }
+        catch (Exception ex) { _operationError = $"ダウンロードエラー: {ex.Message}"; }
+        finally { item.Downloading = false; }
+    }
+
+    // ---- E2EE 削除 ----
+
+    private async Task HandleE2eeDelete(string fileId)
+    {
+        _operationError = null;
+        try
+        {
+            await E2eeApi.DeleteFileAsync(VolumeName, fileId);
+            await RefreshE2eeList();
+        }
+        catch (Exception ex) { _operationError = $"削除エラー: {ex.Message}"; }
+    }
+
+    // ---- 通常ボリューム: ダウンロード ----
+
+    private async Task DownloadFile(FileMetadata file)
+    {
+        try
+        {
+            var token = await FileApi.IssueStreamTokenAsync(VolumeName, file.Name);
+            var url = FileApi.GetDownloadUrl(VolumeName, file.Name, token);
+            await JS.InvokeVoidAsync("eval", $"window.open('{url}', '_blank')");
+        }
+        catch (Exception ex) { _operationError = $"ダウンロードエラー: {ex.Message}"; }
+    }
+
+    // ---- 通常ボリューム: 削除 ----
+
+    private async Task DeleteFile(FileMetadata file)
+    {
+        try
+        {
+            await FileApi.DeleteAsync(VolumeName, file.Name);
+            _files?.Remove(file);
+        }
+        catch (Exception ex) { _operationError = $"削除エラー: {ex.Message}"; }
+    }
+
+    // ---- メディアプレビュー ----
+
+    private async Task PreviewMedia(string fileName)
+    {
+        _selectedFile = fileName;
+        _previewElementId = $"media-{fileName.Replace(".", "-").Replace("/", "-").Replace("\\", "-")}";
+        StateHasChanged();
+
+        await Task.Delay(50);
+
+        if (_isE2ee)
+        {
+            await SetupE2eePlayer(fileName);
+        }
+        else
+        {
+            await SetupStreamingPlayer(fileName);
+        }
+    }
+
+    private async Task SetupStreamingPlayer(string fileName)
+    {
+        var mediaType = MediaHelper.GetMediaType(fileName);
+        var apiBase = Http.BaseAddress!.AbsoluteUri.TrimEnd('/');
+        await JS.InvokeVoidAsync("cistaMedia.setStreamUrl", _previewElementId, apiBase, VolumeName, fileName, mediaType.ToString());
+    }
+
+    private async Task SetupE2eePlayer(string fileName)
+    {
+        var mimeType = MediaHelper.GetMimeType(fileName);
+        var masterKeyHandle = _masterKeyHandle ?? VolumeMountService.GetE2eeKeyHandle(VolumeName);
+
+        if (string.IsNullOrEmpty(masterKeyHandle))
+        {
+            await SetupStreamingPlayer(fileName);
+            return;
+        }
+
+        // E2EE ファイル ID を検索
+        var e2eeItem = _e2eeFiles.FirstOrDefault(f => f.PlainName == fileName);
+        if (e2eeItem is null)
+        {
+            await SetupStreamingPlayer(fileName);
+            return;
+        }
+
+        try
+        {
+            var chunk0Data = await E2eeApi.DownloadChunkAsync(VolumeName, e2eeItem.Entry.FileId, 0);
+            if (chunk0Data.Length < 16) { await SetupStreamingPlayer(fileName); return; }
+
+            var salt = new byte[16];
+            Buffer.BlockCopy(chunk0Data, 0, salt, 0, 16);
+            var fileSaltBase64 = Convert.ToBase64String(salt);
+            var apiBase = Http.BaseAddress!.AbsoluteUri.TrimEnd('/');
+
+            await JS.InvokeVoidAsync("cistaMedia.streamE2eeDirect", new
+            {
+                elementId = _previewElementId,
+                mimeType,
+                apiUrl = apiBase,
+                jwtToken = "",
+                volumeName = VolumeName,
+                fileId = e2eeItem.Entry.FileId,
+                chunkCount = e2eeItem.Entry.ChunkCount,
+                masterKeyHandle,
+                fileSaltBase64,
+            });
+        }
+        catch { await SetupStreamingPlayer(fileName); }
+    }
+
+    private void ClosePreview()
+    {
+        _selectedFile = null;
+    }
+
+    // ---- ヘルパー ----
+
+    private static string FormatFileSize(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024:F1} KB";
+        if (bytes < 1024 * 1024 * 1024) return $"{bytes / (1024.0 * 1024.0):F1} MB";
+        return $"{bytes / (1024.0 * 1024.0 * 1024.0):F1} GB";
+    }
+
+    private static long ComputeEncryptedLength(long plainSize, int chunkSize)
+    {
+        int totalChunks = Math.Max(1, (int)((plainSize + chunkSize - 1) / chunkSize));
+        long saltOverhead = 16;
+        long tagOverhead = (long)totalChunks * 16;
+        return plainSize + saltOverhead + tagOverhead;
+    }
+
+    private class E2eeFileViewItem
+    {
+        public E2eeFileEntry Entry { get; set; } = null!;
+        public string PlainName { get; set; } = "";
+        public bool Downloading { get; set; }
+    }
+
+    private async void OnAuthStateChanged() => StateHasChanged();
+
+    public async ValueTask DisposeAsync()
+    {
+        // プレビューの Blob URL を revoke
+        // （必要に応じて実装）
+        await ValueTask.CompletedTask;
+    }
+
+    public void Dispose()
+    {
+        Auth.StateChanged -= OnAuthStateChanged;
+    }
+}

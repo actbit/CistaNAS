@@ -5,13 +5,31 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CistaNAS.Wasm</title>
-    <base href="/wasm/" />
-    <link rel="preload" id="webassembly" />
+    <base href="/" />
+    <link href="_framework/dotnet.36tb8tg7zz.js" rel="preload" as="script" fetchpriority="high" crossorigin="anonymous" integrity="sha256-a8T9sg3W+KV7PV2i6zLdNWKeqpZoWbYCsOPZsbIzlBw=" />
     <link rel="stylesheet" href="lib/bootstrap/dist/css/bootstrap.min.css" />
-    <link rel="stylesheet" href="css/app.css" />
+    <link rel="stylesheet" href="app.css" />
     <link rel="icon" type="image/png" href="favicon.png" />
     <link href="CistaNAS.Wasm.styles.css" rel="stylesheet" />
-    <script type="importmap"></script>
+    <script type="importmap">{
+  "imports": {
+    "./_framework/blazor.webassembly.js": "./_framework/blazor.webassembly.958z1vx7fr.js",
+    "./_framework/dotnet.js": "./_framework/dotnet.36tb8tg7zz.js",
+    "./_framework/dotnet.native.js": "./_framework/dotnet.native.rjbmzc4jpg.js",
+    "./_framework/dotnet.runtime.js": "./_framework/dotnet.runtime.r2kbxkuujc.js"
+  },
+  "scopes": {},
+  "integrity": {
+    "./_framework/blazor.webassembly.958z1vx7fr.js": "sha256-A59Tr9HqEhHMu8kU7kruLI9ayw5MRS6Lvc6z7jCbghk=",
+    "./_framework/blazor.webassembly.js": "sha256-A59Tr9HqEhHMu8kU7kruLI9ayw5MRS6Lvc6z7jCbghk=",
+    "./_framework/dotnet.36tb8tg7zz.js": "sha256-a8T9sg3W+KV7PV2i6zLdNWKeqpZoWbYCsOPZsbIzlBw=",
+    "./_framework/dotnet.js": "sha256-a8T9sg3W+KV7PV2i6zLdNWKeqpZoWbYCsOPZsbIzlBw=",
+    "./_framework/dotnet.native.js": "sha256-95bE510j3EADMNW2OKa/DMBhu8N632dl5HGeBfXNEf4=",
+    "./_framework/dotnet.native.rjbmzc4jpg.js": "sha256-95bE510j3EADMNW2OKa/DMBhu8N632dl5HGeBfXNEf4=",
+    "./_framework/dotnet.runtime.js": "sha256-YyudibIWETMKrLb+nAZdJ+xDY7HY6BWf6s32UAdcvCU=",
+    "./_framework/dotnet.runtime.r2kbxkuujc.js": "sha256-YyudibIWETMKrLb+nAZdJ+xDY7HY6BWf6s32UAdcvCU="
+  }
+}</script>
 </head>
 
 <body>
@@ -28,7 +46,9 @@
         <a href="." class="reload">Reload</a>
         <span class="dismiss">🗙</span>
     </div>
-    <script src="_framework/blazor.webassembly#[.{fingerprint}].js"></script>
+    <script src="_framework/blazor.webassembly.958z1vx7fr.js"></script>
+    <script src="js/mediaHelper.js"></script>
+    <script type="module" src="js/e2ee.js"></script>
 </body>
 
 </html>

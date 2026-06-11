@@ -21,8 +21,11 @@
   <!-- WASMをpublishしてWebのwwwrootにコピー -->
   <Target Name="PublishWasmAndCopy" BeforeTargets="Build">
     <Exec Command="dotnet publish ../CistaNAS.Wasm/CistaNAS.Wasm.csproj -c $(Configuration) -o ./publish-wasm-temp -nologo" />
+    <!-- 古いWASM成果物をクリーンアップ（ハッシュ変更時のSRI整合性エラー防止） -->
+    <RemoveDir Directories="./wwwroot/_framework" Condition="Exists('./wwwroot/_framework')" />
     <ItemGroup>
-      <WasmFiles Include="./publish-wasm-temp/wwwroot/**/*" />
+      <WasmFiles Include="./publish-wasm-temp/wwwroot/**/*"
+                 Exclude="./publish-wasm-temp/wwwroot/**/*.gz;./publish-wasm-temp/wwwroot/**/*.br" />
     </ItemGroup>
     <Copy SourceFiles="@(WasmFiles)" DestinationFolder="wwwroot/%(RecursiveDir)" SkipUnchangedFiles="true" />
     <RemoveDir Directories="./publish-wasm-temp" />

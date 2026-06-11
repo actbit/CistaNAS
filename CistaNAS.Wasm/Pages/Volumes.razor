@@ -1,0 +1,771 @@
+@page "/volumes"
+@using CistaNAS.Wasm.Auth
+@using CistaNAS.Wasm.Services
+@using CistaNAS.Wasm.Models
+@implements IDisposable
+@inject VolumeApiClient VolumeApi
+@inject AccountApiClient AccountApi
+@inject GroupApiClient GroupApi
+@inject E2eeInterop E2ee
+@inject ClientVolumeMountService MountService
+@inject WasmAuthStateProvider Auth
+@inject NavigationManager Nav
+
+<PageTitle>ボリューム - CistaNAS</PageTitle>
+
+@if (!Auth.IsLoggedIn)
+{
+    <div class="alert alert-warning">ログインしてください。</div>
+    <a href="/login" class="btn btn-primary">ログイン</a>
+}
+else
+{
+    <h1>ボリューム管理</h1>
+
+    <!-- ボリューム作成 -->
+    <div class="card mb-4">
+        <div class="card-header">ボリューム作成</div>
+        <div class="card-body">
+            <div class="form-narrow">
+                <div class="mb-3">
+                    <label class="form-label">名前</label>
+                    <input class="form-control" @bind="_createModel.Name" placeholder="例: data" />
+                </div>
+                <div class="mb-3 form-check">
+                    <input type="checkbox" class="form-check-input" id="chkEncrypted" @bind="_createModel.Encrypted" />
+                    <label class="form-check-label" for="chkEncrypted">暗号化する</label>
+                </div>
+                @if (_createModel.Encrypted)
+                {
+                    <div class="mb-3">
+                        <label class="form-label">暗号化方式</label>
+                        <div class="form-check">
+                            <input type="radio" class="form-check-input" name="encMode" id="encServer"
+                                   checked="@(_createModel.EncryptionMode == "server")"
+                                   @onchange="@(() => _createModel.EncryptionMode = "server")" />
+                            <label class="form-check-label" for="encServer">
+                                サーバー暗号化（AES-XTS）
+                            </label>
+                        </div>
+                        <div class="form-check">
+                            <input type="radio" class="form-check-input" name="encMode" id="encE2ee"
+                                   checked="@(_createModel.EncryptionMode == "e2ee")"
+                                   @onchange="@(() => _createModel.EncryptionMode = "e2ee")" />
+                            <label class="form-check-label" for="encE2ee">
+                                E2EE（エンドツーエンド暗号化）
+                            </label>
+                        </div>
+                        <div class="form-check">
+                            <input type="radio" class="form-check-input" name="encMode" id="encGroupE2ee"
+                                   checked="@(_createModel.EncryptionMode == "group-e2ee")"
+                                   @onchange="@(() => _createModel.EncryptionMode = "group-e2ee")" />
+                            <label class="form-check-label" for="encGroupE2ee">
+                                グループ E2EE（ECDH 共有対応）
+                            </label>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">パスワード（確認用）</label>
+                        <input type="password" class="form-control" @bind="_createModel.Password" />
+                    </div>
+                }
+                @if (_createModel.Encrypted && _createModel.EncryptionMode == "e2ee")
+                {
+                    <div class="alert alert-info">
+                        <strong>E2EE ボリューム</strong>: マスターキーはブラウザ内で生成され、サーバーには送信されません。
+                        パスワードを紛失するとデータを復旧できません。
+                    </div>
+                }
+                else if (_createModel.Encrypted && _createModel.EncryptionMode == "group-e2ee")
+                {
+                    <div class="alert alert-info">
+                        <strong>グループ E2EE ボリューム</strong>: ECDH 鍵交換でメンバー間共有が可能な E2EE ボリューム。
+                        マスターキーはパスワードでラップし、メンバー追加時に公開鍵で ECIES ラップします。
+                    </div>
+                }
+                else if (_createModel.Encrypted)
+                {
+                    <div class="alert alert-info">
+                        ユーザー <strong>@Auth.CurrentUsername</strong> の認証情報でマスター鍵を暗号化します。
+                    </div>
+                }
+            </div>
+            <button class="btn btn-success" disabled="@_isCreating" @onclick="HandleCreate">
+                @(_isCreating ? "作成中..." : "作成")
+            </button>
+            @if (_createError is not null)
+            {
+                <div class="alert alert-danger mt-2">@_createError</div>
+            }
+        </div>
+    </div>
+
+    <!-- ボリューム一覧 -->
+    <h2>ボリューム一覧</h2>
+    @if (_isLoading)
+    {
+        <p>読み込み中...</p>
+    }
+    else if (_volumes is null || _volumes.Count == 0)
+    {
+        <p>ボリュームがありません。</p>
+    }
+    else
+    {
+        <div class="table-responsive">
+            <table class="table table-striped table-hover">
+                <thead>
+                    <tr>
+                        <th>名前</th>
+                        <th>暗号化</th>
+                        <th class="d-none d-md-table-cell">所有ユーザー</th>
+                        <th class="d-none d-md-table-cell">共有</th>
+                        <th>状態</th>
+                        <th class="d-none d-lg-table-cell">作成日</th>
+                        <th class="text-nowrap">操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var v in _volumes)
+                    {
+                        <tr>
+                            <td>
+                                @v.Name
+                                @if (v.IsHome)
+                                {
+                                    <span class="badge bg-info ms-1">Home</span>
+                                }
+                            </td>
+                            <td>
+                                @if (v.EncryptionMode == "e2ee" || v.EncryptionMode == "group-e2ee")
+                                {
+                                    <span class="badge bg-info">E2EE</span>
+                                }
+                                else if (v.Encrypted)
+                                {
+                                    <span class="badge bg-primary">サーバー</span>
+                                }
+                                else
+                                {
+                                    <span class="badge bg-secondary">なし</span>
+                                }
+                            </td>
+                            <td class="d-none d-md-table-cell">@v.OwnerUser</td>
+                            <td class="d-none d-md-table-cell">@(v.AuthorizedUsers.Count > 1 ? $"{v.AuthorizedUsers.Count} ユーザー" : "-")</td>
+                            <td>
+                                @if (v.IsMounted)
+                                {
+                                    <span class="badge bg-success">マウント済み</span>
+                                }
+                                else
+                                {
+                                    <span class="badge bg-secondary">未マウント</span>
+                                }
+                            </td>
+                            <td class="d-none d-lg-table-cell">@v.CreatedAt.ToLocalTime().ToString("yyyy/MM/dd HH:mm")</td>
+                            <td>
+                                @if (v.IsMounted)
+                                {
+                                    <button class="btn btn-sm btn-outline-danger me-1" @onclick="() => HandleLock(v.Name)">ロック</button>
+                                    <a href="/files/@v.Name" class="btn btn-sm btn-outline-primary me-1">ファイル</a>
+                                }
+                                else
+                                {
+                                    <button class="btn btn-sm btn-outline-primary me-1"
+                                            @onclick="() => ShowMountDialog(v.Name, v.Encrypted, v.EncryptionMode)">マウント</button>
+                                }
+                                @if (v.OwnerUser == Auth.CurrentUsername && v.Encrypted && !v.IsHome)
+                                {
+                                    <button class="btn btn-sm btn-outline-secondary" @onclick="() => ShowShareDialog(v.Name)">共有</button>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    }
+
+    @if (_lockError is not null)
+    {
+        <div class="alert alert-danger mt-2">@_lockError</div>
+    }
+
+    <!-- マウントダイアログ -->
+    @if (_mountTarget is not null)
+    {
+        <div class="modal d-block" tabindex="-1" style="background-color:rgba(0,0,0,0.5)">
+            <div class="modal-dialog modal-dialog-scrollable modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">マウント: @_mountTarget</h5>
+                        <button type="button" class="btn-close" @onclick="CloseMountDialog"></button>
+                    </div>
+                    <div class="modal-body">
+                        @if (_mountIsE2ee)
+                        {
+                            <div class="alert alert-warning">
+                                E2EE ボリュームです。パスワードを入力するとブラウザ内でマスターキーが導出されます。
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">パスワード</label>
+                                <input type="password" class="form-control" @bind="_mountPassword" />
+                            </div>
+                        }
+                        else if (_mountNeedsPassword)
+                        {
+                            <div class="mb-3">
+                                <label class="form-label">パスワード</label>
+                                <input type="password" class="form-control" @bind="_mountPassword" />
+                            </div>
+                        }
+                        else
+                        {
+                            <p>非暗号化ボリュームです。</p>
+                        }
+                        @if (_mountError is not null)
+                        {
+                            <div class="alert alert-danger">@_mountError</div>
+                        }
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" @onclick="CloseMountDialog">キャンセル</button>
+                        <button type="button" class="btn btn-primary" disabled="@_isMounting" @onclick="HandleMount">
+                            @(_isMounting ? "マウント中..." : "マウント")
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
+
+    <!-- 共有ダイアログ -->
+    @if (_shareTarget is not null)
+    {
+        <div class="modal d-block" tabindex="-1" style="background-color:rgba(0,0,0,0.5)">
+            <div class="modal-dialog modal-dialog-scrollable modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">共有: @_shareTarget</h5>
+                        <button type="button" class="btn-close" @onclick="CloseShareDialog"></button>
+                    </div>
+                    <div class="modal-body">
+                        <h6>アクセス権のあるユーザー</h6>
+                        <ul class="list-group mb-3">
+                            @foreach (var u in _shareUsers)
+                            {
+                                <li class="list-group-item d-flex justify-content-between align-items-center">
+                                    @u
+                                    @if (u != Auth.CurrentUsername)
+                                    {
+                                        <button class="btn btn-sm btn-outline-danger"
+                                                @onclick="() => HandleRevoke(_shareTarget, u)">削除</button>
+                                    }
+                                    else
+                                    {
+                                        <span class="badge bg-primary">オーナー</span>
+                                    }
+                                </li>
+                            }
+                        </ul>
+                        <hr />
+                        <h6>ユーザーを追加</h6>
+                        <div class="mb-2">
+                            <input class="form-control mb-2" placeholder="ユーザー名" @bind="_grantUsername" />
+                            <input type="password" class="form-control mb-2" placeholder="対象ユーザーのパスワード" @bind="_grantPassword" />
+                            <input type="password" class="form-control mb-2" placeholder="自分のパスワード（確認）" @bind="_grantGranterPassword" />
+                        </div>
+                        @if (_shareError is not null)
+                        {
+                            <div class="alert alert-danger">@_shareError</div>
+                        }
+
+                        @if (!_shareIsE2ee)
+                        {
+                            <hr />
+                            <h6>グループアクセス</h6>
+                            @if (_shareGroups.Count > 0)
+                            {
+                                <ul class="list-group mb-2">
+                                    @foreach (var gn in _shareGroups)
+                                    {
+                                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                                            @gn
+                                            <button class="btn btn-sm btn-outline-danger"
+                                                    @onclick="() => HandleRevokeGroup(_shareTarget!, gn)">削除</button>
+                                        </li>
+                                    }
+                                </ul>
+                            }
+                            else
+                            {
+                                <p class="text-muted small">グループに共有されていません。</p>
+                            }
+                            <div class="row g-2 align-items-end">
+                                <div class="col">
+                                    <select class="form-select form-select-sm" @bind="_grantGroupName">
+                                        <option value="">グループを選択</option>
+                                        @foreach (var g in _availableGroups)
+                                        {
+                                            <option value="@g.GroupName">@g.GroupName</option>
+                                        }
+                                    </select>
+                                </div>
+                                <div class="col-auto">
+                                    <button class="btn btn-sm btn-outline-primary" @onclick="HandleGrantGroup">追加</button>
+                                </div>
+                            </div>
+                        }
+                        else
+                        {
+                            <hr />
+                            <h6>ECDH メンバー追加</h6>
+                            <p class="form-text small">
+                                相手ユーザーが公開鍵を登録している場合、ECDH でマスターキーを共有します。
+                            </p>
+                            <div class="row g-2 align-items-end">
+                                <div class="col">
+                                    <input class="form-control form-control-sm" placeholder="ユーザー名" @bind="_ecdhUsername" />
+                                </div>
+                                <div class="col-auto">
+                                    <button class="btn btn-sm btn-outline-primary" @onclick="HandleEcdhGrant">ECDH 共有</button>
+                                </div>
+                            </div>
+                        }
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" @onclick="CloseShareDialog">閉じる</button>
+                        @if (!_shareIsE2ee)
+                        {
+                            <button type="button" class="btn btn-primary" @onclick="HandleGrant">ユーザー追加</button>
+                        }
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
+
+    <a href="/" class="btn btn-secondary mt-3">ホームに戻る</a>
+}
+
+@code {
+    private IReadOnlyList<VolumeInfo>? _volumes;
+    private bool _isLoading = true;
+    private string? _error;
+
+    // 作成フォーム
+    private CreateModel _createModel = new() { Encrypted = true };
+    private bool _isCreating;
+    private string? _createError;
+
+    // マウントダイアログ
+    private string? _mountTarget;
+    private bool _mountNeedsPassword;
+    private bool _mountIsE2ee;
+    private bool _isMounting;
+    private string _mountPassword = "";
+    private string? _mountError;
+
+    // 共有ダイアログ
+    private string? _shareTarget;
+    private IReadOnlyList<string> _shareUsers = [];
+    private bool _shareIsE2ee;
+    private IReadOnlyList<string> _shareGroups = [];
+    private IReadOnlyList<GroupEntity> _availableGroups = [];
+    private string _grantGroupName = "";
+    private string _grantUsername = "";
+    private string _grantPassword = "";
+    private string _grantGranterPassword = "";
+    private string? _shareError;
+    private string _ecdhUsername = "";
+
+    private string? _lockError;
+
+    private sealed class CreateModel
+    {
+        public string Name { get; set; } = "";
+        public string Password { get; set; } = "";
+        public bool Encrypted { get; set; } = true;
+        public string EncryptionMode { get; set; } = "server";
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        Auth.StateChanged += OnAuthStateChanged;
+        await LoadVolumesAsync();
+    }
+
+    private async Task LoadVolumesAsync()
+    {
+        if (!Auth.IsLoggedIn) { _isLoading = false; return; }
+        _isLoading = true;
+
+        try { _volumes = await VolumeApi.ListAsync(); }
+        catch (Exception ex) { _error = $"エラー: {ex.Message}"; }
+        finally { _isLoading = false; }
+    }
+
+    // ---- ボリューム作成 ----
+
+    private async Task HandleCreate()
+    {
+        if (_isCreating) return;
+        _isCreating = true;
+        _createError = null;
+
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_createModel.Name))
+            {
+                _createError = "ボリューム名を入力してください。";
+                return;
+            }
+
+            if (_createModel.Encrypted && _createModel.EncryptionMode == "e2ee")
+            {
+                await HandleCreateE2ee();
+            }
+            else if (_createModel.Encrypted && _createModel.EncryptionMode == "group-e2ee")
+            {
+                await HandleCreateGroupE2ee();
+            }
+            else
+            {
+                await VolumeApi.CreateAsync(
+                    _createModel.Name.Trim(), Auth.CurrentUsername,
+                    _createModel.Encrypted ? _createModel.Password : null,
+                    _createModel.Encrypted);
+            }
+
+            _createModel = new() { Encrypted = true };
+            await LoadVolumesAsync();
+        }
+        catch (Exception ex) { _createError = ex.Message; }
+        finally { _isCreating = false; }
+    }
+
+    private async Task HandleCreateE2ee()
+    {
+        var wrappedKey = await CreatePasswordWrappedKeyAsync(_createModel.Password);
+        await VolumeApi.CreateE2eeAsync(_createModel.Name.Trim(), Auth.CurrentUsername, wrappedKey);
+    }
+
+    private async Task HandleCreateGroupE2ee()
+    {
+        var ownerWrappedKey = await CreatePasswordWrappedKeyAsync(_createModel.Password, wrapType: "password");
+        await VolumeApi.CreateGroupE2eeAsync(_createModel.Name.Trim(), ownerWrappedKey);
+    }
+
+    /// <summary>
+    /// ブラウザ側 JS Interop でパスワードから KEK 導出 → マスターキー生成 → AES-256-GCM ラップを行い、
+    /// サーバー送信用の UserWrappedKey を構築する。
+    /// </summary>
+    private async Task<UserWrappedKey> CreatePasswordWrappedKeyAsync(
+        string password, string wrapType = "password", int iterations = 600_000)
+    {
+        byte[] salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
+        string saltB64 = Convert.ToBase64String(salt);
+        string kekHandle = await E2ee.DeriveKek(password, saltB64, iterations, Auth.CurrentUsername);
+        string mkHandle = await E2ee.GenerateMasterKey();
+        var (nonceB64, ctB64, tagB64) = await E2ee.WrapMasterKey(mkHandle, kekHandle);
+        await E2ee.ClearKey(kekHandle);
+        await E2ee.ClearKey(mkHandle);
+
+        return new UserWrappedKey
+        {
+            WrapType = wrapType,
+            Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = iterations, Salt = salt },
+            WrappedMasterKey = new()
+            {
+                Algorithm = "aes-256-gcm",
+                Nonce = Convert.FromBase64String(nonceB64),
+                Ciphertext = Convert.FromBase64String(ctB64),
+                Tag = Convert.FromBase64String(tagB64),
+            },
+        };
+    }
+
+    private static UserWrappedKey BuildEcdhWrappedKey(
+        string ephemeralPubKeyB64, string nonceB64, string ctB64, string tagB64)
+    {
+        return new UserWrappedKey
+        {
+            WrapType = "ecdh",
+            EphemeralPublicKey = Convert.FromBase64String(ephemeralPubKeyB64),
+            WrappedMasterKey = new()
+            {
+                Algorithm = "aes-256-gcm",
+                Nonce = Convert.FromBase64String(nonceB64),
+                Ciphertext = Convert.FromBase64String(ctB64),
+                Tag = Convert.FromBase64String(tagB64),
+            },
+        };
+    }
+
+    // ---- マウント ----
+
+    private void ShowMountDialog(string name, bool encrypted, string encryptionMode)
+    {
+        _mountTarget = name;
+        _mountNeedsPassword = encrypted;
+        _mountIsE2ee = encryptionMode == "e2ee" || encryptionMode == "group-e2ee";
+        _mountPassword = "";
+        _mountError = null;
+        _isMounting = false;
+    }
+
+    private void CloseMountDialog()
+    {
+        _mountTarget = null;
+        _mountError = null;
+    }
+
+    private async Task HandleMount()
+    {
+        _isMounting = true;
+        _mountError = null;
+
+        try
+        {
+            if (_mountIsE2ee)
+            {
+                // E2EE: サーバー側マウント（アクセス権チェック）+ クライアント側でマスターキー復号
+                var volInfo = await VolumeApi.MountE2eeAsync(_mountTarget!, Auth.CurrentUsername);
+
+                // wrapped key を取得してアンラップ
+                var wrappedKeyResp = await VolumeApi.GetWrappedKeyAsync(_mountTarget!, Auth.CurrentUsername);
+                if (wrappedKeyResp is null)
+                {
+                    _mountError = "ラップ済み鍵が見つかりません。";
+                    return;
+                }
+
+                string? kekHandle = null;
+                string? mkHandle = null;
+                try
+                {
+                    kekHandle = await E2ee.DeriveKek(_mountPassword,
+                        wrappedKeyResp.Kdf.Salt, wrappedKeyResp.Kdf.Iterations, Auth.CurrentUsername);
+
+                    mkHandle = await E2ee.UnwrapMasterKey(
+                        wrappedKeyResp.WrappedMasterKey.Nonce,
+                        wrappedKeyResp.WrappedMasterKey.Ciphertext,
+                        wrappedKeyResp.WrappedMasterKey.Tag,
+                        kekHandle);
+
+                    await E2ee.ClearKey(kekHandle);
+                    kekHandle = null;
+
+                    // クライアント側マウント状態に登録
+                    MountService.MountE2ee(_mountTarget!, mkHandle, wrappedKeyResp.ChunkSize, volInfo.EncryptionMode);
+                }
+                catch
+                {
+                    // 鍵残留防止
+                    if (kekHandle is not null) { try { await E2ee.ClearKey(kekHandle); } catch { } }
+                    if (mkHandle is not null) { try { await E2ee.ClearKey(mkHandle); } catch { } }
+                    throw;
+                }
+            }
+            else
+            {
+                await VolumeApi.MountAsync(_mountTarget!, Auth.CurrentUsername,
+                    _mountNeedsPassword ? _mountPassword : null);
+            }
+
+            CloseMountDialog();
+            await LoadVolumesAsync();
+        }
+        catch (Exception ex) { _mountError = ex.Message; }
+        finally { _isMounting = false; }
+    }
+
+    // ---- ロック ----
+
+    private async Task HandleLock(string name)
+    {
+        _lockError = null;
+        try
+        {
+            // E2EE ボリュームの場合、JS 側の鍵ハンドルをクリア
+            var (mounted, isE2ee) = MountService.GetMountStatus(name);
+            if (mounted && isE2ee)
+            {
+                var handle = MountService.GetE2eeKeyHandle(name);
+                if (handle is not null)
+                {
+                    try { await E2ee.ClearKey(handle); } catch { }
+                }
+            }
+            await VolumeApi.LockAsync(name);
+            MountService.Lock(name);
+            await LoadVolumesAsync();
+        }
+        catch (Exception ex) { _lockError = ex.Message; }
+    }
+
+    // ---- 共有 ----
+
+    private async Task ShowShareDialog(string name)
+    {
+        var vol = _volumes?.FirstOrDefault(v => v.Name == name);
+        if (vol is null) return;
+
+        _shareTarget = name;
+        _shareUsers = vol.AuthorizedUsers;
+        _shareIsE2ee = vol.EncryptionMode == "e2ee" || vol.EncryptionMode == "group-e2ee";
+        _shareGroups = vol.AuthorizedGroups ?? [];
+        _availableGroups = await GroupApi.ListGroupsAsync();
+        _grantGroupName = "";
+        _grantUsername = "";
+        _grantPassword = "";
+        _grantGranterPassword = "";
+        _ecdhUsername = "";
+        _shareError = null;
+    }
+
+    private void CloseShareDialog()
+    {
+        _shareTarget = null;
+        _shareError = null;
+    }
+
+    private async Task HandleGrant()
+    {
+        _shareError = null;
+        try
+        {
+            await VolumeApi.GrantAccessAsync(_shareTarget!, _grantUsername.Trim(), _grantPassword, _grantGranterPassword);
+            await LoadVolumesAsync();
+            var vol = _volumes?.FirstOrDefault(v => v.Name == _shareTarget);
+            if (vol is not null) _shareUsers = vol.AuthorizedUsers;
+            _grantUsername = "";
+            _grantPassword = "";
+            _grantGranterPassword = "";
+        }
+        catch (Exception ex) { _shareError = ex.Message; }
+    }
+
+    private async Task HandleRevoke(string volumeName, string targetUser)
+    {
+        _shareError = null;
+        try
+        {
+            await VolumeApi.RevokeAccessAsync(volumeName, targetUser);
+            await LoadVolumesAsync();
+            var vol = _volumes?.FirstOrDefault(v => v.Name == _shareTarget);
+            if (vol is not null) _shareUsers = vol.AuthorizedUsers;
+        }
+        catch (Exception ex) { _shareError = ex.Message; }
+    }
+
+    private async Task HandleGrantGroup()
+    {
+        if (string.IsNullOrEmpty(_grantGroupName)) return;
+        _shareError = null;
+        try
+        {
+            await VolumeApi.GrantGroupAccessAsync(_shareTarget!, _grantGroupName);
+            await LoadVolumesAsync();
+            var vol = _volumes?.FirstOrDefault(v => v.Name == _shareTarget);
+            if (vol is not null) _shareGroups = vol.AuthorizedGroups ?? [];
+            _grantGroupName = "";
+        }
+        catch (Exception ex) { _shareError = ex.Message; }
+    }
+
+    private async Task HandleRevokeGroup(string volumeName, string groupName)
+    {
+        _shareError = null;
+        try
+        {
+            await VolumeApi.RevokeGroupAccessAsync(volumeName, groupName);
+            await LoadVolumesAsync();
+            var vol = _volumes?.FirstOrDefault(v => v.Name == _shareTarget);
+            if (vol is not null) _shareGroups = vol.AuthorizedGroups ?? [];
+        }
+        catch (Exception ex) { _shareError = ex.Message; }
+    }
+
+    private async Task HandleEcdhGrant()
+    {
+        _shareError = null;
+        if (string.IsNullOrWhiteSpace(_ecdhUsername))
+        {
+            _shareError = "ユーザー名を入力してください。";
+            return;
+        }
+
+        try
+        {
+            // 相手の公開鍵を取得
+            string? recipientPubKey = await AccountApi.GetPublicKeyAsync(_ecdhUsername.Trim());
+            if (recipientPubKey is null)
+            {
+                _shareError = "相手ユーザーの公開鍵が登録されていません。先に設定ページで鍵ペアを生成してください。";
+                return;
+            }
+
+            // 自分のパスワードでマスターキーをアンラップするため、パスワード入力が必要
+            if (string.IsNullOrWhiteSpace(_grantGranterPassword))
+            {
+                _shareError = "自分のパスワードを入力してください（マスターキー復号用）。";
+                return;
+            }
+
+            // wrapped key を取得してアンラップ
+            var wrappedKeyResp = await VolumeApi.GetWrappedKeyAsync(_shareTarget!, Auth.CurrentUsername);
+            if (wrappedKeyResp is null)
+            {
+                _shareError = "自分の wrapped key が見つかりません。";
+                return;
+            }
+
+            string? kekHandle = null;
+            string? mkHandle = null;
+            try
+            {
+                kekHandle = await E2ee.DeriveKek(_grantGranterPassword,
+                    wrappedKeyResp.Kdf.Salt, wrappedKeyResp.Kdf.Iterations, Auth.CurrentUsername);
+
+                mkHandle = await E2ee.UnwrapMasterKey(
+                    wrappedKeyResp.WrappedMasterKey.Nonce,
+                    wrappedKeyResp.WrappedMasterKey.Ciphertext,
+                    wrappedKeyResp.WrappedMasterKey.Tag,
+                    kekHandle);
+
+                await E2ee.ClearKey(kekHandle);
+                kekHandle = null;
+
+                // 相手の公開鍵で ECIES ラップ
+                var (ephPubKey, nonce, ct, tag) = await E2ee.EcdhWrap(mkHandle, recipientPubKey);
+                await E2ee.ClearKey(mkHandle);
+                mkHandle = null;
+
+                var ecdhWrappedKey = BuildEcdhWrappedKey(ephPubKey, nonce, ct, tag);
+                await VolumeApi.AddE2eeWrappedKeyAsync(_shareTarget!, _ecdhUsername.Trim(), ecdhWrappedKey);
+
+                await LoadVolumesAsync();
+                var vol = _volumes?.FirstOrDefault(v => v.Name == _shareTarget);
+                if (vol is not null) _shareUsers = vol.AuthorizedUsers;
+                _ecdhUsername = "";
+                _grantGranterPassword = "";
+            }
+            finally
+            {
+                // 異常系で残った鍵ハンドルを必ずクリア
+                if (kekHandle is not null) { try { await E2ee.ClearKey(kekHandle); } catch { } }
+                if (mkHandle is not null) { try { await E2ee.ClearKey(mkHandle); } catch { } }
+            }
+        }
+        catch (Exception ex) { _shareError = ex.Message; }
+    }
+
+    private async void OnAuthStateChanged()
+    {
+        StateHasChanged();
+        if (Auth.IsLoggedIn && _volumes is null) await LoadVolumesAsync();
+    }
+
+    public void Dispose() => Auth.StateChanged -= OnAuthStateChanged;
+}

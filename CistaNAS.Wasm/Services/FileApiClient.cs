@@ -21,12 +21,11 @@ public sealed class FileApiClient
     /// <summary>ファイルアップロード。</summary>
     public async Task<FileMetadata> UploadAsync(string volumeName, string fileName, Stream content, long contentLength)
     {
-        using var form = new MultipartFormDataContent();
-        var streamContent = new StreamContent(content);
-        form.Add(streamContent, "file", fileName);
+        using var streamContent = new StreamContent(content);
+        streamContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
 
         var response = await _http.PostAsync(
-            $"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(fileName)}", form);
+            $"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(fileName)}", streamContent);
         response.EnsureSuccessStatusCode();
         return (await response.Content.ReadFromJsonAsync<FileMetadata>())!;
     }

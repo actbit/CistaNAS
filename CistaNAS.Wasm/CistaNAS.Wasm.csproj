@@ -5,8 +5,6 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <OverrideHtmlAssetPlaceholders>true</OverrideHtmlAssetPlaceholders>
-    <!-- 静的アセットのBasePathを/wasmに設定 -->
-    <StaticWebAssetBasePath>/wasm</StaticWebAssetBasePath>
   </PropertyGroup>
 
   <ItemGroup>

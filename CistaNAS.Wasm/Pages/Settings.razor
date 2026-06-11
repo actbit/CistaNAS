@@ -1,0 +1,567 @@
+@page "/settings"
+@using CistaNAS.Wasm.Auth
+@using CistaNAS.Wasm.Services
+@implements IDisposable
+@inject WasmAuthStateProvider Auth
+@inject AuthApiClient AuthApi
+@inject AccountApiClient AccountApi
+@inject GroupApiClient GroupApi
+@inject E2eeInterop E2ee
+@inject EncryptionSettingsClient EncSettingsApi
+@inject IJSRuntime JS
+@inject NavigationManager Nav
+
+<PageTitle>設定 - CistaNAS</PageTitle>
+
+@if (!Auth.IsLoggedIn)
+{
+    <div class="alert alert-warning">ログインしてください。</div>
+    <a href="/login" class="btn btn-primary">ログイン</a>
+}
+else
+{
+    <h1>設定</h1>
+
+    <!-- パスワード変更 -->
+    <div class="card mb-4 form-narrow">
+        <div class="card-header">パスワード変更</div>
+        <div class="card-body">
+            @if (_pwSuccess)
+            {
+                <div class="alert alert-success">パスワードを変更しました。再度ログインしてください。</div>
+                <button class="btn btn-primary" @onclick="HandleLogout">ログイン画面へ</button>
+            }
+            else
+            {
+                @if (_pwError is not null)
+                {
+                    <div class="alert alert-danger">@_pwError</div>
+                }
+                <EditForm Model="_pwModel" OnValidSubmit="HandleChangePassword" FormName="ChangePasswordForm">
+                    <div class="mb-3">
+                        <label class="form-label">現在のパスワード</label>
+                        <InputText type="password" @bind-Value="_pwModel.OldPassword" class="form-control" />
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">新しいパスワード</label>
+                        <InputText type="password" @bind-Value="_pwModel.NewPassword" class="form-control" />
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">新しいパスワード（確認）</label>
+                        <InputText type="password" @bind-Value="_pwModel.ConfirmPassword" class="form-control" />
+                    </div>
+                    <button type="submit" class="btn btn-primary" disabled="@_pwLoading">
+                        @(_pwLoading ? "変更中..." : "変更")
+                    </button>
+                </EditForm>
+            }
+        </div>
+    </div>
+
+    <!-- ユーザー管理 (admin) -->
+    @if (Auth.IsAdmin)
+    {
+        <div class="card mb-4">
+            <div class="card-header">ユーザー管理</div>
+            <div class="card-body">
+                @if (_users.Count > 0)
+                {
+                    <div class="table-responsive">
+                        <table class="table table-sm table-striped">
+                            <thead>
+                                <tr>
+                                    <th>ユーザー名</th>
+                                    <th>ロール</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var user in _users)
+                                {
+                                    <tr>
+                                        <td>@user.UserName</td>
+                                        <td>
+                                            <span class="badge bg-primary">@(user.Roles.FirstOrDefault() ?? "user")</span>
+                                        </td>
+                                        <td>
+                                            @if (user.UserName != Auth.CurrentUsername)
+                                            {
+                                                <button class="btn btn-sm btn-outline-danger"
+                                                        @onclick="() => HandleDeleteUser(user.UserName)">削除</button>
+                                            }
+                                            else
+                                            {
+                                                <span class="text-muted">自分</span>
+                                            }
+                                        </td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+
+                <hr />
+                <h6>ユーザー追加</h6>
+                @if (_userError is not null)
+                {
+                    <div class="alert alert-danger">@_userError</div>
+                }
+                @if (_userSuccess)
+                {
+                    <div class="alert alert-success">ユーザーを追加しました。</div>
+                }
+                <div class="row g-2 align-items-end form-narrow">
+                    <div class="col">
+                        <label class="form-label">ユーザー名</label>
+                        <input class="form-control" @bind="_newUsername" />
+                    </div>
+                    <div class="col">
+                        <label class="form-label">パスワード</label>
+                        <input type="password" class="form-control" @bind="_newPassword" />
+                    </div>
+                    <div class="col-auto">
+                        <label class="form-label">ロール</label>
+                        <select class="form-select" @bind="_newUserRole">
+                            <option value="user">user</option>
+                            <option value="admin">admin</option>
+                        </select>
+                    </div>
+                    <div class="col-auto">
+                        <button class="btn btn-success" @onclick="HandleAddUser">追加</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
+
+    <!-- グループ管理 -->
+    <div class="card mb-4">
+        <div class="card-header">グループ管理</div>
+        <div class="card-body">
+            @if (_groups.Count == 0)
+            {
+                <p>グループがありません。</p>
+            }
+            else
+            {
+                <div class="table-responsive">
+                    <table class="table table-sm table-striped">
+                        <thead>
+                            <tr><th>グループ名</th><th>オーナー</th><th>メンバー</th><th>操作</th></tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var g in _groups)
+                            {
+                                <tr>
+                                    <td><a href="#" @onclick="() => SelectGroup(g.GroupName)">@g.GroupName</a></td>
+                                    <td>@g.OwnerUser</td>
+                                    <td>@string.Join(", ", g.MemberNames)</td>
+                                    <td>
+                                        @if (g.OwnerUser == Auth.CurrentUsername)
+                                        {
+                                            <button class="btn btn-sm btn-outline-danger me-1"
+                                                    @onclick="() => HandleDeleteGroup(g.GroupName)">削除</button>
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+
+            <hr />
+            <h6>グループ作成</h6>
+            @if (_groupError is not null)
+            {
+                <div class="alert alert-danger">@_groupError</div>
+            }
+            <div class="row g-2 align-items-end form-narrow">
+                <div class="col">
+                    <label class="form-label">グループ名</label>
+                    <input class="form-control" @bind="_newGroupName" />
+                </div>
+                <div class="col-auto">
+                    <button class="btn btn-success" @onclick="HandleCreateGroup">作成</button>
+                </div>
+            </div>
+
+            @if (_selectedGroup is not null)
+            {
+                <hr />
+                <h6>メンバー管理: @_selectedGroup.GroupName</h6>
+                <ul class="list-group mb-2">
+                    @foreach (var m in _selectedGroup.Members)
+                    {
+                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                            @m.Username
+                            @if (m.Username != _selectedGroup.OwnerUser)
+                            {
+                                <button class="btn btn-sm btn-outline-danger"
+                                        @onclick="() => HandleRemoveMember(_selectedGroup.GroupName, m.Username)">削除</button>
+                            }
+                            else
+                            {
+                                <span class="badge bg-primary">オーナー</span>
+                            }
+                        </li>
+                    }
+                </ul>
+                <div class="row g-2 align-items-end">
+                    <div class="col">
+                        <input class="form-control" placeholder="ユーザー名" @bind="_addMemberName" />
+                    </div>
+                    <div class="col-auto">
+                        <button class="btn btn-primary" @onclick="HandleAddMember">追加</button>
+                    </div>
+                </div>
+            }
+        </div>
+    </div>
+
+    <!-- 暗号化設定 -->
+    <div class="card mb-4">
+        <div class="card-header">暗号化設定</div>
+        <div class="card-body">
+            <div class="row g-3 form-narrow">
+                <div class="col-12">
+                    <label class="form-label">デフォルト暗号化モード（新規ボリューム作成時）</label>
+                    <select class="form-select" @bind="_encSettings.DefaultEncryptionMode">
+                        <option value="server">サーバー暗号化（AES-XTS）</option>
+                        <option value="e2ee">E2EE（エンドツーエンド暗号化）</option>
+                        <option value="none">暗号化なし</option>
+                    </select>
+                    <div class="form-text">新規ボリューム作成時の初期値。ボリュームごとに個別に変更可能。</div>
+                </div>
+                <div class="col-12">
+                    <label class="form-label">E2EE チャンクサイズ</label>
+                    <select class="form-select" @bind="_encSettings.E2eeChunkSize">
+                        <option value="262144">256 KB</option>
+                        <option value="524288">512 KB</option>
+                        <option value="1048576">1 MB（推奨）</option>
+                        <option value="4194304">4 MB</option>
+                    </select>
+                    <div class="form-text">E2EE ボリュームのチャンク分割サイズ。小さいほどストリーミングに有利、大きいほどオーバーヘッドが少ない。</div>
+                </div>
+                <div class="col-12">
+                    <label class="form-label">PBKDF2 反復回数（ボリューム鍵導出）</label>
+                    <input type="number" class="form-control" @bind="_encSettings.KdfIterations" min="10000" step="10000" />
+                    <div class="form-text">現在の設定: @_encSettings.KdfIterations.ToString("N0")。高いほど安全だが遅い。</div>
+                </div>
+                <div class="col-12">
+                    <label class="form-label">セクタサイズ（AES-XTS）</label>
+                    <select class="form-select" @bind="_encSettings.SectorSize">
+                        <option value="512">512 B</option>
+                        <option value="4096">4 KB（推奨）</option>
+                    </select>
+                </div>
+            </div>
+            @if (_encSaveSuccess)
+            {
+                <div class="alert alert-success mt-3">設定を保存しました。</div>
+            }
+            @if (_encError is not null)
+            {
+                <div class="alert alert-danger mt-3">@_encError</div>
+            }
+            <button class="btn btn-primary mt-3" @onclick="HandleSaveEncryption">保存</button>
+        </div>
+    </div>
+
+    <!-- E2EE 鍵ペア管理 -->
+    <div class="card mb-4">
+        <div class="card-header">E2EE 鍵ペア管理</div>
+        <div class="card-body">
+            <p class="form-text">
+                E2EE グループ共有で使用する ECDH 鍵ペアを管理します。
+                秘密鍵はパスワードで暗号化してブラウザに保存します。
+            </p>
+            @if (_keyHasPublicKey)
+            {
+                <div class="alert alert-success">
+                    公開鍵登録済み。E2EE グループ共有を利用できます。
+                </div>
+            }
+            else
+            {
+                <div class="alert alert-warning">
+                    公開鍵が未登録です。鍵ペアを生成してください。
+                </div>
+            }
+            @if (_keyError is not null)
+            {
+                <div class="alert alert-danger">@_keyError</div>
+            }
+            @if (_keySuccess is not null)
+            {
+                <div class="alert alert-success">@_keySuccess</div>
+            }
+            <div class="mb-3">
+                <label class="form-label">パスワード（秘密鍵の暗号化用）</label>
+                <input type="password" class="form-control" style="max-width:300px" @bind="_keyPassword" />
+            </div>
+            <button class="btn btn-primary" disabled="@_keyLoading" @onclick="HandleGenerateKeyPair">
+                @(_keyLoading ? "生成中..." : "鍵ペアを生成・登録")
+            </button>
+        </div>
+    </div>
+}
+
+@code {
+    // パスワード変更
+    private ChangeModel _pwModel = new();
+    private bool _pwLoading;
+    private bool _pwSuccess;
+    private string? _pwError;
+
+    private sealed class ChangeModel
+    {
+        public string OldPassword { get; set; } = "";
+        public string NewPassword { get; set; } = "";
+        public string ConfirmPassword { get; set; } = "";
+    }
+
+    // ユーザー管理
+    private IReadOnlyList<AccountApiClient.UserWithRoles> _users = [];
+    private string _newUsername = "";
+    private string _newPassword = "";
+    private string _newUserRole = "user";
+    private string? _userError;
+    private bool _userSuccess;
+
+    // グループ管理
+    private IReadOnlyList<GroupEntity> _groups = [];
+    private string _newGroupName = "";
+    private string? _groupError;
+    private GroupEntity? _selectedGroup;
+    private string _addMemberName = "";
+
+    // 暗号化設定
+    private EncryptionSettings _encSettings = new();
+    private bool _encSaveSuccess;
+    private string? _encError;
+
+    // E2EE 鍵ペア管理
+    private bool _keyHasPublicKey;
+    private bool _keyLoading;
+    private string _keyPassword = "";
+    private string? _keyError;
+    private string? _keySuccess;
+
+    protected override async Task OnInitializedAsync()
+    {
+        Auth.StateChanged += OnAuthStateChanged;
+        await RefreshData();
+    }
+
+    private async Task RefreshData()
+    {
+        if (!Auth.IsLoggedIn) return;
+
+        if (Auth.IsAdmin)
+        {
+            try { _users = await AccountApi.ListWithRolesAsync(); } catch { }
+        }
+
+        try { _groups = await GroupApi.ListGroupsAsync(); } catch { }
+
+        try
+        {
+            var settings = await EncSettingsApi.GetAsync();
+            _encSettings = settings;
+        }
+        catch { }
+
+        try { _keyHasPublicKey = await AccountApi.GetPublicKeyAsync(Auth.CurrentUsername) is not null; } catch { }
+    }
+
+    // ---- パスワード変更 ----
+
+    private async Task HandleChangePassword()
+    {
+        if (_pwModel.NewPassword != _pwModel.ConfirmPassword)
+        {
+            _pwError = "パスワードが一致しません。";
+            return;
+        }
+
+        _pwLoading = true;
+        _pwError = null;
+
+        try
+        {
+            var ok = await AuthApi.ChangePasswordAsync(_pwModel.OldPassword, _pwModel.NewPassword);
+            if (ok) _pwSuccess = true;
+            else _pwError = "現在のパスワードが正しくありません。";
+        }
+        catch { _pwError = "パスワード変更に失敗しました。"; }
+        finally { _pwLoading = false; }
+    }
+
+    private async Task HandleLogout()
+    {
+        await Auth.LogoutAsync();
+        Nav.NavigateTo("/login", forceLoad: false);
+    }
+
+    // ---- ユーザー管理 ----
+
+    private async Task HandleAddUser()
+    {
+        _userError = null; _userSuccess = false;
+        try
+        {
+            await AccountApi.CreateUserAsync(_newUsername.Trim(), _newPassword, _newUserRole);
+            _newUsername = ""; _newPassword = ""; _newUserRole = "user";
+            _userSuccess = true;
+            await RefreshData();
+        }
+        catch (Exception ex) { _userError = ex.Message; }
+    }
+
+    private async Task HandleDeleteUser(string username)
+    {
+        _userError = null;
+        try
+        {
+            await AccountApi.DeleteUserAsync(username);
+            await RefreshData();
+        }
+        catch (Exception ex) { _userError = ex.Message; }
+    }
+
+    // ---- グループ管理 ----
+
+    private async Task HandleCreateGroup()
+    {
+        _groupError = null;
+        try
+        {
+            await GroupApi.CreateAsync(_newGroupName.Trim());
+            _newGroupName = "";
+            await RefreshData();
+        }
+        catch (Exception ex) { _groupError = ex.Message; }
+    }
+
+    private async Task HandleDeleteGroup(string groupName)
+    {
+        _groupError = null;
+        try
+        {
+            await GroupApi.DeleteAsync(groupName);
+            if (_selectedGroup?.GroupName == groupName) _selectedGroup = null;
+            await RefreshData();
+        }
+        catch (Exception ex) { _groupError = ex.Message; }
+    }
+
+    private async Task SelectGroup(string groupName)
+    {
+        try
+        {
+            var groups = await GroupApi.ListGroupsAsync();
+            _selectedGroup = groups.FirstOrDefault(g => g.GroupName == groupName);
+        }
+        catch { }
+    }
+
+    private async Task HandleAddMember()
+    {
+        _groupError = null;
+        if (_selectedGroup is null) return;
+        try
+        {
+            await GroupApi.AddMemberAsync(_selectedGroup.GroupName, _addMemberName.Trim());
+            _addMemberName = "";
+            await RefreshData();
+            // 再選択
+            var groups = await GroupApi.ListGroupsAsync();
+            _selectedGroup = groups.FirstOrDefault(g => g.GroupName == _selectedGroup?.GroupName);
+        }
+        catch (Exception ex) { _groupError = ex.Message; }
+    }
+
+    private async Task HandleRemoveMember(string groupName, string username)
+    {
+        _groupError = null;
+        try
+        {
+            await GroupApi.RemoveMemberAsync(groupName, username);
+            await RefreshData();
+            var groups = await GroupApi.ListGroupsAsync();
+            _selectedGroup = groups.FirstOrDefault(g => g.GroupName == groupName);
+        }
+        catch (Exception ex) { _groupError = ex.Message; }
+    }
+
+    // ---- 暗号化設定 ----
+
+    private async Task HandleSaveEncryption()
+    {
+        _encSaveSuccess = false; _encError = null;
+        try
+        {
+            await EncSettingsApi.SaveAsync(_encSettings);
+            _encSaveSuccess = true;
+        }
+        catch (Exception ex) { _encError = $"保存エラー: {ex.Message}"; }
+    }
+
+    // ---- E2EE 鍵ペア管理 ----
+
+    private async Task HandleGenerateKeyPair()
+    {
+        _keyLoading = true; _keyError = null; _keySuccess = null;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_keyPassword))
+            {
+                _keyError = "パスワードを入力してください。";
+                return;
+            }
+
+            // ECDH 鍵ペア生成
+            var (pubHandle, privHandle) = await E2ee.GenerateKeyPair();
+
+            // 公開鍵をエクスポート
+            string pubKeyB64 = await E2ee.ExportPublicKey(pubHandle);
+
+            // 秘密鍵をパスワードで暗号化
+            byte[] salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
+            string saltB64 = Convert.ToBase64String(salt);
+            var (nonceB64, wrappedB64) = await E2ee.EncryptPrivateKey(privHandle, _keyPassword, saltB64, 600_000);
+
+            // サーバーに公開鍵を登録
+            await AccountApi.UpdatePublicKeyAsync(pubKeyB64);
+
+            // 暗号化済み秘密鍵を localStorage に保存
+            string key = $"e2ee_privkey_{Auth.CurrentUsername}";
+            string json = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                wrapped = wrappedB64,
+                nonce = nonceB64,
+                salt = saltB64,
+                iterations = 600000
+            });
+            await JS.InvokeVoidAsync("localStorage.setItem", key, json);
+
+            await E2ee.ClearKey(pubHandle);
+            await E2ee.ClearKey(privHandle);
+
+            _keyHasPublicKey = true;
+            _keySuccess = "鍵ペアを生成し、公開鍵を登録しました。";
+        }
+        catch (Exception ex) { _keyError = $"エラー: {ex.Message}"; }
+        finally { _keyLoading = false; }
+    }
+
+    private async void OnAuthStateChanged()
+    {
+        StateHasChanged();
+        await RefreshData();
+    }
+
+    public void Dispose() => Auth.StateChanged -= OnAuthStateChanged;
+}

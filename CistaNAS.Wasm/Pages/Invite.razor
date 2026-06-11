@@ -1,0 +1,182 @@
+@page "/invite/{invitationId}"
+@using CistaNAS.Wasm.Auth
+@using CistaNAS.Wasm.Services
+@using System.Net.Http.Json
+@implements IDisposable
+@inject WasmAuthStateProvider Auth
+@inject AccountApiClient AccountApi
+@inject E2eeInterop E2ee
+@inject HttpClient Http
+@inject NavigationManager Nav
+
+<PageTitle>招待 - CistaNAS</PageTitle>
+
+@if (!Auth.IsLoggedIn)
+{
+    <div class="alert alert-warning">ログインしてください。</div>
+    <a href="/login" class="btn btn-primary">ログイン</a>
+}
+else
+{
+    <h1>招待の受諾</h1>
+
+    @if (_notFound)
+    {
+        <div class="alert alert-warning">招待が見つかりません。URL が正しいか確認してください。</div>
+    }
+    else if (_invite is null)
+    {
+        <p>読み込み中...</p>
+    }
+    else if (_accepted)
+    {
+        <div class="alert alert-success">
+            招待を受諾しました。オーナーがメンバー追加を行うとマウントできるようになります。
+        </div>
+        <a href="/volumes" class="btn btn-primary">ボリューム一覧へ</a>
+    }
+    else
+    {
+        <div class="card" style="max-width:500px">
+            <div class="card-body">
+                <p><strong>@_invite.InviterUsername</strong> からの招待</p>
+                <p class="text-muted small">作成日時: @_invite.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm")</p>
+
+                @if (_hasPublicKey)
+                {
+                    <div class="alert alert-success small">公開鍵登録済み。ECDH 共有が可能です。</div>
+                }
+                else
+                {
+                    <div class="alert alert-warning small">
+                        公開鍵が未登録です。先に<a href="/settings">設定</a>で鍵ペアを生成してください。
+                    </div>
+                }
+
+                @if (_error is not null)
+                {
+                    <div class="alert alert-danger">@_error</div>
+                }
+
+                <button class="btn btn-primary" disabled="@(_loading || !_hasPublicKey)"
+                        @onclick="HandleAccept">
+                    @(_loading ? "処理中..." : "招待を受諾する")
+                </button>
+            </div>
+        </div>
+    }
+}
+
+@code {
+    [Parameter] public string InvitationId { get; set; } = "";
+
+    private InviteData? _invite;
+    private bool _loading;
+    private bool _accepted;
+    private bool _notFound;
+    private string? _error;
+    private bool _hasPublicKey;
+
+    private sealed class InviteData
+    {
+        public string InvitationId { get; set; } = "";
+        public string InviterUsername { get; set; } = "";
+        public DateTimeOffset CreatedAt { get; set; }
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        Auth.StateChanged += OnAuthStateChanged;
+        await LoadInviteAsync();
+    }
+
+    private async Task LoadInviteAsync()
+    {
+        if (!Auth.IsLoggedIn) return;
+
+        try
+        {
+            var response = await Http.GetAsync($"/api/v1/e2ee/invitations/{Uri.EscapeDataString(InvitationId)}");
+            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                _notFound = true;
+                return;
+            }
+            response.EnsureSuccessStatusCode();
+            _invite = await response.Content.ReadFromJsonAsync<InviteData>();
+        }
+        catch
+        {
+            _notFound = true;
+            return;
+        }
+
+        // 公開鍵チェック
+        try { _hasPublicKey = await AccountApi.GetPublicKeyAsync(Auth.CurrentUsername) is not null; }
+        catch { _hasPublicKey = false; }
+    }
+
+    private async Task HandleAccept()
+    {
+        _loading = true;
+        _error = null;
+
+        try
+        {
+            if (!_hasPublicKey)
+            {
+                _error = "公開鍵が登録されていません。";
+                return;
+            }
+
+            var pubKey = await AccountApi.GetPublicKeyAsync(Auth.CurrentUsername);
+            if (pubKey is null)
+            {
+                _error = "公開鍵が見つかりません。";
+                return;
+            }
+
+            // 招待 ID（16 進文字列）をバイト配列 → Base64 に変換して HKDF の入力とする
+            byte[] secretBytes = Convert.FromHexString(InvitationId);
+            string secretB64 = Convert.ToBase64String(secretBytes);
+
+            // 招待鍵を導出
+            string invKeyHandle = await E2ee.DeriveInvitationKey(secretB64);
+            try
+            {
+                // 公開鍵を招待鍵で暗号化
+                var (nonce, encPubKey) = await E2ee.EncryptForInvitation(pubKey, invKeyHandle);
+
+                // 招待受諾 API を呼び出す
+                var response = await Http.PostAsJsonAsync(
+                    $"/api/v1/e2ee/invitations/{Uri.EscapeDataString(InvitationId)}/accept",
+                    new { EncryptedPublicKey = encPubKey, Nonce = nonce });
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    var err = await response.Content.ReadFromJsonAsync<ErrorResponse>();
+                    _error = err?.Error ?? "招待の受諾に失敗しました。";
+                    return;
+                }
+
+                _accepted = true;
+            }
+            finally
+            {
+                try { await E2ee.ClearKey(invKeyHandle); } catch { }
+            }
+        }
+        catch (Exception ex) { _error = ex.Message; }
+        finally { _loading = false; }
+    }
+
+    private sealed record ErrorResponse(string? Error);
+
+    private async void OnAuthStateChanged()
+    {
+        StateHasChanged();
+        if (Auth.IsLoggedIn && _invite is null && !_notFound) await LoadInviteAsync();
+    }
+
+    public void Dispose() => Auth.StateChanged -= OnAuthStateChanged;
+}
