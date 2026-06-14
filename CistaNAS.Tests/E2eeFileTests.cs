@@ -82,7 +82,8 @@ public class E2eeFileTests : IAsyncDisposable
         Assert.Equal(fileSalt, salt0);
         Assert.Equal(plain0, dec0);
 
-        byte[] dec1 = E2eeCrypto.DecryptChunk(dl1, fileKey, 1, out _);
+        // チャンク1の復号にはfileSaltが必要
+        byte[] dec1 = E2eeCrypto.DecryptChunk(dl1, fileKey, 1, salt0);
         Assert.Equal(plain1, dec1);
     }
 

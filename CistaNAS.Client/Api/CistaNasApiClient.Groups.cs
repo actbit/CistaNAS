@@ -18,11 +18,21 @@ public static class CistaNasApiClientGroups
         var result = new List<GroupInfo>();
         foreach (var g in json.EnumerateArray())
         {
+            var members = new List<string>();
+            if (g.TryGetProperty("members", out var membersEl))
+            {
+                foreach (var m in membersEl.EnumerateArray())
+                    members.Add(m.GetProperty("username").GetString() ?? "");
+            }
+
             result.Add(new GroupInfo
             {
                 GroupName = g.GetProperty("groupName").GetString()!,
                 CreatedAt = g.GetProperty("createdAt").GetDateTimeOffset(),
-                OwnerUsername = g.GetProperty("ownerUsername").GetString()!,
+                OwnerUsername = g.TryGetProperty("ownerUser", out var ownerEl)
+                    ? ownerEl.GetString() ?? ""
+                    : g.TryGetProperty("ownerUsername", out var owner2) ? owner2.GetString() ?? "" : "",
+                Members = members,
             });
         }
         return result;
@@ -76,4 +86,5 @@ public class GroupInfo
     public required string GroupName { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public string OwnerUsername { get; set; } = "";
+    public List<string> Members { get; set; } = [];
 }

@@ -4,6 +4,6 @@
   <Project Path="CistaNAS.ServiceDefaults/CistaNAS.ServiceDefaults.csproj" />
   <Project Path="CistaNAS.Shared/CistaNAS.Shared.csproj" />
   <Project Path="CistaNAS.Tests/CistaNAS.Tests.csproj" />
-  <Project Path="CistaNAS.Wasm/CistaNAS.Wasm.csproj" />
   <Project Path="CistaNAS.Web/CistaNAS.Web.csproj" />
+  <Project Path="CistaNAS.Wasm/CistaNAS.Wasm.csproj" />
 </Solution>

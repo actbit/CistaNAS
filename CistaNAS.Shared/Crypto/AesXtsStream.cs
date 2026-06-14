@@ -1,11 +1,11 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 
 namespace CistaNAS.Shared.Crypto;
 
 /// <summary>
 /// IEEE 1619 / NIST SP 800-38E の XTS-AES によるシーク可能な暗号化ストリーム。
 /// 低レベル実装。Volume / File 層から呼ばれる。
-/// WASM / ネイティブ自動切替 (IAesEcb)。
 /// </summary>
 /// <remarks>
 /// <para>基底ストリームには「暗号化データ領域のみ」を渡す（ボリュームヘッダは含めない）。</para>
@@ -23,9 +23,11 @@ public sealed class AesXtsStream : Stream
     private readonly Stream _base;
     private readonly bool _leaveOpen;
     private readonly int _sectorSize;
-    private readonly IAesEcb _dataEnc;
-    private readonly IAesEcb _dataDec;
-    private readonly IAesEcb _tweakEnc;
+    private readonly Aes _dataAes;   // K1: データ暗号化
+    private readonly Aes _tweakAes;  // K2: トウィーク暗号化
+    private readonly ICryptoTransform _dataEnc;
+    private readonly ICryptoTransform _dataDec;
+    private readonly ICryptoTransform _tweakEnc;
 
     private long _length;
     private long _position;
@@ -53,10 +55,19 @@ public sealed class AesXtsStream : Stream
         _length = logicalLength;
         CanWrite = writable;
 
-        // WASM / ネイティブ自動切替
-        _dataEnc = AesEcbFactory.CreateEncryptor(key[..32]);
-        _dataDec = AesEcbFactory.CreateFull(key[..32]);
-        _tweakEnc = AesEcbFactory.CreateEncryptor(key[32..]);
+        _dataAes = Aes.Create();
+        _dataAes.Mode = CipherMode.ECB;
+        _dataAes.Padding = PaddingMode.None;
+        _dataAes.Key = key[..32].ToArray();
+
+        _tweakAes = Aes.Create();
+        _tweakAes.Mode = CipherMode.ECB;
+        _tweakAes.Padding = PaddingMode.None;
+        _tweakAes.Key = key[32..].ToArray();
+
+        _dataEnc = _dataAes.CreateEncryptor();
+        _dataDec = _dataAes.CreateDecryptor();
+        _tweakEnc = _tweakAes.CreateEncryptor();
     }
 
     public override bool CanRead => true;
@@ -92,10 +103,12 @@ public sealed class AesXtsStream : Stream
 
     private void ComputeTweak(long sectorIndex, Span<byte> tweak)
     {
-        Span<byte> du = stackalloc byte[BlockSize];
-        du.Clear();
-        BinaryPrimitives.WriteUInt64LittleEndian(du, (ulong)sectorIndex);
-        _tweakEnc.EncryptBlock(du, tweak);
+        // TransformBlock requires byte[], so use direct byte[] instead of stackalloc+ToArray
+        byte[] inBuf = new byte[BlockSize];
+        byte[] outBuf = new byte[BlockSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(inBuf, (ulong)sectorIndex);
+        _tweakEnc.TransformBlock(inBuf, 0, BlockSize, outBuf, 0);
+        ((Span<byte>)outBuf).CopyTo(tweak);
     }
 
     /// <summary>セクタ（=データユニット）を in-place で暗号化/復号する。</summary>
@@ -107,18 +120,15 @@ public sealed class AesXtsStream : Stream
         Span<byte> t = stackalloc byte[BlockSize];
         ComputeTweak(sectorIndex, t);
 
-        IAesEcb cipher = encrypt ? _dataEnc : _dataDec;
-        Span<byte> tmpIn = stackalloc byte[BlockSize];
-        Span<byte> tmpOut = stackalloc byte[BlockSize];
+        ICryptoTransform cipher = encrypt ? _dataEnc : _dataDec;
+        byte[] tmpIn = new byte[BlockSize];
+        byte[] tmpOut = new byte[BlockSize];
 
         for (int off = 0; off < data.Length; off += BlockSize)
         {
             Span<byte> blk = data.Slice(off, BlockSize);
             for (int i = 0; i < BlockSize; i++) tmpIn[i] = (byte)(blk[i] ^ t[i]);
-            if (encrypt)
-                cipher.EncryptBlock(tmpIn, tmpOut);
-            else
-                cipher.DecryptBlock(tmpIn, tmpOut);
+            cipher.TransformBlock(tmpIn, 0, BlockSize, tmpOut, 0);
             for (int i = 0; i < BlockSize; i++) blk[i] = (byte)(tmpOut[i] ^ t[i]);
             MultiplyAlpha(t);
         }
@@ -354,6 +364,11 @@ public sealed class AesXtsStream : Stream
             _dataEnc.Dispose();
             _dataDec.Dispose();
             _tweakEnc.Dispose();
+            // 暗号鍵のメモリゼロ化
+            CryptographicOperations.ZeroMemory(_dataAes.Key);
+            CryptographicOperations.ZeroMemory(_tweakAes.Key);
+            _dataAes.Dispose();
+            _tweakAes.Dispose();
             if (!_leaveOpen) _base.Dispose();
         }
         _disposed = true;

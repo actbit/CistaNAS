@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>CistaNAS</title>
+    <title>CistaNAS.Wasm</title>
     <base href="/" />
     <link rel="preload" id="webassembly" />
     <link rel="stylesheet" href="lib/bootstrap/dist/css/bootstrap.min.css" />
@@ -24,13 +24,13 @@
     </div>
 
     <div id="blazor-error-ui">
-        エラーが発生しました。
-        <a href="." class="reload">再読み込み</a>
+        An unhandled error has occurred.
+        <a href="." class="reload">Reload</a>
         <span class="dismiss">🗙</span>
     </div>
-    <script src="_framework/blazor.webassembly.js"></script>
-    <script src="js/downloadHelper.js"></script>
+    <script src="_framework/blazor.webassembly#[.{fingerprint}].js"></script>
     <script src="js/mediaHelper.js"></script>
+    <script type="module" src="js/e2ee.js"></script>
 </body>
 
 </html>

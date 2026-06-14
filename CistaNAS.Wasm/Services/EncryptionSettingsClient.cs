@@ -30,6 +30,6 @@ public sealed class EncryptionSettings
 {
     public string DefaultEncryptionMode { get; set; } = "server";
     public int E2eeChunkSize { get; set; } = 1048576;
-    public int KdfIterations { get; set; } = 310_000;
+    public int KdfIterations { get; set; } = 600_000;
     public int SectorSize { get; set; } = 4096;
 }

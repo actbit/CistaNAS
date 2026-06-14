@@ -46,13 +46,16 @@ public sealed class AuthApiClient
     {
         try
         {
-            // setup エンドポイントに空リクエストを送って 409 ならセットアップ済み
-            var response = await _http.PostAsJsonAsync("/api/v1/auth/setup", new SetupRequest("probe", "probe12345678"));
-            return response.StatusCode == System.Net.HttpStatusCode.Conflict;
+            var response = await _http.GetAsync("/api/v1/auth/has-users");
+            response.EnsureSuccessStatusCode();
+            var result = await response.Content.ReadFromJsonAsync<HasUsersResponse>();
+            return result?.HasUsers ?? true;
         }
         catch
         {
             return true; // エラー時はセットアップ済みとみなす
         }
     }
+
+    private sealed record HasUsersResponse(bool HasUsers);
 }

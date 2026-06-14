@@ -150,11 +150,29 @@ builder.Services.AddCistaNasServices(cista);
 builder.Services.AddScoped<WebDavHandler>();
 
 // ---- E2EE ----
-builder.Services.AddScoped<E2eeInterop>();
+// Server-side Blazor 用（WASM SPA モードでは不要）
+// builder.Services.AddScoped<E2eeInterop>();
 
 // ---- Blazor (Interactive Server rendering) ----
-builder.Services.AddRazorComponents()
-    .AddInteractiveServerComponents();
+// WASM SPA としてホストするため Server rendering は無効化
+// builder.Services.AddRazorComponents()
+//     .AddInteractiveServerComponents();
+
+// ---- レスポンス圧縮（WASM アセットの gzip 転送用） ----
+// TEMP: SRI チェックとの競合を検証するため一時的に無効化
+// builder.Services.AddResponseCompression(options =>
+// {
+//     options.EnableForHttps = true;
+//     options.MimeTypes = new[]
+//     {
+//         "text/css",
+//         "text/javascript",
+//         "application/javascript",
+//         "application/wasm",
+//         "application/json",
+//         "image/svg+xml",
+//     };
+// });
 
 // ---- CORS（外部クライアント向け） ----
 builder.Services.AddCors(options =>
@@ -253,6 +271,9 @@ else
 // X-Forwarded-For / X-Forwarded-Proto ヘッダーを信用する
 app.UseForwardedHeaders();
 
+// レスポンス圧縮（TEMP: SRI デバッグのため無効化）
+// app.UseResponseCompression();
+
 // Kestrel が HTTPS でリッスンしている場合のみリダイレクトを有効化
 // （リバースプロキシで TLS 終端する構成では ASPNETCORE_URLS が http になるため無効化）
 var urls = builder.Configuration["ASPNETCORE_URLS"] ?? "";
@@ -269,14 +290,15 @@ app.Use(async (ctx, next) =>
     headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()";
     if (!ctx.Request.Headers.ContainsKey("Content-Security-Policy"))
     {
-        headers["Content-Security-Policy"] =
-            "default-src 'self'; " +
-            "script-src 'self'; " +
-            "style-src 'self' 'unsafe-inline'; " +
-            "img-src 'self' data: blob:; " +
-            "media-src 'self' blob:; " +
-            "connect-src 'self'; " +
-            "frame-ancestors 'self';";
+        // 開発環境ではCSPを緩和
+        var csp = "default-src 'self'; " +
+                  "script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
+                  "style-src 'self' 'unsafe-inline'; " +
+                  "img-src 'self' data: blob:; " +
+                  "media-src 'self' blob:; " +
+                  "connect-src 'self' 'unsafe-eval' 'unsafe-inline'; " +
+                  "frame-ancestors 'self';";
+        headers["Content-Security-Policy"] = csp;
     }
     await next();
 });
@@ -285,11 +307,22 @@ app.UseCors();
 app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
-app.UseAntiforgery();
+// Server-side Blazor 用（WASM SPA モードでは不要）
+// app.UseAntiforgery();
 
-app.MapStaticAssets();
-app.MapRazorComponents<App>()
-    .AddInteractiveServerRenderMode();
+app.UseStaticFiles(new StaticFileOptions
+{
+    ServeUnknownFileTypes = true,
+    DefaultContentType = "application/octet-stream",
+});
+
+// ---- WASM SPA フォールバック ----
+// API・WebDAVリクエスト以外を index.html にフォールバック
+app.MapFallbackToFile("index.html");
+
+// Server-side BlazorはWASM統合により無効化
+// app.MapRazorComponents<App>()
+//     .AddInteractiveServerRenderMode();
 
 // ---- /api/v1 : REST API ----
 var api = app.MapGroup("/api/v1");

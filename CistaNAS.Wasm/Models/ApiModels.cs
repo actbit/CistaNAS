@@ -111,13 +111,30 @@ public sealed record AddGroupMemberRequest(string Username);
 public sealed record SetPublicKeyRequest(string PublicKey);
 public sealed record CreateGroupE2eeVolumeRequest(string GroupName, UserWrappedKey OwnerWrappedKey, int ChunkSize = 1048576);
 public sealed record CreateInvitationRequest(string TargetUsername);
-public sealed record AcceptInvitationRequest(string InvitationId, string EncryptedPublicKey, string Nonce);
+public sealed record AcceptInvitationRequest(string EncryptedPublicKey, string Nonce);
 public sealed record StreamTokenRequest(string VolumeName, string FileName);
 
-/// <summary>ラップ鍵取得レスポンス。</summary>
+/// <summary>ラップ鍵取得レスポンス。サーバーは Base64 文字列で返す。</summary>
 public sealed record WrappedKeyResponse(
     string WrapType,
-    KdfParams Kdf,
-    WrappedKeyParams WrappedMasterKey,
-    byte[]? EphemeralPublicKey,
+    WrappedKeyKdfJson Kdf,
+    WrappedKeyParamsJson WrappedMasterKey,
+    string? EphemeralPublicKey,
     int ChunkSize);
+
+/// <summary>KDF パラメータ（JSON 用、Salt は Base64 文字列）。</summary>
+public sealed class WrappedKeyKdfJson
+{
+    public string Algorithm { get; set; } = "pbkdf2-sha256";
+    public int Iterations { get; set; }
+    public string Salt { get; set; } = "";
+}
+
+/// <summary>ラップ済みマスターキーパラメータ（JSON 用、Nonce/Ciphertext/Tag は Base64 文字列）。</summary>
+public sealed class WrappedKeyParamsJson
+{
+    public string Algorithm { get; set; } = "aes-256-gcm";
+    public string Nonce { get; set; } = "";
+    public string Ciphertext { get; set; } = "";
+    public string Tag { get; set; } = "";
+}

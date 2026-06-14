@@ -348,7 +348,17 @@ public static class E2eeEndpoints
         if (record.InviterUsername != caller && !string.Equals(record.TargetUsername, caller, StringComparison.Ordinal))
             return Results.Forbid();
 
-        return Results.Ok(new { record.InvitationId, record.InviterUsername, record.CreatedAt });
+        // 招待者には受諾済みデータ（暗号化された公開鍵）も返す
+        return Results.Ok(new
+        {
+            record.InvitationId,
+            record.InviterUsername,
+            record.TargetUsername,
+            record.CreatedAt,
+            record.EncryptedPublicKey,
+            record.Nonce,
+            AcceptedAt = record.AcceptedAt,
+        });
     }
 
     private static IResult AcceptInvitation(string invitationId, AcceptInvitationRequest req,
@@ -367,8 +377,8 @@ public static class E2eeEndpoints
         try
         {
             invSvc.SetAcceptedData(invitationId, req.EncryptedPublicKey, req.Nonce);
-            // 受諾完了後に招待を削除（再利用防止）
-            invSvc.Remove(invitationId);
+            // 招待者が暗号化済み公開鍵を取得できるよう、削除は BackgroundService の
+            // クリーンアップに委ねる（MaxAge 到達時に自動削除）。
             return Results.Ok();
         }
         catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }

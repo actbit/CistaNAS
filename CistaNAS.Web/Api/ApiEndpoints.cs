@@ -1,4 +1,5 @@
 using CistaNAS.Web.Authorization;
+using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
 using StreamingTokenService = CistaNAS.Web.Services.StreamingTokenService;
@@ -45,6 +46,13 @@ public static class ApiEndpoints
     public static IEndpointRouteBuilder MapCistaNasApi(this WebApplication app, IEndpointRouteBuilder api)
     {
         // ---- 認証 ----
+        api.MapGet("/auth/has-users", async (AccountService accountService) =>
+        {
+            return Results.Ok(new { hasUsers = await accountService.HasAnyUsersAsync() });
+        })
+        .AllowAnonymous()
+        .WithName("HasUsers");
+
         api.MapPost("/auth/setup", async (SetupRequest req, AccountService accountService) =>
         {
             if (await accountService.HasAnyUsersAsync())
@@ -285,7 +293,15 @@ public static class ApiEndpoints
         {
             string? username = ctx.User.Identity?.Name;
             if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
-            return Results.Ok(await gs.GetGroupsForUserAsync(username));
+            var groups = await gs.GetGroupsForUserAsync(username);
+            // DTO に射影して EF Core ナビゲーションプロパティの循環参照を回避
+            return Results.Ok(groups.Select(g => new
+            {
+                g.GroupName,
+                g.OwnerUser,
+                g.CreatedAt,
+                Members = g.Members.Select(m => new { m.Username }).ToList()
+            }));
         })
             .WithName("ListGroups");
 
@@ -373,6 +389,103 @@ public static class ApiEndpoints
         })
         .RequireAuthorization(CistaAuthorities.VolumeOwner)
         .WithName("RevokeGroupAccess");
+
+        // ---- アカウント管理 (WASM 用) ----
+        var account = api.MapGroup("/account")
+            .RequireAuthorization()
+            .RequireRateLimiting("api");
+
+        account.MapGet("/users", async (AccountService accountSvc, HttpContext ctx) =>
+        {
+            string? username = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+            var users = await accountSvc.ListWithRolesAsync();
+            return Results.Ok(users.Select(u => new
+            {
+                u.User.UserName,
+                Roles = u.Roles
+            }));
+        })
+        .WithName("ListUsers");
+
+        account.MapPost("/users", async (HttpContext ctx, AccountService accountSvc) =>
+        {
+            string? caller = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(caller)) return Results.Unauthorized();
+            if (!ctx.User.IsInRole("admin")) return Results.Forbid();
+
+            var body = await ctx.Request.ReadFromJsonAsync<CreateUserRequest>();
+            if (body is null) return Results.BadRequest(new { error = "リクエストボディが無効です。" });
+
+            try
+            {
+                await accountSvc.CreateUserAsync(body.Username, body.Password, body.Role ?? "user");
+                return Results.Created($"/api/v1/account/users/{Uri.EscapeDataString(body.Username)}", null);
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .WithName("CreateUser");
+
+        account.MapDelete("/users/{username}", async (string username, HttpContext ctx, AccountService accountSvc) =>
+        {
+            string? caller = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(caller)) return Results.Unauthorized();
+            if (!ctx.User.IsInRole("admin")) return Results.Forbid();
+
+            try
+            {
+                await accountSvc.DeleteUserAsync(username);
+                return Results.NoContent();
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .WithName("DeleteUser");
+
+        // ---- 暗号化設定 (WASM 用) ----
+        var settings = api.MapGroup("/settings")
+            .RequireAuthorization()
+            .RequireRateLimiting("api");
+
+        settings.MapGet("/encryption", (EncryptionSettingsService encSvc) =>
+        {
+            var vol = encSvc.CurrentVolumeOptions();
+            return Results.Ok(new
+            {
+                DefaultEncryptionMode = vol.DefaultEncryptionMode ?? "server",
+                E2eeChunkSize = vol.E2eeChunkSize > 0 ? vol.E2eeChunkSize : 1048576,
+                KdfIterations = vol.KdfIterations > 0 ? vol.KdfIterations : 310_000,
+                SectorSize = vol.SectorSize > 0 ? vol.SectorSize : 4096,
+            });
+        })
+        .WithName("GetEncryptionSettings");
+
+        settings.MapPut("/encryption", async (HttpContext ctx, EncryptionSettingsService encSvc) =>
+        {
+            string? username = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+            if (!ctx.User.IsInRole("admin")) return Results.Forbid();
+
+            var body = await ctx.Request.ReadFromJsonAsync<UpdateEncryptionSettingsRequest>();
+            if (body is null) return Results.BadRequest(new { error = "リクエストボディが無効です。" });
+
+            try
+            {
+                var current = encSvc.CurrentVolumeOptions();
+                var updated = new VolumeOptions
+                {
+                    SectorSize = body.SectorSize,
+                    KdfIterations = body.KdfIterations,
+                    DefaultEncryptionMode = body.DefaultEncryptionMode,
+                    E2eeChunkSize = body.E2eeChunkSize,
+                    ChunkStorage = current.ChunkStorage,
+                    ServerChunkSize = current.ServerChunkSize,
+                };
+                encSvc.SaveVolumeOptions(updated);
+                return Results.Ok();
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .WithName("SaveEncryptionSettings");
 
         return api;
     }

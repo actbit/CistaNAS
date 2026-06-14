@@ -184,6 +184,24 @@ public static class E2eeCrypto
         return result;
     }
 
+    /// <summary>チャンクを復号する（fileSaltを指定）。</summary>
+    public static byte[] DecryptChunk(byte[] encData, byte[] fileKey, int chunkIndex, byte[] fileSalt, string algorithm = "aes-256-gcm")
+    {
+        int offset = chunkIndex == 0 && fileSalt.Length > 0 ? SaltSize : 0;
+
+        switch (algorithm.ToLowerInvariant())
+        {
+            case "aes-256-gcm":
+                return DecryptChunkAesGcm(encData, fileKey, chunkIndex, fileSalt, offset);
+
+            case "chacha20-poly1305":
+                return DecryptChunkChaCha20(encData, fileKey, chunkIndex, fileSalt, offset);
+
+            default:
+                throw new ArgumentException($"サポートされていないチャンク暗号化アルゴリズム: {algorithm}");
+        }
+    }
+
     /// <summary>チャンクを復号する。</summary>
     public static byte[] DecryptChunk(byte[] encData, byte[] fileKey, int chunkIndex, out byte[] fileSalt, string algorithm = "aes-256-gcm")
     {
@@ -323,6 +341,116 @@ public static class E2eeCrypto
         }
 
         return Encoding.UTF8.GetString(plain);
+    }
+
+    // ---- ECDH 鍵交換 (P-256) ----
+
+    /// <summary>ECIES の HKDF info 文字列。WASM/Web の e2ee.js と統一。</summary>
+    private const string EciesInfo = "CistaNAS-ECIES";
+
+    /// <summary>ECDH P-256 鍵ペアを生成し、(publicKey, privateKey) を返す。
+    /// 公開鍵は raw 非圧縮点（0x04 || X[32] || Y[32], 65 バイト）。ブラウザ exportKey("raw") と一致。
+    /// 秘密鍵は SEC1（ExportECPrivateKey）。ローカル完結でサーバーへは送らない。</summary>
+    public static (byte[] PublicKey, byte[] PrivateKey) GenerateEcdhKeyPair()
+    {
+        using var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
+        var pubKey = ExportRawPublicKey(ecdh.ExportParameters(false).Q);
+        var privKey = ecdh.ExportECPrivateKey();
+        return (pubKey, privKey);
+    }
+
+    /// <summary>ECIES ラップ: 相手の公開鍵でマスターキーを共有鍵暗号化する。
+    /// WASM/Web の e2ee.js ecdhWrap とプロトコル互換
+    /// （raw 公開鍵 + HKDF-SHA256(salt=空, info="CistaNAS-ECIES") + AES-256-GCM）。</summary>
+    public static (byte[] EphemeralPublicKey, byte[] Nonce, byte[] Ciphertext, byte[] Tag) EcdhWrap(
+        byte[] masterKey, byte[] recipientPublicKeyRaw)
+    {
+        // 一時鍵ペア生成
+        using var ephemeral = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
+
+        // 相手の公開鍵を raw からインポート
+        using var recipient = ImportPublicKeyFromRaw(recipientPublicKeyRaw);
+
+        // 生の ECDH 共有秘密 Z（ブラウザ crypto.subtle.deriveBits("ECDH", 256) とバイト完全一致）
+        byte[] sharedSecret = ephemeral.DeriveRawSecretAgreement(recipient.PublicKey);
+
+        // HKDF-SHA256 でラップ鍵を導出（salt=空）
+        byte[] wrappingKey = HkdfSha256(sharedSecret, Array.Empty<byte>(),
+            Encoding.UTF8.GetBytes(EciesInfo), 32);
+        CryptographicOperations.ZeroMemory(sharedSecret);
+
+        // AES-256-GCM でマスターキーを暗号化
+        var (nonce, ct, tag) = WrapMasterKey(masterKey, wrappingKey, "aes-256-gcm");
+        CryptographicOperations.ZeroMemory(wrappingKey);
+
+        // 一時公開鍵を raw でエクスポート
+        byte[] ephemeralPubKey = ExportRawPublicKey(ephemeral.ExportParameters(false).Q);
+        return (ephemeralPubKey, nonce, ct, tag);
+    }
+
+    /// <summary>ECIES アンラップ: 自分の秘密鍵でマスターキーを復号する。
+    /// WASM/Web の e2ee.js ecdhUnwrap とプロトコル互換。</summary>
+    public static byte[] EcdhUnwrap(byte[] nonce, byte[] ct, byte[] tag,
+        byte[] ephemeralPublicKeyRaw, byte[] myPrivateKeySec1)
+    {
+        // 自分の秘密鍵を SEC1 からインポート
+        using var mine = ECDiffieHellman.Create();
+        mine.ImportECPrivateKey(myPrivateKeySec1, out _);
+
+        // 相手の一時公開鍵を raw からインポート
+        using var ephemeral = ImportPublicKeyFromRaw(ephemeralPublicKeyRaw);
+
+        // 生の ECDH 共有秘密 Z
+        byte[] sharedSecret = mine.DeriveRawSecretAgreement(ephemeral.PublicKey);
+
+        // HKDF-SHA256 でラップ鍵を導出
+        byte[] wrappingKey = HkdfSha256(sharedSecret, Array.Empty<byte>(),
+            Encoding.UTF8.GetBytes(EciesInfo), 32);
+        CryptographicOperations.ZeroMemory(sharedSecret);
+
+        try
+        {
+            return UnwrapMasterKey(nonce, ct, tag, wrappingKey, "aes-256-gcm");
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(wrappingKey);
+        }
+    }
+
+    /// <summary>raw 非圧縮点公開鍵（0x04 || X[32] || Y[32], 65 バイト）を ECPoint から構築。</summary>
+    private static byte[] ExportRawPublicKey(ECPoint q)
+    {
+        byte[] raw = new byte[65];
+        raw[0] = 0x04;
+        Buffer.BlockCopy(PadField(q.X), 0, raw, 1, 32);
+        Buffer.BlockCopy(PadField(q.Y), 0, raw, 33, 32);
+        return raw;
+    }
+
+    /// <summary>raw 非圧縮点公開鍵（65 バイト）から ECDiffieHellman を構築。</summary>
+    private static ECDiffieHellman ImportPublicKeyFromRaw(byte[] raw)
+    {
+        if (raw is null || raw.Length != 65 || raw[0] != 0x04)
+            throw new ArgumentException("公開鍵は raw 非圧縮点 65 バイト（0x04 || X || Y）である必要があります。", nameof(raw));
+
+        var ecp = new ECParameters
+        {
+            Curve = ECCurve.NamedCurves.nistP256,
+            Q = new ECPoint { X = raw[1..33], Y = raw[33..65] }
+        };
+        return ECDiffieHellman.Create(ecp);
+    }
+
+    /// <summary>P-256 フィールド要素を 32 バイトに左ゼロパディング（leading zero の strip 対策）。</summary>
+    private static byte[] PadField(byte[]? value)
+    {
+        if (value is null) return new byte[32];
+        if (value.Length == 32) return value;
+        if (value.Length > 32) throw new ArgumentException("フィールド要素が 32 バイトを超えています。");
+        byte[] padded = new byte[32];
+        Buffer.BlockCopy(value, 0, padded, 32 - value.Length, value.Length);
+        return padded;
     }
 
     // ---- 内部ヘルパー ----

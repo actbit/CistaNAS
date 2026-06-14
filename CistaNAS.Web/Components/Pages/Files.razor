@@ -467,16 +467,48 @@ else
                 return;
             }
 
-            string saltB64 = Convert.ToBase64String(userKey.Kdf.Salt);
-            kekHandle = await E2ee.DeriveKek(_e2eePassword, saltB64, userKey.Kdf.Iterations);
-            string nonceB64 = Convert.ToBase64String(userKey.WrappedMasterKey.Nonce);
-            string ctB64 = Convert.ToBase64String(userKey.WrappedMasterKey.Ciphertext);
-            string tagB64 = Convert.ToBase64String(userKey.WrappedMasterKey.Tag);
+            if (string.Equals(userKey.WrapType, "ecdh", StringComparison.OrdinalIgnoreCase))
+            {
+                // ECDH ラップキー: localStorage の ECDH 秘密鍵（password 復号）で ECIES アンラップ
+                if (userKey.EphemeralPublicKey is null)
+                    throw new Exception("ECDH ラップキーに一時公開鍵が含まれていません。");
 
-            _masterKeyHandle = await E2ee.UnwrapMasterKey(nonceB64, ctB64, tagB64, kekHandle);
-            // アンラップ成功後に KEK をクリアし、変数を null にして finally での再試行を防ぐ
-            await E2ee.ClearKey(kekHandle);
-            kekHandle = null;
+                string privJson = await JS.InvokeAsync<string>("localStorage.getItem", $"e2ee_privkey_{CurrentUsername}");
+                if (string.IsNullOrEmpty(privJson))
+                    throw new Exception("ローカルに E2EE 秘密鍵が見つかりません。先に鍵ペアを生成してください。");
+
+                using var privDoc = System.Text.Json.JsonDocument.Parse(privJson);
+                var privRoot = privDoc.RootElement;
+                string privHandle = await E2ee.DecryptPrivateKey(
+                    privRoot.GetProperty("wrapped").GetString()!,
+                    privRoot.GetProperty("nonce").GetString()!,
+                    _e2eePassword,
+                    privRoot.GetProperty("salt").GetString()!,
+                    privRoot.GetProperty("iterations").GetInt32());
+                try
+                {
+                    _masterKeyHandle = await E2ee.EcdhUnwrap(
+                        Convert.ToBase64String(userKey.WrappedMasterKey.Nonce),
+                        Convert.ToBase64String(userKey.WrappedMasterKey.Ciphertext),
+                        Convert.ToBase64String(userKey.WrappedMasterKey.Tag),
+                        Convert.ToBase64String(userKey.EphemeralPublicKey),
+                        privHandle);
+                }
+                finally { await E2ee.ClearKey(privHandle); }
+            }
+            else
+            {
+                string saltB64 = Convert.ToBase64String(userKey.Kdf.Salt);
+                kekHandle = await E2ee.DeriveKek(_e2eePassword, saltB64, userKey.Kdf.Iterations, CurrentUsername);
+                string nonceB64 = Convert.ToBase64String(userKey.WrappedMasterKey.Nonce);
+                string ctB64 = Convert.ToBase64String(userKey.WrappedMasterKey.Ciphertext);
+                string tagB64 = Convert.ToBase64String(userKey.WrappedMasterKey.Tag);
+
+                _masterKeyHandle = await E2ee.UnwrapMasterKey(nonceB64, ctB64, tagB64, kekHandle);
+                // アンラップ成功後に KEK をクリアし、変数を null にして finally での再試行を防ぐ
+                await E2ee.ClearKey(kekHandle);
+                kekHandle = null;
+            }
 
             _e2eeUnlocked = true;
             _e2eePassword = "";

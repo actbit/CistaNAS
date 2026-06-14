@@ -20,10 +20,11 @@ public sealed class E2eeInterop(IJSRuntime js) : IAsyncDisposable
     // ---- 鍵管理 ----
 
     /// <summary>PBKDF2 で KEK を導出し、JS 側にキャッシュしてハンドルを返す。</summary>
-    public async Task<string> DeriveKek(string password, string saltBase64, int iterations)
+    /// <param name="username">クロスプラットフォーム互換のため SHA256(username) をソルトに混入（VolumeHeader.DeriveKek と統一）。</param>
+    public async Task<string> DeriveKek(string password, string saltBase64, int iterations, string? username = null)
     {
         var mod = await GetModule();
-        return await mod.InvokeAsync<string>("deriveKek", password, saltBase64, iterations);
+        return await mod.InvokeAsync<string>("deriveKek", password, saltBase64, iterations, username as object);
     }
 
     /// <summary>マスターキーを JS 側で生成してハンドルを返す。</summary>

@@ -79,7 +79,8 @@ public class ClientE2eeRoundtripTests : IAsyncDisposable
         Assert.Equal(fileSalt, extractedSalt);
         Assert.Equal(plainChunk0, decChunk0);
 
-        byte[] decChunk1 = E2eeCrypto.DecryptChunk(encChunk1, fileKey, 1, out _);
+        // チャンク1の復号にはfileSaltが必要
+        byte[] decChunk1 = E2eeCrypto.DecryptChunk(encChunk1, fileKey, 1, fileSalt);
         Assert.Equal(plainChunk1, decChunk1);
 
         CryptographicOperations.ZeroMemory(clientMasterKey);

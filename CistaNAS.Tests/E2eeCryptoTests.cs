@@ -125,9 +125,15 @@ public class E2eeCryptoTests
         Assert.Equal(chunkSize + 16, encrypted[1].Length);
         Assert.Equal(500 + 16, encrypted[2].Length);
 
-        for (int i = 0; i < 3; i++)
+        // チャンク0からfileSaltを取得
+        byte[] dec0 = E2eeCrypto.DecryptChunk(encrypted[0], fileKey, 0, out var salt0);
+        Assert.Equal(plains[0], dec0);
+        Assert.Equal(fileSalt, salt0);
+
+        // 残りのチャンクを復号（fileSaltを再利用）
+        for (int i = 1; i < 3; i++)
         {
-            byte[] dec = E2eeCrypto.DecryptChunk(encrypted[i], fileKey, i, out _);
+            byte[] dec = E2eeCrypto.DecryptChunk(encrypted[i], fileKey, i, fileSalt);
             Assert.Equal(plains[i], dec);
         }
     }

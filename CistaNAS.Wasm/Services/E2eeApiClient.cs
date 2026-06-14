@@ -75,14 +75,6 @@ public sealed class E2eeApiClient
         response.EnsureSuccessStatusCode();
     }
 
-    /// <summary>E2EE マウント情報。</summary>
-    public async Task<E2eeMountResponse> GetMountInfoAsync(string volumeName)
-    {
-        var result = await _http.GetFromJsonAsync<E2eeMountResponse>(
-            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/mount");
-        return result!;
-    }
-
     /// <summary>ボリューム使用量統計。</summary>
     public async Task<E2eeVolumeStats> GetStatsAsync(string volumeName)
     {
@@ -100,5 +92,16 @@ public sealed class E2eeApiClient
         response.EnsureSuccessStatusCode();
     }
 
+    /// <summary>招待を作成する。</summary>
+    public async Task<string> CreateInvitationAsync(string targetUsername)
+    {
+        var response = await _http.PostAsJsonAsync("/api/v1/e2ee/invitations",
+            new CreateInvitationRequest(targetUsername));
+        response.EnsureSuccessStatusCode();
+        var result = await response.Content.ReadFromJsonAsync<InvitationIdResponse>();
+        return result?.InvitationId ?? "";
+    }
+
     private sealed record HashResponse(string Hash);
+    private sealed record InvitationIdResponse(string InvitationId);
 }

@@ -22,4 +22,16 @@ public partial class MainWindow : Window
                 vm.ShowMountCommand.Execute(null);
         }
     }
+
+    private void CloseMountDialog(object? sender, RoutedEventArgs e)
+    {
+        if (DataContext is MainViewModel vm)
+            vm.ShowMountDialog = false;
+    }
+
+    private void CloseShareDialog(object? sender, RoutedEventArgs e)
+    {
+        if (DataContext is MainViewModel vm)
+            vm.ShowShareDialog = false;
+    }
 }

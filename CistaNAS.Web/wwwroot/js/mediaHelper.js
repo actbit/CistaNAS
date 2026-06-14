@@ -15,6 +15,38 @@ window.cistaMedia = {
         }
     },
 
+    /**
+     * ストリーミングURLを取得してメディア要素にセットする。
+     * Blazorから呼び出す。
+     */
+    async setStreamUrl(elementId, apiBase, volumeName, fileName, mediaType) {
+        const element = document.getElementById(elementId);
+        if (!element) {
+            console.error("Element not found:", elementId);
+            return;
+        }
+
+        try {
+            // sessionStorageからJWTトークンを取得
+            const jwtToken = sessionStorage.getItem("cista_jwt");
+            if (!jwtToken) {
+                console.error("JWT token not found in sessionStorage");
+                return;
+            }
+
+            // ストリーミングURLを取得
+            const streamUrl = await this.getStreamUrl(apiBase, volumeName, fileName, jwtToken);
+            element.src = streamUrl;
+
+            // video/audio要素の場合はload()を呼ぶ
+            if (element.tagName === "VIDEO" || element.tagName === "AUDIO") {
+                element.load();
+            }
+        } catch (err) {
+            console.error("Failed to set stream URL:", err);
+        }
+    },
+
     // ---- 通常ボリューム: ストリーミング ----
 
     /**
@@ -157,8 +189,9 @@ window.cistaMedia = {
             if (idx >= total) return null;
             const url = options.apiUrl + "/api/v1/e2ee/" + encodeURIComponent(options.volumeName)
                 + "/download-chunk/" + options.fileId + "/" + idx;
+            const jwtToken = options.jwtToken || sessionStorage.getItem("cista_jwt");
             const resp = await fetch(url, {
-                headers: { "Authorization": "Bearer " + options.jwtToken }
+                headers: { "Authorization": "Bearer " + jwtToken }
             });
             if (!resp.ok) throw new Error("chunk download failed: " + resp.status + " idx=" + idx);
             const encBuf = await resp.arrayBuffer();
@@ -174,7 +207,7 @@ window.cistaMedia = {
                 encB64, options.masterKeyHandle, idx, options.fileSaltBase64);
 
             idx++;
-            try { options.dotNetRef.invokeMethod("OnProgress", idx); } catch {}
+            try { if (options.dotNetRef) options.dotNetRef.invokeMethod("OnProgress", idx); } catch {}
 
             return plainB64;
         };
@@ -229,6 +262,9 @@ async function fallbackBlob(element, mimeType, getNextChunk, onProgress) {
     const blob = new Blob(chunks, { type: mimeType });
     const url = URL.createObjectURL(blob);
     element.src = url;
-    element.load();
-    try { await element.play(); } catch {}
+    // <img> には load()/play() が無いため video/audio のみ呼ぶ（画像は src 設定だけで表示）
+    if (element.tagName === "VIDEO" || element.tagName === "AUDIO") {
+        element.load();
+        try { await element.play(); } catch {}
+    }
 }

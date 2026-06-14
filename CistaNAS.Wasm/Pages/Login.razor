@@ -1,0 +1,85 @@
+@page "/login"
+@using CistaNAS.Wasm.Auth
+@using CistaNAS.Wasm.Services
+@implements IDisposable
+@inject WasmAuthStateProvider Auth
+@inject AuthApiClient AuthApi
+@inject NavigationManager Nav
+
+<PageTitle>ログイン - CistaNAS</PageTitle>
+
+<h1>ログイン</h1>
+
+@if (Auth.IsLoggedIn)
+{
+    <p>既にログインしています。</p>
+    <a href="/volumes" class="btn btn-primary">ボリューム一覧へ</a>
+}
+else
+{
+    @if (_error is not null)
+    {
+        <div class="alert alert-danger">@_error</div>
+    }
+
+    <div class="form-narrow">
+        <EditForm Model="_model" OnValidSubmit="HandleLogin" FormName="LoginForm">
+            <div class="mb-3">
+                <label class="form-label">ユーザー名</label>
+                <InputText @bind-Value="_model.Username" class="form-control" />
+            </div>
+            <div class="mb-3">
+                <label class="form-label">パスワード</label>
+                <InputText type="password" @bind-Value="_model.Password" class="form-control" />
+            </div>
+            <button type="submit" class="btn btn-primary" disabled="@_loading">
+                @(_loading ? "ログイン中..." : "ログイン")
+            </button>
+        </EditForm>
+    </div>
+}
+
+@code {
+    private LoginModel _model = new();
+    private bool _loading;
+    private string? _error;
+
+    private sealed class LoginModel
+    {
+        public string Username { get; set; } = "";
+        public string Password { get; set; } = "";
+    }
+
+    protected override void OnInitialized() => Auth.StateChanged += StateChanged;
+
+    private async Task HandleLogin()
+    {
+        _loading = true;
+        _error = null;
+
+        try
+        {
+            var result = await AuthApi.LoginAsync(_model.Username, _model.Password);
+            if (result is not null)
+            {
+                await Auth.SetTokenAsync(result.AccessToken, result.ExpiresAt);
+                Nav.NavigateTo("/volumes", forceLoad: false);
+            }
+            else
+            {
+                _error = "ユーザー名またはパスワードが正しくありません。";
+            }
+        }
+        catch
+        {
+            _error = "ログイン中にエラーが発生しました。";
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private void StateChanged() => StateHasChanged();
+    public void Dispose() => Auth.StateChanged -= StateChanged;
+}
