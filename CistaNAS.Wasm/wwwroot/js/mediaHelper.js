@@ -262,6 +262,9 @@ async function fallbackBlob(element, mimeType, getNextChunk, onProgress) {
     const blob = new Blob(chunks, { type: mimeType });
     const url = URL.createObjectURL(blob);
     element.src = url;
-    element.load();
-    try { await element.play(); } catch {}
+    // <img> には load()/play() が無いため video/audio のみ呼ぶ（画像は src 設定だけで表示）
+    if (element.tagName === "VIDEO" || element.tagName === "AUDIO") {
+        element.load();
+        try { await element.play(); } catch {}
+    }
 }

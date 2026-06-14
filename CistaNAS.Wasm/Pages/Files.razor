@@ -297,16 +297,48 @@ else
 
             _e2eeChunkSize = wrappedKeyResp.ChunkSize;
 
-            kekHandle = await E2ee.DeriveKek(_e2eePassword, wrappedKeyResp.Kdf.Salt, wrappedKeyResp.Kdf.Iterations, Auth.CurrentUsername);
+            if (string.Equals(wrappedKeyResp.WrapType, "ecdh", StringComparison.OrdinalIgnoreCase))
+            {
+                // ECDH ラップキー: localStorage の ECDH 秘密鍵（password 復号）で ECIES アンラップ
+                if (string.IsNullOrEmpty(wrappedKeyResp.EphemeralPublicKey))
+                    throw new Exception("ECDH ラップキーに一時公開鍵が含まれていません。");
 
-            _masterKeyHandle = await E2ee.UnwrapMasterKey(
-                wrappedKeyResp.WrappedMasterKey.Nonce,
-                wrappedKeyResp.WrappedMasterKey.Ciphertext,
-                wrappedKeyResp.WrappedMasterKey.Tag,
-                kekHandle);
+                string privJson = await JS.InvokeAsync<string>("localStorage.getItem", $"e2ee_privkey_{Auth.CurrentUsername}");
+                if (string.IsNullOrEmpty(privJson))
+                    throw new Exception("ローカルに E2EE 秘密鍵が見つかりません。先に鍵ペアを生成してください。");
 
-            await E2ee.ClearKey(kekHandle);
-            kekHandle = null;
+                using var privDoc = System.Text.Json.JsonDocument.Parse(privJson);
+                var privRoot = privDoc.RootElement;
+                string privHandle = await E2ee.DecryptPrivateKey(
+                    privRoot.GetProperty("wrapped").GetString()!,
+                    privRoot.GetProperty("nonce").GetString()!,
+                    _e2eePassword,
+                    privRoot.GetProperty("salt").GetString()!,
+                    privRoot.GetProperty("iterations").GetInt32());
+                try
+                {
+                    _masterKeyHandle = await E2ee.EcdhUnwrap(
+                        wrappedKeyResp.WrappedMasterKey.Nonce,
+                        wrappedKeyResp.WrappedMasterKey.Ciphertext,
+                        wrappedKeyResp.WrappedMasterKey.Tag,
+                        wrappedKeyResp.EphemeralPublicKey,
+                        privHandle);
+                }
+                finally { await E2ee.ClearKey(privHandle); }
+            }
+            else
+            {
+                kekHandle = await E2ee.DeriveKek(_e2eePassword, wrappedKeyResp.Kdf.Salt, wrappedKeyResp.Kdf.Iterations, Auth.CurrentUsername);
+
+                _masterKeyHandle = await E2ee.UnwrapMasterKey(
+                    wrappedKeyResp.WrappedMasterKey.Nonce,
+                    wrappedKeyResp.WrappedMasterKey.Ciphertext,
+                    wrappedKeyResp.WrappedMasterKey.Tag,
+                    kekHandle);
+
+                await E2ee.ClearKey(kekHandle);
+                kekHandle = null;
+            }
 
             _e2eeUnlocked = true;
             _e2eePassword = "";

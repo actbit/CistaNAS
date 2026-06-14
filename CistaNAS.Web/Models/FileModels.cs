@@ -100,7 +100,6 @@ public sealed record AddE2eeWrappedKeysBatchRequest(
     [Required] Dictionary<string, VolumeHeader.UserWrappedKey> WrappedKeys);
 public sealed record CreateInvitationRequest([Required] [StringLength(128)] string TargetUsername);
 public sealed record AcceptInvitationRequest(
-    [Required] string InvitationId,
     [Required] string EncryptedPublicKey,
     [Required] string Nonce);
 public sealed record InvitationResponse(string InvitationId, string InviterUsername, DateTimeOffset CreatedAt);

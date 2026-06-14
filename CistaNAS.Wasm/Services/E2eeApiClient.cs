@@ -75,14 +75,6 @@ public sealed class E2eeApiClient
         response.EnsureSuccessStatusCode();
     }
 
-    /// <summary>E2EE マウント情報。</summary>
-    public async Task<E2eeMountResponse> GetMountInfoAsync(string volumeName)
-    {
-        var result = await _http.GetFromJsonAsync<E2eeMountResponse>(
-            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/mount");
-        return result!;
-    }
-
     /// <summary>ボリューム使用量統計。</summary>
     public async Task<E2eeVolumeStats> GetStatsAsync(string volumeName)
     {

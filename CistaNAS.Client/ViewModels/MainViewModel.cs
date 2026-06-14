@@ -314,7 +314,7 @@ public partial class MainViewModel : ObservableObject
         CryptographicOperations.ZeroMemory(kek);
         CryptographicOperations.ZeroMemory(masterKey);
 
-        await CistaNasApiClientE2eeExtensions.CreateGroupVolumeAsync(_api!, CreateVolName, nonce, ct, tag);
+        await CistaNasApiClientE2eeExtensions.CreateGroupVolumeAsync(_api!, CreateVolName, nonce, ct, tag, salt, 600_000);
     }
 
     [RelayCommand]
@@ -503,12 +503,12 @@ public partial class MainViewModel : ObservableObject
             byte[] masterKey = E2eeCrypto.UnwrapMasterKey(wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag, kek);
             CryptographicOperations.ZeroMemory(kek);
 
-            // ECIES ラップ (E2eeCrypto を使用)
-            byte[] recipientPubKeyDer = Convert.FromBase64String(recipientPubKeyB64);
-            var (ephPubKey, nonce, ct, tag) = E2eeCrypto.EcdhWrap(masterKey, recipientPubKeyDer);
+            // ECIES ラップ (E2eeCrypto を使用) - 相手公開鍵は raw 非圧縮点 65B
+            byte[] recipientPubKeyRaw = Convert.FromBase64String(recipientPubKeyB64);
+            var (ephPubKey, nonce, ct, tag) = E2eeCrypto.EcdhWrap(masterKey, recipientPubKeyRaw);
             CryptographicOperations.ZeroMemory(masterKey);
 
-            await CistaNasApiClientE2eeExtensions.AddWrappedKeyAsync(_api, SelectedVolume.Name, EcdhUsername.Trim(), nonce, ct, tag);
+            await CistaNasApiClientE2eeExtensions.AddWrappedKeyAsync(_api, SelectedVolume.Name, EcdhUsername.Trim(), nonce, ct, tag, ephPubKey);
             StatusMessage = $"{EcdhUsername} に ECDH 共有しました。";
             EcdhUsername = "";
             GrantGranterPassword = "";
@@ -709,24 +709,25 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand]
     private async Task GenerateKeyPair()
     {
-        if (_api is null || string.IsNullOrWhiteSpace(KeyPairPassword)) return;
+        if (_api is null || string.IsNullOrWhiteSpace(Username)) return;
         IsBusy = true;
         try
         {
-            // ECDH P-256 鍵ペア生成
+            // ECDH P-256 鍵ペア生成（公開鍵は raw 非圧縮点 65B、秘密鍵は SEC1）
             var (publicKey, privateKey) = E2eeCrypto.GenerateEcdhKeyPair();
+            try
+            {
+                // 公開鍵をサーバーに登録（raw 65B を Base64 で送信。WASM と同一形式）
+                await CistaNasApiClientE2eeExtensions.SetMyPublicKeyAsync(_api, publicKey);
 
-            // 公開鍵をサーバーに登録
-            await CistaNasApiClientE2eeExtensions.SetMyPublicKeyAsync(_api, publicKey);
-
-            // 秘密鍵をパスワードで暗号化してローカルに保存
-            byte[] salt = RandomNumberGenerator.GetBytes(16);
-            byte[] kek = E2eeCrypto.DeriveKek(Username!, KeyPairPassword, salt, 600_000);
-            var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(privateKey, kek);
-            CryptographicOperations.ZeroMemory(kek);
-            CryptographicOperations.ZeroMemory(privateKey);
-
-            // TODO: 暗号化済み秘密鍵をローカルファイルに保存
+                // 秘密鍵を DPAPI (CurrentUser) で保護してローカルに永続化。
+                // マウント時にパスワード入力不要で ECDH アンラップ可能。
+                EcdhKeyStore.SavePrivateKey(Username!, privateKey);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(privateKey);
+            }
 
             HasPublicKey = true;
             StatusMessage = "E2EE 鍵ペアを生成・登録しました。";

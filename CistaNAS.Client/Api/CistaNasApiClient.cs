@@ -79,6 +79,10 @@ public sealed class CistaNasApiClient
             KdfAlgorithm = kdf.GetProperty("algorithm").GetString()!,
             KdfIterations = kdf.GetProperty("iterations").GetInt32(),
             KdfSalt = Convert.FromBase64String(kdf.GetProperty("salt").GetString()!),
+            WrapType = json.TryGetProperty("wrapType", out var wt) && wt.ValueKind == JsonValueKind.String
+                ? wt.GetString() : "password",
+            EphemeralPublicKey = json.TryGetProperty("ephemeralPublicKey", out var eph) && eph.ValueKind == JsonValueKind.String
+                ? Convert.FromBase64String(eph.GetString()!) : null,
             WrappedNonce = Convert.FromBase64String(wk.GetProperty("nonce").GetString()!),
             WrappedCiphertext = Convert.FromBase64String(wk.GetProperty("ciphertext").GetString()!),
             WrappedTag = Convert.FromBase64String(wk.GetProperty("tag").GetString()!),
@@ -233,6 +237,10 @@ public class WrappedKeyInfo
     public required string KdfAlgorithm { get; set; }
     public required int KdfIterations { get; set; }
     public required byte[] KdfSalt { get; set; }
+    /// <summary>"password" or "ecdh"。未指定時は password。</summary>
+    public string? WrapType { get; set; }
+    /// <summary>ECDH ラップキーの一時公開鍵（raw 65B）。password ラップ時は null。</summary>
+    public byte[]? EphemeralPublicKey { get; set; }
     public required byte[] WrappedNonce { get; set; }
     public required byte[] WrappedCiphertext { get; set; }
     public required byte[] WrappedTag { get; set; }

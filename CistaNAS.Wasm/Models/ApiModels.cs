@@ -111,7 +111,7 @@ public sealed record AddGroupMemberRequest(string Username);
 public sealed record SetPublicKeyRequest(string PublicKey);
 public sealed record CreateGroupE2eeVolumeRequest(string GroupName, UserWrappedKey OwnerWrappedKey, int ChunkSize = 1048576);
 public sealed record CreateInvitationRequest(string TargetUsername);
-public sealed record AcceptInvitationRequest(string InvitationId, string EncryptedPublicKey, string Nonce);
+public sealed record AcceptInvitationRequest(string EncryptedPublicKey, string Nonce);
 public sealed record StreamTokenRequest(string VolumeName, string FileName);
 
 /// <summary>ラップ鍵取得レスポンス。サーバーは Base64 文字列で返す。</summary>

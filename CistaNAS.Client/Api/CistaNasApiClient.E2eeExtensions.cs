@@ -8,9 +8,9 @@ public static class CistaNasApiClientE2eeExtensions
 {
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
-    /// <summary>E2EE ボリュームにユーザーの wrapped key を追加する（ECDH 用）。</summary>
+    /// <summary>E2EE ボリュームにユーザーの ECDH ラップキーを追加する。</summary>
     public static async Task AddWrappedKeyAsync(this CistaNasApiClient client, string volumeName, string username,
-        byte[] wrappedNonce, byte[] wrappedCt, byte[] wrappedTag)
+        byte[] wrappedNonce, byte[] wrappedCt, byte[] wrappedTag, byte[] ephemeralPublicKey)
     {
         var http = GetHttp(client);
         var req = new
@@ -25,6 +25,7 @@ public static class CistaNasApiClientE2eeExtensions
                     iterations = 0,
                     salt = Array.Empty<byte>()
                 },
+                ephemeralPublicKey,
                 wrappedMasterKey = new
                 {
                     algorithm = "aes-256-gcm",
@@ -57,13 +58,13 @@ public static class CistaNasApiClientE2eeExtensions
         return result;
     }
 
-    /// <summary>E2EE ボリュームに複数ユーザーの wrapped key を一括追加する（ECDH 用）。</summary>
+    /// <summary>E2EE ボリュームに複数ユーザーの ECDH ラップキーを一括追加する。</summary>
     public static async Task AddWrappedKeysBatchAsync(this CistaNasApiClient client, string volumeName,
-        Dictionary<string, (byte[] nonce, byte[] ct, byte[] tag)> wrappedKeys)
+        Dictionary<string, (byte[] nonce, byte[] ct, byte[] tag, byte[] ephemeralPublicKey)> wrappedKeys)
     {
         var http = GetHttp(client);
         var keys = new Dictionary<string, object>();
-        foreach (var (username, (nonce, ct, tag)) in wrappedKeys)
+        foreach (var (username, (nonce, ct, tag, ephemeralPublicKey)) in wrappedKeys)
         {
             keys[username] = new
             {
@@ -74,6 +75,7 @@ public static class CistaNasApiClientE2eeExtensions
                     iterations = 0,
                     salt = Array.Empty<byte>()
                 },
+                ephemeralPublicKey,
                 wrappedMasterKey = new
                 {
                     algorithm = "aes-256-gcm",
@@ -116,9 +118,9 @@ public static class CistaNasApiClientE2eeExtensions
         res.EnsureSuccessStatusCode();
     }
 
-    /// <summary>グループ専用 E2EE ボリュームを作成する（ECDH 用）。</summary>
+    /// <summary>グループ専用 E2EE ボリュームを作成する（オーナー鍵は password ラップ）。</summary>
     public static async Task<VolumeInfo> CreateGroupVolumeAsync(this CistaNasApiClient client, string groupName,
-        byte[] wrappedNonce, byte[] wrappedCt, byte[] wrappedTag, int chunkSize = 1048576)
+        byte[] wrappedNonce, byte[] wrappedCt, byte[] wrappedTag, byte[] kdfSalt, int kdfIterations, int chunkSize = 1048576)
     {
         var http = GetHttp(client);
         var req = new
@@ -126,12 +128,12 @@ public static class CistaNasApiClientE2eeExtensions
             groupName,
             ownerWrappedKey = new
             {
-                wrapType = "ecdh",
+                wrapType = "password",
                 kdf = new
                 {
                     algorithm = "pbkdf2-sha256",
-                    iterations = 0,
-                    salt = Array.Empty<byte>()
+                    iterations = kdfIterations,
+                    salt = kdfSalt
                 },
                 wrappedMasterKey = new
                 {

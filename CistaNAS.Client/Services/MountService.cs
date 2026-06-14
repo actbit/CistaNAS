@@ -25,11 +25,41 @@ public sealed class MountService
         // サーバーから wrapped key 情報を取得
         var wkInfo = await api.GetWrappedKeyAsync(volumeName, username);
 
-        // KEK を導出してマスターキーをアンラップ
-        byte[] kek = E2eeCrypto.DeriveKek(username, password, wkInfo.KdfSalt, wkInfo.KdfIterations);
-        byte[] masterKey = E2eeCrypto.UnwrapMasterKey(
-            wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag, kek);
-        CryptographicOperations.ZeroMemory(kek);
+        byte[] masterKey;
+        if (string.Equals(wkInfo.WrapType, "ecdh", StringComparison.OrdinalIgnoreCase))
+        {
+            // ECDH ラップキー: 自分の秘密鍵（DPAPI 永続化）で ECIES アンラップ。password 不要。
+            byte[]? privateKey = EcdhKeyStore.LoadPrivateKey(username);
+            if (privateKey is null)
+                throw new InvalidOperationException(
+                    "ローカルに ECDH 秘密鍵が見つかりません。先に設定で鍵ペアを生成してください。");
+            if (wkInfo.EphemeralPublicKey is null)
+                throw new InvalidOperationException("ECDH ラップキーに一時公開鍵が含まれていません。");
+            try
+            {
+                masterKey = E2eeCrypto.EcdhUnwrap(
+                    wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag,
+                    wkInfo.EphemeralPublicKey, privateKey);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(privateKey);
+            }
+        }
+        else
+        {
+            // password ラップキー: KEK を導出してアンラップ
+            byte[] kek = E2eeCrypto.DeriveKek(username, password, wkInfo.KdfSalt, wkInfo.KdfIterations);
+            try
+            {
+                masterKey = E2eeCrypto.UnwrapMasterKey(
+                    wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag, kek);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(kek);
+            }
+        }
 
         var fs = new CistaNasFileSystem(api, masterKey, volumeName, wkInfo.ChunkSize);
         await MountDokanAsync(volumeName, driveLetter, fs, masterKey);

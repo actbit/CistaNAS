@@ -430,7 +430,7 @@ else
     {
         byte[] salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
         string saltB64 = Convert.ToBase64String(salt);
-        string kekHandle = await E2ee.DeriveKek(password, saltB64, iterations);
+        string kekHandle = await E2ee.DeriveKek(password, saltB64, iterations, CurrentUsername);
         string mkHandle = await E2ee.GenerateMasterKey();
         var (nonceB64, ctB64, tagB64) = await E2ee.WrapMasterKey(mkHandle, kekHandle);
         await E2ee.ClearKey(kekHandle);
@@ -610,7 +610,7 @@ else
             try
             {
                 kekHandle = await E2ee.DeriveKek(_grantGranterPassword,
-                    Convert.ToBase64String(myKey.Kdf.Salt), myKey.Kdf.Iterations);
+                    Convert.ToBase64String(myKey.Kdf.Salt), myKey.Kdf.Iterations, CurrentUsername);
                 mkHandle = await E2ee.UnwrapMasterKey(
                     Convert.ToBase64String(myKey.WrappedMasterKey.Nonce),
                     Convert.ToBase64String(myKey.WrappedMasterKey.Ciphertext),
