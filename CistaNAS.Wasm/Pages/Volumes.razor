@@ -223,6 +223,7 @@ else
                         {
                             <div class="alert alert-warning">
                                 E2EE ボリュームです。パスワードを入力するとブラウザ内でマスターキーが導出されます。
+                                他のユーザーから E2EE 共有されたボリュームでは、ご自身の E2EE 鍵ペア生成時のパスワードを入力してください。
                             </div>
                             <div class="mb-3">
                                 <label class="form-label">パスワード</label>
@@ -591,12 +592,20 @@ else
 
                         using var privDoc = System.Text.Json.JsonDocument.Parse(privJson);
                         var privRoot = privDoc.RootElement;
-                        string privHandle = await E2ee.DecryptPrivateKey(
-                            privRoot.GetProperty("wrapped").GetString()!,
-                            privRoot.GetProperty("nonce").GetString()!,
-                            _mountPassword,
-                            privRoot.GetProperty("salt").GetString()!,
-                            privRoot.GetProperty("iterations").GetInt32());
+                        string privHandle;
+                        try
+                        {
+                            privHandle = await E2ee.DecryptPrivateKey(
+                                privRoot.GetProperty("wrapped").GetString()!,
+                                privRoot.GetProperty("nonce").GetString()!,
+                                _mountPassword,
+                                privRoot.GetProperty("salt").GetString()!,
+                                privRoot.GetProperty("iterations").GetInt32());
+                        }
+                        catch
+                        {
+                            throw new Exception("E2EE 鍵ペアのパスワードが正しくありません。E2EE 鍵ペア生成時のパスワードを入力してください。");
+                        }
                         try
                         {
                             mkHandle = await E2ee.EcdhUnwrap(
