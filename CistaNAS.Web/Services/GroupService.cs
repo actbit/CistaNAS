@@ -1,4 +1,5 @@
 using CistaNAS.Web.Identity;
+using CistaNAS.Web.Models;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -24,6 +25,13 @@ public sealed class GroupService(
             .Include(g => g.Members)
             .Where(g => g.Members.Any(m => m.Username == username))
             .ToListAsync();
+
+    /// <summary>ユーザーが所属するグループを DTO（EF ナビゲーションの循環参照回避）で返す。</summary>
+    public async Task<List<GroupDto>> GetGroupDtosForUserAsync(string username)
+        => (await GetGroupsForUserAsync(username))
+            .Select(g => new GroupDto(g.GroupName, g.OwnerUser, g.CreatedAt,
+                g.Members.Select(m => new MemberDto(m.Username)).ToList()))
+            .ToList();
 
     public async Task<bool> IsMemberAsync(string groupName, string username)
         => await db.Groups

@@ -293,15 +293,7 @@ public static class ApiEndpoints
         {
             string? username = ctx.User.Identity?.Name;
             if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
-            var groups = await gs.GetGroupsForUserAsync(username);
-            // DTO に射影して EF Core ナビゲーションプロパティの循環参照を回避
-            return Results.Ok(groups.Select(g => new
-            {
-                g.GroupName,
-                g.OwnerUser,
-                g.CreatedAt,
-                Members = g.Members.Select(m => new { m.Username }).ToList()
-            }));
+            return Results.Ok(await gs.GetGroupDtosForUserAsync(username));
         })
             .WithName("ListGroups");
 
@@ -399,12 +391,7 @@ public static class ApiEndpoints
         {
             string? username = ctx.User.Identity?.Name;
             if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
-            var users = await accountSvc.ListWithRolesAsync();
-            return Results.Ok(users.Select(u => new
-            {
-                u.User.UserName,
-                Roles = u.Roles
-            }));
+            return Results.Ok(await accountSvc.ListUserDtosAsync());
         })
         .WithName("ListUsers");
 
@@ -470,17 +457,7 @@ public static class ApiEndpoints
 
             try
             {
-                var current = encSvc.CurrentVolumeOptions();
-                var updated = new VolumeOptions
-                {
-                    SectorSize = body.SectorSize,
-                    KdfIterations = body.KdfIterations,
-                    DefaultEncryptionMode = body.DefaultEncryptionMode,
-                    E2eeChunkSize = body.E2eeChunkSize,
-                    ChunkStorage = current.ChunkStorage,
-                    ServerChunkSize = current.ServerChunkSize,
-                };
-                encSvc.SaveVolumeOptions(updated);
+                encSvc.UpdateVolumeOptions(body);
                 return Results.Ok();
             }
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
