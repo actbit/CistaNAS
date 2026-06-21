@@ -77,11 +77,13 @@ public sealed partial class VolumeService
     }
 
     /// <summary>ユーザーのパスワード変更時に全ボリュームの鍵を再ラップ。</summary>
-    public Task RewrapAllForUserAsync(string username, string oldPassword, string newPassword)
+    public async Task RewrapAllForUserAsync(string username, string oldPassword, string newPassword)
     {
-        return UnderMountGateAsync(async () =>
+        // ボリューム一覧はゲート外で取得し、ゲート保持時間を最小化する
+        var volumeNames = await _metaStore.ListVolumeNamesAsync();
+
+        await UnderMountGateAsync(async () =>
         {
-            var volumeNames = await _metaStore.ListVolumeNamesAsync();
             foreach (var name in volumeNames)
             {
                 var header = await LoadHeaderIfExistsAsync(name);
@@ -129,11 +131,13 @@ public sealed partial class VolumeService
         });
     }
 
-    public Task RemoveGroupFromAllVolumesAsync(string groupName)
+    public async Task RemoveGroupFromAllVolumesAsync(string groupName)
     {
-        return UnderMountGateAsync(async () =>
+        // ボリューム一覧はゲート外で取得し、ゲート保持時間を最小化する
+        var volumeNames = await _metaStore.ListVolumeNamesAsync();
+
+        await UnderMountGateAsync(async () =>
         {
-            var volumeNames = await _metaStore.ListVolumeNamesAsync();
             foreach (var name in volumeNames)
             {
                 var header = await LoadHeaderIfExistsAsync(name);
