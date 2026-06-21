@@ -24,8 +24,7 @@
     <!-- 古いWASM成果物をクリーンアップ（ハッシュ変更時のSRI整合性エラー防止） -->
     <RemoveDir Directories="./wwwroot/_framework" Condition="Exists('./wwwroot/_framework')" />
     <ItemGroup>
-      <WasmFiles Include="./publish-wasm-temp/wwwroot/**/*"
-                 Exclude="./publish-wasm-temp/wwwroot/**/*.gz;./publish-wasm-temp/wwwroot/**/*.br" />
+      <WasmFiles Include="./publish-wasm-temp/wwwroot/**/*" Exclude="./publish-wasm-temp/wwwroot/**/*.gz;./publish-wasm-temp/wwwroot/**/*.br" />
     </ItemGroup>
     <Copy SourceFiles="@(WasmFiles)" DestinationFolder="wwwroot/%(RecursiveDir)" SkipUnchangedFiles="true" />
     <RemoveDir Directories="./publish-wasm-temp" />
@@ -44,6 +43,7 @@
     </PackageReference>
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.8" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.2" />
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="3.50.3" />
   </ItemGroup>
 
 </Project>
