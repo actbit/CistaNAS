@@ -13,8 +13,8 @@ public class ChunkedReadStreamTests
     private const int ChunkSize = 65536; // テスト用に小さめ
 
     /// <summary>暗号化チャンクを InMemoryChunkStore に書き込み、ChunkedReadStream を返す。</summary>
-    private static (ChunkedReadStream stream, byte[] originalData, InMemoryChunkStore store)
-        PrepareStream(byte[] plainData, int chunksCount, byte[]? key = null)
+    private static async Task<(ChunkedReadStream stream, byte[] originalData, InMemoryChunkStore store)>
+        PrepareStreamAsync(byte[] plainData, int chunksCount, byte[]? key = null)
     {
         key ??= MasterKey();
         var store = new InMemoryChunkStore();
@@ -27,7 +27,7 @@ public class ChunkedReadStreamTests
             byte[] chunkPlain = plainData[offset..(offset + size)];
             byte[] encrypted = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, i, SectorSize, ChunkSize, chunkPlain);
             using var ms = new MemoryStream(encrypted);
-            store.WriteChunkAsync("vol", "file", i, ms).Wait();
+            await store.WriteChunkAsync("vol", "file", i, ms);
             chunkSizes.Add(size);
             offset += size;
         }
@@ -37,10 +37,10 @@ public class ChunkedReadStreamTests
     }
 
     [Fact]
-    public void SingleChunk_Roundtrip()
+    public async Task SingleChunk_Roundtrip()
     {
         byte[] plain = RandomNumberGenerator.GetBytes(ChunkSize);
-        var (stream, _, _) = PrepareStream(plain, 1);
+        var (stream, _, _) = await PrepareStreamAsync(plain, 1);
         using (stream)
         {
             byte[] result = new byte[plain.Length];
@@ -56,10 +56,10 @@ public class ChunkedReadStreamTests
     }
 
     [Fact]
-    public void MultiChunk_Roundtrip()
+    public async Task MultiChunk_Roundtrip()
     {
         byte[] plain = RandomNumberGenerator.GetBytes(ChunkSize * 3 + 1234);
-        var (stream, _, _) = PrepareStream(plain, 4);
+        var (stream, _, _) = await PrepareStreamAsync(plain, 4);
         using (stream)
         {
             byte[] result = new byte[plain.Length];
@@ -69,10 +69,10 @@ public class ChunkedReadStreamTests
     }
 
     [Fact]
-    public void Seek_And_Read()
+    public async Task Seek_And_Read()
     {
         byte[] plain = RandomNumberGenerator.GetBytes(ChunkSize * 2 + 500);
-        var (stream, _, _) = PrepareStream(plain, 3);
+        var (stream, _, _) = await PrepareStreamAsync(plain, 3);
         using (stream)
         {
             // 中央付近に Seek
@@ -88,11 +88,11 @@ public class ChunkedReadStreamTests
     }
 
     [Fact]
-    public void Read_AcrossChunkBoundary()
+    public async Task Read_AcrossChunkBoundary()
     {
         // チャンク境界をまたぐ読み取り
         byte[] plain = RandomNumberGenerator.GetBytes(ChunkSize * 2);
-        var (stream, _, _) = PrepareStream(plain, 2);
+        var (stream, _, _) = await PrepareStreamAsync(plain, 2);
         using (stream)
         {
             // チャンク境界の前後100バイトを読み取る
@@ -107,10 +107,10 @@ public class ChunkedReadStreamTests
     }
 
     [Fact]
-    public void Read_WithSmallBuffer()
+    public async Task Read_WithSmallBuffer()
     {
         byte[] plain = RandomNumberGenerator.GetBytes(5000);
-        var (stream, _, _) = PrepareStream(plain, 1);
+        var (stream, _, _) = await PrepareStreamAsync(plain, 1);
         using (stream)
         {
             byte[] result = new byte[plain.Length];
@@ -128,10 +128,10 @@ public class ChunkedReadStreamTests
     }
 
     [Fact]
-    public void Position_And_Length()
+    public async Task Position_And_Length()
     {
         byte[] plain = RandomNumberGenerator.GetBytes(ChunkSize * 2 + 100);
-        var (stream, _, _) = PrepareStream(plain, 3);
+        var (stream, _, _) = await PrepareStreamAsync(plain, 3);
         using (stream)
         {
             Assert.Equal(plain.Length, stream.Length);
@@ -143,10 +143,10 @@ public class ChunkedReadStreamTests
     }
 
     [Fact]
-    public void Read_PastEnd_ReturnsZero()
+    public async Task Read_PastEnd_ReturnsZero()
     {
         byte[] plain = RandomNumberGenerator.GetBytes(100);
-        var (stream, _, _) = PrepareStream(plain, 1);
+        var (stream, _, _) = await PrepareStreamAsync(plain, 1);
         using (stream)
         {
             // 全データ読み取り
@@ -161,10 +161,10 @@ public class ChunkedReadStreamTests
     }
 
     [Fact]
-    public void SeekOrigin_All()
+    public async Task SeekOrigin_All()
     {
         byte[] plain = RandomNumberGenerator.GetBytes(ChunkSize + 500);
-        var (stream, _, _) = PrepareStream(plain, 2);
+        var (stream, _, _) = await PrepareStreamAsync(plain, 2);
         using (stream)
         {
             // Begin
@@ -182,10 +182,10 @@ public class ChunkedReadStreamTests
     }
 
     [Fact]
-    public void ChunkCache_Reuse()
+    public async Task ChunkCache_Reuse()
     {
         byte[] plain = RandomNumberGenerator.GetBytes(ChunkSize);
-        var (stream, _, _) = PrepareStream(plain, 1);
+        var (stream, _, _) = await PrepareStreamAsync(plain, 1);
         using (stream)
         {
             // 1回目: チャンク読み込み
@@ -202,10 +202,10 @@ public class ChunkedReadStreamTests
     }
 
     [Fact]
-    public void Disposed_Read_Throws()
+    public async Task Disposed_Read_Throws()
     {
         byte[] plain = RandomNumberGenerator.GetBytes(100);
-        var (stream, _, _) = PrepareStream(plain, 1);
+        var (stream, _, _) = await PrepareStreamAsync(plain, 1);
         stream.Dispose();
 
         byte[] buf = new byte[10];
@@ -230,7 +230,7 @@ public class ChunkedReadStreamTests
     public async Task ReadAsync_Roundtrip()
     {
         byte[] plain = RandomNumberGenerator.GetBytes(ChunkSize * 2 + 500);
-        var (stream, _, _) = PrepareStream(plain, 3);
+        var (stream, _, _) = await PrepareStreamAsync(plain, 3);
         await using (stream.ConfigureAwait(false))
         {
             byte[] result = new byte[plain.Length];
@@ -243,7 +243,7 @@ public class ChunkedReadStreamTests
     public async Task ReadAsync_WithCancellationToken()
     {
         byte[] plain = RandomNumberGenerator.GetBytes(ChunkSize);
-        var (stream, _, _) = PrepareStream(plain, 1);
+        var (stream, _, _) = await PrepareStreamAsync(plain, 1);
         await using (stream.ConfigureAwait(false))
         {
             using var cts = new CancellationTokenSource();
@@ -265,7 +265,7 @@ public class ChunkedReadStreamTests
         byte[] plain = RandomNumberGenerator.GetBytes(ChunkSize);
         byte[] encrypted = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 0, SectorSize, ChunkSize, plain);
         using var ms = new MemoryStream(encrypted);
-        store.WriteChunkAsync("vol", "cancel", 0, ms).Wait();
+        await store.WriteChunkAsync("vol", "cancel", 0, ms);
 
         // 2チャンク目を書き込まない → 2チャンク目読み取り時にチャンクが見つからない
         var bigSizes = new List<int> { ChunkSize, ChunkSize };
@@ -298,7 +298,7 @@ public class ChunkedReadStreamTests
     public async Task ReadAsync_AcrossChunkBoundary()
     {
         byte[] plain = RandomNumberGenerator.GetBytes(ChunkSize * 3);
-        var (stream, _, _) = PrepareStream(plain, 3);
+        var (stream, _, _) = await PrepareStreamAsync(plain, 3);
         await using (stream.ConfigureAwait(false))
         {
             int start = ChunkSize - 50;

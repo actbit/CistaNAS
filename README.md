@@ -95,6 +95,20 @@ dotnet run --project CistaNAS.AppHost
 
 初回起動時は `/setup` にリダイレクトされ、管理者ユーザーの作成を求められる。
 
+### MinIO（S3 互換ストレージ）付きで起動
+
+環境変数 `ENABLE_MINIO=true` で Aspire が MinIO コンテナを起動し、webfrontend を S3 バックエンドに自動切替します。デフォルト（未設定）は local ストレージで本番影響なし。
+
+```bash
+# 環境変数で指定
+ENABLE_MINIO=true dotnet run --project CistaNAS.AppHost
+
+# またはコマンドライン引数で
+dotnet run --project CistaNAS.AppHost -- --ENABLE_MINIO true
+```
+
+MinIO コンソール: `http://localhost:9001`（認証: `minioadmin` / `minioadmin`）
+
 ### 個別起動（Aspire なし）
 
 ```bash
