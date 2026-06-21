@@ -1,19 +1,12 @@
 using System.Security.Cryptography;
-using CistaNAS.Web.Services;
+using CistaNAS.Web.Services.Streams;
 
 namespace CistaNAS.Tests;
 
 public class FileSubStreamTests
 {
-    private static readonly Type? FileSubStreamType =
-        typeof(FileService).Assembly.GetTypes()
-            .FirstOrDefault(t => t.Name.EndsWith("__FileSubStream") && typeof(Stream).IsAssignableFrom(t));
-
     private static Stream CreateFileSubStream(Stream baseStream, long offset, long length, SemaphoreSlim streamLock)
-    {
-        Assert.NotNull(FileSubStreamType);
-        return (Stream)Activator.CreateInstance(FileSubStreamType!, baseStream, offset, length, streamLock)!;
-    }
+        => new FileSubStream(baseStream, offset, length, streamLock);
 
     private static (Stream subStream, MemoryStream baseStream, byte[] data, SemaphoreSlim lock_) PrepareStream(
         int totalSize, long offset, long length)

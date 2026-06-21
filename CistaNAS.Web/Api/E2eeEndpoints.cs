@@ -116,30 +116,10 @@ public static class E2eeEndpoints
 
         try
         {
-            var header = await vs.GetVolumeHeaderAsync(volumeName);
-            if (!header.UserKeys.TryGetValue(username, out var key))
-                return Results.NotFound(new { error = "このユーザーの wrapped key が見つかりません。" });
-
-            return Results.Ok(new
-            {
-                wrapType = key.WrapType,
-                kdf = new
-                {
-                    algorithm = key.Kdf.Algorithm,
-                    iterations = key.Kdf.Iterations,
-                    salt = Convert.ToBase64String(key.Kdf.Salt),
-                },
-                wrappedMasterKey = new
-                {
-                    algorithm = key.WrappedMasterKey.Algorithm,
-                    nonce = Convert.ToBase64String(key.WrappedMasterKey.Nonce),
-                    ciphertext = Convert.ToBase64String(key.WrappedMasterKey.Ciphertext),
-                    tag = Convert.ToBase64String(key.WrappedMasterKey.Tag),
-                },
-                ephemeralPublicKey = key.EphemeralPublicKey is not null
-                    ? Convert.ToBase64String(key.EphemeralPublicKey) : null,
-                chunkSize = header.ChunkSize,
-            });
+            var res = await vs.GetWrappedKeyAsync(volumeName, username);
+            return res is not null
+                ? Results.Ok(res)
+                : Results.NotFound(new { error = "このユーザーの wrapped key が見つかりません。" });
         }
         catch (VolumeException ex)
         {

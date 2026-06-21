@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using CistaNAS.Web.Configuration;
+using CistaNAS.Web.Models;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Web.Services;
@@ -93,6 +94,22 @@ public sealed class EncryptionSettingsService
             _logger.LogError(ex, "cista-settings.json への保存に失敗しました。");
             throw;
         }
+    }
+
+    /// <summary>UpdateEncryptionSettingsRequest から VolumeOptions を構築して保存（ChunkStorage/ServerChunkSize は現状維持）。</summary>
+    public void UpdateVolumeOptions(UpdateEncryptionSettingsRequest body)
+    {
+        var current = CurrentVolumeOptions();
+        var updated = new VolumeOptions
+        {
+            SectorSize = body.SectorSize,
+            KdfIterations = body.KdfIterations,
+            DefaultEncryptionMode = body.DefaultEncryptionMode,
+            E2eeChunkSize = body.E2eeChunkSize,
+            ChunkStorage = current.ChunkStorage,
+            ServerChunkSize = current.ServerChunkSize,
+        };
+        SaveVolumeOptions(updated);
     }
 
     /// <summary>AuthOptions を cista-settings.json に保存する。</summary>

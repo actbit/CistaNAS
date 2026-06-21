@@ -111,6 +111,18 @@ public sealed class VolumeHeader
 
     public bool IsE2ee => EncryptionMode == "e2ee";
 
+    /// <summary>CipherAlgorithm 文字列をパースした実効値。未設定時は AES-256-XTS。</summary>
+    public CistaNAS.Shared.Crypto.CipherAlgorithm EffectiveCipherAlgorithm =>
+        string.IsNullOrEmpty(CipherAlgorithm)
+            ? CistaNAS.Shared.Crypto.CipherAlgorithm.Aes256Xts
+            : CipherAlgorithmExtensions.ParseCipherAlgorithm(CipherAlgorithm);
+
+    /// <summary>実効セクタサイズ（バイト）。未設定時は 4096。</summary>
+    public int EffectiveSectorSize => SectorSize > 0 ? SectorSize : 4096;
+
+    /// <summary>実効サーバーチャンクサイズ（バイト）。未設定時は 4 MiB。</summary>
+    public int EffectiveServerChunkSize => ServerChunkSize > 0 ? ServerChunkSize : 4194304;
+
     /// <summary>
     /// KEK 導出: PBKDF2-SHA256(password, SHA256(username) || salt, iterations, 32)
     /// ユーザー名がソルトの一部 → 同じパスワードでもユーザー違いで別 KEK。

@@ -1,4 +1,5 @@
 using CistaNAS.Web.Identity;
+using CistaNAS.Web.Models;
 using CistaNAS.Web.Volume;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
@@ -45,6 +46,12 @@ public sealed class AccountService(
             return (u, (IList<string>)roles);
         }).ToList();
     }
+
+    /// <summary>ユーザー一覧を DTO（UserName/Roles のみ）で返す。</summary>
+    public async Task<List<UserDto>> ListUserDtosAsync()
+        => (await ListWithRolesAsync())
+            .Select(u => new UserDto(u.User.UserName ?? "", u.Roles))
+            .ToList();
 
     public async Task CreateUserAsync(string username, string password, string role = "user")
     {

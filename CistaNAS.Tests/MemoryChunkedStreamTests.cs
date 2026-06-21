@@ -1,6 +1,5 @@
-using System.Reflection;
 using System.Security.Cryptography;
-using CistaNAS.Web.Services;
+using CistaNAS.Web.Services.Streams;
 using CistaNAS.Web.Storage;
 using CistaNAS.Tests.Helpers;
 
@@ -8,15 +7,8 @@ namespace CistaNAS.Tests;
 
 public class MemoryChunkedStreamTests
 {
-    private static readonly Type? MemoryChunkedStreamType =
-        typeof(FileService).Assembly.GetTypes()
-            .FirstOrDefault(t => t.Name.EndsWith("__MemoryChunkedStream") && typeof(Stream).IsAssignableFrom(t));
-
     private static Stream CreateMemoryChunkedStream(IChunkStore store, string vol, string obj, IReadOnlyList<int> chunkSizes)
-    {
-        Assert.NotNull(MemoryChunkedStreamType);
-        return (Stream)Activator.CreateInstance(MemoryChunkedStreamType!, store, vol, obj, chunkSizes)!;
-    }
+        => new MemoryChunkedStream(store, vol, obj, chunkSizes);
 
     private static (Stream stream, byte[] originalData) PrepareStream(byte[] data, int chunkSize)
     {

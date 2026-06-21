@@ -38,3 +38,15 @@ public sealed record VolumeInfo(
 
 /// <summary>ボリューム操作の業務エラー。</summary>
 public sealed class VolumeException(string message) : Exception(message);
+
+/// <summary>E2EE wrapped key 取得レスポンス（GetWrappedKey API）。</summary>
+public sealed record WrappedKeyResponse(
+    string WrapType,
+    KdfResponse Kdf,
+    WrappedMasterKeyResponse WrappedMasterKey,
+    string? EphemeralPublicKey,
+    int ChunkSize);
+
+public sealed record KdfResponse(string Algorithm, int Iterations, string Salt);
+
+public sealed record WrappedMasterKeyResponse(string Algorithm, string Nonce, string Ciphertext, string Tag);

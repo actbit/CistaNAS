@@ -1,136 +1,14 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
-using CistaNAS.Web.Configuration;
 using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Journal;
 using CistaNAS.Web.Models;
+using CistaNAS.Web.Services.Streams;
 using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Web.Services;
-
-/// <summary>
-/// async-friendly なファイル単位の読み書きゲート。
-/// 複数の並行読み取りを許可し、書き込みは全読み取りの完了を待機する。
-/// <see cref="ReaderWriterLockSlim"/> と異なりスレッドアフィンではないため、
-/// async/await で別スレッドに継続しても正しく動作する。
-/// </summary>
-internal sealed class AsyncFileGate : IDisposable
-{
-    private int _readerCount;
-    private int _writerWaiting; // ライター待機中フラグ（スタベーション防止）
-    private readonly SemaphoreSlim _gate = new(1, 1);
-    // ライターに「全リーダー完了」を即時通知する TCS
-    private TaskCompletionSource<object?>? _readersCompletedTcs;
-    private bool _disposed;
-
-    /// <summary>読み取りロックを取得。並行読み取り可。戻り値の IDisposable で解放。</summary>
-    public async Task<IDisposable> EnterReadAsync(CancellationToken ct)
-    {
-        // ライター待機中は新規リーダーの入場をブロック（スタベーション防止）
-        while (true)
-        {
-            await _gate.WaitAsync(ct);
-            if (Volatile.Read(ref _writerWaiting) == 0)
-            {
-                _readerCount++;
-                _gate.Release();
-                return new ReadReleaser(this);
-            }
-            _gate.Release();
-            await Task.Delay(TimeSpan.FromMilliseconds(10), ct);
-        }
-    }
-
-    /// <summary>書き込みロックを取得。全読み取りの完了を即時通知で待機。戻り値の IDisposable で解放。</summary>
-    public async Task<IDisposable> EnterWriteAsync(CancellationToken ct)
-    {
-        // 入口でキャンセル要求をチェックし、_writerWaiting を残さないように。
-        // 戻り時の例外パスでも _writerWaiting を必ず 0 に戻す。
-        bool writerWaitingSet = false;
-        try
-        {
-            await _gate.WaitAsync(ct);
-            Volatile.Write(ref _writerWaiting, 1);
-            writerWaitingSet = true;
-            while (_readerCount > 0)
-            {
-                // TCS を作成（gate 保持中）してから二重チェック
-                _readersCompletedTcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
-                if (Volatile.Read(ref _readerCount) == 0)
-                {
-                    // 二重チェック: 待機中に全リーダーが完了 → 即時突破
-                    _readersCompletedTcs = null;
-                    break;
-                }
-                _gate.Release();
-                try
-                {
-                    using var reg = ct.Register(static state => ((TaskCompletionSource<object?>)state!).TrySetCanceled(), _readersCompletedTcs);
-                    await _readersCompletedTcs.Task;
-                }
-                catch
-                {
-                    // キャンセル時は _writerWaiting をリセット
-                    // 注: gate は既に while ループ内で Release 済み。再 Release しないこと。
-                    Volatile.Write(ref _writerWaiting, 0);
-                    writerWaitingSet = false;
-                    _readersCompletedTcs = null;
-                    throw;
-                }
-                await _gate.WaitAsync(ct);
-            }
-            _readersCompletedTcs = null;
-            // _gate を保持したまま返す → ExitWrite で解放
-            return new WriteReleaser(this);
-        }
-        catch
-        {
-            // 外側のリトライ中の _gate.WaitAsync(ct) がキャンセルされた場合や
-            // 入口で即時キャンセルされた場合に _writerWaiting を必ずリセットする。
-            if (writerWaitingSet)
-            {
-                Volatile.Write(ref _writerWaiting, 0);
-                writerWaitingSet = false;
-            }
-            throw;
-        }
-    }
-
-    private void ExitRead()
-    {
-        if (Interlocked.Decrement(ref _readerCount) == 0 && Volatile.Read(ref _writerWaiting) == 1)
-        {
-            // 最後のリーダーが抜けた → ライターに即時通知
-            _readersCompletedTcs?.TrySetResult(result: null!);
-        }
-    }
-
-    private void ExitWrite()
-    {
-        Volatile.Write(ref _writerWaiting, 0);
-        _gate.Release();
-    }
-
-    public void Dispose()
-    {
-        if (_disposed) return;
-        _disposed = true;
-        _readersCompletedTcs?.TrySetCanceled();
-        _gate.Dispose();
-    }
-
-    private sealed class ReadReleaser(AsyncFileGate gate) : IDisposable
-    {
-        public void Dispose() => gate.ExitRead();
-    }
-
-    private sealed class WriteReleaser(AsyncFileGate gate) : IDisposable
-    {
-        public void Dispose() => gate.ExitWrite();
-    }
-}
 
 /// <summary>
 /// マウント済みボリューム内のファイル読み書き・一覧・削除。Scoped 登録。
@@ -176,17 +54,6 @@ public sealed class FileService
         _chunkStore = chunkStore;
     }
 
-    /// <summary>ボリュームがチャンクストレージモードか。</summary>
-    private bool IsChunkMode(string volumeName)
-    {
-        var (header, _) = _volumeService.GetMountedKeys(volumeName);
-        return header.StorageMode == "chunk";
-    }
-
-    /// <summary>ボリュームのマウント情報（チャンク暗号化用）を取得。</summary>
-    private (VolumeHeader Header, byte[]? MasterKey) GetVolumeKeys(string volumeName)
-        => _volumeService.GetMountedKeys(volumeName);
-
     /// <summary>ボリューム内の全ファイルを一覧。</summary>
     public async Task<ListFilesResponse> ListAsync(string volumeName, CancellationToken ct = default)
     {
@@ -209,7 +76,7 @@ public sealed class FileService
         ArgumentException.ThrowIfNullOrEmpty(fileName);
         if (contentLength < 0) throw new ArgumentOutOfRangeException(nameof(contentLength));
 
-        if (IsChunkMode(volumeName))
+        if (_volumeService.IsChunkMode(volumeName))
             return await UploadChunkedAsync(volumeName, fileName, content, contentLength, ct);
 
         // ロック順序: fileGate → catLock → streamLock（デッドロック防止）
@@ -322,8 +189,8 @@ public sealed class FileService
     /// <summary>チャンクモードのアップロード本体。</summary>
     private async Task<FileMetadata> UploadChunkedInternalAsync(string volumeName, string fileName, Stream content, long contentLength, CancellationToken ct)
     {
-        var (header, masterKey) = GetVolumeKeys(volumeName);
-        int chunkSize = header.ServerChunkSize > 0 ? header.ServerChunkSize : 4194304;
+        var (header, masterKey) = _volumeService.GetMountedKeys(volumeName);
+        int chunkSize = header.EffectiveServerChunkSize;
 
         // ジャーナル: 書き込み前
         string opId = await _journalService.RecordAsync(volumeName, new JournalEntry
@@ -351,7 +218,7 @@ public sealed class FileService
             byte[] buffer = new byte[chunkSize];
             int chunkIndex = 0;
             long remaining = contentLength;
-            int sectorSize = header.SectorSize > 0 ? header.SectorSize : 4096;
+            int sectorSize = header.EffectiveSectorSize;
 
             while (remaining > 0)
             {
@@ -364,11 +231,8 @@ public sealed class FileService
                 // 暗号化ボリュームの場合はチャンク暗号化
                 if (header.Encrypted && masterKey is not null)
                 {
-                    var cipherAlgorithm = string.IsNullOrEmpty(header.CipherAlgorithm)
-                        ? CipherAlgorithm.Aes256Xts
-                        : CipherAlgorithmExtensions.ParseCipherAlgorithm(header.CipherAlgorithm);
                     chunkData = ChunkEncryptor.EncryptChunk(
-                        masterKey, cipherAlgorithm,
+                        masterKey, header.EffectiveCipherAlgorithm,
                         chunkIndex, sectorSize, chunkSize, chunkData);
                 }
 
@@ -419,7 +283,7 @@ public sealed class FileService
                 if (!catalog.Files.TryGetValue(fileName, out var meta))
                     throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
 
-                if (meta.IsChunked && IsChunkMode(volumeName))
+                if (meta.IsChunked && _volumeService.IsChunkMode(volumeName))
                     return DownloadChunkedResponse(volumeName, fileName, meta, readLock);
 
                 // ローカルモード: 従来のストリームベース
@@ -447,19 +311,16 @@ public sealed class FileService
     /// <summary>チャンクモード: チャンクを遅延取得して Seekable なストリームで返す。</summary>
     private FileDownloadResponse DownloadChunkedResponse(string volumeName, string fileName, FileMetadata meta, IDisposable readLock)
     {
-        var (header, masterKey) = GetVolumeKeys(volumeName);
-        int sectorSize = header.SectorSize > 0 ? header.SectorSize : 4096;
-        int chunkSize = header.ServerChunkSize > 0 ? header.ServerChunkSize : 4194304;
+        var (header, masterKey) = _volumeService.GetMountedKeys(volumeName);
+        int sectorSize = header.EffectiveSectorSize;
+        int chunkSize = header.EffectiveServerChunkSize;
 
         Stream chunkedStream;
         if (header.Encrypted && masterKey is not null)
         {
-            var cipherAlgorithm = string.IsNullOrEmpty(header.CipherAlgorithm)
-                ? CipherAlgorithm.Aes256Xts
-                : CipherAlgorithmExtensions.ParseCipherAlgorithm(header.CipherAlgorithm);
             chunkedStream = new ChunkedReadStream(
                 _chunkStore, volumeName, fileName, masterKey,
-                cipherAlgorithm,
+                header.EffectiveCipherAlgorithm,
                 sectorSize, chunkSize, meta.ChunkSizes);
         }
         else
@@ -474,7 +335,7 @@ public sealed class FileService
     /// <summary>ファイルを削除。</summary>
     public async Task DeleteAsync(string volumeName, string fileName, CancellationToken ct = default)
     {
-        bool isChunkMode = IsChunkMode(volumeName);
+        bool isChunkMode = _volumeService.IsChunkMode(volumeName);
 
         // ロック順序: fileGate → catLock（デッドロック防止）
         var gate = _fileGates.GetOrAdd((volumeName, fileName), _ => new AsyncFileGate());
@@ -504,7 +365,7 @@ public sealed class FileService
             // チャンクモード: S3 からチャンクを削除（リトライ付き）
             if (isChunkMode)
             {
-                await DeleteChunksWithRetryAsync(volumeName, fileName, ct);
+                await _chunkStore.DeleteChunksWithRetryAsync(volumeName, fileName, ct);
             }
 
             await _journalService.CommitAsync(volumeName, opId, ct);
@@ -513,34 +374,6 @@ public sealed class FileService
         // 削除完了後にファイルゲートをクリーンアップ
         if (_fileGates.TryRemove((volumeName, fileName), out var removed))
             removed.Dispose();
-    }
-
-    /// <summary>チャンク削除をリトライ付きで実行。</summary>
-    private async Task DeleteChunksWithRetryAsync(string volumeName, string fileName, CancellationToken ct)
-    {
-        const int maxRetries = 3;
-        Exception? lastException = null;
-
-        for (int i = 0; i < maxRetries; i++)
-        {
-            try
-            {
-                await _chunkStore.DeleteChunksAsync(volumeName, fileName, ct);
-                return; // 成功時は即時リターン
-            }
-            catch (Exception ex)
-            {
-                lastException = ex;
-                if (i < maxRetries - 1)
-                {
-                    // 指数バックオフで待機
-                    await Task.Delay(100 * (i + 1), ct);
-                }
-            }
-        }
-
-        // 全リトライ失敗時はログのみ記録（孤児チャンクは許容）
-        // カタログ削除は完了しているため、データ不整合にはならない
     }
 
     /// <summary>クラッシュ復旧：未コミットジャーナルからカタログを修復。</summary>
@@ -558,7 +391,7 @@ public sealed class FileService
         }
 
         // チャンクモード: WriteFile 未完了のファイルでチャンク欠落がある場合はカタログから削除
-        if (IsChunkMode(volumeName))
+        if (_volumeService.IsChunkMode(volumeName))
         {
             var brokenFiles = new List<string>();
             foreach (var (fileName, meta) in catalog.Files)
@@ -629,327 +462,5 @@ public sealed class FileService
         JsonSerializer.Serialize(ms, catalog, JsonOptions);
         ms.Position = 0;
         await _storage.WriteAtomicAsync($"{volumeName}/catalog.json", ms, ct);
-    }
-}
-
-/// <summary>
-/// ダウンロード中の読み取りゲートを保持するストリームラッパー。
-/// Dispose 時にファイルゲートの読み取りロックを解放し、アップロード/削除を許可する。
-/// </summary>
-internal sealed class GateReadStream(Stream inner, IDisposable gateLock) : Stream
-{
-    public override bool CanRead => inner.CanRead;
-    public override bool CanSeek => inner.CanSeek;
-    public override bool CanWrite => false;
-    public override long Length => inner.Length;
-    public override long Position
-    {
-        get => inner.Position;
-        set => inner.Position = value;
-    }
-
-    public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
-    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-        => inner.ReadAsync(buffer, cancellationToken);
-    public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
-    public override void Flush() => inner.Flush();
-
-    public override void SetLength(long value) => throw new NotSupportedException();
-    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-
-    private bool _lockReleased;
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            inner.Dispose();
-            if (!_lockReleased)
-            {
-                gateLock.Dispose();
-                _lockReleased = true;
-            }
-        }
-        base.Dispose(disposing);
-    }
-}
-
-/// <summary>ボリューム I/O ガードをストリーム Dispose 時に解放するラッパー。</summary>
-internal sealed class IoGuardReadStream(Stream inner, IDisposable ioGuard) : Stream
-{
-    public override bool CanRead => inner.CanRead;
-    public override bool CanSeek => inner.CanSeek;
-    public override bool CanWrite => false;
-    public override long Length => inner.Length;
-    public override long Position { get => inner.Position; set => inner.Position = value; }
-
-    public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
-    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-        => inner.ReadAsync(buffer, cancellationToken);
-    public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
-    public override void Flush() => inner.Flush();
-
-    public override void SetLength(long value) => throw new NotSupportedException();
-    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-
-    private bool _disposed;
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing && !_disposed)
-        {
-            _disposed = true;
-            inner.Dispose();
-            ioGuard.Dispose();
-        }
-        base.Dispose(disposing);
-    }
-}
-
-/// <summary>ボリュームストリームの部分範囲を読み取るラッパー。基礎ストリームは破棄しない。</summary>
-file sealed class FileSubStream(Stream baseStream, long offset, long length, SemaphoreSlim streamLock) : Stream
-{
-    private long _position;
-
-    public override bool CanRead => true;
-    public override bool CanSeek => true;
-    public override bool CanWrite => false;
-    public override long Length => length;
-    public override long Position
-    {
-        get => _position;
-        set
-        {
-            if (value < 0 || value > length) throw new ArgumentOutOfRangeException(nameof(value));
-            _position = value;
-        }
-    }
-
-    public override long Seek(long seekOffset, SeekOrigin origin)
-    {
-        long newPos = origin switch
-        {
-            SeekOrigin.Begin => seekOffset,
-            SeekOrigin.Current => _position + seekOffset,
-            SeekOrigin.End => length + seekOffset,
-            _ => throw new ArgumentOutOfRangeException(nameof(origin)),
-        };
-        if (newPos < 0 || newPos > length) throw new ArgumentOutOfRangeException(nameof(seekOffset));
-        _position = newPos;
-        return newPos;
-    }
-
-    public override int Read(byte[] buffer, int bufOffset, int count)
-    {
-        if (_position >= length) return 0;
-        int toRead = (int)Math.Min(count, length - _position);
-        // 同期パスだが Dokan コールバック等の制約上 GetAwaiter().GetResult() を使用。
-        // streamLock はボリューム単位で共有されるが、通常は短時間で解放されるためデッドロックリスクは低い。
-        streamLock.WaitAsync(CancellationToken.None).GetAwaiter().GetResult();
-        try
-        {
-            baseStream.Position = offset + _position;
-            int read = baseStream.Read(buffer, bufOffset, toRead);
-            _position += read;
-            return read;
-        }
-        finally
-        {
-            streamLock.Release();
-        }
-    }
-
-    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-    {
-        if (_position >= length) return 0;
-        int toRead = (int)Math.Min(buffer.Length, length - _position);
-        await streamLock.WaitAsync(cancellationToken);
-        try
-        {
-            baseStream.Position = offset + _position;
-            int read = await baseStream.ReadAsync(buffer[..toRead], cancellationToken);
-            _position += read;
-            return read;
-        }
-        finally
-        {
-            streamLock.Release();
-        }
-    }
-
-    public override void Flush() { }
-
-    public override void SetLength(long value) => throw new NotSupportedException();
-
-    public override void Write(byte[] buffer, int writeOffset, int count) => throw new NotSupportedException();
-}
-
-/// <summary>非暗号化チャンクストアから遅延取得する Seekable ストリーム。</summary>
-file sealed class MemoryChunkedStream : Stream
-{
-    private readonly IChunkStore _chunkStore;
-    private readonly string _volumeName;
-    private readonly string _objectId;
-    private readonly IReadOnlyList<int> _chunkSizes;
-    private readonly long[] _cumulativeSizes;
-    private readonly long _totalLength;
-
-    private long _position;
-    private volatile int _cachedChunkIndex = -1;
-    private byte[]? _cachedData;
-    private bool _disposed;
-
-    public MemoryChunkedStream(
-        IChunkStore chunkStore,
-        string volumeName,
-        string objectId,
-        IReadOnlyList<int> chunkSizes)
-    {
-        _chunkStore = chunkStore;
-        _volumeName = volumeName;
-        _objectId = objectId;
-        _chunkSizes = chunkSizes;
-
-        _cumulativeSizes = new long[chunkSizes.Count];
-        long acc = 0;
-        for (int i = 0; i < chunkSizes.Count; i++)
-        {
-            _cumulativeSizes[i] = acc;
-            acc += chunkSizes[i];
-        }
-        _totalLength = acc;
-    }
-
-    public override bool CanRead => true;
-    public override bool CanSeek => true;
-    public override bool CanWrite => false;
-    public override long Length => _totalLength;
-
-    public override long Position
-    {
-        get => _position;
-        set
-        {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            ArgumentOutOfRangeException.ThrowIfNegative(value);
-            ArgumentOutOfRangeException.ThrowIfGreaterThan(value, _totalLength);
-            _position = value;
-        }
-    }
-
-    public override int Read(byte[] buffer, int offset, int count)
-    {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_position >= _totalLength) return 0;
-        count = (int)Math.Min(count, _totalLength - _position);
-        int totalRead = 0;
-
-        while (count > 0)
-        {
-            (int chunkIdx, int offsetInChunk) = LocatePosition(_position);
-            byte[] data = GetChunk(chunkIdx);
-            int available = data.Length - offsetInChunk;
-            int toRead = Math.Min(count, available);
-            Array.Copy(data, offsetInChunk, buffer, offset + totalRead, toRead);
-
-            _position += toRead;
-            totalRead += toRead;
-            count -= toRead;
-        }
-        return totalRead;
-    }
-
-    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-    {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_position >= _totalLength) return 0;
-        int count = (int)Math.Min(buffer.Length, _totalLength - _position);
-        int totalRead = 0;
-
-        while (count > 0)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            (int chunkIdx, int offsetInChunk) = LocatePosition(_position);
-            byte[] data = await GetChunkAsync(chunkIdx, cancellationToken);
-            int available = data.Length - offsetInChunk;
-            int toRead = Math.Min(count, available);
-            data.AsMemory(offsetInChunk, toRead).CopyTo(buffer.Slice(totalRead));
-
-            _position += toRead;
-            totalRead += toRead;
-            count -= toRead;
-        }
-        return totalRead;
-    }
-
-    public override long Seek(long offset, SeekOrigin origin)
-    {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        long target = origin switch
-        {
-            SeekOrigin.Begin => offset,
-            SeekOrigin.Current => _position + offset,
-            SeekOrigin.End => _totalLength + offset,
-            _ => throw new ArgumentOutOfRangeException(nameof(origin)),
-        };
-        ArgumentOutOfRangeException.ThrowIfNegative(target);
-        ArgumentOutOfRangeException.ThrowIfGreaterThan(target, _totalLength);
-        _position = target;
-        return _position;
-    }
-
-    private (int ChunkIndex, int OffsetInChunk) LocatePosition(long position)
-    {
-        int lo = 0, hi = _cumulativeSizes.Length - 1;
-        while (lo < hi)
-        {
-            int mid = (lo + hi + 1) / 2;
-            if (_cumulativeSizes[mid] <= position) lo = mid;
-            else hi = mid - 1;
-        }
-        return (lo, (int)(position - _cumulativeSizes[lo]));
-    }
-
-    private byte[] GetChunk(int chunkIndex)
-    {
-        if (_cachedChunkIndex == chunkIndex && _cachedData is not null)
-            return _cachedData;
-
-        byte[]? data = _chunkStore.ReadChunk(_volumeName, _objectId, chunkIndex);
-        if (data is null)
-            throw new InvalidOperationException($"チャンク {chunkIndex} がストレージに見つかりません。");
-
-        _cachedData = data;
-        _cachedChunkIndex = chunkIndex;
-        return data;
-    }
-
-    private async Task<byte[]> GetChunkAsync(int chunkIndex, CancellationToken ct = default)
-    {
-        if (_cachedChunkIndex == chunkIndex && _cachedData is not null)
-            return _cachedData;
-
-        byte[]? data = await _chunkStore.ReadChunkAsync(_volumeName, _objectId, chunkIndex, ct);
-        if (data is null)
-            throw new InvalidOperationException($"チャンク {chunkIndex} がストレージに見つかりません。");
-
-        _cachedData = data;
-        _cachedChunkIndex = chunkIndex;
-        return data;
-    }
-
-    public override void Flush() { }
-    public override void SetLength(long value) => throw new NotSupportedException();
-    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-
-    protected override void Dispose(bool disposing)
-    {
-        if (_disposed) return;
-        if (disposing)
-        {
-            _cachedData = null;
-        }
-        _disposed = true;
-        base.Dispose(disposing);
     }
 }

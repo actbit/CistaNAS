@@ -3,6 +3,7 @@ using System.Text.Json;
 using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
+using CistaNAS.Web.Services.Streams;
 using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.Options;
@@ -69,13 +70,6 @@ public sealed class E2eeFileService
         return header;
     }
 
-    /// <summary>ボリュームがチャンクストレージモードか。</summary>
-    private bool IsChunkMode(string volumeName)
-    {
-        var (header, _) = _volumeService.GetMountedKeys(volumeName);
-        return header.StorageMode == "chunk";
-    }
-
     /// <summary>ファイルエントリを作成し、FileId を返す。</summary>
     public async Task<E2eeFileEntry> CreateFileAsync(string volumeName, E2eeCreateFileRequest request, string ownerUsername, CancellationToken ct = default)
     {
@@ -105,7 +99,7 @@ public sealed class E2eeFileService
             // ローカルモードで EncryptedLength が実際の暗号化サイズと一致しない場合は
             // オフセットがずれる可能性がある（UploadChunkAsync 呼び出し前に確定するため）。
             long offset = 0;
-            if (!IsChunkMode(volumeName))
+            if (!_volumeService.IsChunkMode(volumeName))
             {
                 foreach (var existing in catalog.Files.Values)
                 {
@@ -173,7 +167,7 @@ public sealed class E2eeFileService
                 using var sha = System.Security.Cryptography.IncrementalHash.CreateHash(
                     System.Security.Cryptography.HashAlgorithmName.SHA256);
 
-                if (IsChunkMode(volumeName))
+                if (_volumeService.IsChunkMode(volumeName))
                 {
                     // チャンクモード: データを全て読み込んでから書き込み
                     byte[] chunkData = new byte[dataLength];
@@ -259,7 +253,7 @@ public sealed class E2eeFileService
                 ? entry.ChunkSizes[chunkIndex]
                 : 0;
 
-            if (IsChunkMode(volumeName))
+            if (_volumeService.IsChunkMode(volumeName))
             {
                 byte[]? chunkData = await _chunkStore.ReadChunkAsync(volumeName, fileId, chunkIndex, ct);
                 if (chunkData is null)
@@ -366,7 +360,7 @@ public sealed class E2eeFileService
     public async Task DeleteFileAsync(string volumeName, string fileId, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
-        bool isChunkMode = IsChunkMode(volumeName);
+        bool isChunkMode = _volumeService.IsChunkMode(volumeName);
         // ボリュームゲートでカタログ R-M-W を直列化 (H-9)
         var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
         await volGate.WaitAsync(ct);
@@ -389,7 +383,7 @@ public sealed class E2eeFileService
         // チャンクモード: S3 からチャンクを削除（リトライ付き）
         if (isChunkMode)
         {
-            await DeleteChunksWithRetryAsync(volumeName, fileId, ct);
+            await _chunkStore.DeleteChunksWithRetryAsync(volumeName, fileId, ct);
         }
 
         // ファイル削除後に対応するゲートを破棄
@@ -411,34 +405,6 @@ public sealed class E2eeFileService
 
         if (_volumeGates.TryRemove(volumeName, out var volGate))
             volGate.Dispose();
-    }
-
-    /// <summary>チャンク削除をリトライ付きで実行。</summary>
-    private async Task DeleteChunksWithRetryAsync(string volumeName, string fileId, CancellationToken ct)
-    {
-        const int maxRetries = 3;
-        Exception? lastException = null;
-
-        for (int i = 0; i < maxRetries; i++)
-        {
-            try
-            {
-                await _chunkStore.DeleteChunksAsync(volumeName, fileId, ct);
-                return; // 成功時は即時リターン
-            }
-            catch (Exception ex)
-            {
-                lastException = ex;
-                if (i < maxRetries - 1)
-                {
-                    // 指数バックオフで待機
-                    await Task.Delay(100 * (i + 1), ct);
-                }
-            }
-        }
-
-        // 全リトライ失敗時はログのみ記録（孤児チャンクは許容）
-        // カタログ削除は完了しているため、データ不整合にはならない
     }
 
     /// <summary>E2EE マウント情報を返す。</summary>
@@ -496,46 +462,4 @@ public sealed class E2eeFileService
 
     private string GetDataPath(string volumeName)
         => Path.Combine(_volumeDataPath, volumeName, "volume.dat");
-}
-
-/// <summary>部分読み取り用 Stream ラッパー。</summary>
-file sealed class SubStream(Stream baseStream, long length) : Stream
-{
-    private readonly long _length = length;
-    private long _remaining = length;
-
-    public override bool CanRead => true;
-    public override bool CanSeek => false;
-    public override bool CanWrite => false;
-    public override long Length => _length;
-    public override long Position { get => _length - _remaining; set => throw new NotSupportedException(); }
-
-    public override int Read(byte[] buffer, int offset, int count)
-    {
-        if (_remaining <= 0) return 0;
-        int toRead = (int)Math.Min(count, _remaining);
-        int read = baseStream.Read(buffer, offset, toRead);
-        _remaining -= read;
-        return read;
-    }
-
-    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-    {
-        if (_remaining <= 0) return 0;
-        int toRead = (int)Math.Min(buffer.Length, _remaining);
-        int read = await baseStream.ReadAsync(buffer[..toRead], cancellationToken);
-        _remaining -= read;
-        return read;
-    }
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing) baseStream.Dispose();
-        base.Dispose(disposing);
-    }
-
-    public override void Flush() { }
-    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-    public override void SetLength(long value) => throw new NotSupportedException();
-    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 }
