@@ -16,12 +16,15 @@ if (string.Equals(builder.Configuration["ENABLE_MINIO"], "true", StringCompariso
         .WithEnvironment("MINIO_ROOT_USER", "minioadmin")
         .WithEnvironment("MINIO_ROOT_PASSWORD", "minioadmin")
         .WithVolume("minio-data", "/data")
-        .WithArgs("server", "/data", "--console-address", ":9001");
+        .WithArgs("server", "/data", "--console-address", ":9001")
+        .WithHttpHealthCheck(path: "/minio/health/ready", endpointName: "s3");
 
     // MinIO 有効時は webfrontend を S3 バックエンドに自動切替。
     // EndpointReference を渡すことで services__minio__0__s3 等の環境変数を注入。
     var s3Endpoint = minio.GetEndpoint("s3");
     web.WithEnvironment("CistaNas__Storage__Provider", "s3")
+       .WithEnvironment("AWS_ACCESS_KEY_ID", "minioadmin")
+       .WithEnvironment("AWS_SECRET_ACCESS_KEY", "minioadmin")
        .WithEnvironment(context =>
        {
            // S3StorageProvider が期待する EndpointOverride を MinIO の動的エンドポイントで上書き

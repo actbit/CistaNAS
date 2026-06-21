@@ -53,7 +53,8 @@ public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output
 
         using var authClient = CreateAuthClient();
 
-        // ボリューム作成（サーバー暗号化 = AES-XTS、S3 チャンクモード）
+        // ボリューム作成（サーバー暗号化 = AES-XTS、S3 チャンクモード）。
+        // CreateAsync は作成時に自動マウントするため、別途マウント API は呼ばない。
         var createResp = await authClient.PostAsJsonAsync("/api/v1/volumes/", new
         {
             name = volName,
@@ -63,16 +64,7 @@ public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output
         });
         Assert.Equal(HttpStatusCode.Created, createResp.StatusCode);
 
-        // マウント
-        var mountResp = await authClient.PostAsJsonAsync($"/api/v1/volumes/{volName}/mount", new
-        {
-            name = volName,
-            username = MinIOFixture.Username,
-            password = "s3-vol-pw",
-        });
-        Assert.Equal(HttpStatusCode.OK, mountResp.StatusCode);
-
-        output.WriteLine($"S3 サーバー暗号化ボリューム作成・マウント成功: {volName}");
+        output.WriteLine($"S3 サーバー暗号化ボリューム作成成功: {volName}");
     }
 
     [Fact]
@@ -81,14 +73,10 @@ public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output
         string volName = $"s3-file-{Guid.NewGuid():N}";
         using var authClient = CreateAuthClient();
 
-        // ボリューム作成・マウント
+        // ボリューム作成（作成時に自動マウントされる）
         await authClient.PostAsJsonAsync("/api/v1/volumes/", new
         {
             name = volName, username = MinIOFixture.Username, password = "f", encrypted = false,
-        });
-        await authClient.PostAsJsonAsync($"/api/v1/volumes/{volName}/mount", new
-        {
-            name = volName, username = MinIOFixture.Username, password = "f",
         });
 
         // ファイルアップロード
@@ -96,7 +84,7 @@ public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output
         string filePath = "docs/readme.bin";
         using (var uploadContent = new ByteArrayContent(data))
         {
-            var uploadResp = await authClient.PutAsync($"/api/v1/files/{volName}/{filePath}", uploadContent);
+            var uploadResp = await authClient.PostAsync($"/api/v1/files/{volName}/{filePath}", uploadContent);
             Assert.True(uploadResp.IsSuccessStatusCode,
                 $"Upload failed: {uploadResp.StatusCode} - {await uploadResp.Content.ReadAsStringAsync()}");
         }
@@ -116,24 +104,22 @@ public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output
         string volName = $"s3-list-{Guid.NewGuid():N}";
         using var authClient = CreateAuthClient();
 
+        // ボリューム作成（作成時に自動マウントされる）
         await authClient.PostAsJsonAsync("/api/v1/volumes/", new
         {
             name = volName, username = MinIOFixture.Username, password = "f", encrypted = false,
         });
-        await authClient.PostAsJsonAsync($"/api/v1/volumes/{volName}/mount", new
-        {
-            name = volName, username = MinIOFixture.Username, password = "f",
-        });
 
         // 2ファイルアップロード
-        await authClient.PutAsync($"/api/v1/files/{volName}/a.txt", new ByteArrayContent([1, 2, 3]));
-        await authClient.PutAsync($"/api/v1/files/{volName}/b.txt", new ByteArrayContent([4, 5, 6]));
+        await authClient.PostAsync($"/api/v1/files/{volName}/a.txt", new ByteArrayContent([1, 2, 3]));
+        await authClient.PostAsync($"/api/v1/files/{volName}/b.txt", new ByteArrayContent([4, 5, 6]));
 
         // 一覧取得
         var listResp = await authClient.GetAsync($"/api/v1/files/{volName}/");
         Assert.True(listResp.IsSuccessStatusCode);
         var listJson = await listResp.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>();
-        Assert.True(listJson.GetArrayLength() >= 2, $"Expected >=2 files, got {listJson.GetArrayLength()}");
+        int fileCount = listJson.GetProperty("files").GetArrayLength();
+        Assert.True(fileCount >= 2, $"Expected >=2 files, got {fileCount}");
 
         // 削除
         var delResp = await authClient.DeleteAsync($"/api/v1/files/{volName}/a.txt");
@@ -272,30 +258,24 @@ public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output
         string volName = $"s3-stream-{Guid.NewGuid():N}";
         using var authClient = CreateAuthClient();
 
+        // ボリューム作成（作成時に自動マウントされる）
         await authClient.PostAsJsonAsync("/api/v1/volumes/", new
         {
             name = volName, username = MinIOFixture.Username, password = "f", encrypted = false,
         });
-        await authClient.PostAsJsonAsync($"/api/v1/volumes/{volName}/mount", new
-        {
-            name = volName, username = MinIOFixture.Username, password = "f",
-        });
 
         // 小さなメディアファイルをアップロード
         byte[] mediaData = RandomNumberGenerator.GetBytes(4096);
-        await authClient.PutAsync($"/api/v1/files/{volName}/video.mp4", new ByteArrayContent(mediaData));
+        await authClient.PostAsync($"/api/v1/files/{volName}/video.mp4", new ByteArrayContent(mediaData));
 
-        // トークン発行
+        // トークン発行（StreamTokenRequest: volumeName / fileName）
         var tokenResp = await authClient.PostAsJsonAsync("/api/v1/stream/token", new
         {
-            volume = volName, path = "video.mp4",
+            volumeName = volName, fileName = "video.mp4",
         });
-
-        // トークン発行エンドポイントが存在すれば成功（実装状況に応じて 200/201）
-        Assert.True(tokenResp.StatusCode == HttpStatusCode.OK
-                 || tokenResp.StatusCode == HttpStatusCode.Created
-                 || tokenResp.StatusCode == HttpStatusCode.BadRequest,
-            $"Stream token endpoint returned unexpected: {tokenResp.StatusCode}");
+        Assert.Equal(HttpStatusCode.OK, tokenResp.StatusCode);
+        var tokenJson = await tokenResp.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>();
+        Assert.False(string.IsNullOrEmpty(tokenJson.GetProperty("token").GetString()));
 
         output.WriteLine($"S3 ストリーミングトークン発行確認: Status={tokenResp.StatusCode}");
     }
