@@ -297,7 +297,7 @@ app.Use(async (ctx, next) =>
                   "style-src 'self' 'unsafe-inline'; " +
                   "img-src 'self' data: blob:; " +
                   "media-src 'self' blob:; " +
-                  "connect-src 'self' 'unsafe-eval' 'unsafe-inline'; " +
+                  "connect-src 'self'; " +
                   "frame-ancestors 'self';";
         headers["Content-Security-Policy"] = csp;
     }
