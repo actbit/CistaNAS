@@ -53,6 +53,10 @@ public sealed partial class VolumeService
                 MountInternalChunked(name, header, masterKey: null);
             else
                 MountInternal(name, header, masterKey: null);
+
+            // クラッシュ復旧: 未コミットジャーナルがあればカタログを修復してクリア
+            await RecoverMountedVolumeAsync(name);
+
             return ToInfo(name, header, true);
         });
     }

@@ -128,6 +128,26 @@ public sealed partial class VolumeService : IAsyncDisposable
         _mounted[name] = new MountedVolume(header, masterKey, Stream.Null);
     }
 
+    // ---- クラッシュ復旧 ----
+
+    /// <summary>
+    /// マウント直後に未コミットジャーナルがあればカタログを修復し、ジャーナルをクリアする。
+    /// FileService（Scoped）をスコープ経由で取得する。復旧失敗はログに記録し、マウント自体は継続。
+    /// </summary>
+    private async Task RecoverMountedVolumeAsync(string name)
+    {
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var fileService = scope.ServiceProvider.GetRequiredService<FileService>();
+            await fileService.RecoverAsync(name);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "ボリューム '{Volume}' のジャーナル復旧に失敗しました。", name);
+        }
+    }
+
     // ---- 内部ヘルパ ----
 
     private async Task<VolumeHeader> LoadHeaderOrThrowAsync(string name)

@@ -376,23 +376,31 @@ public sealed class FileService
             removed.Dispose();
     }
 
-    /// <summary>クラッシュ復旧：未コミットジャーナルからカタログを修復。</summary>
+    /// <summary>クラッシュ復旧：未コミットジャーナルからカタログを修復し、ジャーナルをクリアする。</summary>
+    /// <remarks>
+    /// マウント直後（MountAsync / MountE2eeAsync）に呼ばれる。カタログ操作は通常の読み書きと
+    /// 同じボリューム単位のカタログロックで直列化し、進行中の Upload/Delete との競合を防ぐ。
+    /// </remarks>
     public async Task RecoverAsync(string volumeName, CancellationToken ct = default)
     {
         var pending = await _journalService.RecoverAsync(volumeName, ct);
         if (pending.Count == 0) return;
 
-        // 削除済みエントリはカタログから取り除く
-        var catalog = await LoadCatalogAsync(volumeName, ct);
-        foreach (var entry in pending)
+        SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await catLock.WaitAsync(ct);
+        try
         {
-            if (entry.Operation == JournalOp.DeleteFile)
-                catalog.Files.Remove(entry.Path);
-        }
+            // 削除済みエントリはカタログから取り除く
+            var catalog = await LoadCatalogAsync(volumeName, ct);
+            foreach (var entry in pending)
+            {
+                if (entry.Operation == JournalOp.DeleteFile)
+                    catalog.Files.Remove(entry.Path);
+            }
 
-        // チャンクモード: WriteFile 未完了のファイルでチャンク欠落がある場合はカタログから削除
-        if (_volumeService.IsChunkMode(volumeName))
-        {
+            // チャンクモード: WriteFile 未完了のファイルでチャンク欠落がある場合はカタログから削除
+            if (_volumeService.IsChunkMode(volumeName))
+            {
             var brokenFiles = new List<string>();
             foreach (var (fileName, meta) in catalog.Files)
             {
@@ -411,10 +419,15 @@ public sealed class FileService
             }
             foreach (var broken in brokenFiles)
                 catalog.Files.Remove(broken);
-        }
+            }
 
-        await SaveCatalogAsync(volumeName, catalog, ct);
-        await _journalService.CommitAllAsync(volumeName, ct);
+            await SaveCatalogAsync(volumeName, catalog, ct);
+            await _journalService.CommitAllAsync(volumeName, ct);
+        }
+        finally
+        {
+            catLock.Release();
+        }
     }
 
     /// <summary>ボリューム削除時に対応するカタログロックを破棄。</summary>

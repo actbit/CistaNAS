@@ -243,8 +243,9 @@ using (var initScope = app.Services.CreateAsyncScope())
                 journalLogger.LogWarning(
                     "ボリューム '{Volume}' に未コミットジャーナル {Count} 件を検出。前回クラッシュの可能性があります。",
                     volName, pending.Count);
-                // 復旧は該当ボリュームの FileService 経路で再試行されるべきだが、
-                // ここでは警告ログ出力のみ（破損データの上書きを防ぐため自動再構築はしない）
+                // 実際の修復（カタログ修復＋ジャーナルクリア）は、ボリュームの
+                // MountAsync / MountE2eeAsync 時に RecoverMountedVolumeAsync 経由で行われる。
+                // ここではクラッシュの痕跡を警告ログに出力するのみ。
             }
         }
     }
