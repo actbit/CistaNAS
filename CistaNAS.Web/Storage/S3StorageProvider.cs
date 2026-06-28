@@ -73,22 +73,18 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
 
     public async Task WriteAtomicAsync(string blobPath, Stream content, CancellationToken ct = default)
     {
-        // 一時パスに書き込み → コピー → 一時削除（LocalStorageProvider の rename パターンに相当）
-        // GUID を付与して同時実行時の衝突を防止
-        string tempPath = FullPath(blobPath) + ".tmp-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
-        // ストリームの位置を先頭にリセット（Seek 可能な場合）
+        // 単一の上書き PUT で原子的に置換。S3 の単一オブジェクト PUT は
+        // read-after-write 強一貫性で原子的（旧値か新値かの二者択一、部分破損しない）。
+        // tmp→copy→delete 連鎖と異なり故障点が1つで、孤立 tmp オブジェクトも発生しない。
         if (content.CanSeek && content.Position != 0)
             content.Position = 0;
-        var tempRequest = new PutObjectRequest
+        var request = new PutObjectRequest
         {
             BucketName = _bucket,
-            Key = tempPath,
+            Key = FullPath(blobPath),
             InputStream = content,
         };
-        await _client.PutObjectAsync(tempRequest, ct);
-        await _client.CopyObjectAsync(_bucket, tempPath, _bucket, FullPath(blobPath), ct);
-        try { await _client.DeleteObjectAsync(_bucket, tempPath, ct); }
-        catch (AmazonS3Exception) { /* ベストエフォート */ }
+        await _client.PutObjectAsync(request, ct);
     }
 
     public async Task DeleteAsync(string blobPath, CancellationToken ct = default)
