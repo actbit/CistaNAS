@@ -20,7 +20,10 @@ public static class PasswordHasher
     public static string Hash(string password, int iterations)
     {
         ArgumentException.ThrowIfNullOrEmpty(password);
-        if (iterations < 1) throw new ArgumentOutOfRangeException(nameof(iterations));
+        // Verify 側の上限（MaxVerifyIterations）と一致させる。設定ミスで上限超のハッシュを
+        // 生成すると Verify で弾かれてログイン不能になるため、生成時点でも拒否する。
+        if (iterations < 1 || iterations > MaxVerifyIterations)
+            throw new ArgumentOutOfRangeException(nameof(iterations), $"反復数は 1〜{MaxVerifyIterations} の範囲である必要があります。");
 
         byte[] salt = RandomNumberGenerator.GetBytes(SaltSize);
         byte[] hash = Rfc2898DeriveBytes.Pbkdf2(password, salt, iterations, HashAlgorithmName.SHA256, HashSize);

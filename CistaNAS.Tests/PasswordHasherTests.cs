@@ -24,6 +24,13 @@ public class PasswordHasherTests
         Assert.False(PasswordHasher.Verify("password", encoded));
     }
 
+    /// <summary>Hash 側でも上限超の反復数を拒否すること（Verify との上限不一致でログイン不能になるのを防ぐ）。</summary>
+    [Fact]
+    public void Hash_TooManyIterations_Throws()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => PasswordHasher.Hash("pw", 10_000_001));
+    }
+
     [Fact]
     public void Verify_Malformed_ReturnsFalse()
     {
