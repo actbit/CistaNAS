@@ -14,6 +14,8 @@ public static class PasswordHasher
     private const int SaltSize = 16;
     private const int HashSize = 32;
     private const string Prefix = "pbkdf2-sha256";
+    /// <summary>検証時の反復数上限（保存済みハッシュの改ざんによる CPU DoS を防ぐ）。</summary>
+    private const int MaxVerifyIterations = 10_000_000;
 
     public static string Hash(string password, int iterations)
     {
@@ -32,7 +34,7 @@ public static class PasswordHasher
 
         string[] parts = encoded.Split('$');
         if (parts.Length != 4 || parts[0] != Prefix) return false;
-        if (!int.TryParse(parts[1], out int iterations) || iterations < 1) return false;
+        if (!int.TryParse(parts[1], out int iterations) || iterations < 1 || iterations > MaxVerifyIterations) return false;
 
         byte[] salt, expected;
         try
