@@ -121,8 +121,11 @@ public sealed partial class VolumeService
             if (mv.Header.OwnerUser != username)
                 throw new VolumeException("オーナーのみがボリュームをロックできます。");
 
+            // 新規 I/O の受付を停止してから TryRemove する（レースによる use-after-dispose 防止）。
+            // Close 後に TryGetValue が成功した I/O は EnterAsync で拒否される。
+            mv.IoTracker.Close();
             _mounted.TryRemove(name, out _);
-            // アクティブなファイルI/Oの完了を待機してからストリームを破棄
+            // 既存のアクティブ I/O の完了を待機してからストリームを破棄
             await mv.IoTracker.WaitForZeroAsync();
             mv.Stream.Dispose();
             if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
@@ -186,6 +189,10 @@ public sealed partial class VolumeService
                 if (header.OwnerUser != username)
                     throw new VolumeException("オーナーのみがボリュームを削除できます。");
             }
+            // 新規 I/O の受付を停止してから TryRemove（レースによる use-after-dispose 防止）
+            if (_mounted.TryGetValue(name, out var closing))
+                closing.IoTracker.Close();
+
             if (_mounted.TryRemove(name, out var mv))
             {
                 await mv.IoTracker.WaitForZeroAsync();
