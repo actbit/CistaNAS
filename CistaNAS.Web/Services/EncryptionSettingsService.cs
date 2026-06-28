@@ -85,7 +85,7 @@ public sealed class EncryptionSettingsService
                 ChunkStorage = volume.ChunkStorage,
                 ServerChunkSize = volume.ServerChunkSize,
             };
-            File.WriteAllText(SettingsPath, JsonSerializer.Serialize(persisted, JsonOptions), new UTF8Encoding(false));
+            WriteAtomicSettings(SettingsPath, JsonSerializer.Serialize(persisted, JsonOptions));
             // メモリ上も更新
             _options.Volume = volume;
         }
@@ -125,7 +125,7 @@ public sealed class EncryptionSettingsService
                 Pbkdf2Iterations = auth.Pbkdf2Iterations,
                 WebDavPbkdf2Iterations = auth.WebDavPbkdf2Iterations,
             };
-            File.WriteAllText(SettingsPath, JsonSerializer.Serialize(persisted, JsonOptions), new UTF8Encoding(false));
+            WriteAtomicSettings(SettingsPath, JsonSerializer.Serialize(persisted, JsonOptions));
             _options.Auth = auth;
         }
         catch (Exception ex)
@@ -133,6 +133,19 @@ public sealed class EncryptionSettingsService
             _logger.LogError(ex, "cista-settings.json への保存に失敗しました。");
             throw;
         }
+    }
+
+    /// <summary>
+    /// 設定ファイルを原子的に書き込む（tmp + rename）。書き込み中のクラッシュで
+    /// 0 バイトや中途切れの破損 JSON になるのを防ぎ、Pbkdf2Iterations などの
+    /// セキュリティ設定が知らぬ間にデフォルト値へ強制ダウングレードされるのを防ぐ。
+    /// </summary>
+    private static void WriteAtomicSettings(string path, string content)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        string tmp = path + ".tmp-" + Guid.NewGuid().ToString("N");
+        File.WriteAllText(tmp, content, new UTF8Encoding(false));
+        File.Move(tmp, path, overwrite: true);
     }
 
     private PersistedSettings LoadOrInitPersisted()
