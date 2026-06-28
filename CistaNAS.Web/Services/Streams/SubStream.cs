@@ -8,6 +8,7 @@ internal sealed class SubStream(Stream baseStream, long length) : Stream
 {
     private readonly long _length = length;
     private long _remaining = length;
+    private bool _disposed;
 
     public override bool CanRead => true;
     public override bool CanSeek => false;
@@ -35,7 +36,11 @@ internal sealed class SubStream(Stream baseStream, long length) : Stream
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) baseStream.Dispose();
+        if (disposing && !_disposed)
+        {
+            _disposed = true;
+            baseStream.Dispose();
+        }
         base.Dispose(disposing);
     }
 
