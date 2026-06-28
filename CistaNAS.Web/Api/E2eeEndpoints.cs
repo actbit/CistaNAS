@@ -385,9 +385,11 @@ public static class E2eeEndpoints
     private static async Task<IResult> SetQuota(string volumeName, string username, E2eeSetQuotaRequest req,
         VolumeService vs, HttpContext ctx)
     {
+        string requester = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(requester)) return Results.Unauthorized();
         try
         {
-            await vs.SetUserQuotaAsync(volumeName, username, req.MaxBytes);
+            await vs.SetUserQuotaAsync(volumeName, requester, username, req.MaxBytes);
             return Results.Ok(new { maxBytes = req.MaxBytes });
         }
         catch (VolumeException ex)

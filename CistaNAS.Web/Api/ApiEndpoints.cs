@@ -391,7 +391,9 @@ public static class ApiEndpoints
         {
             string? username = ctx.User.Identity?.Name;
             if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
-            return Results.Ok(await accountSvc.ListUserDtosAsync());
+            // ロール（誰が admin か）は admin ユーザーにのみ開示。一般ユーザーは UserName のみ。
+            bool isAdmin = ctx.User.IsInRole("admin");
+            return Results.Ok(await accountSvc.ListUserDtosAsync(includeRoles: isAdmin));
         })
         .WithName("ListUsers");
 

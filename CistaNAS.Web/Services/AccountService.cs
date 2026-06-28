@@ -47,10 +47,13 @@ public sealed class AccountService(
         }).ToList();
     }
 
-    /// <summary>ユーザー一覧を DTO（UserName/Roles のみ）で返す。</summary>
-    public async Task<List<UserDto>> ListUserDtosAsync()
+    /// <summary>
+    /// ユーザー一覧を DTO で返す。includeRoles=false のとき Roles を空にし、
+    /// 一般ユーザーへのロール（誰が admin か）の漏洩を防ぐ。admin のみ includeRoles=true で呼ぶこと。
+    /// </summary>
+    public async Task<List<UserDto>> ListUserDtosAsync(bool includeRoles = false)
         => (await ListWithRolesAsync())
-            .Select(u => new UserDto(u.User.UserName ?? "", u.Roles))
+            .Select(u => new UserDto(u.User.UserName ?? "", includeRoles ? u.Roles : Array.Empty<string>()))
             .ToList();
 
     public async Task CreateUserAsync(string username, string password, string role = "user")
