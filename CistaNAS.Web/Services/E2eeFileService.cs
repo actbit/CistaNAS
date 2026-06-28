@@ -137,7 +137,7 @@ public sealed class E2eeFileService
     /// <summary>チャンクをアップロードして volume.dat またはチャンクストアに書き込む。</summary>
     public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, Stream data, long dataLength, CancellationToken ct = default)
     {
-        GetE2eeHeader(volumeName);
+        var header = GetE2eeHeader(volumeName);
 
         // ボリュームゲート: カタログ R-M-W (catalog-e2ee.json の Load→Modify→Save) を直列化。
         // 旧実装は per-file gate のみで catalog を更新しており、異なる fileId 間の
@@ -162,6 +162,12 @@ public sealed class E2eeFileService
                 // 同じ chunkIndex の二重アップロードもここで弾く。
                 if (entry.ChunkSizes.Count != chunkIndex)
                     throw new FileServiceException($"チャンク {chunkIndex} は順番にアップロードしてください（期待インデックス: {entry.ChunkSizes.Count}）。");
+
+                // Content-Length（クライアント設定で信頼できない）による巨大バッファ割り当て DoS を防ぐ。
+                // E2EE チャンクの暗号文 = 平文チャンク + salt(16, 先頭のみ) + tag(16) + 余裕。
+                long maxEncChunkBytes = header.ChunkSize + 32 + 64;
+                if (dataLength < 0 || dataLength > maxEncChunkBytes)
+                    throw new FileServiceException($"チャンクデータ長 ({dataLength}) が上限 ({maxEncChunkBytes} バイト) を超えています。");
 
                 // 暗号化チャンクの SHA-256 ハッシュをアップロードと同時に計算
                 using var sha = System.Security.Cryptography.IncrementalHash.CreateHash(

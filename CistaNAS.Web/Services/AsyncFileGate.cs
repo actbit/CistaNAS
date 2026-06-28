@@ -36,17 +36,22 @@ internal sealed class AsyncFileGate : IDisposable
     /// <summary>書き込みロックを取得。全読み取りの完了を即時通知で待機。戻り値の IDisposable で解放。</summary>
     public async Task<IDisposable> EnterWriteAsync(CancellationToken ct)
     {
-        // 入口でキャンセル要求をチェックし、_writerWaiting を残さないように。
-        // 戻り時の例外パスでも _writerWaiting を必ず 0 に戻す。
+        // ライターは _gate を取得したまま全リーダーの完了を待つ（ライター間を直列化）。
+        // かつて待機前に _gate を Release していたため、複数ライターが同時に待機して
+        // _readersCompletedTcs を上書きし、先のライターが永久スタックするハングがあった。
+        // 待機中も _gate を保持することで、2 番目以降のライターは _gate 待ちになり上書きを防ぐ。
         bool writerWaitingSet = false;
+        bool gateHeld = false;
         try
         {
             await _gate.WaitAsync(ct);
+            gateHeld = true;
             Volatile.Write(ref _writerWaiting, 1);
             writerWaitingSet = true;
-            while (_readerCount > 0)
+
+            while (Volatile.Read(ref _readerCount) > 0)
             {
-                // TCS を作成（gate 保持中）してから二重チェック
+                // TCS を作成（_gate 保持中）してから二重チェック
                 _readersCompletedTcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
                 if (Volatile.Read(ref _readerCount) == 0)
                 {
@@ -54,7 +59,6 @@ internal sealed class AsyncFileGate : IDisposable
                     _readersCompletedTcs = null;
                     break;
                 }
-                _gate.Release();
                 try
                 {
                     using var reg = ct.Register(static state => ((TaskCompletionSource<object?>)state!).TrySetCanceled(), _readersCompletedTcs);
@@ -62,28 +66,24 @@ internal sealed class AsyncFileGate : IDisposable
                 }
                 catch
                 {
-                    // キャンセル時は _writerWaiting をリセット
-                    // 注: gate は既に while ループ内で Release 済み。再 Release しないこと。
+                    // キャンセル時: writerWaiting をリセットし _gate を解放（待機中も保持しているため）
+                    _readersCompletedTcs = null;
                     Volatile.Write(ref _writerWaiting, 0);
                     writerWaitingSet = false;
-                    _readersCompletedTcs = null;
+                    _gate.Release();
+                    gateHeld = false;
                     throw;
                 }
-                await _gate.WaitAsync(ct);
             }
             _readersCompletedTcs = null;
-            // _gate を保持したまま返す → ExitWrite で解放
+            // _gate の所有権を WriteReleaser に移譲（ExitWrite で解放）
+            gateHeld = false;
             return new WriteReleaser(this);
         }
         catch
         {
-            // 外側のリトライ中の _gate.WaitAsync(ct) がキャンセルされた場合や
-            // 入口で即時キャンセルされた場合に _writerWaiting を必ずリセットする。
-            if (writerWaitingSet)
-            {
-                Volatile.Write(ref _writerWaiting, 0);
-                writerWaitingSet = false;
-            }
+            if (writerWaitingSet) Volatile.Write(ref _writerWaiting, 0);
+            if (gateHeld) _gate.Release();
             throw;
         }
     }

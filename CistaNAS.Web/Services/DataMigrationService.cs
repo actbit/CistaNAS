@@ -12,7 +12,12 @@ namespace CistaNAS.Web.Services;
 /// </summary>
 public static class DataMigrationService
 {
-    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true,
+        // 旧 users.json/groups.json のキー casing（camelCase/Pascal）に依存しない
+        PropertyNameCaseInsensitive = true,
+    };
 
     public static async Task MigrateIfNeededAsync(
         IStorageProvider storage,
@@ -26,31 +31,39 @@ public static class DataMigrationService
             return;
         }
 
-        // users.json の移行
         byte[]? usersData = await storage.ReadAsync("users.json", ct);
-        if (usersData is not null)
+        byte[]? groupsData = await storage.ReadAsync("groups.json", ct);
+        if (usersData is null && groupsData is null) return;
+
+        // users + groups を単一トランザクションで移行する（部分コミットによるアカウント/グループの
+        // サイレント消失を防ぐ）。失敗時はロールバックして例外再送し、起動を停止して運用者に通知する。
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        try
         {
-            try
+            // users.json の移行
+            if (usersData is not null)
             {
                 var users = JsonSerializer.Deserialize<List<LegacyUserEntry>>(usersData, JsonOptions);
                 if (users is not null && users.Count > 0)
                 {
                     logger.LogInformation("users.json から {Count} 件のユーザーを移行します...", users.Count);
 
-                    // ロールをメモリ上で重複なく収集して一括追加
-                    var roleMap = new Dictionary<string, string>();
+                    // ロールを正規化名（大文字）で重複排除して一括追加。旧データの大文字小文字違い
+                    // （"Admin"/"admin"）で NormalizedName が衝突しないよう、正規化キーを使用する。
+                    var roleMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                     foreach (var entry in users)
                     {
-                        if (!roleMap.ContainsKey(entry.Role))
+                        string normalizedRole = entry.Role.ToUpperInvariant();
+                        if (!roleMap.TryGetValue(normalizedRole, out var roleId))
                         {
-                            var roleId = Guid.NewGuid().ToString();
+                            roleId = Guid.NewGuid().ToString();
                             db.Roles.Add(new ApplicationRole
                             {
                                 Id = roleId,
                                 Name = entry.Role,
-                                NormalizedName = entry.Role.ToUpperInvariant(),
+                                NormalizedName = normalizedRole,
                             });
-                            roleMap[entry.Role] = roleId;
+                            roleMap[normalizedRole] = roleId;
                         }
 
                         db.Users.Add(new ApplicationUser
@@ -69,7 +82,7 @@ public static class DataMigrationService
                         db.UserRoles.Add(new Microsoft.AspNetCore.Identity.IdentityUserRole<string>
                         {
                             UserId = entry.Username,
-                            RoleId = roleMap[entry.Role],
+                            RoleId = roleId,
                         });
                     }
 
@@ -77,17 +90,9 @@ public static class DataMigrationService
                     logger.LogInformation("ユーザー移行完了。");
                 }
             }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "users.json の移行に失敗しました。");
-            }
-        }
 
-        // groups.json の移行
-        byte[]? groupsData = await storage.ReadAsync("groups.json", ct);
-        if (groupsData is not null)
-        {
-            try
+            // groups.json の移行
+            if (groupsData is not null)
             {
                 var groups = JsonSerializer.Deserialize<List<LegacyGroupEntry>>(groupsData, JsonOptions);
                 if (groups is not null && groups.Count > 0)
@@ -95,24 +100,27 @@ public static class DataMigrationService
                     logger.LogInformation("groups.json から {Count} 件のグループを移行します...", groups.Count);
                     foreach (var entry in groups)
                     {
-                        var entity = new GroupEntity
+                        db.Groups.Add(new GroupEntity
                         {
                             GroupName = entry.GroupName,
                             OwnerUser = entry.OwnerUser,
                             CreatedAt = entry.CreatedAt,
                             Members = entry.Members.Select(m => new GroupMemberEntity { Username = m }).ToList(),
-                        };
-                        db.Groups.Add(entity);
+                        });
                     }
 
                     await db.SaveChangesAsync(ct);
                     logger.LogInformation("グループ移行完了。");
                 }
             }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "groups.json の移行に失敗しました。");
-            }
+
+            await tx.CommitAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            await tx.RollbackAsync(ct);
+            logger.LogError(ex, "users.json/groups.json の移行に失敗しました。ロールバックしました。");
+            throw;
         }
     }
 

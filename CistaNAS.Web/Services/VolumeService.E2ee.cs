@@ -53,6 +53,10 @@ public sealed partial class VolumeService
                 MountInternalChunked(name, header, masterKey: null);
             else
                 MountInternal(name, header, masterKey: null);
+
+            // クラッシュ復旧: 未コミットジャーナルがあればカタログを修復してクリア
+            await RecoverMountedVolumeAsync(name);
+
             return ToInfo(name, header, true);
         });
     }
@@ -107,8 +111,9 @@ public sealed partial class VolumeService
             var group = await FindGroupAsync(groupName)
                 ?? throw new VolumeException($"グループ '{groupName}' が見つかりません。");
 
-            if (!group.Members.Any(m => string.Equals(m.Username, ownerUsername, StringComparison.Ordinal)))
-                throw new VolumeException($"ユーザー '{ownerUsername}' はグループ '{groupName}' のメンバーではありません。");
+            // グループボリュームの作成はグループオーナーのみ（メンバーによる勝手な作成を防ぐ）。
+            if (group.OwnerUser != ownerUsername)
+                throw new VolumeException("グループオーナーのみがグループボリュームを作成できます。");
 
             string volName = $"{VolumeHeader.GroupPrefix}{groupName}";
             if (await _metaStore.ExistsAsync(volName))

@@ -67,23 +67,26 @@ public sealed class CistaNasFileSystem : IDokanOperations
         public long PlainLength;
 
         private byte[]? _fileKey;
+        private byte[]? _fileSalt;
         private readonly object _fileKeyLock = new();
 
-        /// <summary>FileKey をスレッドセーフに設定する。上書き可能（他クライアントの上書きで salt が変わった場合に再導出が必要）。</summary>
-        public void SetFileKey(byte[] key)
+        /// <summary>FileKey と fileSalt をスレッドセーフに設定。上書き可能（他クライアントの上書きで salt が変わった場合に再導出が必要）。</summary>
+        public void SetFileKey(byte[] key, byte[] salt)
         {
             lock (_fileKeyLock)
             {
                 _fileKey = key;
+                _fileSalt = salt;
             }
         }
 
-        /// <summary>FileKey が設定されているか確認し、設定されていれば返す。</summary>
-        public bool TryGetFileKey(out byte[]? key)
+        /// <summary>FileKey と fileSalt が設定されているか確認し、設定されていれば返す。</summary>
+        public bool TryGetFileKey(out byte[]? key, out byte[]? salt)
         {
             lock (_fileKeyLock)
             {
                 key = _fileKey;
+                salt = _fileSalt;
                 return _fileKey is not null;
             }
         }
@@ -353,22 +356,23 @@ public sealed class CistaNasFileSystem : IDokanOperations
                 var cache = GetOrCreateCache(fileId);
                 if (cache is null) return (DokanResult.FileNotFound, 0);
 
-                // チャンク 0 から salt を抽出して fileKey を確定
-                if (!cache.TryGetFileKey(out var fileKey))
+                // チャンク 0 から salt を抽出して fileKey を確定。
+                // salt は全チャンクの nonce 導出（DeriveChunkNonce）で共通して使うため保持する。
+                if (!cache.TryGetFileKey(out var fileKey, out var fileSalt))
                 {
                     var encData = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
                     if (encData.Length <= 16)
                         return (DokanResult.InternalError, 0);
 
-                    byte[] salt = new byte[16];
-                    Buffer.BlockCopy(encData, 0, salt, 0, 16);
-                    var derivedKey = E2eeCrypto.DeriveFileKey(_masterKey!, salt);
+                    fileSalt = new byte[16];
+                    Buffer.BlockCopy(encData, 0, fileSalt, 0, 16);
+                    var derivedKey = E2eeCrypto.DeriveFileKey(_masterKey!, fileSalt);
 
                     // チャンク 0 を復号してキャッシュ
-                    var chunk = E2eeCrypto.DecryptChunk(encData, derivedKey, 0, out _);
+                    var chunk = E2eeCrypto.DecryptChunk(encData, derivedKey, 0, fileSalt);
                     PutChunkToPool(fileId, 0, chunk, ComputeHashHex(encData));
 
-                    cache.SetFileKey(derivedKey);
+                    cache.SetFileKey(derivedKey, fileSalt);
                     fileKey = derivedKey;
                 }
 
@@ -398,12 +402,13 @@ public sealed class CistaNasFileSystem : IDokanOperations
                             // fileKey が変わった場合はキャッシュをクリアして再構築
                             if (newKey != fileKey)
                             {
-                                cache.SetFileKey(newKey);
+                                cache.SetFileKey(newKey, newSalt);
                                 fileKeyToUse = newKey;
+                                fileSalt = newSalt;
                                 RemoveFileChunksFromPool(fileId);
 
                                 // チャンク0を復号してキャッシュ
-                                var chunk0 = E2eeCrypto.DecryptChunk(chunk0Data, newKey, 0, out _);
+                                var chunk0 = E2eeCrypto.DecryptChunk(chunk0Data, newKey, 0, newSalt);
                                 PutChunkToPool(fileId, 0, chunk0, ComputeHashHex(chunk0Data));
                             }
                         }
@@ -446,7 +451,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
                         {
                             // ハッシュ不一致 or ハッシュなし or 通信失敗 → 再ダウンロード
                             var encData = await _api.DownloadChunkAsync(_volumeName, fileId, i);
-                            chunk = E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, out _);
+                            chunk = E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, fileSalt!);
                             PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));
                         }
                     }
@@ -768,7 +773,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
     // 内部ヘルパー
     // ====================================================================
 
-    private void UploadWriteState(WriteState ws)
+    internal void UploadWriteState(WriteState ws)
     {
         byte[] plainData = ws.GetFinalData();
         if (plainData.Length == 0 && ws.CurrentSize == 0)
@@ -779,17 +784,10 @@ public sealed class CistaNasFileSystem : IDokanOperations
         {
             try
             {
+                // サーバーは同名 upsert で上書きするため、既存ファイルの個別削除は不要。
+                // （非E2EE では ExistingFileId == PlainName のため、アップロード後に削除すると
+                //   新ファイルを消去してしまう。E2EE は別 fileId なので削除が正しい）
                 CistaNasApiClientFiles.UploadFileAsync(_api, _volumeName, ws.PlainName, plainData).GetAwaiter().GetResult();
-
-                // 旧ファイルの削除（上書きの場合）
-                if (ws.ExistingFileId is not null)
-                {
-                    try
-                    {
-                        CistaNasApiClientFiles.DeleteFileAsync(_api, _volumeName, ws.ExistingFileId).GetAwaiter().GetResult();
-                    }
-                    catch { /* ベストエフォート: 孤児は許容 */ }
-                }
 
                 _listingCache.Invalidate();
                 lock (_statsLock) { _cachedStats = null; }
@@ -813,22 +811,35 @@ public sealed class CistaNasFileSystem : IDokanOperations
         long encLength = 16L + plainLength + (long)chunkCount * 16;
         string fileId = _api.CreateFileAsync(_volumeName, encName, encLength, chunkCount).GetAwaiter().GetResult();
 
-        int written = 0;
-        for (int i = 0; i < chunkCount; i++)
+        bool finalized = false;
+        try
         {
-            int chunkLen = Math.Min(_chunkSize, plainLength - written);
-            byte[] chunk = new byte[chunkLen];
-            Buffer.BlockCopy(plainData, written, chunk, 0, chunkLen);
+            int written = 0;
+            for (int i = 0; i < chunkCount; i++)
+            {
+                int chunkLen = Math.Min(_chunkSize, plainLength - written);
+                byte[] chunk = new byte[chunkLen];
+                Buffer.BlockCopy(plainData, written, chunk, 0, chunkLen);
 
-            byte[] encChunk = E2eeCrypto.EncryptChunk(chunk, fileKey, i, fileSalt, isFirstChunk: i == 0);
-            _api.UploadChunkAsync(_volumeName, fileId, i, encChunk).GetAwaiter().GetResult();
-            written += chunkLen;
+                byte[] encChunk = E2eeCrypto.EncryptChunk(chunk, fileKey, i, fileSalt, isFirstChunk: i == 0);
+                _api.UploadChunkAsync(_volumeName, fileId, i, encChunk).GetAwaiter().GetResult();
+                written += chunkLen;
+            }
+
+            _api.FinalizeFileAsync(_volumeName, fileId, encLength).GetAwaiter().GetResult();
+            finalized = true;
+        }
+        catch
+        {
+            // ロールバック: 作成中の fileId を削除し、サーバーに孤児ファイルを残さない。
+            // 旧ファイル（ExistingFileId）は新ファイルが完成していないため保持する。
+            try { _api.DeleteFileAsync(_volumeName, fileId).GetAwaiter().GetResult(); }
+            catch { /* ベストエフォート */ }
+            throw;
         }
 
-        _api.FinalizeFileAsync(_volumeName, fileId, encLength).GetAwaiter().GetResult();
-
-        // 旧ファイルの削除（上書きの場合）
-        if (ws.ExistingFileId is not null)
+        // 旧ファイルの削除（新ファイル完成後のみ）
+        if (finalized && ws.ExistingFileId is not null)
         {
             try
             {

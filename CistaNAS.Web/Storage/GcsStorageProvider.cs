@@ -57,14 +57,10 @@ public sealed class GcsStorageProvider : IStorageProvider, IAsyncDisposable
 
     public async Task WriteAtomicAsync(string blobPath, Stream content, CancellationToken ct = default)
     {
-        // GUID を付与して同時実行時の衝突を防止（S3/Azure 実装との整合性）
-        string tempPath = FullPath(blobPath) + ".tmp-" + Guid.NewGuid().ToString("N");
-        await _client.UploadObjectAsync(_bucket, tempPath, null, content, cancellationToken: ct);
-        // CopyObjectAsync は内部で Rewrite API を使用し、コピー完了までポーリングする。
-        await _client.CopyObjectAsync(_bucket, tempPath, _bucket, FullPath(blobPath),
+        // 単一の上書きアップロードで原子的に置換（GCS の UploadObject は上書き・原子的）。
+        // tmp→copy→delete 連鎖を廃止し、故障点と孤立オブジェクトを削減。
+        await _client.UploadObjectAsync(_bucket, FullPath(blobPath), null, content,
             cancellationToken: ct);
-        try { await _client.DeleteObjectAsync(_bucket, tempPath, cancellationToken: ct); }
-        catch (GoogleApiException) { /* ベストエフォート */ }
     }
 
     public async Task DeleteAsync(string blobPath, CancellationToken ct = default)

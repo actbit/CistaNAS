@@ -128,6 +128,26 @@ public sealed partial class VolumeService : IAsyncDisposable
         _mounted[name] = new MountedVolume(header, masterKey, Stream.Null);
     }
 
+    // ---- クラッシュ復旧 ----
+
+    /// <summary>
+    /// マウント直後に未コミットジャーナルがあればカタログを修復し、ジャーナルをクリアする。
+    /// FileService（Scoped）をスコープ経由で取得する。復旧失敗はログに記録し、マウント自体は継続。
+    /// </summary>
+    private async Task RecoverMountedVolumeAsync(string name)
+    {
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var fileService = scope.ServiceProvider.GetRequiredService<FileService>();
+            await fileService.RecoverAsync(name);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "ボリューム '{Volume}' のジャーナル復旧に失敗しました。", name);
+        }
+    }
+
     // ---- 内部ヘルパ ----
 
     private async Task<VolumeHeader> LoadHeaderOrThrowAsync(string name)
@@ -219,18 +239,30 @@ public sealed partial class VolumeService : IAsyncDisposable
     private sealed class ActiveIoTracker
     {
         private int _activeCount;
+        private bool _closed; // 新規 I/O 受付停止（アンマウント開始以降）
         private readonly object _gate = new();
         private TaskCompletionSource<object?>? _zeroTcs;
 
         public Task<IDisposable> EnterAsync(CancellationToken ct)
         {
-            // 同期ロックで _activeCount をインクリメント
-            // （非同期ロールバックの心配はないため lock で十分）
+            // _closed チェックと _activeCount インクリメントを同一ロック内で原子化し、
+            // アンマウント中の新規 I/O 受付を確実に拒否する（use-after-dispose 防止）。
             lock (_gate)
             {
+                if (_closed)
+                    throw new VolumeException("ボリュームはアンマウント中です。");
                 _activeCount++;
             }
             return Task.FromResult<IDisposable>(new Releaser(this));
+        }
+
+        /// <summary>新規 I/O の受付を停止する（アンマウント開始時に呼ぶ）。既存 I/O は継続し完了を待つ。</summary>
+        public void Close()
+        {
+            lock (_gate)
+            {
+                _closed = true;
+            }
         }
 
         /// <summary>アクティブ I/O がゼロになるまで待機する。</summary>

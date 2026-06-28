@@ -25,8 +25,10 @@ internal sealed class IoGuardReadStream(Stream inner, IDisposable ioGuard) : Str
         if (disposing && !_disposed)
         {
             _disposed = true;
-            inner.Dispose();
-            ioGuard.Dispose();
+            // 内側 Dispose が例外を投げても I/O ガードは確実に解放する。
+            // 解放漏れはボリュームのアンマウント（WaitForZeroAsync）を恒久スタックさせる。
+            try { inner.Dispose(); }
+            finally { ioGuard.Dispose(); }
         }
         base.Dispose(disposing);
     }

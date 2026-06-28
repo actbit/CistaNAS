@@ -154,12 +154,16 @@ public sealed partial class VolumeService
     // ---- ユーザークオータ ----
 
     /// <summary>ユーザーのクオータを設定する（ボリュームオーナーのみ）。</summary>
-    public Task SetUserQuotaAsync(string volumeName, string targetUsername, long maxBytes)
+    public Task SetUserQuotaAsync(string volumeName, string requesterUsername, string targetUsername, long maxBytes)
     {
         // _mountGate で並行 MountAsync / ヘッダ更新との競合を防ぐ (H-4)
         return UnderMountGateAsync(async () =>
         {
             var header = await LoadHeaderOrThrowAsync(volumeName);
+            // サービス層でもオーナー確認（API の VolumeOwner ポリシーのみに頼らない
+            // defense-in-depth）。Grant*/Revoke* 系と一貫した二重チェック。
+            if (header.OwnerUser != requesterUsername)
+                throw new VolumeException("オーナーのみがクオータを設定できます。");
             header.UserQuotas[targetUsername] = maxBytes;
             await _metaStore.SaveAsync(volumeName, header);
 

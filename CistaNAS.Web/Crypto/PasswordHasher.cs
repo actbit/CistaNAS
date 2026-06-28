@@ -14,11 +14,16 @@ public static class PasswordHasher
     private const int SaltSize = 16;
     private const int HashSize = 32;
     private const string Prefix = "pbkdf2-sha256";
+    /// <summary>検証時の反復数上限（保存済みハッシュの改ざんによる CPU DoS を防ぐ）。</summary>
+    private const int MaxVerifyIterations = 10_000_000;
 
     public static string Hash(string password, int iterations)
     {
         ArgumentException.ThrowIfNullOrEmpty(password);
-        if (iterations < 1) throw new ArgumentOutOfRangeException(nameof(iterations));
+        // Verify 側の上限（MaxVerifyIterations）と一致させる。設定ミスで上限超のハッシュを
+        // 生成すると Verify で弾かれてログイン不能になるため、生成時点でも拒否する。
+        if (iterations < 1 || iterations > MaxVerifyIterations)
+            throw new ArgumentOutOfRangeException(nameof(iterations), $"反復数は 1〜{MaxVerifyIterations} の範囲である必要があります。");
 
         byte[] salt = RandomNumberGenerator.GetBytes(SaltSize);
         byte[] hash = Rfc2898DeriveBytes.Pbkdf2(password, salt, iterations, HashAlgorithmName.SHA256, HashSize);
@@ -32,7 +37,7 @@ public static class PasswordHasher
 
         string[] parts = encoded.Split('$');
         if (parts.Length != 4 || parts[0] != Prefix) return false;
-        if (!int.TryParse(parts[1], out int iterations) || iterations < 1) return false;
+        if (!int.TryParse(parts[1], out int iterations) || iterations < 1 || iterations > MaxVerifyIterations) return false;
 
         byte[] salt, expected;
         try

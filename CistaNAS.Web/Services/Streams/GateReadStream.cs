@@ -31,11 +31,16 @@ internal sealed class GateReadStream(Stream inner, IDisposable gateLock) : Strea
     {
         if (disposing)
         {
-            inner.Dispose();
-            if (!_lockReleased)
+            // 内側 Dispose が例外を投げてもゲートロックは確実に解放する（例外安全性）。
+            // 解放漏れは当該ファイルへのアップロード/削除の恒久スタベーションになる。
+            try { inner.Dispose(); }
+            finally
             {
-                gateLock.Dispose();
-                _lockReleased = true;
+                if (!_lockReleased)
+                {
+                    gateLock.Dispose();
+                    _lockReleased = true;
+                }
             }
         }
         base.Dispose(disposing);

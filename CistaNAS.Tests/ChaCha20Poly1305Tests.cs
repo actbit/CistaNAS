@@ -469,6 +469,32 @@ public class ChaCha20Poly1305Tests
     }
 
     /// <summary>
+    /// フルブロック（16 バイト倍数）を含む Poly1305 ラウンドトリップ。
+    /// Poly1305 の最終フルブロックに hibit(2^128) を加える RFC 8439 §2.5 準拠の
+    /// 自己整合性を検証（Encrypt/Decrypt が同一実装で一貫することを確認）。
+    /// </summary>
+    [Theory]
+    [InlineData(16)]
+    [InlineData(32)]
+    [InlineData(48)]
+    [InlineData(64)]
+    public void ChaCha20Poly1305_FullFinalBlock_Roundtrip(int size)
+    {
+        byte[] key = RandomNumberGenerator.GetBytes(32);
+        byte[] nonce = RandomNumberGenerator.GetBytes(12);
+        byte[] plaintext = RandomNumberGenerator.GetBytes(size);
+
+        var (_, ciphertext, tag) = ClientChaCha20.Encrypt(plaintext, key, nonce);
+        byte[] decrypted = ClientChaCha20.Decrypt(ciphertext, tag, nonce, key);
+
+        Assert.Equal(plaintext, decrypted);
+        // タグ改ざんで検出されること（フルブロックでも MAC が有効）
+        tag[0] ^= 0xFF;
+        Assert.ThrowsAny<CryptographicException>(() =>
+            ClientChaCha20.Decrypt(ciphertext, tag, nonce, key));
+    }
+
+    /// <summary>
     /// ChaCha20-Poly1305 タグ検証失敗。
     /// </summary>
     [Fact]

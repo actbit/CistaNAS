@@ -285,12 +285,12 @@ public class DokanFileSystemTests
         Parallel.For(0, 100, i =>
         {
             byte[] key = i % 2 == 0 ? key1 : key2;
-            cache.SetFileKey(key);
+            cache.SetFileKey(key, new byte[16]);
         });
 
         // SetFileKey は上書き可能（他クライアントの上書きで salt が変わった場合に再導出が必要）
         // いずれかのキーが保持されていることを確認
-        Assert.True(cache.TryGetFileKey(out var retrievedKey));
+        Assert.True(cache.TryGetFileKey(out var retrievedKey, out _));
         Assert.True(retrievedKey == key1 || retrievedKey == key2,
             $"キーは key1 または key2 のいずれかである必要があります。実際: {BitConverter.ToString(retrievedKey)}");
     }
@@ -306,8 +306,8 @@ public class DokanFileSystemTests
         Parallel.For(0, 100, i =>
         {
             if (i == 50)
-                cache.SetFileKey(key);
-            bool hasKey = cache.TryGetFileKey(out _);
+                cache.SetFileKey(key, new byte[16]);
+            bool hasKey = cache.TryGetFileKey(out _, out _);
             results.Add(hasKey);
         });
 

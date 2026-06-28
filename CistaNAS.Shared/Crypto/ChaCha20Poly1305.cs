@@ -327,38 +327,27 @@ public static class ChaCha20Poly1305
         while (length > 0)
         {
             int blockSize = Math.Min(PolyBlock, length);
-            bool isFinalBlock = (blockSize == length);  // 最後のブロックかどうか
 
             // 16 バイトブロックを構築
             block.Clear();
             data.AsSpan(offset, blockSize).CopyTo(block);
 
-            if (isFinalBlock)
-            {
-                // 最終ブロック: 末尾に 0x01 を追加（partial の場合のみ）、
-                // hibit (2^128) は **加算しない**
-                if (blockSize < PolyBlock)
-                {
-                    block[blockSize] = 0x01;
-                }
-                // else: blockSize == 16 で full 最終ブロック → そのまま 16 バイト + hibit=0
-            }
-            else
-            {
-                // 非最終ブロック: 16 バイトのデータ + hibit (2^128) を加算
-                // c4 = (m[12..16] >> 8) | HIBIT
-            }
+            // フルブロック（16B）には hibit(2^128) を c4 に加算（最終・中間問わず）。
+            // partial ブロック（最終のみ到達可能）は末尾 0x01 を付加し hibit は加えない
+            // （RFC 8439 §2.5 / poly1305-donna 準拠）。
+            bool isFullBlock = blockSize == PolyBlock;
+            if (!isFullBlock)
+                block[blockSize] = 0x01;
 
             // リトルエンディアン 5 リム 26-bit (poly1305-donna の bit 配置と一致)
             uint c0 = BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(0, 4)) & BIT_26;
             uint c1 = (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(3, 4)) >> 2) & BIT_26;
             uint c2 = (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(6, 4)) >> 4) & BIT_26;
             uint c3 = (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(9, 4)) >> 6) & BIT_26;
-            // poly1305-donna 準拠: 非最終ブロックのみ HIBIT (2^128) をセット。
-            // 最終ブロックは 0x01 パディングのみ（RFC 8439 §2.5 の poly1305-donna 実装に従う）。
-            uint c4 = isFinalBlock
-                ? (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(12, 4)) >> 8)
-                : (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(12, 4)) >> 8) | HIBIT;
+            // フルブロックは HIBIT(2^128) を加算。partial ブロックは 0x01 パディングのみ。
+            uint c4 = isFullBlock
+                ? (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(12, 4)) >> 8) | HIBIT
+                : (BinaryPrimitives.ReadUInt32LittleEndian(block.Slice(12, 4)) >> 8);
 
             offset += blockSize;
             length -= blockSize;

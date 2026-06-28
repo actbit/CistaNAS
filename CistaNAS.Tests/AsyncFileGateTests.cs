@@ -137,6 +137,43 @@ public class AsyncFileGateTests
         Assert.True(writerEntered);
     }
 
+    /// <summary>
+    /// リーダー保持中に2つのライターが同時に待機しても、先のライターが
+    /// 永久スタックしないこと（_readersCompletedTcs の上書きによるハング回帰防止）。
+    /// </summary>
+    [Fact]
+    public async Task TwoWriters_BothAcquire_NoHang()
+    {
+        using var gate = new AsyncFileGate();
+        var readLock = await gate.EnterReadAsync(Ct);
+
+        var w1Entered = new TaskCompletionSource<bool>();
+        var w2Entered = new TaskCompletionSource<bool>();
+
+        var w1 = Task.Run(async () =>
+        {
+            using var wl = await gate.EnterWriteAsync(Ct);
+            w1Entered.SetResult(true);
+            await Task.Delay(100);
+        });
+
+        var w2 = Task.Run(async () =>
+        {
+            using var wl = await gate.EnterWriteAsync(Ct);
+            w2Entered.SetResult(true);
+            wl.Dispose();
+        });
+
+        await Task.Delay(200); // 両ライターが待機状態に入るまで待つ
+
+        readLock.Dispose(); // リーダー解放 → ライターが順に取得されるはず
+
+        // 5 秒以内に両ライターが取得できること（ハングしない）
+        await w1Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await w2Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await w1;
+    }
+
     /// <summary>読み取りロックの Dispose が正しくカウントを減らす。</summary>
     [Fact]
     public async Task ReadLockDispose_DecrementsCount()
