@@ -97,6 +97,43 @@ public class FileServiceTests : IAsyncDisposable
         Assert.Equal(300, meta.Length);
     }
 
+    /// <summary>
+    /// 既存ファイルより短い上書きで、残領域が旧データ残留ではなくゼロクリアされること。
+    /// カタログは短い長さを記録するが、volume.dat 上の残りバイトに旧内容が残らない。
+    /// </summary>
+    [Fact]
+    public async Task Upload_OverwriteShorter_ClearsResidualData()
+    {
+        string vol = await MountVol("residual");
+        var fs = GetFileService();
+
+        byte[] data1 = new byte[1000];
+        Array.Fill(data1, (byte)0xAB);
+        using (var ms = new MemoryStream(data1))
+            await fs.UploadAsync(vol, "file.bin", ms, data1.Length);
+
+        byte[] data2 = new byte[500];
+        Array.Fill(data2, (byte)0xCD);
+        using (var ms = new MemoryStream(data2))
+            await fs.UploadAsync(vol, "file.bin", ms, data2.Length);
+
+        // volume.dat の残領域 [500, 1000) を直接読み、旧データ(0xAB)でなく
+        // ゼロクリアされていることを検証（カタログは Length=500 で論理的には見えない領域）
+        var (ioGuard, stream, _) = await _vs.GetMountedForIoAsync(vol);
+        try
+        {
+            stream.Seek(500, SeekOrigin.Begin);
+            byte[] residual = new byte[500];
+            int read = stream.Read(residual, 0, 500);
+            Assert.Equal(500, read);
+            Assert.All(residual, b => Assert.Equal(0, b));
+        }
+        finally
+        {
+            ioGuard.Dispose();
+        }
+    }
+
     [Fact]
     public async Task Download_NotFound_Throws()
     {

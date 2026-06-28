@@ -141,6 +141,23 @@ public sealed class FileService
                     writtenBytes += read;
                     remaining -= read;
                 }
+
+                // 既存ファイル領域を再利用して短くなった場合、残領域を暗号化ゼロでクリア。
+                // カタログは writtenBytes で短縮記録されるが、volume.dat 上の残りバイトに
+                // 旧内容（暗号文）が残留するのを防ぐ。
+                if (existing is not null && existing.Length >= contentLength && existing.Length > writtenBytes)
+                {
+                    stream.Seek(offset + writtenBytes, SeekOrigin.Begin);
+                    Array.Clear(buffer, 0, buffer.Length);
+                    long zRemain = existing.Length - writtenBytes;
+                    while (zRemain > 0)
+                    {
+                        int n = (int)Math.Min(buffer.Length, zRemain);
+                        await stream.WriteAsync(buffer.AsMemory(0, n), ct);
+                        zRemain -= n;
+                    }
+                }
+
                 await stream.FlushAsync(ct);
             }
             finally
