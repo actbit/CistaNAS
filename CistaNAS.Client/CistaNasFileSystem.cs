@@ -811,22 +811,35 @@ public sealed class CistaNasFileSystem : IDokanOperations
         long encLength = 16L + plainLength + (long)chunkCount * 16;
         string fileId = _api.CreateFileAsync(_volumeName, encName, encLength, chunkCount).GetAwaiter().GetResult();
 
-        int written = 0;
-        for (int i = 0; i < chunkCount; i++)
+        bool finalized = false;
+        try
         {
-            int chunkLen = Math.Min(_chunkSize, plainLength - written);
-            byte[] chunk = new byte[chunkLen];
-            Buffer.BlockCopy(plainData, written, chunk, 0, chunkLen);
+            int written = 0;
+            for (int i = 0; i < chunkCount; i++)
+            {
+                int chunkLen = Math.Min(_chunkSize, plainLength - written);
+                byte[] chunk = new byte[chunkLen];
+                Buffer.BlockCopy(plainData, written, chunk, 0, chunkLen);
 
-            byte[] encChunk = E2eeCrypto.EncryptChunk(chunk, fileKey, i, fileSalt, isFirstChunk: i == 0);
-            _api.UploadChunkAsync(_volumeName, fileId, i, encChunk).GetAwaiter().GetResult();
-            written += chunkLen;
+                byte[] encChunk = E2eeCrypto.EncryptChunk(chunk, fileKey, i, fileSalt, isFirstChunk: i == 0);
+                _api.UploadChunkAsync(_volumeName, fileId, i, encChunk).GetAwaiter().GetResult();
+                written += chunkLen;
+            }
+
+            _api.FinalizeFileAsync(_volumeName, fileId, encLength).GetAwaiter().GetResult();
+            finalized = true;
+        }
+        catch
+        {
+            // ロールバック: 作成中の fileId を削除し、サーバーに孤児ファイルを残さない。
+            // 旧ファイル（ExistingFileId）は新ファイルが完成していないため保持する。
+            try { _api.DeleteFileAsync(_volumeName, fileId).GetAwaiter().GetResult(); }
+            catch { /* ベストエフォート */ }
+            throw;
         }
 
-        _api.FinalizeFileAsync(_volumeName, fileId, encLength).GetAwaiter().GetResult();
-
-        // 旧ファイルの削除（上書きの場合）
-        if (ws.ExistingFileId is not null)
+        // 旧ファイルの削除（新ファイル完成後のみ）
+        if (finalized && ws.ExistingFileId is not null)
         {
             try
             {
