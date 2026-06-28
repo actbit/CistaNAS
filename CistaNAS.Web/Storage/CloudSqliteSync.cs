@@ -35,7 +35,10 @@ public sealed class CloudSqliteSync : IHostedService, IDisposable
         }
         else
         {
-            _localPath = Path.GetTempFileName();
+            // テンポラリでも固定パス（プロセス再起動で同じファイルを再利用）。
+            // シャットダウン時のアップロード失敗から次回起動で復旧できるよう、
+            // 毎回新しい空ファイルを作らずパスごとのファイルを維持する。
+            _localPath = Path.Combine(Path.GetTempPath(), _blobKey);
             _isTemp = true;
         }
 
@@ -45,8 +48,15 @@ public sealed class CloudSqliteSync : IHostedService, IDisposable
     public string LocalDbPath => _localPath;
 
     /// <summary>起動時にオブジェクトストレージから DB ファイルをダウンロードする。</summary>
+    /// <remarks>
+    /// ローカルが既に存在する場合は上書きしない（ローカルを真実のソースとする）。
+    /// シャットダウン時のアップロード失敗でクラウドが古いままでも、次回起動で
+    /// ローカルの最新状態を維持し、DB 変更の消失を防ぐ。
+    /// </remarks>
     public async Task DownloadAsync(CancellationToken ct = default)
     {
+        if (File.Exists(_localPath)) return;
+
         byte[]? data = await _storage.ReadAsync(_blobKey, ct);
         if (data is not null)
             await File.WriteAllBytesAsync(_localPath, data, ct);
@@ -79,21 +89,35 @@ public sealed class CloudSqliteSync : IHostedService, IDisposable
 
     public async Task StopAsync(CancellationToken ct)
     {
-        bool uploadSucceeded = false;
-        try
+        // シャットダウン時の DB アップロードを確実化（リトライ付き）。
+        // 失敗してもローカルファイルは保持し、次回起動の DownloadAsync で
+        // ローカルが優先されることで DB 変更の消失を防ぐ。
+        Exception? lastError = null;
+        for (int attempt = 0; attempt < 3 && !ct.IsCancellationRequested; attempt++)
         {
-            await UploadIfDirtyAsync().WaitAsync(TimeSpan.FromSeconds(10), ct);
-            uploadSucceeded = true;
+            try
+            {
+                await UploadIfDirtyAsync(ct);
+                lastError = null;
+                break;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                if (attempt < 2)
+                {
+                    try { await Task.Delay(TimeSpan.FromSeconds(2 * (attempt + 1)), ct); }
+                    catch (OperationCanceledException) { break; }
+                }
+            }
         }
-        catch (TimeoutException)
-        {
-            Console.Error.WriteLine("[Warning] Cloud sync upload timed out during shutdown.");
-        }
-        catch (Exception) { /* シャットダウン中の競合は無視 */ }
 
-        // アップロード失敗時はテンポラリファイルを保持（次回起動時に復旧可能）。
-        // 成功時またはテンポラリでない場合は安全に Dispose できる。
-        if (uploadSucceeded || !_isTemp)
+        if (lastError is not null)
+            Console.Error.WriteLine($"[Error] Cloud sync upload failed during shutdown: {lastError.Message}");
+
+        // アップロード成功時のみテンポラリファイルを削除（クラウドが最新のため）。
+        // 永続ファイルは Dispose で削除されない。失敗時はテンポラリも保持し次回起動で復旧。
+        if (_isTemp && lastError is null)
             Dispose();
     }
 }
