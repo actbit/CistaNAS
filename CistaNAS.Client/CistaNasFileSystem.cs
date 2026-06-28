@@ -773,7 +773,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
     // 内部ヘルパー
     // ====================================================================
 
-    private void UploadWriteState(WriteState ws)
+    internal void UploadWriteState(WriteState ws)
     {
         byte[] plainData = ws.GetFinalData();
         if (plainData.Length == 0 && ws.CurrentSize == 0)
@@ -784,17 +784,10 @@ public sealed class CistaNasFileSystem : IDokanOperations
         {
             try
             {
+                // サーバーは同名 upsert で上書きするため、既存ファイルの個別削除は不要。
+                // （非E2EE では ExistingFileId == PlainName のため、アップロード後に削除すると
+                //   新ファイルを消去してしまう。E2EE は別 fileId なので削除が正しい）
                 CistaNasApiClientFiles.UploadFileAsync(_api, _volumeName, ws.PlainName, plainData).GetAwaiter().GetResult();
-
-                // 旧ファイルの削除（上書きの場合）
-                if (ws.ExistingFileId is not null)
-                {
-                    try
-                    {
-                        CistaNasApiClientFiles.DeleteFileAsync(_api, _volumeName, ws.ExistingFileId).GetAwaiter().GetResult();
-                    }
-                    catch { /* ベストエフォート: 孤児は許容 */ }
-                }
 
                 _listingCache.Invalidate();
                 lock (_statsLock) { _cachedStats = null; }
