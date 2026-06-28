@@ -135,75 +135,170 @@ public sealed class CistaNasFileSystem : IDokanOperations
 
     // ---- 内部クラス: 書き込みバッファ ----
 
-    internal sealed class WriteState
-    {
-        public string PlainName;
-        public string? ExistingFileId; // 上書き時の旧ファイルID
-        private byte[] _buffer;
-        private long _writtenLength;    // 実際に書き込んだ最大位置
-        private long _declaredSize = -1; // SetEndOfFile で指定されたサイズ
-        private readonly object _lock = new();
+    // ---- 内部クラス: 書き込み状態（チャンクベース差分保存） ----
 
-        public WriteState(string plainName, string? existingFileId, int initialCapacity = 64 * 1024)
+    internal abstract class WriteState
+    {
+        public readonly string PlainName;
+        public readonly string? ExistingFileId; // 上書き時の旧ファイルID（E2EE は fileId、非E2EE は plainName または null）
+        protected readonly CistaNasFileSystem Fs;
+        public long DeclaredSize = -1; // SetEndOfFile で指定されたサイズ
+
+        protected WriteState(CistaNasFileSystem fs, string plainName, string? existingFileId)
         {
+            Fs = fs;
             PlainName = plainName;
             ExistingFileId = existingFileId;
-            _buffer = new byte[initialCapacity];
-            _writtenLength = 0;
         }
 
-        public long CurrentSize
+        public abstract long CurrentSize { get; }
+        public abstract void Write(byte[] data, int dataOffset, int count, long fileOffset);
+        public abstract void SetDeclaredSize(long size);
+    }
+
+    // 非 E2EE: 汚れたバイト範囲を記録し、Cleanup で PATCH（部分書き込み）する。RMW 不要（サーバー AesXtsStream が処理）。
+    internal sealed class PlainRangeWriteState : WriteState
+    {
+        private readonly List<(long Offset, byte[] Data)> _ranges = new();
+        private long _maxWritten;
+        private readonly long _existingLength;
+
+        public PlainRangeWriteState(CistaNasFileSystem fs, string plainName, string? existingFileId, long existingLength = 0)
+            : base(fs, plainName, existingFileId)
+        {
+            _existingLength = existingLength;
+        }
+
+        public IReadOnlyList<(long Offset, byte[] Data)> Ranges => _ranges;
+
+        public override long CurrentSize
         {
             get
             {
-                lock (_lock) { return _declaredSize >= 0 ? _declaredSize : _writtenLength; }
+                long basis = Math.Max(_maxWritten, _existingLength);
+                return DeclaredSize >= 0 ? Math.Max(DeclaredSize, basis) : basis;
             }
         }
 
-        public void Write(byte[] data, int dataOffset, int count, long fileOffset)
+        public override void Write(byte[] data, int dataOffset, int count, long fileOffset)
         {
-            lock (_lock)
+            if (count <= 0) return;
+            byte[] copy = new byte[count];
+            Buffer.BlockCopy(data, dataOffset, copy, 0, count);
+            _ranges.Add((fileOffset, copy));
+            long end = fileOffset + count;
+            if (end > _maxWritten) _maxWritten = end;
+        }
+
+        public override void SetDeclaredSize(long size)
+        {
+            DeclaredSize = size;
+            if (size > _maxWritten) _maxWritten = size;
+        }
+    }
+
+    // E2EE: 汚れたチャンクを RMW（既存チャンク DL→復号→部分更新）で追跡し、Cleanup で汚れたチャンクだけ差分上書きする。
+    internal sealed class E2eeChunkWriteState : WriteState
+    {
+        private readonly Dictionary<int, byte[]> _dirtyChunks = new();
+        private long _maxWritten;
+        private byte[]? _existingFileSalt;
+        private byte[]? _existingFileKey;
+        private int _existingChunkCount;
+        private long _existingPlainLength;
+
+        public E2eeChunkWriteState(CistaNasFileSystem fs, string plainName, string? existingFileId)
+            : base(fs, plainName, existingFileId)
+        {
+            if (existingFileId is not null)
             {
-                long endOffset = fileOffset + count;
-                EnsureCapacity(endOffset);
-                Buffer.BlockCopy(data, dataOffset, _buffer, (int)fileOffset, count);
-                if (endOffset > _writtenLength)
-                    _writtenLength = endOffset;
+                var cache = fs.GetOrCreateCache(existingFileId);
+                if (cache is not null)
+                {
+                    _existingChunkCount = cache.ChunkCount;
+                    _existingPlainLength = cache.PlainLength;
+                    if (cache.TryGetFileKey(out var key, out var salt))
+                    {
+                        _existingFileKey = key;
+                        _existingFileSalt = salt;
+                    }
+                    else if (_existingChunkCount > 0)
+                    {
+                        // fileKey 未設定 → chunk0 の salt から導出（差分保存の RMW で既存チャンク復号に必要）
+                        try
+                        {
+                            var (enc0, _) = fs._api.DownloadChunkAsync(fs._volumeName, existingFileId, 0).GetAwaiter().GetResult();
+                            if (enc0.Length > E2eeCrypto.SaltSize)
+                            {
+                                var salt0 = new byte[E2eeCrypto.SaltSize];
+                                Buffer.BlockCopy(enc0, 0, salt0, 0, E2eeCrypto.SaltSize);
+                                _existingFileKey = E2eeCrypto.DeriveFileKey(fs._masterKey!, salt0);
+                                _existingFileSalt = salt0;
+                                cache.SetFileKey(_existingFileKey, _existingFileSalt);
+                            }
+                        }
+                        catch { /* ベストエフォート: 導出失敗時は新規チャンク扱い */ }
+                    }
+                }
             }
         }
 
-        public void SetDeclaredSize(long size)
+        public IReadOnlyDictionary<int, byte[]> DirtyChunks => _dirtyChunks;
+        public byte[]? ExistingFileSalt => _existingFileSalt;
+        public byte[]? ExistingFileKey => _existingFileKey;
+        public int ExistingChunkCount => _existingChunkCount;
+        public long ExistingPlainLength => _existingPlainLength;
+
+        public override long CurrentSize
         {
-            lock (_lock)
+            get
             {
-                _declaredSize = size;
-                if (size > _buffer.Length)
-                    EnsureCapacity(size);
+                if (DeclaredSize >= 0) return Math.Max(DeclaredSize, _maxWritten);
+                return Math.Max(_maxWritten, ExistingFileId is not null ? _existingPlainLength : 0);
             }
         }
 
-        public byte[] GetFinalData()
+        public override void Write(byte[] data, int dataOffset, int count, long fileOffset)
         {
-            lock (_lock)
+            if (count <= 0) return;
+            int chunkSize = Fs._chunkSize;
+            long endOffset = fileOffset + count;
+            int startChunk = (int)(fileOffset / chunkSize);
+            int endChunk = (int)((endOffset - 1) / chunkSize);
+
+            for (int ci = startChunk; ci <= endChunk; ci++)
             {
-                int length = _declaredSize >= 0
-                    ? (int)Math.Min(_declaredSize, _writtenLength > 0 ? _writtenLength : _declaredSize)
-                    : (int)_writtenLength;
-                if (length <= 0) return [];
-                byte[] result = new byte[length];
-                Array.Copy(_buffer, result, length);
-                return result;
+                long chunkStart = (long)ci * chunkSize;
+                byte[] chunk = GetOrLoadChunk(ci);
+                long relStart = Math.Max(0, fileOffset - chunkStart);
+                long relEnd = Math.Min(chunk.Length, endOffset - chunkStart);
+                int copyLen = (int)(relEnd - relStart);
+                long srcStart = Math.Max(0, chunkStart - fileOffset);
+                Buffer.BlockCopy(data, dataOffset + (int)srcStart, chunk, (int)relStart, copyLen);
+                _dirtyChunks[ci] = chunk;
             }
+            if (endOffset > _maxWritten) _maxWritten = endOffset;
         }
 
-        private void EnsureCapacity(long needed)
+        public override void SetDeclaredSize(long size)
         {
-            if (needed <= _buffer.Length) return;
-            long newCapacity = Math.Max(_buffer.Length * 2L, needed);
-            if (newCapacity > int.MaxValue) newCapacity = int.MaxValue;
-            byte[] newBuffer = new byte[(int)newCapacity];
-            Array.Copy(_buffer, newBuffer, Math.Min(_buffer.Length, (int)newCapacity));
-            _buffer = newBuffer;
+            DeclaredSize = size;
+            if (size > _maxWritten) _maxWritten = size;
+        }
+
+        private byte[] GetOrLoadChunk(int ci)
+        {
+            if (_dirtyChunks.TryGetValue(ci, out var cached)) return cached;
+
+            int chunkSize = Fs._chunkSize;
+            // 既存チャンク: DL + 復号（末尾保持のため RMW）
+            if (ExistingFileId is not null && ci < _existingChunkCount
+                && _existingFileKey is not null && _existingFileSalt is not null)
+            {
+                return Fs.LoadPlainChunkForWrite(ExistingFileId, ci, _existingFileKey, _existingFileSalt);
+            }
+            // 新規チャンク: chunkSize のゼロ
+            return new byte[chunkSize];
         }
     }
 
@@ -246,10 +341,18 @@ public sealed class CistaNasFileSystem : IDokanOperations
                 return DokanResult.Success;
             }
 
-            // 非E2EE モード: ファイルパスを設定
+            // 非E2EE モード: 読み取りはファイルパス、書き込みアクセスは差分保存（PlainRangeWriteState）
             if (!_isE2ee)
             {
-                info.Context = plainName;
+                if ((access & (DokanNet.FileAccess.WriteData | DokanNet.FileAccess.GenericWrite)) != 0)
+                {
+                    long existingLength = GetExistingPlainLength(plainName);
+                    info.Context = new PlainRangeWriteState(this, plainName, plainName, existingLength);
+                }
+                else
+                {
+                    info.Context = plainName;
+                }
                 return DokanResult.Success;
             }
 
@@ -257,10 +360,10 @@ public sealed class CistaNasFileSystem : IDokanOperations
             var fileId = FindFileId(plainName);
             if (fileId is not null)
             {
-                // 書き込みアクセスがある場合は上書きモード
-                if ((access & DokanNet.FileAccess.WriteData) != 0)
+                // 書き込みアクセスがある場合は上書きモード（チャンク差分保存）
+                if ((access & (DokanNet.FileAccess.WriteData | DokanNet.FileAccess.GenericWrite)) != 0)
                 {
-                    info.Context = new WriteState(plainName, existingFileId: fileId);
+                    info.Context = new E2eeChunkWriteState(this, plainName, fileId);
                     return DokanResult.Success;
                 }
                 info.Context = fileId;
@@ -269,7 +372,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
 
             if (mode == FileMode.OpenOrCreate)
             {
-                info.Context = new WriteState(plainName, existingFileId: null);
+                info.Context = new E2eeChunkWriteState(this, plainName, null);
                 return DokanResult.Success;
             }
 
@@ -281,7 +384,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
             // 非E2EE モード: 新規作成
             if (!_isE2ee)
             {
-                info.Context = new WriteState(plainName, existingFileId: null);
+                info.Context = new PlainRangeWriteState(this, plainName, null);
                 return DokanResult.Success;
             }
 
@@ -290,7 +393,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
             if (existing is not null)
                 return DokanResult.FileExists;
 
-            info.Context = new WriteState(plainName, existingFileId: null);
+            info.Context = new E2eeChunkWriteState(this, plainName, null);
             return DokanResult.Success;
         }
 
@@ -298,25 +401,131 @@ public sealed class CistaNasFileSystem : IDokanOperations
         {
             // Create: 既存ファイルを上書き
 
-            // 非E2EE モード
+            // 非E2EE モード: 既存ファイル長を取得して末尾保持
             if (!_isE2ee)
             {
-                info.Context = new WriteState(plainName, existingFileId: plainName);
+                long existingLength = GetExistingPlainLength(plainName);
+                info.Context = new PlainRangeWriteState(this, plainName, plainName, existingLength);
                 return DokanResult.Success;
             }
 
-            // E2EE モード: 旧IDを保持して Cleanup で削除
+            // E2EE モード: 旧IDを保持（差分上書き時は維持、新規作成時は Cleanup で削除）
             var existing = FindFileId(plainName);
-            info.Context = new WriteState(plainName, existingFileId: existing);
+            info.Context = new E2eeChunkWriteState(this, plainName, existing);
             return DokanResult.Success;
         }
 
         return DokanResult.Success;
     }
 
+    /// <summary>非E2EE: 既存ファイルの平文長を取得（差分保存で末尾保持のため）。</summary>
+    private long GetExistingPlainLength(string plainName)
+    {
+        try
+        {
+            var entries = CistaNasApiClientFiles.ListFilesAsync(_api, _volumeName).GetAwaiter().GetResult();
+            var e = entries.FirstOrDefault(x => string.Equals(x.Name, plainName, StringComparison.OrdinalIgnoreCase));
+            return e?.Length ?? 0;
+        }
+        catch { return 0; }
+    }
+
+    /// <summary>書き込み中のハンドル（WriteState）からの読み込み: 書き込みバッファ（dirty）+ 既存をマージして返す。</summary>
+    private NtStatus ReadFromWriteState(WriteState ws, byte[] buffer, out int bytesRead, long offset)
+    {
+        bytesRead = 0;
+        try
+        {
+            int totalRead = Task.Run(async () =>
+            {
+                byte[] result = new byte[buffer.Length];
+                int filled = 0;
+
+                if (ws is PlainRangeWriteState plain)
+                {
+                    // 既存データ（サーバー Range）を下地にする
+                    if (plain.ExistingFileId is not null)
+                    {
+                        try
+                        {
+                            var existing = await CistaNasApiClientFiles.DownloadFileRangeAsync(_api, _volumeName, ws.PlainName, offset, buffer.Length);
+                            Array.Copy(existing, 0, result, 0, existing.Length);
+                            filled = existing.Length;
+                        }
+                        catch { }
+                    }
+                    // dirty ranges で上書き
+                    foreach (var (off, data) in plain.Ranges)
+                    {
+                        long overlapStart = Math.Max(off, offset);
+                        long overlapEnd = Math.Min(off + data.Length, offset + buffer.Length);
+                        if (overlapEnd > overlapStart)
+                        {
+                            int copyOff = (int)(overlapStart - offset);
+                            int srcOff = (int)(overlapStart - off);
+                            int copyLen = (int)(overlapEnd - overlapStart);
+                            Array.Copy(data, srcOff, result, copyOff, copyLen);
+                            filled = Math.Max(filled, copyOff + copyLen);
+                        }
+                    }
+                }
+                else if (ws is E2eeChunkWriteState e2ee)
+                {
+                    int chunkSize = _chunkSize;
+                    int startChunk = (int)(offset / chunkSize);
+
+                    for (int ci = startChunk; filled < buffer.Length; ci++)
+                    {
+                        long chunkStart = (long)ci * chunkSize;
+                        if (chunkStart >= offset + buffer.Length) break;
+
+                        byte[] chunk;
+                        if (e2ee.DirtyChunks.TryGetValue(ci, out var dirty))
+                        {
+                            chunk = dirty;
+                        }
+                        else if (e2ee.ExistingFileId is not null && ci < e2ee.ExistingChunkCount
+                                 && e2ee.ExistingFileKey is not null && e2ee.ExistingFileSalt is not null)
+                        {
+                            chunk = LoadPlainChunkForWrite(e2ee.ExistingFileId, ci, e2ee.ExistingFileKey, e2ee.ExistingFileSalt);
+                        }
+                        else
+                        {
+                            // 新規ファイルのギャップ or 既存超: ゼロチャンク
+                            chunk = new byte[chunkSize];
+                        }
+
+                        int copyOff = (int)Math.Max(0, offset - chunkStart);
+                        int maxCopy = Math.Min(chunk.Length - copyOff, buffer.Length - filled);
+                        if (copyOff < chunk.Length && maxCopy > 0)
+                        {
+                            Array.Copy(chunk, copyOff, result, filled, maxCopy);
+                            filled += maxCopy;
+                        }
+                    }
+                }
+
+                Array.Copy(result, 0, buffer, 0, filled);
+                return filled;
+            }).GetAwaiter().GetResult();
+
+            bytesRead = totalRead;
+            return DokanResult.Success;
+        }
+        catch
+        {
+            return DokanResult.InternalError;
+        }
+    }
+
     public NtStatus ReadFile(string fileName, byte[] buffer, out int bytesRead, long offset, IDokanFileInfo info)
     {
         bytesRead = 0;
+
+        // 書き込み中のハンドル（WriteState）からの読み込み: 書き込みバッファ + 既存をマージして返す。
+        // エディタが読み書き両用で開いた際、編集前/編集中の内容を読めるようにする。
+        if (info.Context is WriteState ws)
+            return ReadFromWriteState(ws, buffer, out bytesRead, offset);
 
         // 非E2EE モード: Range リクエストで必要な部分のみダウンロード
         if (!_isE2ee)
@@ -360,7 +569,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
                 // salt は全チャンクの nonce 導出（DeriveChunkNonce）で共通して使うため保持する。
                 if (!cache.TryGetFileKey(out var fileKey, out var fileSalt))
                 {
-                    var encData = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
+                    var (encData, rev0) = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
                     if (encData.Length <= 16)
                         return (DokanResult.InternalError, 0);
 
@@ -369,7 +578,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
                     var derivedKey = E2eeCrypto.DeriveFileKey(_masterKey!, fileSalt);
 
                     // チャンク 0 を復号してキャッシュ
-                    var chunk = E2eeCrypto.DecryptChunk(encData, derivedKey, 0, fileSalt);
+                    var chunk = E2eeCrypto.DecryptChunk(encData, derivedKey, 0, fileSalt, rev0);
                     PutChunkToPool(fileId, 0, chunk, ComputeHashHex(encData));
 
                     cache.SetFileKey(derivedKey, fileSalt);
@@ -385,14 +594,15 @@ public sealed class CistaNasFileSystem : IDokanOperations
                     string? serverHash = null;
                     try
                     {
-                        serverHash = await _api.GetChunkHashAsync(_volumeName, fileId, 0);
+                        var (h0c, _) = await _api.GetChunkHashAsync(_volumeName, fileId, 0);
+                        serverHash = h0c;
                     }
                     catch { /* 通信失敗時は後で再ダウンロード */ }
 
                     if (serverHash is null || serverHash != chunk0Cached.Value.EncryptedHash)
                     {
                         // チャンク0が変わっている可能性があるため、再ダウンロードして salt を確認
-                        var chunk0Data = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
+                        var (chunk0Data, chunk0Rev) = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
                         if (chunk0Data.Length > E2eeCrypto.SaltSize)
                         {
                             byte[] newSalt = new byte[E2eeCrypto.SaltSize];
@@ -408,7 +618,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
                                 RemoveFileChunksFromPool(fileId);
 
                                 // チャンク0を復号してキャッシュ
-                                var chunk0 = E2eeCrypto.DecryptChunk(chunk0Data, newKey, 0, newSalt);
+                                var chunk0 = E2eeCrypto.DecryptChunk(chunk0Data, newKey, 0, newSalt, chunk0Rev);
                                 PutChunkToPool(fileId, 0, chunk0, ComputeHashHex(chunk0Data));
                             }
                         }
@@ -435,7 +645,8 @@ public sealed class CistaNasFileSystem : IDokanOperations
                         string? serverHash = null;
                         try
                         {
-                            serverHash = await _api.GetChunkHashAsync(_volumeName, fileId, i);
+                            var (hi, _) = await _api.GetChunkHashAsync(_volumeName, fileId, i);
+                            serverHash = hi;
                         }
                         catch
                         {
@@ -450,16 +661,16 @@ public sealed class CistaNasFileSystem : IDokanOperations
                         else
                         {
                             // ハッシュ不一致 or ハッシュなし or 通信失敗 → 再ダウンロード
-                            var encData = await _api.DownloadChunkAsync(_volumeName, fileId, i);
-                            chunk = E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, fileSalt!);
+                            var (encData, rev) = await _api.DownloadChunkAsync(_volumeName, fileId, i);
+                            chunk = E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, fileSalt!, rev);
                             PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));
                         }
                     }
                     else
                     {
                         // キャッシュミス: ダウンロード + 復号 + キャッシュ保存
-                        var encData = await _api.DownloadChunkAsync(_volumeName, fileId, i);
-                        chunk = E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, out _);
+                        var (encData, rev) = await _api.DownloadChunkAsync(_volumeName, fileId, i);
+                        chunk = E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, fileSalt!, rev);
                         PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));
                     }
 
@@ -775,92 +986,170 @@ public sealed class CistaNasFileSystem : IDokanOperations
 
     internal void UploadWriteState(WriteState ws)
     {
-        byte[] plainData = ws.GetFinalData();
-        if (plainData.Length == 0 && ws.CurrentSize == 0)
-            return;
-
-        // 非E2EE モード: 平文アップロード
-        if (!_isE2ee)
+        // 例外はそのまま上位（Cleanup）に伝播させる。Cleanup が void 制約でエラーを飲む。
+        switch (ws)
         {
-            try
-            {
-                // サーバーは同名 upsert で上書きするため、既存ファイルの個別削除は不要。
-                // （非E2EE では ExistingFileId == PlainName のため、アップロード後に削除すると
-                //   新ファイルを消去してしまう。E2EE は別 fileId なので削除が正しい）
-                CistaNasApiClientFiles.UploadFileAsync(_api, _volumeName, ws.PlainName, plainData).GetAwaiter().GetResult();
+            case PlainRangeWriteState plain:
+                UploadPlain(plain);
+                break;
+            case E2eeChunkWriteState e2ee:
+                if (e2ee.ExistingFileId is null)
+                    UploadE2eeNewFile(e2ee);
+                else
+                    UploadE2eeDiff(e2ee);
+                break;
+        }
 
-                _listingCache.Invalidate();
-                lock (_statsLock) { _cachedStats = null; }
-            }
-            catch
+        _listingCache.Invalidate();
+        lock (_statsLock) { _cachedStats = null; }
+    }
+
+    // 非E2EE: 汚れた範囲を PATCH（差分保存）。Critical-3 と同様、DELETE は呼ばない。
+    private void UploadPlain(PlainRangeWriteState ws)
+    {
+        bool isNew = ws.ExistingFileId is null;
+
+        // 新規ファイルで offset=0 から始まらない（sparse）または空の場合は全体アップロードで確実に作成。
+        if (isNew && (ws.Ranges.Count == 0 || ws.Ranges[0].Offset != 0))
+        {
+            long size = ws.CurrentSize;
+            byte[] full = new byte[Math.Max(0, size)];
+            foreach (var (off, data) in ws.Ranges)
             {
-                // エラーを無視（Cleanup は void）
+                if (off >= 0 && off + data.Length <= full.Length)
+                    Buffer.BlockCopy(data, 0, full, (int)off, data.Length);
             }
+            CistaNasApiClientFiles.UploadFileAsync(_api, _volumeName, ws.PlainName, full).GetAwaiter().GetResult();
             return;
         }
 
-        // E2EE モード: ファイル名暗号化 + チャンク暗号化
+        if (ws.Ranges.Count == 0)
+        {
+            // 既存ファイルで書き込みなし → 何もしない
+            return;
+        }
+
+        // 各範囲を PATCH（サーバー AesXtsStream がセクタ RMW で安全に部分上書き）
+        foreach (var (off, data) in ws.Ranges)
+        {
+            CistaNasApiClientFiles.PatchFileRangeAsync(_api, _volumeName, ws.PlainName, off, data).GetAwaiter().GetResult();
+        }
+    }
+
+    // E2EE 新規ファイル: 新 fileSalt で全チャンク作成（従来方式、Critical-4 ロールバック維持）。
+    private void UploadE2eeNewFile(E2eeChunkWriteState ws)
+    {
         string encName = E2eeCrypto.EncryptFilename(ws.PlainName, _masterKey!);
         byte[] fileSalt = E2eeCrypto.GenerateFileSalt();
         byte[] fileKey = E2eeCrypto.DeriveFileKey(_masterKey!, fileSalt);
 
-        int plainLength = plainData.Length;
-        int chunkCount = plainLength == 0 ? 0 : (plainLength + _chunkSize - 1) / _chunkSize;
-        if (chunkCount == 0) chunkCount = 1;
-
+        long plainLength = ws.CurrentSize;
+        int chunkCount = plainLength == 0 ? 1 : (int)((plainLength + _chunkSize - 1) / _chunkSize);
         long encLength = 16L + plainLength + (long)chunkCount * 16;
         string fileId = _api.CreateFileAsync(_volumeName, encName, encLength, chunkCount).GetAwaiter().GetResult();
 
         bool finalized = false;
         try
         {
-            int written = 0;
+            long written = 0;
             for (int i = 0; i < chunkCount; i++)
             {
-                int chunkLen = Math.Min(_chunkSize, plainLength - written);
-                byte[] chunk = new byte[chunkLen];
-                Buffer.BlockCopy(plainData, written, chunk, 0, chunkLen);
-
+                int chunkLen = (int)Math.Min(_chunkSize, plainLength - written);
+                byte[] chunk;
+                if (ws.DirtyChunks.TryGetValue(i, out var dirty))
+                {
+                    chunk = new byte[chunkLen];
+                    Array.Copy(dirty, chunk, Math.Min(dirty.Length, chunkLen));
+                }
+                else
+                {
+                    chunk = new byte[chunkLen]; // ゼロ
+                }
                 byte[] encChunk = E2eeCrypto.EncryptChunk(chunk, fileKey, i, fileSalt, isFirstChunk: i == 0);
                 _api.UploadChunkAsync(_volumeName, fileId, i, encChunk).GetAwaiter().GetResult();
                 written += chunkLen;
             }
-
             _api.FinalizeFileAsync(_volumeName, fileId, encLength).GetAwaiter().GetResult();
             finalized = true;
         }
         catch
         {
-            // ロールバック: 作成中の fileId を削除し、サーバーに孤児ファイルを残さない。
-            // 旧ファイル（ExistingFileId）は新ファイルが完成していないため保持する。
+            // ロールバック: 作成中の fileId を削除し、サーバーに孤児ファイルを残さない（Critical-4）。
             try { _api.DeleteFileAsync(_volumeName, fileId).GetAwaiter().GetResult(); }
             catch { /* ベストエフォート */ }
             throw;
         }
 
-        // 旧ファイルの削除（新ファイル完成後のみ）
-        if (finalized && ws.ExistingFileId is not null)
+        if (finalized)
         {
-            try
+            _fileIdCache[ws.PlainName] = fileId;
+            _cache[fileId] = new FileCache
             {
-                _api.DeleteFileAsync(_volumeName, ws.ExistingFileId).GetAwaiter().GetResult();
-                _cache.TryRemove(ws.ExistingFileId, out _);
-                RemoveFileChunksFromPool(ws.ExistingFileId);
-            }
-            catch { /* ベストエフォート: 孤児は許容 */ }
+                PlainName = ws.PlainName,
+                FileId = fileId,
+                ChunkCount = chunkCount,
+                PlainLength = plainLength,
+            };
+        }
+    }
+
+    // E2EE 既存ファイル差分: 汚れたチャンクだけ再暗号化（revision+1）して差分上書き。fileSalt/fileKey は維持。
+    private void UploadE2eeDiff(E2eeChunkWriteState ws)
+    {
+        string fileId = ws.ExistingFileId!;
+        byte[] fileSalt = ws.ExistingFileSalt!;
+        byte[] fileKey = ws.ExistingFileKey!;
+
+        long newPlainLength = ws.CurrentSize;
+        int newChunkCount = newPlainLength == 0 ? 0 : (int)((newPlainLength + _chunkSize - 1) / _chunkSize);
+
+        // 汚れたチャンクだけ再暗号化して replace（未変更チャンクは維持 → 末尾保持）。
+        foreach (var (ci, chunk) in ws.DirtyChunks)
+        {
+            if (ci >= newChunkCount) continue; // 縮小で不要になったチャンクは送らない
+            int chunkLen = (int)Math.Min(_chunkSize, newPlainLength - (long)ci * _chunkSize);
+            byte[] toEncrypt = chunk.Length == chunkLen ? chunk : ResizeChunk(chunk, chunkLen);
+
+            // 現在 revision を取得し +1 で暗号化（AES-GCM の nonce 再利用回避）
+            int currentRev = 0;
+            try { var (_, rev) = _api.GetChunkHashAsync(_volumeName, fileId, ci).GetAwaiter().GetResult(); currentRev = rev; }
+            catch { }
+
+            byte[] encChunk = E2eeCrypto.EncryptChunk(toEncrypt, fileKey, ci, fileSalt, isFirstChunk: ci == 0, revision: currentRev + 1);
+            _api.UploadChunkAsync(_volumeName, fileId, ci, encChunk, replace: true).GetAwaiter().GetResult();
+
+            // チャンクプールのキャッシュを更新（新しい暗号文ハッシュで）
+            PutChunkToPool(fileId, ci, toEncrypt, ComputeHashHex(encChunk));
         }
 
+        // FinalizeFile で長さ確定（縮小時は ChunkCount 指定で論理切り詰め）
+        int finalizeChunkCount = Math.Max(1, newChunkCount);
+        long encLength = 16L + newPlainLength + (long)finalizeChunkCount * 16;
+        int? chunkCountParam = newChunkCount < ws.ExistingChunkCount ? newChunkCount : null;
+        _api.FinalizeFileAsync(_volumeName, fileId, encLength, chunkCountParam).GetAwaiter().GetResult();
+
         // キャッシュ更新
-        _fileIdCache[ws.PlainName] = fileId;
-        _cache[fileId] = new FileCache
+        if (_cache.TryGetValue(fileId, out var cache))
         {
-            PlainName = ws.PlainName,
-            FileId = fileId,
-            ChunkCount = chunkCount,
-            PlainLength = plainLength,
-        };
-        _listingCache.Invalidate();
-        lock (_statsLock) { _cachedStats = null; } // 使用量が変わったので再取得
+            cache.ChunkCount = finalizeChunkCount;
+            cache.PlainLength = newPlainLength;
+        }
+    }
+
+    private static byte[] ResizeChunk(byte[] chunk, int newLen)
+    {
+        byte[] result = new byte[newLen];
+        Array.Copy(chunk, result, Math.Min(chunk.Length, newLen));
+        return result;
+    }
+
+    /// <summary>E2EE: 既存チャンクを DL + 復号して平文を返す（差分保存の RMW 用）。チャンクプールも更新。</summary>
+    internal byte[] LoadPlainChunkForWrite(string fileId, int chunkIndex, byte[] fileKey, byte[] fileSalt)
+    {
+        var (data, revision) = _api.DownloadChunkAsync(_volumeName, fileId, chunkIndex).GetAwaiter().GetResult();
+        byte[] chunk = E2eeCrypto.DecryptChunk(data, fileKey, chunkIndex, fileSalt, revision);
+        PutChunkToPool(fileId, chunkIndex, chunk, ComputeHashHex(data));
+        return chunk;
     }
 
     // ---- チャンクプール操作（グローバル20チャンク上限、ハッシュ検証付き） ----

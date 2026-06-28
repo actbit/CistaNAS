@@ -192,6 +192,225 @@ public sealed class FileService
         }
     }
 
+    /// <summary>ファイルの一部を書き込む（差分保存）。既存ファイルの offset に上書き、必要に応じて拡張。</summary>
+    public async Task<FileMetadata> PatchRangeAsync(string volumeName, string fileName, long offset, Stream content, long contentLength, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(fileName);
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
+        if (contentLength < 0) throw new ArgumentOutOfRangeException(nameof(contentLength));
+
+        if (_volumeService.IsChunkMode(volumeName))
+            return await PatchChunkedAsync(volumeName, fileName, offset, content, contentLength, ct);
+
+        // ロック順序: fileGate → catLock → streamLock（デッドロック防止）
+        var gate = _fileGates.GetOrAdd((volumeName, fileName), _ => new AsyncFileGate());
+        using (await gate.EnterWriteAsync(ct))
+        {
+            return await PatchInternalAsync(volumeName, fileName, offset, content, contentLength, ct);
+        }
+    }
+
+    /// <summary>非チャンクモードの部分書き込み本体。AesXtsStream のセクタ単位 RMW で安全に部分上書き。</summary>
+    private async Task<FileMetadata> PatchInternalAsync(string volumeName, string fileName, long offset, Stream content, long contentLength, CancellationToken ct)
+    {
+        var (ioGuard, stream, _) = await _volumeService.GetMountedForIoAsync(volumeName, ct);
+        try
+        {
+        string opId = await _journalService.RecordAsync(volumeName, new JournalEntry
+        {
+            Operation = JournalOp.WriteFile,
+            Path = fileName,
+            Length = checked((int)Math.Min(contentLength, int.MaxValue)),
+        }, ct);
+
+        FileMetadata meta;
+        SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await catLock.WaitAsync(ct);
+        try
+        {
+            var catalog = await LoadCatalogAsync(volumeName, ct);
+            catalog.Files.TryGetValue(fileName, out var existing);
+
+            SemaphoreSlim streamLock = _streamLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+            await streamLock.WaitAsync(ct);
+            try
+            {
+                long baseOffset = existing?.Offset ?? stream.Length;
+                byte[] buffer = new byte[81920];
+
+                // 新規ファイルで offset > 0（sparse）: baseOffset..baseOffset+offset を暗号化ゼロで埋める。
+                // AesXtsStream は平文ゼロを暗号化ゼロとして書き込む。
+                if (existing is null && offset > 0)
+                {
+                    stream.Seek(baseOffset, SeekOrigin.Begin);
+                    Array.Clear(buffer, 0, buffer.Length);
+                    long zRemain = offset;
+                    while (zRemain > 0)
+                    {
+                        int n = (int)Math.Min(buffer.Length, zRemain);
+                        await stream.WriteAsync(buffer.AsMemory(0, n), ct);
+                        zRemain -= n;
+                    }
+                }
+
+                stream.Seek(baseOffset + offset, SeekOrigin.Begin);
+                long remaining = contentLength;
+                long written = 0;
+                while (remaining > 0)
+                {
+                    int toRead = (int)Math.Min(buffer.Length, remaining);
+                    int read = await content.ReadAsync(buffer.AsMemory(0, toRead), ct);
+                    if (read == 0) break;
+                    await stream.WriteAsync(buffer.AsMemory(0, read), ct);
+                    written += read;
+                    remaining -= read;
+                }
+                await stream.FlushAsync(ct);
+
+                long logicalEnd = baseOffset + offset + written;
+                long newLength = existing is not null
+                    ? Math.Max(existing.Length, logicalEnd - baseOffset)
+                    : (logicalEnd - baseOffset);
+
+                meta = new FileMetadata
+                {
+                    Name = fileName,
+                    Offset = baseOffset,
+                    Length = newLength,
+                    CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
+                    ModifiedAt = DateTimeOffset.UtcNow,
+                };
+                catalog.Files[fileName] = meta;
+                await SaveCatalogAsync(volumeName, catalog, ct);
+            }
+            finally
+            {
+                streamLock.Release();
+            }
+        }
+        finally
+        {
+            catLock.Release();
+        }
+
+        await _journalService.CommitAsync(volumeName, opId, ct);
+        return meta;
+        }
+        finally
+        {
+            ioGuard.Dispose();
+        }
+    }
+
+    /// <summary>チャンクモードの部分書き込み本体。該当チャンクを RMW（復号→部分更新→再暗号化）して S3 に上書き。</summary>
+    private async Task<FileMetadata> PatchChunkedAsync(string volumeName, string fileName, long offset, Stream content, long contentLength, CancellationToken ct)
+    {
+        var (header, masterKey) = _volumeService.GetMountedKeys(volumeName);
+        int chunkSize = header.EffectiveServerChunkSize;
+        int sectorSize = header.EffectiveSectorSize;
+        var algorithm = header.EffectiveCipherAlgorithm;
+        bool encrypted = header.Encrypted && masterKey is not null;
+
+        var gate = _fileGates.GetOrAdd((volumeName, fileName), _ => new AsyncFileGate());
+        using (await gate.EnterWriteAsync(ct))
+        {
+            string opId = await _journalService.RecordAsync(volumeName, new JournalEntry
+            {
+                Operation = JournalOp.WriteFile,
+                Path = fileName,
+                Length = checked((int)Math.Min(contentLength, int.MaxValue)),
+            }, ct);
+
+            SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+            await catLock.WaitAsync(ct);
+            try
+            {
+                var catalog = await LoadCatalogAsync(volumeName, ct);
+                catalog.Files.TryGetValue(fileName, out var existing);
+
+                var chunkSizes = existing?.ChunkSizes ?? new List<int>();
+                long existingLength = existing?.Length ?? 0;
+                long newLength = Math.Max(existingLength, offset + contentLength);
+                int firstChunk = (int)(offset / chunkSize);
+                int lastChunk = (int)((offset + contentLength - 1) / chunkSize);
+                int lastNeeded = (int)((newLength - 1) / chunkSize);
+
+                // 書き込みデータを一時バッファへ（差分編集なので通常小さい）
+                byte[] contentData = new byte[contentLength];
+                int totalRead = 0;
+                while (totalRead < contentLength)
+                {
+                    int n = await content.ReadAsync(contentData.AsMemory(totalRead, (int)contentLength - totalRead), ct);
+                    if (n == 0) break;
+                    totalRead += n;
+                }
+
+                for (int ci = 0; ci <= lastNeeded; ci++)
+                {
+                    bool inWriteRange = ci >= firstChunk && ci <= lastChunk;
+                    bool isExisting = ci < chunkSizes.Count;
+                    // 既存チャンクで書き込み範囲外 → 维持（再書き込みしない）
+                    if (!inWriteRange && isExisting) continue;
+
+                    int curPlainSize = (int)Math.Min(chunkSize, newLength - (long)ci * chunkSize);
+                    if (curPlainSize <= 0) break;
+
+                    byte[] plain = new byte[curPlainSize];
+                    if (encrypted && isExisting && chunkSizes[ci] > 0)
+                    {
+                        byte[]? enc = await _chunkStore.ReadChunkAsync(volumeName, fileName, ci, ct);
+                        if (enc is not null)
+                        {
+                            int origLen = Math.Min(chunkSizes[ci], curPlainSize);
+                            var dec = ChunkEncryptor.DecryptChunk(masterKey!, algorithm, ci, sectorSize, chunkSize, enc, origLen);
+                            Array.Copy(dec, plain, Math.Min(dec.Length, plain.Length));
+                        }
+                    }
+
+                    if (inWriteRange)
+                    {
+                        long chunkStart = (long)ci * chunkSize;
+                        long relStart = Math.Max(0, offset - chunkStart);
+                        long relEnd = Math.Min(curPlainSize, offset + totalRead - chunkStart);
+                        long srcStart = Math.Max(0, chunkStart - offset);
+                        int copyLen = (int)(relEnd - relStart);
+                        if (copyLen > 0)
+                            Array.Copy(contentData, (int)srcStart, plain, (int)relStart, copyLen);
+                    }
+
+                    byte[] stored = encrypted
+                        ? ChunkEncryptor.EncryptChunk(masterKey!, algorithm, ci, sectorSize, chunkSize, plain)
+                        : plain;
+                    using var ms = new MemoryStream(stored);
+                    await _chunkStore.WriteChunkAsync(volumeName, fileName, ci, ms, ct);
+
+                    while (chunkSizes.Count <= ci) chunkSizes.Add(0);
+                    chunkSizes[ci] = curPlainSize;
+                }
+
+                var meta = new FileMetadata
+                {
+                    Name = fileName,
+                    Offset = 0,
+                    Length = newLength,
+                    ChunkCount = lastNeeded + 1,
+                    ChunkSizes = chunkSizes,
+                    CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
+                    ModifiedAt = DateTimeOffset.UtcNow,
+                };
+                catalog.Files[fileName] = meta;
+                await SaveCatalogAsync(volumeName, catalog, ct);
+
+                await _journalService.CommitAsync(volumeName, opId, ct);
+                return meta;
+            }
+            finally
+            {
+                catLock.Release();
+            }
+        }
+    }
+
     /// <summary>チャンクモード: ファイルをチャンク分割して暗号化し S3 に保存。</summary>
     private async Task<FileMetadata> UploadChunkedAsync(string volumeName, string fileName, Stream content, long contentLength, CancellationToken ct = default)
     {

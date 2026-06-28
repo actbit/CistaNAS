@@ -14,17 +14,18 @@ namespace CistaNAS.Tests;
 /// </summary>
 public class DokanUploadWriteStateTests
 {
-    /// <summary>全リクエストを記録し 200 OK を返すモック。</summary>
+    /// <summary>全リクエストを記録し 200 OK を返すモック。PATCH は FileMetadata JSON を返す。</summary>
     private sealed class RecordingHandler : HttpMessageHandler
     {
         public List<(string Method, string Uri)> Requests { get; } = new();
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             Requests.Add((request.Method.Method, request.RequestUri!.ToString()!));
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new StringContent("")
-            });
+            // PATCH（差分書き込み）は FileMetadata JSON を期待する
+            var content = request.Method.Method == "PATCH"
+                ? new StringContent("{\"name\":\"file.txt\",\"length\":3,\"createdAt\":\"2026-01-01T00:00:00Z\",\"modifiedAt\":\"2026-01-01T00:00:00Z\"}", Encoding.UTF8, "application/json")
+                : new StringContent("");
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
         }
     }
 
@@ -49,40 +50,40 @@ public class DokanUploadWriteStateTests
     }
 
     /// <summary>
-    /// 非E2EE 上書き（ExistingFileId == PlainName）で、アップロード後に削除 API を呼ばないこと。
-    /// 修正前は同名 upsert 後に DELETE して新ファイルを消去していた（Critical-3）。
+    /// 非E2EE 既存ファイルの部分編集で、PATCH（差分書き込み）が呼ばれ DELETE は呼ばれないこと。
+    /// Critical-3 整合: 差分保存では部分上書きで新ファイル削除は発生しない。
     /// </summary>
     [Fact]
-    public void UploadWriteState_NonE2eeOverwrite_DoesNotDeleteUploadedFile()
+    public void UploadWriteState_NonE2eePartialEdit_SendsPatch_NoDelete()
     {
         var handler = new RecordingHandler();
         var api = new CistaNasApiClient(new HttpClient(handler) { BaseAddress = new Uri("http://test/") });
         var fs = new CistaNasFileSystem(api, "vol");
 
-        var ws = new CistaNasFileSystem.WriteState("file.txt", existingFileId: "file.txt");
+        var ws = new CistaNasFileSystem.PlainRangeWriteState(fs, "file.txt", "file.txt", existingLength: 100);
         ws.Write(new byte[] { 1, 2, 3 }, 0, 3, 0);
 
         fs.UploadWriteState(ws);
 
-        // POST（アップロード）は1回以上呼ばれる
-        Assert.Contains(handler.Requests, r => r.Method == "POST");
-        // DELETE は呼ばれない（修正前は ExistingFileId==PlainName を DELETE して新ファイルを消していた）
+        // PATCH（差分）が呼ばれる
+        Assert.Contains(handler.Requests, r => r.Method == "PATCH");
+        // DELETE は呼ばれない
         Assert.DoesNotContain(handler.Requests, r => r.Method == "DELETE");
     }
 
     /// <summary>
-    /// E2EE チャンクアップロード途中で失敗した場合、作成中の fileId を削除（ロールバック）し、
-    /// 旧ファイルは保持すること。修正前は孤児の新ファイルがサーバーに残っていた。
+    /// E2EE 新規ファイル作成時にチャンクアップロードが失敗した場合、作成中の fileId を削除（ロールバック）すること。
+    /// Critical-4 整合: サーバーに孤児ファイルを残さない。
     /// </summary>
     [Fact]
-    public void UploadWriteState_E2eeChunkFailure_RollsBackCreatedFile()
+    public void UploadWriteState_E2eeNewFileChunkFailure_RollsBackCreatedFile()
     {
         var handler = new FailUploadChunkHandler();
         var api = new CistaNasApiClient(new HttpClient(handler) { BaseAddress = new Uri("http://test/") });
         byte[] masterKey = RandomNumberGenerator.GetBytes(32);
         var fs = new CistaNasFileSystem(api, masterKey, "vol");
 
-        var ws = new CistaNasFileSystem.WriteState("plain.txt", existingFileId: "oldfile");
+        var ws = new CistaNasFileSystem.E2eeChunkWriteState(fs, "plain.txt", null);  // 新規ファイル
         ws.Write(RandomNumberGenerator.GetBytes(100), 0, 100, 0);
 
         // UploadChunk 失敗で例外（ロールバック後に再送）
@@ -91,8 +92,5 @@ public class DokanUploadWriteStateTests
         // 作成中 fileId の DELETE（ロールバック）が呼ばれる
         Assert.Contains(handler.Requests,
             r => r.Method == "DELETE" && r.Uri.Contains(FailUploadChunkHandler.CreatedFileId));
-        // 旧ファイル(oldfile)の DELETE は呼ばれない（新ファイル未完成のため保持）
-        Assert.DoesNotContain(handler.Requests,
-            r => r.Method == "DELETE" && r.Uri.Contains("oldfile"));
     }
 }

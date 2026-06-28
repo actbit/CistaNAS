@@ -142,12 +142,12 @@ public static class E2eeEndpoints
     }
 
     private static async Task<IResult> UploadChunk(string volumeName, string fileId, int chunkIndex,
-        HttpRequest request, VolumeService vs, E2eeFileService e2eeFs)
+        HttpRequest request, VolumeService vs, E2eeFileService e2eeFs, bool replace = false)
     {
         long len = request.ContentLength ?? 0;
         try
         {
-            await e2eeFs.UploadChunkAsync(volumeName, fileId, chunkIndex, request.Body, len, request.HttpContext.RequestAborted);
+            await e2eeFs.UploadChunkAsync(volumeName, fileId, chunkIndex, request.Body, len, replace, request.HttpContext.RequestAborted);
             return Results.Ok();
         }
         catch (FileServiceException ex)
@@ -160,7 +160,8 @@ public static class E2eeEndpoints
     {
         try
         {
-            var (stream, length) = await e2eeFs.DownloadChunkAsync(volumeName, fileId, chunkIndex, ctx.RequestAborted);
+            var (stream, length, revision) = await e2eeFs.DownloadChunkAsync(volumeName, fileId, chunkIndex, ctx.RequestAborted);
+            ctx.Response.Headers["X-Chunk-Revision"] = revision.ToString();
             return Results.Stream(stream, "application/octet-stream", null, null, enableRangeProcessing: false);
         }
         catch (FileServiceException ex)
@@ -171,9 +172,9 @@ public static class E2eeEndpoints
 
     private static async Task<IResult> GetChunkHash(string volumeName, string fileId, int chunkIndex, HttpContext ctx, E2eeFileService e2eeFs)
     {
-        var hash = await e2eeFs.GetChunkHashAsync(volumeName, fileId, chunkIndex, ctx.RequestAborted);
+        var (hash, revision) = await e2eeFs.GetChunkHashAsync(volumeName, fileId, chunkIndex, ctx.RequestAborted);
         return hash is not null
-            ? Results.Ok(new { hash })
+            ? Results.Ok(new { hash, revision })
             : Results.NotFound(new { error = "チャンクハッシュが見つかりません。" });
     }
 

@@ -99,36 +99,46 @@ public sealed class CistaNasApiClient
         return json.GetProperty("fileId").GetString()!;
     }
 
-    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, byte[] data)
+    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, byte[] data, bool replace = false)
     {
         var content = new ByteArrayContent(data);
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        var query = replace ? "?replace=true" : "";
         var res = await _http.PostAsync(
-            $"/api/v1/e2ee/{volumeName}/upload-chunk/{fileId}/{chunkIndex}", content);
+            $"/api/v1/e2ee/{volumeName}/upload-chunk/{fileId}/{chunkIndex}{query}", content);
         res.EnsureSuccessStatusCode();
     }
 
-    public async Task<byte[]> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex)
+    public async Task<(byte[] Data, int Revision)> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex)
     {
         var res = await _http.GetAsync($"/api/v1/e2ee/{volumeName}/download-chunk/{fileId}/{chunkIndex}");
         res.EnsureSuccessStatusCode();
-        return await res.Content.ReadAsByteArrayAsync();
+        byte[] data = await res.Content.ReadAsByteArrayAsync();
+        int revision = 0;
+        if (res.Headers.TryGetValues("X-Chunk-Revision", out var vals))
+        {
+            var v = vals.FirstOrDefault();
+            if (v is not null && int.TryParse(v, out int rev)) revision = rev;
+        }
+        return (data, revision);
     }
 
-    /// <summary>チャンクの事前計算ハッシュを取得する（軽量エンドポイント）。ハッシュなしの場合は null。</summary>
-    public async Task<string?> GetChunkHashAsync(string volumeName, string fileId, int chunkIndex)
+    /// <summary>チャンクの事前計算ハッシュと revision を取得する（軽量エンドポイント）。ハッシュなしの場合は (null, 0)。</summary>
+    public async Task<(string? Hash, int Revision)> GetChunkHashAsync(string volumeName, string fileId, int chunkIndex)
     {
         var res = await _http.GetAsync($"/api/v1/e2ee/{volumeName}/chunk-hash/{fileId}/{chunkIndex}");
         if (res.StatusCode == System.Net.HttpStatusCode.NotFound)
-            return null;
+            return (null, 0);
         res.EnsureSuccessStatusCode();
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();
-        return json.TryGetProperty("hash", out var h) ? h.GetString() : null;
+        string? hash = json.TryGetProperty("hash", out var h) ? h.GetString() : null;
+        int revision = json.TryGetProperty("revision", out var r) ? r.GetInt32() : 0;
+        return (hash, revision);
     }
 
-    public async Task FinalizeFileAsync(string volumeName, string fileId, long actualLength)
+    public async Task FinalizeFileAsync(string volumeName, string fileId, long actualLength, int? chunkCount = null)
     {
-        var req = new { actualEncryptedLength = actualLength };
+        var req = new { actualEncryptedLength = actualLength, chunkCount };
         var res = await _http.PatchAsJsonAsync($"/api/v1/e2ee/{volumeName}/finalize-file/{fileId}", req, JsonOpts);
         res.EnsureSuccessStatusCode();
     }

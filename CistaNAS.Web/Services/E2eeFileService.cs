@@ -135,7 +135,7 @@ public sealed class E2eeFileService
     }
 
     /// <summary>チャンクをアップロードして volume.dat またはチャンクストアに書き込む。</summary>
-    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, Stream data, long dataLength, CancellationToken ct = default)
+    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, Stream data, long dataLength, bool replace = false, CancellationToken ct = default)
     {
         var header = GetE2eeHeader(volumeName);
 
@@ -154,14 +154,32 @@ public sealed class E2eeFileService
                 if (!catalog.Files.TryGetValue(fileId, out var entry))
                     throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
 
-                if (chunkIndex < 0 || chunkIndex >= entry.ChunkCount)
-                    throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です（0-{entry.ChunkCount - 1}）。");
+                if (chunkIndex < 0)
+                    throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です。");
 
-                // 順不同アップロードの厳密検出: 現在のチャンクインデックスが、
-                // これまでにアップロード済みのチャンク数と一致しない場合は拒否。
-                // 同じ chunkIndex の二重アップロードもここで弾く。
-                if (entry.ChunkSizes.Count != chunkIndex)
-                    throw new FileServiceException($"チャンク {chunkIndex} は順番にアップロードしてください（期待インデックス: {entry.ChunkSizes.Count}）。");
+                // 差分上書き（replace）か新規順次アップロードかで範囲チェックを切替。
+                // replace=true: 既存チャンク（chunkIndex < ChunkCount）の上書き、または末尾追記（== ChunkCount）を許可。
+                //   既存チャンク上書きは nonce の revision を +1 して AES-GCM の nonce 再利用を防ぐ。
+                // replace=false: 従来の順次アップロード強制（新規ファイル作成用）。
+                int prevChunkCount = entry.ChunkCount;
+                if (replace)
+                {
+                    if (chunkIndex > entry.ChunkCount)
+                        throw new FileServiceException($"チャンク {chunkIndex} は範囲外です（差分上書きは 0-{entry.ChunkCount}）。");
+                    if (chunkIndex == entry.ChunkCount)
+                        entry.ChunkCount = chunkIndex + 1; // 末尾追記: チャンクを拡張
+                }
+                else
+                {
+                    if (chunkIndex >= entry.ChunkCount)
+                        throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です（0-{entry.ChunkCount - 1}）。");
+
+                    // 順不同アップロードの厳密検出: 現在のチャンクインデックスが、
+                    // これまでにアップロード済みのチャンク数と一致しない場合は拒否。
+                    // 同じ chunkIndex の二重アップロードもここで弾く。
+                    if (entry.ChunkSizes.Count != chunkIndex)
+                        throw new FileServiceException($"チャンク {chunkIndex} は順番にアップロードしてください（期待インデックス: {entry.ChunkSizes.Count}）。");
+                }
 
                 // Content-Length（クライアント設定で信頼できない）による巨大バッファ割り当て DoS を防ぐ。
                 // E2EE チャンクの暗号文 = 平文チャンク + salt(16, 先頭のみ) + tag(16) + 余裕。
@@ -196,7 +214,7 @@ public sealed class E2eeFileService
                 {
                     long chunkOffset = entry.Offset;
                     for (int i = 0; i < chunkIndex; i++)
-                        chunkOffset += entry.ChunkSizes[i];
+                        chunkOffset += i < entry.ChunkSizes.Count ? entry.ChunkSizes[i] : 0;
 
                     string dataPath = GetDataPath(volumeName);
                     using var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
@@ -228,6 +246,14 @@ public sealed class E2eeFileService
                     entry.ChunkHashes.Add("");
                 entry.ChunkHashes[chunkIndex] = hashHex;
 
+                // revision: 既存チャンクの差分上書き（replace && chunkIndex < prevChunkCount）は
+                // nonce を一意にするため +1。新規/追記チャンクは初回 revision=0。
+                while (entry.ChunkRevisions.Count <= chunkIndex)
+                    entry.ChunkRevisions.Add(0);
+                entry.ChunkRevisions[chunkIndex] = (replace && chunkIndex < prevChunkCount)
+                    ? entry.ChunkRevisions[chunkIndex] + 1
+                    : 0;
+
                 await SaveCatalogAsync(volumeName, catalog, ct);
             }
         }
@@ -238,7 +264,7 @@ public sealed class E2eeFileService
     }
 
     /// <summary>チャンクをダウンロード。</summary>
-    public async Task<(Stream Stream, long Length)> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex, CancellationToken ct = default)
+    public async Task<(Stream Stream, long Length, int Revision)> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
 
@@ -255,6 +281,8 @@ public sealed class E2eeFileService
             if (chunkIndex < 0 || chunkIndex >= entry.ChunkCount)
                 throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です。");
 
+            int revision = chunkIndex < entry.ChunkRevisions.Count ? entry.ChunkRevisions[chunkIndex] : 0;
+
             long chunkLength = chunkIndex < entry.ChunkSizes.Count
                 ? entry.ChunkSizes[chunkIndex]
                 : 0;
@@ -264,19 +292,19 @@ public sealed class E2eeFileService
                 byte[]? chunkData = await _chunkStore.ReadChunkAsync(volumeName, fileId, chunkIndex, ct);
                 if (chunkData is null)
                     throw new FileServiceException($"チャンク {chunkIndex} が見つかりません。");
-                return (new GateReadStream(new MemoryStream(chunkData), readLock), chunkData.Length);
+                return (new GateReadStream(new MemoryStream(chunkData), readLock), chunkData.Length, revision);
             }
 
             long chunkOffset = entry.Offset;
             for (int i = 0; i < chunkIndex; i++)
-                chunkOffset += entry.ChunkSizes[i];
+                chunkOffset += i < entry.ChunkSizes.Count ? entry.ChunkSizes[i] : 0;
 
             string dataPath = GetDataPath(volumeName);
             var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             try
             {
                 fs.Seek(chunkOffset, SeekOrigin.Begin);
-                return (new GateReadStream(new SubStream(fs, chunkLength), readLock), chunkLength);
+                return (new GateReadStream(new SubStream(fs, chunkLength), readLock), chunkLength, revision);
             }
             catch
             {
@@ -291,8 +319,8 @@ public sealed class E2eeFileService
         }
     }
 
-    /// <summary>チャンクの事前計算ハッシュを返す（カタログ参照のみ、データ読み取りなし）。</summary>
-    public async Task<string?> GetChunkHashAsync(string volumeName, string fileId, int chunkIndex, CancellationToken ct = default)
+    /// <summary>チャンクの事前計算ハッシュと revision を返す（カタログ参照のみ、データ読み取りなし）。</summary>
+    public async Task<(string? Hash, int Revision)> GetChunkHashAsync(string volumeName, string fileId, int chunkIndex, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
 
@@ -304,13 +332,14 @@ public sealed class E2eeFileService
             var catalog = await LoadCatalogAsync(volumeName, ct);
 
             if (!catalog.Files.TryGetValue(fileId, out var entry))
-                return null;
+                return (null, 0);
 
             if (chunkIndex < 0 || chunkIndex >= entry.ChunkHashes.Count)
-                return null;
+                return (null, 0);
 
             string hash = entry.ChunkHashes[chunkIndex];
-            return string.IsNullOrEmpty(hash) ? null : hash;
+            int revision = chunkIndex < entry.ChunkRevisions.Count ? entry.ChunkRevisions[chunkIndex] : 0;
+            return string.IsNullOrEmpty(hash) ? (null, 0) : (hash, revision);
         }
         finally
         {
@@ -335,6 +364,17 @@ public sealed class E2eeFileService
                     throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
                 entry.EncryptedLength = request.ActualEncryptedLength;
                 entry.ModifiedAt = DateTimeOffset.UtcNow;
+
+                // ファイル長変更（縮小）時のチャンク数調整（論理切り詰め）。
+                // チャンクモードの物理チャンク削除はベストエフォート（カタログ整合性を優先）。
+                if (request.ChunkCount is int newCc && newCc >= 0 && newCc < entry.ChunkCount)
+                {
+                    entry.ChunkCount = newCc;
+                    if (entry.ChunkSizes.Count > newCc) entry.ChunkSizes.RemoveRange(newCc, entry.ChunkSizes.Count - newCc);
+                    if (entry.ChunkHashes.Count > newCc) entry.ChunkHashes.RemoveRange(newCc, entry.ChunkHashes.Count - newCc);
+                    if (entry.ChunkRevisions.Count > newCc) entry.ChunkRevisions.RemoveRange(newCc, entry.ChunkRevisions.Count - newCc);
+                }
+
                 await SaveCatalogAsync(volumeName, catalog, ct);
             }
         }

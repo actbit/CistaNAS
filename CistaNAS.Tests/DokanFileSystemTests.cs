@@ -10,73 +10,76 @@ public class DokanFileSystemTests
     // WriteState テスト
     // ====================================================================
 
+    // ====================================================================
+    // PlainRangeWriteState テスト（非E2EE 差分保存）
+    // ====================================================================
+
     [Fact]
-    public void WriteState_WriteAtOffset0_StoresData()
+    public void PlainRangeWriteState_WriteAtOffset0_RecordsRange()
     {
-        var ws = new CistaNasFileSystem.WriteState("test.txt", null);
+        var fs = CreateTestFs();
+        var ws = new CistaNasFileSystem.PlainRangeWriteState(fs, "test.txt", null);
         byte[] data = { 1, 2, 3, 4, 5 };
         ws.Write(data, 0, data.Length, 0);
 
-        byte[] result = ws.GetFinalData();
-        Assert.Equal(data, result);
+        Assert.Single(ws.Ranges);
+        Assert.Equal(0L, ws.Ranges[0].Offset);
+        Assert.Equal(data, ws.Ranges[0].Data);
     }
 
     [Fact]
-    public void WriteState_MultipleWrites_Contiguous()
+    public void PlainRangeWriteState_MultipleWrites_RecordsAllRanges()
     {
-        var ws = new CistaNasFileSystem.WriteState("test.txt", null);
-        byte[] chunk1 = { 1, 2, 3 };
-        byte[] chunk2 = { 4, 5, 6 };
+        var fs = CreateTestFs();
+        var ws = new CistaNasFileSystem.PlainRangeWriteState(fs, "test.txt", null);
+        ws.Write(new byte[] { 1, 2, 3 }, 0, 3, 0);
+        ws.Write(new byte[] { 4, 5, 6 }, 0, 3, 10);
 
-        ws.Write(chunk1, 0, chunk1.Length, 0);
-        ws.Write(chunk2, 0, chunk2.Length, 3);
-
-        byte[] result = ws.GetFinalData();
-        Assert.Equal(new byte[] { 1, 2, 3, 4, 5, 6 }, result);
+        Assert.Equal(2, ws.Ranges.Count);
+        Assert.Equal(0L, ws.Ranges[0].Offset);
+        Assert.Equal(10L, ws.Ranges[1].Offset);
+        Assert.Equal(13, ws.CurrentSize);
     }
 
     [Fact]
-    public void WriteState_WriteAtNonZeroOffset()
+    public void PlainRangeWriteState_DeclaredSize_Honored()
     {
-        var ws = new CistaNasFileSystem.WriteState("test.txt", null);
-        byte[] data = { 0xAA, 0xBB, 0xCC };
-        ws.Write(data, 0, data.Length, 1000);
-
-        byte[] result = ws.GetFinalData();
-        Assert.Equal(1003, result.Length);
-        Assert.Equal(0xAA, result[1000]);
-        Assert.Equal(0xBB, result[1001]);
-        Assert.Equal(0xCC, result[1002]);
+        var fs = CreateTestFs();
+        var ws = new CistaNasFileSystem.PlainRangeWriteState(fs, "test.txt", null);
+        ws.Write(new byte[] { 1, 2, 3 }, 0, 3, 0);
+        ws.SetDeclaredSize(100);
+        Assert.Equal(100, ws.CurrentSize);
     }
 
     [Fact]
-    public void WriteState_SetDeclaredSize_TruncatesBuffer()
+    public void PlainRangeWriteState_ExistingLength_PreservesTail()
     {
-        var ws = new CistaNasFileSystem.WriteState("test.txt", null);
-        byte[] largeData = new byte[1000];
-        for (int i = 0; i < largeData.Length; i++) largeData[i] = (byte)(i & 0xFF);
+        var fs = CreateTestFs();
+        // 既存ファイル長 1000。先頭1バイトだけ書き換え → CurrentSize は既存長を維持（末尾保持）
+        var ws = new CistaNasFileSystem.PlainRangeWriteState(fs, "test.txt", "test.txt", existingLength: 1000);
+        ws.Write(new byte[] { 0xAA }, 0, 1, 0);
 
-        ws.Write(largeData, 0, largeData.Length, 0);
-        ws.SetDeclaredSize(500);
-
-        byte[] result = ws.GetFinalData();
-        Assert.Equal(500, result.Length);
-        for (int i = 0; i < 500; i++)
-            Assert.Equal((byte)(i & 0xFF), result[i]);
+        Assert.Equal(1000, ws.CurrentSize);
+        Assert.Single(ws.Ranges);
     }
 
-    [Fact]
-    public void WriteState_NoDeclaredSize_ReturnsActualWrittenLength()
-    {
-        var ws = new CistaNasFileSystem.WriteState("test.txt", null);
-        byte[] data = { 1, 2, 3 };
-        ws.Write(data, 0, data.Length, 50);
+    // ====================================================================
+    // E2eeChunkWriteState テスト（E2EE 差分保存）
+    // ====================================================================
 
-        byte[] result = ws.GetFinalData();
-        Assert.Equal(53, result.Length);
-        Assert.Equal(1, result[50]);
-        Assert.Equal(2, result[51]);
-        Assert.Equal(3, result[52]);
+    [Fact]
+    public void E2eeChunkWriteState_NewFile_WriteTracksDirtyChunk()
+    {
+        var fs = CreateTestFsE2ee();
+        var ws = new CistaNasFileSystem.E2eeChunkWriteState(fs, "test.txt", null);
+        // 新規ファイル（既存チャンク無し）→ ゼロ埋めチャンク。DL 不要。
+        ws.Write(new byte[] { 1, 2, 3 }, 0, 3, 0);
+
+        Assert.Single(ws.DirtyChunks);
+        Assert.Equal(3, ws.CurrentSize);
+        Assert.Equal(1, ws.DirtyChunks[0][0]);
+        Assert.Equal(2, ws.DirtyChunks[0][1]);
+        Assert.Equal(3, ws.DirtyChunks[0][2]);
     }
 
     // ====================================================================
@@ -85,6 +88,10 @@ public class DokanFileSystemTests
 
     private static CistaNasFileSystem CreateTestFs()
         => new(new CistaNAS.Client.Api.CistaNasApiClient(new HttpClient()), "test-volume");
+
+    private static CistaNasFileSystem CreateTestFsE2ee(byte[]? masterKey = null)
+        => new(new CistaNAS.Client.Api.CistaNasApiClient(new HttpClient()),
+            masterKey ?? System.Security.Cryptography.RandomNumberGenerator.GetBytes(32), "test-volume");
 
     [Fact]
     public void ChunkPool_PutAndGet_Roundtrip()

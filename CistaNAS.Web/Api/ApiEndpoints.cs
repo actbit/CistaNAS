@@ -213,6 +213,23 @@ public static class ApiEndpoints
         })
         .WithName("UploadFile");
 
+        // 部分書き込み（差分保存）。?offset=N でバイトオフセット指定、body が部分データ。
+        // 既存 POST（全体上書き）とは明確に分離。サーバーは AesXtsStream のセクタ RMW で安全に部分上書き。
+        files.MapPatch("/{*filePath}", async (string volumeName, string filePath, long offset, HttpContext ctx, FileService fs) =>
+        {
+            try
+            {
+                string fileName = PathSanitizer.SanitizeFileName(filePath);
+                long len = ctx.Request.ContentLength ?? 0;
+                var stream = ctx.Request.Body;
+                var meta = await fs.PatchRangeAsync(volumeName, fileName, offset, stream, len, ctx.RequestAborted);
+                return Results.Ok(meta);
+            }
+            catch (Exception ex) when (ex is VolumeException or FileServiceException)
+            { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .WithName("PatchFileRange");
+
         files.MapGet("/{*filePath}", async (string volumeName, string filePath, FileService fs, HttpContext ctx, CancellationToken ct) =>
         {
             try

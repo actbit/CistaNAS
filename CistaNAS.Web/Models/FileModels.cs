@@ -52,6 +52,10 @@ public sealed class E2eeFileEntry
     /// <summary>各チャンクの暗号化データの SHA-256 ハッシュ（16進数文字列）。アップロード時に計算。</summary>
     public List<string> ChunkHashes { get; set; } = [];
 
+    /// <summary>各チャンクの暗号化リビジョン。差分上書きで AES-GCM の nonce を一意に保つために使用。
+    /// 0=初回（従来フォーマットと後方互換）。要素不足/空は 0 扱い。クライアントは復号時にこの revision を nonce 導出に使う。</summary>
+    public List<int> ChunkRevisions { get; set; } = [];
+
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset ModifiedAt { get; set; }
 
@@ -63,7 +67,9 @@ public sealed record E2eeCreateFileRequest(
     [Required] string EncryptedName,
     [Range(0, long.MaxValue)] long EncryptedLength,
     [Range(1, 100000)] int ChunkCount);
-public sealed record E2eeFinalizeFileRequest([Range(0, long.MaxValue)] long ActualEncryptedLength);
+public sealed record E2eeFinalizeFileRequest(
+    [Range(0, long.MaxValue)] long ActualEncryptedLength,
+    int? ChunkCount = null);
 public sealed record E2eeListFilesResponse(IReadOnlyList<E2eeFileEntry> Files);
 public sealed record E2eeMountResponse(int ChunkSize, string EncryptionMode);
 
