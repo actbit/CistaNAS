@@ -87,6 +87,42 @@ public class E2eeFileTests : IAsyncDisposable
         Assert.Equal(plain1, dec1);
     }
 
+    /// <summary>replace モードで同じ chunkIndex を上書きするたびに revision が +1 される（nonce 再利用回避）。</summary>
+    [Fact]
+    public async Task UploadChunk_ReplaceMode_IncrementsRevision()
+    {
+        string vol = await MountE2eeAsync("test-replace");
+        const int chunkSize = 4096;
+        var e2eeFs = GetE2eeFileService();
+        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc-replace", chunkSize + 16 * 2, 1), "testuser");
+
+        byte[] fileSalt = E2eeCrypto.GenerateFileSalt();
+        byte[] fileKey = E2eeCrypto.DeriveFileKey(_masterKey, fileSalt);
+        byte[] plain = RandomNumberGenerator.GetBytes(chunkSize);
+
+        // 初回（replace=false）→ revision=0
+        byte[] enc0 = E2eeCrypto.EncryptChunk(plain, fileKey, 0, fileSalt, isFirstChunk: true);
+        using (var ms = new MemoryStream(enc0))
+            await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0, ms, enc0.Length, replace: false);
+        var (_, rev0) = await e2eeFs.GetChunkHashAsync(vol, entry.FileId, 0);
+        Assert.Equal(0, rev0);
+
+        // 差分上書き（replace=true）→ revision=1
+        byte[] enc1 = E2eeCrypto.EncryptChunk(plain, fileKey, 0, fileSalt, isFirstChunk: true, revision: 1);
+        using (var ms1 = new MemoryStream(enc1))
+            await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0, ms1, enc1.Length, replace: true);
+        var (hash1, rev1) = await e2eeFs.GetChunkHashAsync(vol, entry.FileId, 0);
+        Assert.Equal(1, rev1);
+        Assert.NotNull(hash1);
+
+        // さらに上書き（replace=true）→ revision=2
+        byte[] enc2 = E2eeCrypto.EncryptChunk(plain, fileKey, 0, fileSalt, isFirstChunk: true, revision: 2);
+        using (var ms2 = new MemoryStream(enc2))
+            await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0, ms2, enc2.Length, replace: true);
+        var (_, rev2) = await e2eeFs.GetChunkHashAsync(vol, entry.FileId, 0);
+        Assert.Equal(2, rev2);
+    }
+
     [Fact]
     public async Task ListFiles_ReturnsCreatedFiles()
     {
