@@ -27,11 +27,13 @@ public class DokanIntegrationTests
         public readonly Dictionary<string, byte[]> Files = new(StringComparer.OrdinalIgnoreCase);
         public int PatchCount;
         public int PostCount;
+        public List<(string Method, string Uri)> Requests = new();
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             var uri = request.RequestUri!.ToString();
             var method = request.Method.Method;
+            Requests.Add((method, uri));
 
             const string prefix = "/api/v1/files/vol/";
             int idx = uri.IndexOf(prefix, StringComparison.Ordinal);
@@ -180,6 +182,8 @@ public class DokanIntegrationTests
             // 初期ファイル作成（全体書き込み）
             byte[] initial = Enumerable.Range(0, 1000).Select(i => (byte)(i & 0xFF)).ToArray();
             File.WriteAllBytes(mountPoint + "test.txt", initial);
+            int patchBefore = storage.PatchCount;
+            int postBefore = storage.PostCount;
 
             // 部分編集: 先頭1バイトを 0xFF に（末尾は触らない）
             using (var f = new FileStream(mountPoint + "test.txt", FileMode.Open, FileAccess.Write))
@@ -195,8 +199,9 @@ public class DokanIntegrationTests
             for (int i = 1; i < 1000; i++)
                 Assert.Equal(initial[i], result[i]);
 
-            // 差分保存の検証: 部分編集は PATCH（全体 POST ではない）
-            Assert.True(storage.PatchCount > 0, "差分保存で PATCH が呼ばれるべき");
+            // 帯域削減: 部分編集は PATCH 追加（全体 POST ではない）。POST は増えない。
+            Assert.Equal(patchBefore + 1, storage.PatchCount);
+            Assert.Equal(postBefore, storage.PostCount);
         }
         finally
         {
@@ -258,6 +263,7 @@ public class DokanIntegrationTests
         }
 
         private readonly Dictionary<string, FileEntry> _byFileId = new();
+        public int ReplaceUploadCount;
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
@@ -292,6 +298,7 @@ public class DokanIntegrationTests
                 string fileId = seg[1];
                 int chunkIndex = int.Parse(seg[2]);
                 bool replace = query.Split('&').Contains("replace=true");
+                if (replace) ReplaceUploadCount++;
                 var entry = _byFileId[fileId];
                 byte[] data = await request.Content!.ReadAsByteArrayAsync(ct);
                 bool isExisting = entry.Chunks.ContainsKey(chunkIndex);
@@ -307,7 +314,11 @@ public class DokanIntegrationTests
                 string fileId = seg[1];
                 var body = await request.Content!.ReadFromJsonAsync<JsonElement>(ct);
                 if (_byFileId.TryGetValue(fileId, out var e))
+                {
                     e.EncryptedLength = body.GetProperty("actualEncryptedLength").GetInt64();
+                    if (body.TryGetProperty("chunkCount", out var cc) && cc.ValueKind == JsonValueKind.Number)
+                        e.ChunkCount = cc.GetInt32();
+                }
                 return OkJson("");
             }
 
@@ -391,6 +402,168 @@ public class DokanIntegrationTests
             Assert.Equal((byte)0xFF, result[0]);
             for (int i = 1; i < initial.Length; i++)
                 Assert.Equal(initial[i], result[i]);
+        }
+        finally
+        {
+            dokan.RemoveMountPoint(mountPoint);
+            await loop;
+            instance.Dispose();
+        }
+    }
+
+    /// <summary>E2EE: 3チャンク中 chunk0 だけ編集 → replace upload-chunk は1回だけ（帯域削減）。</summary>
+    [Fact]
+    public async Task E2ee_PartialEdit_SendsOnlyDirtyChunk()
+    {
+        var storage = new E2eeStorageHandler();
+        byte[] masterKey = RandomNumberGenerator.GetBytes(32);
+        var api = new CistaNasApiClient(new HttpClient(storage) { BaseAddress = new Uri("http://test/") });
+        int chunkSize = 4096;
+        var fs = new CistaNasFileSystem(api, masterKey, "vol", chunkSize: chunkSize);
+
+        char drive = FindFreeDrive();
+        string mountPoint = $"{drive}:\\";
+        var (dokan, instance, loop) = Mount(fs, mountPoint);
+        await WaitForMountAsync(mountPoint);
+
+        try
+        {
+            byte[] initial = new byte[chunkSize * 3];
+            for (int i = 0; i < initial.Length; i++) initial[i] = (byte)(i & 0xFF);
+            File.WriteAllBytes(mountPoint + "diff.txt", initial);
+
+            int replaceBefore = storage.ReplaceUploadCount;
+
+            // chunk0 の先頭1バイトだけ編集（chunk1/2 は触らない）
+            using (var f = new FileStream(mountPoint + "diff.txt", FileMode.Open, FileAccess.Write))
+            {
+                f.Seek(0, SeekOrigin.Begin);
+                f.Write(new byte[] { 0xFF }, 0, 1);
+            }
+
+            // 差分上書きは chunk0 のみ（replace upload-chunk 1回）。chunk1/2 は送信されない。
+            Assert.Equal(1, storage.ReplaceUploadCount - replaceBefore);
+        }
+        finally
+        {
+            dokan.RemoveMountPoint(mountPoint);
+            await loop;
+            instance.Dispose();
+        }
+    }
+
+    /// <summary>E2EE: チャンク境界をまたぐ書き込み（chunk0末尾 + chunk1先頭）の RMW。</summary>
+    [Fact]
+    public async Task E2ee_ChunkBoundary_SpansTwoChunks()
+    {
+        var storage = new E2eeStorageHandler();
+        byte[] masterKey = RandomNumberGenerator.GetBytes(32);
+        var api = new CistaNasApiClient(new HttpClient(storage) { BaseAddress = new Uri("http://test/") });
+        int chunkSize = 4096;
+        var fs = new CistaNasFileSystem(api, masterKey, "vol", chunkSize: chunkSize);
+
+        char drive = FindFreeDrive();
+        string mountPoint = $"{drive}:\\";
+        var (dokan, instance, loop) = Mount(fs, mountPoint);
+        await WaitForMountAsync(mountPoint);
+
+        try
+        {
+            byte[] initial = new byte[chunkSize * 2];
+            for (int i = 0; i < initial.Length; i++) initial[i] = (byte)(i & 0xFF);
+            File.WriteAllBytes(mountPoint + "boundary.txt", initial);
+
+            // 境界またぎ: offset chunkSize-10 から 20バイト（chunk0末尾10 + chunk1先頭10）
+            byte[] patch = Enumerable.Range(0, 20).Select(_ => (byte)0xAA).ToArray();
+            using (var f = new FileStream(mountPoint + "boundary.txt", FileMode.Open, FileAccess.Write))
+            {
+                f.Seek(chunkSize - 10, SeekOrigin.Begin);
+                f.Write(patch, 0, 20);
+            }
+
+            byte[] result = File.ReadAllBytes(mountPoint + "boundary.txt");
+            Assert.Equal(initial.Length, result.Length);
+            for (int i = 0; i < chunkSize - 10; i++) Assert.Equal(initial[i], result[i]);
+            for (int i = 0; i < 20; i++) Assert.Equal((byte)0xAA, result[chunkSize - 10 + i]);
+            for (int i = chunkSize + 10; i < initial.Length; i++) Assert.Equal(initial[i], result[i]);
+        }
+        finally
+        {
+            dokan.RemoveMountPoint(mountPoint);
+            await loop;
+            instance.Dispose();
+        }
+    }
+
+    /// <summary>非E2EE: 末尾に追記してファイル長が拡張される。</summary>
+    [Fact]
+    public async Task NonE2ee_Append_ExtendsFile()
+    {
+        var storage = new InMemoryStorageHandler();
+        var api = new CistaNasApiClient(new HttpClient(storage) { BaseAddress = new Uri("http://test/") });
+        var fs = new CistaNasFileSystem(api, "vol");
+
+        char drive = FindFreeDrive();
+        string mountPoint = $"{drive}:\\";
+        var (dokan, instance, loop) = Mount(fs, mountPoint);
+        await WaitForMountAsync(mountPoint);
+
+        try
+        {
+            byte[] initial = Enumerable.Range(0, 500).Select(i => (byte)(i & 0xFF)).ToArray();
+            File.WriteAllBytes(mountPoint + "append.txt", initial);
+
+            // 末尾に追記（offset 500 から 100バイト）→ ファイル長 600
+            byte[] append = Enumerable.Range(0, 100).Select(_ => (byte)0xBB).ToArray();
+            using (var f = new FileStream(mountPoint + "append.txt", FileMode.Open, FileAccess.Write))
+            {
+                f.Seek(500, SeekOrigin.Begin);
+                f.Write(append, 0, 100);
+            }
+
+            byte[] result = File.ReadAllBytes(mountPoint + "append.txt");
+            Assert.Equal(600, result.Length);
+            for (int i = 0; i < 500; i++) Assert.Equal(initial[i], result[i]);
+            for (int i = 0; i < 100; i++) Assert.Equal((byte)0xBB, result[500 + i]);
+        }
+        finally
+        {
+            dokan.RemoveMountPoint(mountPoint);
+            await loop;
+            instance.Dispose();
+        }
+    }
+
+    /// <summary>E2EE: SetEndOfFile で縮小 → ChunkCount 削減（FinalizeFile ChunkCount）。</summary>
+    [Fact]
+    public async Task E2ee_Truncate_ShrinksFile()
+    {
+        var storage = new E2eeStorageHandler();
+        byte[] masterKey = RandomNumberGenerator.GetBytes(32);
+        var api = new CistaNasApiClient(new HttpClient(storage) { BaseAddress = new Uri("http://test/") });
+        int chunkSize = 4096;
+        var fs = new CistaNasFileSystem(api, masterKey, "vol", chunkSize: chunkSize);
+
+        char drive = FindFreeDrive();
+        string mountPoint = $"{drive}:\\";
+        var (dokan, instance, loop) = Mount(fs, mountPoint);
+        await WaitForMountAsync(mountPoint);
+
+        try
+        {
+            byte[] initial = new byte[chunkSize * 3];
+            for (int i = 0; i < initial.Length; i++) initial[i] = (byte)(i & 0xFF);
+            File.WriteAllBytes(mountPoint + "trunc.txt", initial);
+
+            // 1チャンク分に縮小
+            using (var f = new FileStream(mountPoint + "trunc.txt", FileMode.Open, FileAccess.Write))
+            {
+                f.SetLength(chunkSize);
+            }
+
+            byte[] result = File.ReadAllBytes(mountPoint + "trunc.txt");
+            Assert.Equal(chunkSize, result.Length);
+            for (int i = 0; i < chunkSize; i++) Assert.Equal(initial[i], result[i]);
         }
         finally
         {
