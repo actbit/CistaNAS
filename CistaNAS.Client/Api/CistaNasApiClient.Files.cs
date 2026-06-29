@@ -106,6 +106,25 @@ public static class CistaNasApiClientFiles
         return await res.Content.ReadAsByteArrayAsync();
     }
 
+    /// <summary>ファイルの一部を書き込む（差分保存）。PATCH /files/{volume}/{path}?offset=N。</summary>
+    public static async Task<FileMetadata> PatchFileRangeAsync(this CistaNasApiClient client, string volumeName, string filePath, long offset, byte[] data)
+    {
+        var http = GetHttp(client);
+        var content = new ByteArrayContent(data);
+        content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+        var res = await http.PatchAsync(
+            $"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(filePath)}?offset={offset}", content);
+        res.EnsureSuccessStatusCode();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        return new FileMetadata
+        {
+            Name = json.GetProperty("name").GetString()!,
+            Length = json.GetProperty("length").GetInt64(),
+            CreatedAt = json.GetProperty("createdAt").GetDateTimeOffset(),
+            ModifiedAt = json.GetProperty("modifiedAt").GetDateTimeOffset(),
+        };
+    }
+
     private static HttpClient GetHttp(CistaNasApiClient client)
     {
         var field = typeof(CistaNasApiClient).GetField("_http", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)

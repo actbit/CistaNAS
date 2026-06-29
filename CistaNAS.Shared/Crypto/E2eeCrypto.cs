@@ -113,15 +113,15 @@ public static class E2eeCrypto
     // ---- チャンク暗号化 ----
 
     /// <summary>チャンクを暗号化する。</summary>
-    public static byte[] EncryptChunk(byte[] plaintext, byte[] fileKey, int chunkIndex, byte[] fileSalt, bool isFirstChunk, string algorithm = "aes-256-gcm")
+    public static byte[] EncryptChunk(byte[] plaintext, byte[] fileKey, int chunkIndex, byte[] fileSalt, bool isFirstChunk, int revision = 0, string algorithm = "aes-256-gcm")
     {
         switch (algorithm.ToLowerInvariant())
         {
             case "aes-256-gcm":
-                return EncryptChunkAesGcm(plaintext, fileKey, chunkIndex, fileSalt, isFirstChunk);
+                return EncryptChunkAesGcm(plaintext, fileKey, chunkIndex, fileSalt, isFirstChunk, revision);
 
             case "chacha20-poly1305":
-                return EncryptChunkChaCha20(plaintext, fileKey, chunkIndex, fileSalt, isFirstChunk);
+                return EncryptChunkChaCha20(plaintext, fileKey, chunkIndex, fileSalt, isFirstChunk, revision);
 
             default:
                 throw new ArgumentException($"サポートされていないチャンク暗号化アルゴリズム: {algorithm}");
@@ -129,9 +129,9 @@ public static class E2eeCrypto
     }
 
     /// <summary>AES-256-GCM でチャンクを暗号化。</summary>
-    private static byte[] EncryptChunkAesGcm(byte[] plaintext, byte[] fileKey, int chunkIndex, byte[] fileSalt, bool isFirstChunk)
+    private static byte[] EncryptChunkAesGcm(byte[] plaintext, byte[] fileKey, int chunkIndex, byte[] fileSalt, bool isFirstChunk, int revision)
     {
-        byte[] nonce = DeriveChunkNonce(fileKey, fileSalt, chunkIndex);
+        byte[] nonce = DeriveChunkNonce(fileKey, fileSalt, chunkIndex, revision);
         byte[] aad = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(aad, chunkIndex);
         byte[] ct = new byte[plaintext.Length];
@@ -154,9 +154,9 @@ public static class E2eeCrypto
     }
 
     /// <summary>ChaCha20-Poly1305 でチャンクを暗号化。</summary>
-    private static byte[] EncryptChunkChaCha20(byte[] plaintext, byte[] fileKey, int chunkIndex, byte[] fileSalt, bool isFirstChunk)
+    private static byte[] EncryptChunkChaCha20(byte[] plaintext, byte[] fileKey, int chunkIndex, byte[] fileSalt, bool isFirstChunk, int revision)
     {
-        byte[] nonce = DeriveChunkNonce(fileKey, fileSalt, chunkIndex);
+        byte[] nonce = DeriveChunkNonce(fileKey, fileSalt, chunkIndex, revision);
         byte[] aad = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(aad, chunkIndex);
 
@@ -185,17 +185,17 @@ public static class E2eeCrypto
     }
 
     /// <summary>チャンクを復号する（fileSaltを指定）。</summary>
-    public static byte[] DecryptChunk(byte[] encData, byte[] fileKey, int chunkIndex, byte[] fileSalt, string algorithm = "aes-256-gcm")
+    public static byte[] DecryptChunk(byte[] encData, byte[] fileKey, int chunkIndex, byte[] fileSalt, int revision = 0, string algorithm = "aes-256-gcm")
     {
         int offset = chunkIndex == 0 && fileSalt.Length > 0 ? SaltSize : 0;
 
         switch (algorithm.ToLowerInvariant())
         {
             case "aes-256-gcm":
-                return DecryptChunkAesGcm(encData, fileKey, chunkIndex, fileSalt, offset);
+                return DecryptChunkAesGcm(encData, fileKey, chunkIndex, fileSalt, offset, revision);
 
             case "chacha20-poly1305":
-                return DecryptChunkChaCha20(encData, fileKey, chunkIndex, fileSalt, offset);
+                return DecryptChunkChaCha20(encData, fileKey, chunkIndex, fileSalt, offset, revision);
 
             default:
                 throw new ArgumentException($"サポートされていないチャンク暗号化アルゴリズム: {algorithm}");
@@ -203,7 +203,7 @@ public static class E2eeCrypto
     }
 
     /// <summary>チャンクを復号する。</summary>
-    public static byte[] DecryptChunk(byte[] encData, byte[] fileKey, int chunkIndex, out byte[] fileSalt, string algorithm = "aes-256-gcm")
+    public static byte[] DecryptChunk(byte[] encData, byte[] fileKey, int chunkIndex, out byte[] fileSalt, int revision = 0, string algorithm = "aes-256-gcm")
     {
         fileSalt = [];
         int offset = 0;
@@ -218,10 +218,10 @@ public static class E2eeCrypto
         switch (algorithm.ToLowerInvariant())
         {
             case "aes-256-gcm":
-                return DecryptChunkAesGcm(encData, fileKey, chunkIndex, fileSalt, offset);
+                return DecryptChunkAesGcm(encData, fileKey, chunkIndex, fileSalt, offset, revision);
 
             case "chacha20-poly1305":
-                return DecryptChunkChaCha20(encData, fileKey, chunkIndex, fileSalt, offset);
+                return DecryptChunkChaCha20(encData, fileKey, chunkIndex, fileSalt, offset, revision);
 
             default:
                 throw new ArgumentException($"サポートされていないチャンク暗号化アルゴリズム: {algorithm}");
@@ -229,7 +229,7 @@ public static class E2eeCrypto
     }
 
     /// <summary>AES-256-GCM でチャンクを復号。</summary>
-    private static byte[] DecryptChunkAesGcm(byte[] encData, byte[] fileKey, int chunkIndex, byte[] fileSalt, int offset)
+    private static byte[] DecryptChunkAesGcm(byte[] encData, byte[] fileKey, int chunkIndex, byte[] fileSalt, int offset, int revision)
     {
         if (encData.Length < offset + GcmTagSize)
             throw new CryptographicException("暗号化データが短すぎます。");
@@ -239,7 +239,7 @@ public static class E2eeCrypto
         Buffer.BlockCopy(encData, offset, ct, 0, ctLen);
         Buffer.BlockCopy(encData, offset + ctLen, tag, 0, GcmTagSize);
 
-        byte[] nonce = DeriveChunkNonce(fileKey, fileSalt, chunkIndex);
+        byte[] nonce = DeriveChunkNonce(fileKey, fileSalt, chunkIndex, revision);
         byte[] aad = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(aad, chunkIndex);
         byte[] plain = new byte[ctLen];
@@ -249,7 +249,7 @@ public static class E2eeCrypto
     }
 
     /// <summary>ChaCha20-Poly1305 でチャンクを復号。</summary>
-    private static byte[] DecryptChunkChaCha20(byte[] encData, byte[] fileKey, int chunkIndex, byte[] fileSalt, int offset)
+    private static byte[] DecryptChunkChaCha20(byte[] encData, byte[] fileKey, int chunkIndex, byte[] fileSalt, int offset, int revision)
     {
         if (encData.Length < offset + GcmTagSize)
             throw new CryptographicException("暗号化データが短すぎます。");
@@ -259,7 +259,7 @@ public static class E2eeCrypto
         Buffer.BlockCopy(encData, offset, ct, 0, ctLen);
         Buffer.BlockCopy(encData, offset + ctLen, tag, 0, GcmTagSize);
 
-        byte[] nonce = DeriveChunkNonce(fileKey, fileSalt, chunkIndex);
+        byte[] nonce = DeriveChunkNonce(fileKey, fileSalt, chunkIndex, revision);
         byte[] aad = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(aad, chunkIndex);
 
@@ -461,15 +461,26 @@ public static class E2eeCrypto
     /// fileSalt を含めることで、FileKey 漏洩時の Nonce 予測可能性を低減し、
     /// ファイルごとに一意な Nonce 空間を保証する。
     /// </summary>
-    private static byte[] DeriveChunkNonce(byte[] fileKey, byte[] fileSalt, int chunkIndex)
+    private static byte[] DeriveChunkNonce(byte[] fileKey, byte[] fileSalt, int chunkIndex, int revision = 0)
     {
         using var hmac = new HMACSHA256(fileKey);
-        // fileSalt || chunkIndex で HMAC（fileKey は鍵として HMACSHA256 に渡済み）
+        // 入力 = fileSalt || chunkIndex [|| revision]
+        // fileKey は鍵として HMACSHA256 に渡済み。
+        // revision == 0 のときは従来フォーマット（入力に revision を含めない）→ 既存ファイルと後方互換。
+        // revision > 0 のときだけ le32 revision を追加し、同じ chunkIndex の安全な再暗号化（差分上書き）を可能にする。
         hmac.TransformBlock(fileSalt, 0, fileSalt.Length, null, 0);
 
         byte[] indexBytes = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(indexBytes, chunkIndex);
         hmac.TransformBlock(indexBytes, 0, indexBytes.Length, null, 0);
+
+        if (revision > 0)
+        {
+            byte[] revBytes = new byte[4];
+            BinaryPrimitives.WriteInt32LittleEndian(revBytes, revision);
+            hmac.TransformBlock(revBytes, 0, revBytes.Length, null, 0);
+        }
+
         hmac.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
 
         return hmac.Hash[..GcmNonceSize];

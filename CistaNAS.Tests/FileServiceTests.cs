@@ -180,6 +180,62 @@ public class FileServiceTests : IAsyncDisposable
         Assert.Empty(list.Files);
     }
 
+    /// <summary>PatchRangeAsync で部分書き込み。未書き換えの末尾が保持される（AesXtsStream セクタ RMW）。</summary>
+    [Fact]
+    public async Task PatchRange_PartialWrite_PreservesTail()
+    {
+        string vol = await MountVol("patch-test");
+        var fs = GetFileService();
+
+        byte[] initial = new byte[1000];
+        for (int i = 0; i < initial.Length; i++) initial[i] = (byte)(i & 0xFF);
+        using (var ms = new MemoryStream(initial))
+            await fs.UploadAsync(vol, "patch.bin", ms, initial.Length);
+
+        // offset 100 から 50バイト部分書き込み
+        byte[] patch = new byte[50];
+        Array.Fill(patch, (byte)0xAB);
+        using (var pms = new MemoryStream(patch))
+            await fs.PatchRangeAsync(vol, "patch.bin", 100, pms, patch.Length);
+
+        var dl = await fs.DownloadAsync(vol, "patch.bin");
+        using var dlStream = dl.Stream;
+        Assert.Equal(1000, dl.Length);
+        var result = new byte[1000];
+        await dlStream.ReadExactlyAsync(result);
+
+        for (int i = 0; i < 100; i++) Assert.Equal(initial[i], result[i]);
+        for (int i = 100; i < 150; i++) Assert.Equal((byte)0xAB, result[i]);
+        for (int i = 150; i < 1000; i++) Assert.Equal(initial[i], result[i]);
+    }
+
+    /// <summary>PatchRangeAsync で末尾に追記し、ファイル長が拡張される。</summary>
+    [Fact]
+    public async Task PatchRange_Append_ExtendsFile()
+    {
+        string vol = await MountVol("patch-append");
+        var fs = GetFileService();
+
+        byte[] initial = new byte[500];
+        for (int i = 0; i < initial.Length; i++) initial[i] = (byte)(i & 0xFF);
+        using (var ms = new MemoryStream(initial))
+            await fs.UploadAsync(vol, "app.bin", ms, initial.Length);
+
+        // offset 500 に 100バイト追記 → 600
+        byte[] append = new byte[100];
+        Array.Fill(append, (byte)0xCD);
+        using (var ams = new MemoryStream(append))
+            await fs.PatchRangeAsync(vol, "app.bin", 500, ams, append.Length);
+
+        var dl = await fs.DownloadAsync(vol, "app.bin");
+        using var dlStream = dl.Stream;
+        Assert.Equal(600, dl.Length);
+        var result = new byte[600];
+        await dlStream.ReadExactlyAsync(result);
+        for (int i = 0; i < 500; i++) Assert.Equal(initial[i], result[i]);
+        for (int i = 500; i < 600; i++) Assert.Equal((byte)0xCD, result[i]);
+    }
+
     private async Task<string> MountVol(string name)
     {
         await _vs.CreateAsync(name, "testuser", "testpw", encrypted: false);

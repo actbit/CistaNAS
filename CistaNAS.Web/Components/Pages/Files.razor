@@ -327,7 +327,7 @@ else
         string fileSaltB64;
         try
         {
-            var (chunkStream, chunkLen) = await E2eeFileSvc.DownloadChunkAsync(VolumeName, entry.FileId, 0);
+            var (chunkStream, chunkLen, _) = await E2eeFileSvc.DownloadChunkAsync(VolumeName, entry.FileId, 0);
             byte[] firstChunk = new byte[chunkLen];
             using (chunkStream)
             {
@@ -398,7 +398,7 @@ else
 
             for (int i = 0; i < entry.ChunkCount; i++)
             {
-                var (chunkStream, chunkLen) = await E2eeFileSvc.DownloadChunkAsync(VolumeName, entry.FileId, i);
+                var (chunkStream, chunkLen, _) = await E2eeFileSvc.DownloadChunkAsync(VolumeName, entry.FileId, i);
                 byte[] encData = new byte[chunkLen];
                 using (chunkStream)
                 {
@@ -663,7 +663,7 @@ else
 
             for (int i = 0; i < entry.ChunkCount; i++)
             {
-                var (chunkStream, chunkLen) = await E2eeFileSvc.DownloadChunkAsync(VolumeName, entry.FileId, i);
+                var (chunkStream, chunkLen, _) = await E2eeFileSvc.DownloadChunkAsync(VolumeName, entry.FileId, i);
                 byte[] encData = null!;
                 using (chunkStream)
                 {

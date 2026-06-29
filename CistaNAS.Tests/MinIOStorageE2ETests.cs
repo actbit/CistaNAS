@@ -242,7 +242,7 @@ public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output
         // 全チャンク復号検証
         for (int i = 0; i < 3; i++)
         {
-            byte[] downloaded = await Api.DownloadChunkAsync(volName, fileId, i);
+            var (downloaded, _) = await Api.DownloadChunkAsync(volName, fileId, i);
             byte[] decrypted = E2eeCrypto.DecryptChunk(downloaded, fileKey, i, fileSalt);
             Assert.Equal(plainChunks[i], decrypted);
         }
