@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Security.AccessControl;
+using System.Security.Cryptography;
 using CistaNAS.Client.Api;
+using CistaNAS.Client.Security;
 using CistaNAS.Shared.Crypto;
 using DokanNet;
 
@@ -10,10 +12,10 @@ namespace CistaNAS.Client;
 /// Dokan ベースの仮想ファイルシステム。
 /// CistaNAS のボリューム（E2EE/非E2EE両対応）を Windows エクスプローラーにマウントする。
 /// </summary>
-public sealed class CistaNasFileSystem : IDokanOperations
+public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 {
     private readonly CistaNasApiClient _api;
-    private readonly byte[]? _masterKey;  // E2EE モードでのみ使用
+    private readonly SecureBuffer? _masterKey;  // E2EE モードでのみ使用（VirtualLock + ゼロクリア保護）
     private readonly string _volumeName;
     private readonly int _chunkSize;
     private readonly bool _isE2ee;  // E2EE モードフラグ
@@ -41,7 +43,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
     public CistaNasFileSystem(CistaNasApiClient api, byte[] masterKey, string volumeName, int chunkSize = 1048576)
     {
         _api = api;
-        _masterKey = masterKey;
+        _masterKey = new SecureBuffer(masterKey);
         _volumeName = volumeName;
         _chunkSize = chunkSize;
         _isE2ee = true;
@@ -88,6 +90,18 @@ public sealed class CistaNasFileSystem : IDokanOperations
                 key = _fileKey;
                 salt = _fileSalt;
                 return _fileKey is not null;
+            }
+        }
+
+        /// <summary>FileKey と fileSalt をゼロクリア（アンマウント時）。</summary>
+        public void Dispose()
+        {
+            lock (_fileKeyLock)
+            {
+                if (_fileKey is not null) CryptographicOperations.ZeroMemory(_fileKey);
+                if (_fileSalt is not null) CryptographicOperations.ZeroMemory(_fileSalt);
+                _fileKey = null;
+                _fileSalt = null;
             }
         }
     }
@@ -154,6 +168,9 @@ public sealed class CistaNasFileSystem : IDokanOperations
         public abstract long CurrentSize { get; }
         public abstract void Write(byte[] data, int dataOffset, int count, long fileOffset);
         public abstract void SetDeclaredSize(long size);
+
+        /// <summary>機密データ（ファイルキー、平文チャンク等）をゼロクリア。Cleanup/アンマウント時に呼ぶ。</summary>
+        public virtual void Dispose() { }
     }
 
     // 非 E2EE: 汚れたバイト範囲を記録し、Cleanup で PATCH（部分書き込み）する。RMW 不要（サーバー AesXtsStream が処理）。
@@ -195,6 +212,14 @@ public sealed class CistaNasFileSystem : IDokanOperations
             DeclaredSize = size;
             if (size > _maxWritten) _maxWritten = size;
         }
+
+        // 平文バッファをゼロクリア
+        public override void Dispose()
+        {
+            foreach (var (_, data) in _ranges)
+                CryptographicOperations.ZeroMemory(data);
+            _ranges.Clear();
+        }
     }
 
     // E2EE: 汚れたチャンクを RMW（既存チャンク DL→復号→部分更新）で追跡し、Cleanup で汚れたチャンクだけ差分上書きする。
@@ -232,7 +257,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
                             {
                                 var salt0 = new byte[E2eeCrypto.SaltSize];
                                 Buffer.BlockCopy(enc0, 0, salt0, 0, E2eeCrypto.SaltSize);
-                                _existingFileKey = E2eeCrypto.DeriveFileKey(fs._masterKey!, salt0);
+                                _existingFileKey = E2eeCrypto.DeriveFileKey(fs._masterKey!.Buffer, salt0);
                                 _existingFileSalt = salt0;
                                 cache.SetFileKey(_existingFileKey, _existingFileSalt);
                             }
@@ -286,6 +311,16 @@ public sealed class CistaNasFileSystem : IDokanOperations
             if (size > _maxWritten) _maxWritten = size;
         }
 
+        // ファイルキー・salt・平文チャンクをゼロクリア
+        public override void Dispose()
+        {
+            if (_existingFileKey is not null) CryptographicOperations.ZeroMemory(_existingFileKey);
+            if (_existingFileSalt is not null) CryptographicOperations.ZeroMemory(_existingFileSalt);
+            foreach (var (_, chunk) in _dirtyChunks)
+                CryptographicOperations.ZeroMemory(chunk);
+            _dirtyChunks.Clear();
+        }
+
         private byte[] GetOrLoadChunk(int ci)
         {
             if (_dirtyChunks.TryGetValue(ci, out var cached)) return cached;
@@ -317,6 +352,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
             catch { /* Cleanup は void なのでエラーを飲む */ }
             finally
             {
+                ws.Dispose(); // 機密データ（ファイルキー・平文チャンク）をゼロクリア
                 info.Context = null;
             }
         }
@@ -575,7 +611,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
 
                     fileSalt = new byte[16];
                     Buffer.BlockCopy(encData, 0, fileSalt, 0, 16);
-                    var derivedKey = E2eeCrypto.DeriveFileKey(_masterKey!, fileSalt);
+                    var derivedKey = E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, fileSalt);
 
                     // チャンク 0 を復号してキャッシュ
                     var chunk = E2eeCrypto.DecryptChunk(encData, derivedKey, 0, fileSalt, rev0);
@@ -607,7 +643,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
                         {
                             byte[] newSalt = new byte[E2eeCrypto.SaltSize];
                             Buffer.BlockCopy(chunk0Data, 0, newSalt, 0, E2eeCrypto.SaltSize);
-                            var newKey = E2eeCrypto.DeriveFileKey(_masterKey!, newSalt);
+                            var newKey = E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, newSalt);
 
                             // fileKey が変わった場合はキャッシュをクリアして再構築
                             if (newKey != fileKey)
@@ -821,7 +857,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
             foreach (var entry in e2eeEntries)
             {
                 string plainName;
-                try { plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!); }
+                try { plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!.Buffer); }
                 catch { plainName = $"<{entry.FileId[..8]}...>"; }
 
                 long plainLength = Math.Max(0, entry.EncryptedLength - E2eeCrypto.SaltSize - (long)entry.ChunkCount * E2eeCrypto.GcmTagSize);
@@ -1039,9 +1075,9 @@ public sealed class CistaNasFileSystem : IDokanOperations
     // E2EE 新規ファイル: 新 fileSalt で全チャンク作成（従来方式、Critical-4 ロールバック維持）。
     private void UploadE2eeNewFile(E2eeChunkWriteState ws)
     {
-        string encName = E2eeCrypto.EncryptFilename(ws.PlainName, _masterKey!);
+        string encName = E2eeCrypto.EncryptFilename(ws.PlainName, _masterKey!.Buffer);
         byte[] fileSalt = E2eeCrypto.GenerateFileSalt();
-        byte[] fileKey = E2eeCrypto.DeriveFileKey(_masterKey!, fileSalt);
+        byte[] fileKey = E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, fileSalt);
 
         long plainLength = ws.CurrentSize;
         int chunkCount = plainLength == 0 ? 1 : (int)((plainLength + _chunkSize - 1) / _chunkSize);
@@ -1224,7 +1260,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
             var entries = _api.ListFilesAsync(_volumeName).GetAwaiter().GetResult();
             foreach (var entry in entries)
             {
-                string decrypted = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!);
+                string decrypted = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!.Buffer);
                 _fileIdCache.TryAdd(decrypted, entry.FileId);
             }
             return _fileIdCache.TryGetValue(plainName, out var found) ? found : null;
@@ -1232,6 +1268,24 @@ public sealed class CistaNasFileSystem : IDokanOperations
         catch { }
 
         return null;
+    }
+
+    /// <summary>アンマウント時: マスターキー（VirtualUnlock 含む）・ファイルキー・平文チャンクをゼロクリア。</summary>
+    public void Dispose()
+    {
+        _masterKey?.Dispose();
+        foreach (var cache in _cache.Values)
+            cache.Dispose();
+        _cache.Clear();
+
+        // 平文チャンクプールもゼロクリア
+        lock (_chunkPoolLock)
+        {
+            foreach (var (_, (data, _)) in _chunkPool)
+                CryptographicOperations.ZeroMemory(data);
+            _chunkPool.Clear();
+            _chunkLru.Clear();
+        }
     }
 
     private FileCache? GetOrCreateCache(string fileId)
@@ -1246,7 +1300,7 @@ public sealed class CistaNasFileSystem : IDokanOperations
             var entry = entries.FirstOrDefault(e => e.FileId == fileId);
             if (entry is null) return null;
 
-            string plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!);
+            string plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!.Buffer);
             long plainLength = Math.Max(0, entry.EncryptedLength - E2eeCrypto.SaltSize - (long)entry.ChunkCount * E2eeCrypto.GcmTagSize);
             var cache = new FileCache
             {

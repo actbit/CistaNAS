@@ -3,6 +3,7 @@ using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text.Json;
 using CistaNAS.Client.Api;
+using CistaNAS.Client.Security;
 using CistaNAS.Client.Services;
 using CistaNAS.Shared.Crypto;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -294,12 +295,11 @@ public partial class MainViewModel : ObservableObject
     private async Task CreateE2eeVolumeAsync()
     {
         byte[] salt = RandomNumberGenerator.GetBytes(16);
-        byte[] kek = E2eeCrypto.DeriveKek(Username!, CreateVolPassword, salt, 600_000);
+        using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, CreateVolPassword, salt, 600_000));
         byte[] masterKey = new byte[32];
         RandomNumberGenerator.Fill(masterKey);
-        var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
-        CryptographicOperations.ZeroMemory(kek);
-        CryptographicOperations.ZeroMemory(masterKey);
+        using var mkBuf = new SecureBuffer(masterKey);
+        var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(mkBuf.Buffer, kekBuf.Buffer);
 
         await _api!.CreateVolumeAsync(CreateVolName, Username!, nonce, ct, tag, salt, 600_000);
     }
@@ -307,12 +307,11 @@ public partial class MainViewModel : ObservableObject
     private async Task CreateGroupE2eeVolumeAsync()
     {
         byte[] salt = RandomNumberGenerator.GetBytes(16);
-        byte[] kek = E2eeCrypto.DeriveKek(Username!, CreateVolPassword, salt, 600_000);
+        using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, CreateVolPassword, salt, 600_000));
         byte[] masterKey = new byte[32];
         RandomNumberGenerator.Fill(masterKey);
-        var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
-        CryptographicOperations.ZeroMemory(kek);
-        CryptographicOperations.ZeroMemory(masterKey);
+        using var mkBuf = new SecureBuffer(masterKey);
+        var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(mkBuf.Buffer, kekBuf.Buffer);
 
         await CistaNasApiClientE2eeExtensions.CreateGroupVolumeAsync(_api!, CreateVolName, nonce, ct, tag, salt, 600_000);
     }
@@ -499,14 +498,12 @@ public partial class MainViewModel : ObservableObject
 
             // 自分の wrapped key を取得してアンラップ
             var wkInfo = await _api.GetWrappedKeyAsync(SelectedVolume.Name, Username!);
-            byte[] kek = E2eeCrypto.DeriveKek(Username!, GrantGranterPassword, wkInfo.KdfSalt, wkInfo.KdfIterations);
-            byte[] masterKey = E2eeCrypto.UnwrapMasterKey(wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag, kek);
-            CryptographicOperations.ZeroMemory(kek);
+            using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, GrantGranterPassword, wkInfo.KdfSalt, wkInfo.KdfIterations));
+            using var mkBuf = new SecureBuffer(E2eeCrypto.UnwrapMasterKey(wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag, kekBuf.Buffer));
 
             // ECIES ラップ (E2eeCrypto を使用) - 相手公開鍵は raw 非圧縮点 65B
             byte[] recipientPubKeyRaw = Convert.FromBase64String(recipientPubKeyB64);
-            var (ephPubKey, nonce, ct, tag) = E2eeCrypto.EcdhWrap(masterKey, recipientPubKeyRaw);
-            CryptographicOperations.ZeroMemory(masterKey);
+            var (ephPubKey, nonce, ct, tag) = E2eeCrypto.EcdhWrap(mkBuf.Buffer, recipientPubKeyRaw);
 
             await CistaNasApiClientE2eeExtensions.AddWrappedKeyAsync(_api, SelectedVolume.Name, EcdhUsername.Trim(), nonce, ct, tag, ephPubKey);
             StatusMessage = $"{EcdhUsername} に ECDH 共有しました。";

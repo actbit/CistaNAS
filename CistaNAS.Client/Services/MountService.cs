@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using CistaNAS.Client.Api;
+using CistaNAS.Client.Security;
 using CistaNAS.Shared.Crypto;
 using DokanNet;
 
@@ -37,9 +38,10 @@ public sealed class MountService
                 throw new InvalidOperationException("ECDH ラップキーに一時公開鍵が含まれていません。");
             try
             {
+                using var privBuf = new SecureBuffer(privateKey);
                 masterKey = E2eeCrypto.EcdhUnwrap(
                     wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag,
-                    wkInfo.EphemeralPublicKey, privateKey);
+                    wkInfo.EphemeralPublicKey, privBuf.Buffer);
             }
             finally
             {
@@ -52,8 +54,9 @@ public sealed class MountService
             byte[] kek = E2eeCrypto.DeriveKek(username, password, wkInfo.KdfSalt, wkInfo.KdfIterations);
             try
             {
+                using var kekBuf = new SecureBuffer(kek);
                 masterKey = E2eeCrypto.UnwrapMasterKey(
-                    wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag, kek);
+                    wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag, kekBuf.Buffer);
             }
             finally
             {
@@ -62,7 +65,7 @@ public sealed class MountService
         }
 
         var fs = new CistaNasFileSystem(api, masterKey, volumeName, wkInfo.ChunkSize);
-        await MountDokanAsync(volumeName, driveLetter, fs, masterKey);
+        await MountDokanAsync(volumeName, driveLetter, fs);
     }
 
     /// <summary>
@@ -78,7 +81,7 @@ public sealed class MountService
         await CistaNasApiClientVolumes.MountVolumeAsync(api, volumeName, password);
 
         var fs = new CistaNasFileSystem(api, volumeName);
-        await MountDokanAsync(volumeName, driveLetter, fs, null);
+        await MountDokanAsync(volumeName, driveLetter, fs);
     }
 
     /// <summary>
@@ -93,10 +96,10 @@ public sealed class MountService
         await CistaNasApiClientVolumes.MountVolumeAsync(api, volumeName, "");
 
         var fs = new CistaNasFileSystem(api, volumeName);
-        await MountDokanAsync(volumeName, driveLetter, fs, null);
+        await MountDokanAsync(volumeName, driveLetter, fs);
     }
 
-    private async Task MountDokanAsync(string volumeName, string driveLetter, CistaNasFileSystem fs, byte[]? masterKey)
+    private async Task MountDokanAsync(string volumeName, string driveLetter, CistaNasFileSystem fs)
     {
         var cts = new CancellationTokenSource();
         var task = Task.Run(() =>
@@ -114,7 +117,7 @@ public sealed class MountService
                     });
 
                 using var instance = builder.Build(fs);
-                _mounted[volumeName] = new MountedVolume(driveLetter, instance, cts, masterKey);
+                _mounted[volumeName] = new MountedVolume(driveLetter, instance, cts, fs);
                 instance.WaitForFileSystemClosed(uint.MaxValue);
             }
             finally
@@ -136,8 +139,7 @@ public sealed class MountService
 
         new DokanNet.Dokan(logger: null!).RemoveMountPoint(mv.DriveLetter);
         mv.Cts.Cancel();
-        if (mv.MasterKey is not null)
-            CryptographicOperations.ZeroMemory(mv.MasterKey);
+        mv.Fs.Dispose(); // マスターキー（VirtualUnlock 含む）・ファイルキー・平文チャンクをゼロクリア
 
         await Task.CompletedTask;
     }
@@ -147,11 +149,11 @@ public sealed class MountService
     public string? GetMountPoint(string volumeName)
         => _mounted.TryGetValue(volumeName, out var mv) ? mv.DriveLetter : null;
 
-    private sealed class MountedVolume(string driveLetter, DokanInstance instance, CancellationTokenSource cts, byte[]? masterKey)
+    private sealed class MountedVolume(string driveLetter, DokanInstance instance, CancellationTokenSource cts, CistaNasFileSystem fs)
     {
         public string DriveLetter { get; } = driveLetter;
         public DokanInstance Instance { get; } = instance;
         public CancellationTokenSource Cts { get; } = cts;
-        public byte[]? MasterKey { get; } = masterKey;
+        public CistaNasFileSystem Fs { get; } = fs;
     }
 }
