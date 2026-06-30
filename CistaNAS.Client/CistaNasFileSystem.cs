@@ -27,7 +27,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
     private readonly ConcurrentDictionary<string, FileCache> _cache = new(StringComparer.Ordinal);
 
     // グローバルチャンクプール: 全ファイル合計20チャンク上限（ハッシュ検証付き）
-    private readonly Dictionary<(string FileId, int ChunkIndex), (byte[] Data, string EncryptedHash)> _chunkPool = new();
+    private readonly Dictionary<(string FileId, int ChunkIndex), (SecureBuffer Data, string EncryptedHash)> _chunkPool = new();
     private readonly LinkedList<(string FileId, int ChunkIndex)> _chunkLru = new();
     private readonly object _chunkPoolLock = new();
     private const int MaxGlobalChunks = 20;
@@ -68,7 +68,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public int ChunkCount;
         public long PlainLength;
 
-        private byte[]? _fileKey;
+        private SecureBuffer? _fileKey;
         private byte[]? _fileSalt;
         private readonly object _fileKeyLock = new();
 
@@ -77,7 +77,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         {
             lock (_fileKeyLock)
             {
-                _fileKey = key;
+                _fileKey?.Dispose(); // 古いキーを VirtualUnlock + ゼロクリア
+                _fileKey = new SecureBuffer(key); // VirtualLock でページング退避防止
                 _fileSalt = salt;
             }
         }
@@ -87,18 +88,18 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         {
             lock (_fileKeyLock)
             {
-                key = _fileKey;
+                key = _fileKey?.Buffer;
                 salt = _fileSalt;
                 return _fileKey is not null;
             }
         }
 
-        /// <summary>FileKey と fileSalt をゼロクリア（アンマウント時）。</summary>
+        /// <summary>FileKey を VirtualUnlock + ゼロクリア、fileSalt をゼロクリア（アンマウント時）。</summary>
         public void Dispose()
         {
             lock (_fileKeyLock)
             {
-                if (_fileKey is not null) CryptographicOperations.ZeroMemory(_fileKey);
+                _fileKey?.Dispose();
                 if (_fileSalt is not null) CryptographicOperations.ZeroMemory(_fileSalt);
                 _fileKey = null;
                 _fileSalt = null;
@@ -311,10 +312,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             if (size > _maxWritten) _maxWritten = size;
         }
 
-        // ファイルキー・salt・平文チャンクをゼロクリア
+        // salt・平文チャンクをゼロクリア（_existingFileKey は FileCache が管理するためここでは消さない）
         public override void Dispose()
         {
-            if (_existingFileKey is not null) CryptographicOperations.ZeroMemory(_existingFileKey);
             if (_existingFileSalt is not null) CryptographicOperations.ZeroMemory(_existingFileSalt);
             foreach (var (_, chunk) in _dirtyChunks)
                 CryptographicOperations.ZeroMemory(chunk);
@@ -1200,7 +1200,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             {
                 _chunkLru.Remove(key);
                 _chunkLru.AddFirst(key);
-                return entry;
+                return (entry.Data.Buffer, entry.EncryptedHash);
             }
             return null;
         }
@@ -1212,21 +1212,25 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         lock (_chunkPoolLock)
         {
             var key = (fileId, chunkIndex);
+            var buf = new SecureBuffer(data);
             if (_chunkPool.ContainsKey(key))
             {
                 _chunkLru.Remove(key);
                 _chunkLru.AddFirst(key);
-                _chunkPool[key] = (data, encryptedHash);
+                _chunkPool[key].Data.Dispose(); // 古いチャンクを VirtualUnlock + ゼロクリア
+                _chunkPool[key] = (buf, encryptedHash);
                 return;
             }
 
-            _chunkPool[key] = (data, encryptedHash);
+            _chunkPool[key] = (buf, encryptedHash);
             _chunkLru.AddFirst(key);
 
             while (_chunkPool.Count > MaxGlobalChunks)
             {
                 var evict = _chunkLru.Last!.Value;
                 _chunkLru.RemoveLast();
+                if (_chunkPool.TryGetValue(evict, out var evicted))
+                    evicted.Data.Dispose(); // 平文チャンクを VirtualUnlock + ゼロクリア
                 _chunkPool.Remove(evict);
             }
         }
@@ -1240,6 +1244,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             var toRemove = _chunkPool.Keys.Where(k => k.FileId == fileId).ToList();
             foreach (var k in toRemove)
             {
+                if (_chunkPool.TryGetValue(k, out var entry))
+                    entry.Data.Dispose(); // 平文チャンクを VirtualUnlock + ゼロクリア
                 _chunkPool.Remove(k);
                 _chunkLru.Remove(k);
             }
@@ -1282,7 +1288,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         lock (_chunkPoolLock)
         {
             foreach (var (_, (data, _)) in _chunkPool)
-                CryptographicOperations.ZeroMemory(data);
+                data.Dispose(); // SecureBuffer.Dispose（VirtualUnlock + ゼロクリア）
             _chunkPool.Clear();
             _chunkLru.Clear();
         }
