@@ -68,7 +68,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public int ChunkCount;
         public long PlainLength;
 
-        private byte[]? _fileKey;
+        private SecureBuffer? _fileKey;
         private byte[]? _fileSalt;
         private readonly object _fileKeyLock = new();
 
@@ -77,7 +77,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         {
             lock (_fileKeyLock)
             {
-                _fileKey = key;
+                _fileKey?.Dispose(); // 古いキーを VirtualUnlock + ゼロクリア
+                _fileKey = new SecureBuffer(key); // VirtualLock でページング退避防止
                 _fileSalt = salt;
             }
         }
@@ -87,18 +88,18 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         {
             lock (_fileKeyLock)
             {
-                key = _fileKey;
+                key = _fileKey?.Buffer;
                 salt = _fileSalt;
                 return _fileKey is not null;
             }
         }
 
-        /// <summary>FileKey と fileSalt をゼロクリア（アンマウント時）。</summary>
+        /// <summary>FileKey を VirtualUnlock + ゼロクリア、fileSalt をゼロクリア（アンマウント時）。</summary>
         public void Dispose()
         {
             lock (_fileKeyLock)
             {
-                if (_fileKey is not null) CryptographicOperations.ZeroMemory(_fileKey);
+                _fileKey?.Dispose();
                 if (_fileSalt is not null) CryptographicOperations.ZeroMemory(_fileSalt);
                 _fileKey = null;
                 _fileSalt = null;
@@ -311,10 +312,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             if (size > _maxWritten) _maxWritten = size;
         }
 
-        // ファイルキー・salt・平文チャンクをゼロクリア
+        // salt・平文チャンクをゼロクリア（_existingFileKey は FileCache が管理するためここでは消さない）
         public override void Dispose()
         {
-            if (_existingFileKey is not null) CryptographicOperations.ZeroMemory(_existingFileKey);
             if (_existingFileSalt is not null) CryptographicOperations.ZeroMemory(_existingFileSalt);
             foreach (var (_, chunk) in _dirtyChunks)
                 CryptographicOperations.ZeroMemory(chunk);
