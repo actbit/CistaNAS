@@ -36,14 +36,6 @@ public sealed class AccountApiClient
         response.EnsureSuccessStatusCode();
     }
 
-    /// <summary>admin かどうか。</summary>
-    public async Task<bool> IsAdminAsync(string username)
-    {
-        // WasmAuthStateProvider の JWT クレームから判定
-        // 実際の API コールは不要
-        return false; // 呼び出し元で AuthProvider を使う
-    }
-
     /// <summary>公開鍵を取得。</summary>
     public async Task<string?> GetPublicKeyAsync(string username)
     {
