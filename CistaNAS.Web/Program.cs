@@ -149,30 +149,22 @@ builder.Services.AddCistaNasServices(cista);
 // ---- WebDAV ----
 builder.Services.AddScoped<WebDavHandler>();
 
-// ---- E2EE ----
-// Server-side Blazor 用（WASM SPA モードでは不要）
-// builder.Services.AddScoped<E2eeInterop>();
-
-// ---- Blazor (Interactive Server rendering) ----
-// WASM SPA としてホストするため Server rendering は無効化
-// builder.Services.AddRazorComponents()
-//     .AddInteractiveServerComponents();
-
-// ---- レスポンス圧縮（WASM アセットの gzip 転送用） ----
-// TEMP: SRI チェックとの競合を検証するため一時的に無効化
-// builder.Services.AddResponseCompression(options =>
-// {
-//     options.EnableForHttps = true;
-//     options.MimeTypes = new[]
-//     {
-//         "text/css",
-//         "text/javascript",
-//         "application/javascript",
-//         "application/wasm",
-//         "application/json",
-//         "image/svg+xml",
-//     };
-// });
+// ---- レスポンス圧縮（WASM アセットの brotli/gzip 転送用） ----
+// SRI（blazor.boot.json の integrity）は非圧縮アセットのハッシュで検証されるため、
+// 動的圧縮でも展開後に整合する。静的 .br/.gz 配信ではなく動的圧縮を採用（Web.csproj 参照）。
+builder.Services.AddResponseCompression(options =>
+{
+    options.EnableForHttps = true;
+    options.MimeTypes = new[]
+    {
+        "text/css",
+        "text/javascript",
+        "application/javascript",
+        "application/wasm",
+        "application/json",
+        "image/svg+xml",
+    };
+});
 
 // ---- CORS（外部クライアント向け） ----
 builder.Services.AddCors(options =>
@@ -272,8 +264,8 @@ else
 // X-Forwarded-For / X-Forwarded-Proto ヘッダーを信用する
 app.UseForwardedHeaders();
 
-// レスポンス圧縮（TEMP: SRI デバッグのため無効化）
-// app.UseResponseCompression();
+// レスポンス圧縮（WASM アセットの brotli/gzip 配信）
+app.UseResponseCompression();
 
 // Kestrel が HTTPS でリッスンしている場合のみリダイレクトを有効化
 // （リバースプロキシで TLS 終端する構成では ASPNETCORE_URLS が http になるため無効化）
@@ -292,13 +284,19 @@ app.Use(async (ctx, next) =>
     if (!ctx.Request.Headers.ContainsKey("Content-Security-Policy"))
     {
         // 開発環境ではCSPを緩和
-        var csp = "default-src 'self'; " +
-                  "script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
-                  "style-src 'self' 'unsafe-inline'; " +
+        // 'unsafe-inline' は .NET 10 Blazor WASM が生成する <script type="importmap">（インライン）に必須。
+        // ハッシュ/nonce は fingerprint でビルド毎に変わるため使えず、インライン許可が現実解。
+        // 'unsafe-eval' は使わず 'wasm-unsafe-eval'（WASM ランタイム内のみ評価）で任意 JS eval を遮断。
+        var csp = "base-uri 'self'; " +
+                  "default-src 'self'; " +
+                  "object-src 'none'; " +
+                  "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; " +
+                  "style-src 'self'; " +
                   "img-src 'self' data: blob:; " +
                   "media-src 'self' blob:; " +
                   "connect-src 'self'; " +
-                  "frame-ancestors 'self';";
+                  "frame-ancestors 'self'; " +
+                  "upgrade-insecure-requests";
         headers["Content-Security-Policy"] = csp;
     }
     await next();
@@ -308,8 +306,6 @@ app.UseCors();
 app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
-// Server-side Blazor 用（WASM SPA モードでは不要）
-// app.UseAntiforgery();
 
 app.UseStaticFiles(new StaticFileOptions
 {
@@ -320,10 +316,6 @@ app.UseStaticFiles(new StaticFileOptions
 // ---- WASM SPA フォールバック ----
 // API・WebDAVリクエスト以外を index.html にフォールバック
 app.MapFallbackToFile("index.html");
-
-// Server-side BlazorはWASM統合により無効化
-// app.MapRazorComponents<App>()
-//     .AddInteractiveServerRenderMode();
 
 // ---- /api/v1 : REST API ----
 var api = app.MapGroup("/api/v1");

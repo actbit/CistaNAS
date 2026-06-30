@@ -20,6 +20,10 @@ builder.Services.AddScoped<AuthHeaderHandler>();
 builder.Services.AddScoped(sp =>
 {
     var handler = sp.GetRequiredService<AuthHeaderHandler>();
+    // DelegatingHandler には InnerHandler（実配信ハンドラ）の設定が必要。
+    // .NET 10 Blazor WASM では HttpClientHandler がブラウザ fetch にマッピングされる。
+    // 未設定だと net_http_handler_not_assigned で全 API 呼び出しが失敗する。
+    handler.InnerHandler = new HttpClientHandler();
     // WASM は同一サーバーでホストされるため相対 URL
     return new HttpClient(handler) { BaseAddress = new Uri(sp.GetRequiredService<NavigationManager>().BaseUri) };
 });

@@ -299,7 +299,7 @@ else
             }
             <div class="mb-3">
                 <label class="form-label">パスワード（秘密鍵の暗号化用）</label>
-                <input type="password" class="form-control" style="max-width:300px" @bind="_keyPassword" />
+                <input type="password" class="form-control input-narrow" @bind="_keyPassword" />
             </div>
             <button class="btn btn-primary" disabled="@_keyLoading" @onclick="HandleGenerateKeyPair">
                 @(_keyLoading ? "生成中..." : "鍵ペアを生成・登録")

@@ -109,10 +109,12 @@ export function clearAllKeys() {
 async function deriveFileKey(masterKey, fileSalt) {
     const rawKey = await crypto.subtle.exportKey("raw", masterKey);
     const keyMaterial = await crypto.subtle.importKey("raw", rawKey, "HKDF", false, ["deriveKey"]);
+    // extractable=true: encryptChunk/decryptChunk が nonce 導出のために fileKey の raw を exportKey する。
+    // (CistaNAS.Web の E2eeCrypto.DeriveFileKey は byte[] を直接使うが、JS 側は CryptoKey から export する必要がある)
     return await crypto.subtle.deriveKey(
         { name: "HKDF", hash: "SHA-256", salt: fileSalt, info: new TextEncoder().encode("cista-file-key") },
         keyMaterial,
-        { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+        { name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
 }
 
 async function deriveChunkNonce(fileKeyRaw, chunkIndex, fileSalt) {
