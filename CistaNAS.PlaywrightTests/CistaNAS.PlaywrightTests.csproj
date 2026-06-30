@@ -20,6 +20,7 @@
   <ItemGroup>
     <ProjectReference Include="..\CistaNAS.AppHost\CistaNAS.AppHost.csproj" />
     <ProjectReference Include="..\CistaNAS.Shared\CistaNAS.Shared.csproj" />
+    <ProjectReference Include="..\CistaNAS.Wasm\CistaNAS.Wasm.csproj" />
   </ItemGroup>
 
   <ItemGroup>
