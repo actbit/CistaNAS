@@ -9,14 +9,7 @@ public sealed class GroupApiClient
 
     public GroupApiClient(HttpClient http) => _http = http;
 
-    /// <summary>グループ一覧。</summary>
-    public async Task<IReadOnlyList<GroupEntity>> ListAsync()
-    {
-        var result = await _http.GetFromJsonAsync<List<GroupEntity>>("/api/v1/groups");
-        return result ?? [];
-    }
-
-    /// <summary>全グループ一覧（admin 用、メンバー情報付き）。</summary>
+    /// <summary>グループ一覧（メンバー情報付き）。</summary>
     public async Task<IReadOnlyList<GroupEntity>> ListGroupsAsync()
     {
         var result = await _http.GetFromJsonAsync<List<GroupEntity>>("/api/v1/groups");
