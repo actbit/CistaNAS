@@ -542,7 +542,7 @@ else
         {
             var token = await FileApi.IssueStreamTokenAsync(VolumeName, file.Name);
             var url = FileApi.GetDownloadUrl(VolumeName, file.Name, token);
-            await JS.InvokeVoidAsync("eval", $"window.open('{url}', '_blank')");
+            await JS.InvokeVoidAsync("cista.openUrl", url);
         }
         catch (Exception ex) { _operationError = $"ダウンロードエラー: {ex.Message}"; }
     }

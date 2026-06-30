@@ -3,6 +3,7 @@
 @implements IDisposable
 @inject WasmAuthStateProvider Auth
 @inject AuthApiClient AuthApi
+@inject IJSRuntime JS
 
 <div class="top-row ps-3 navbar navbar-dark">
     <div class="container-fluid">
@@ -16,7 +17,7 @@
 
 <input type="checkbox" title="Navigation menu" class="navbar-toggler" />
 
-<div class="nav-scrollable" onclick="document.querySelector('.navbar-toggler').click()">
+<div class="nav-scrollable" @onclick="CloseNavOnClick">
     <nav class="nav flex-column">
         <div class="nav-item px-3">
             <NavLink class="nav-link" href="" Match="NavLinkMatch.All">
@@ -72,6 +73,13 @@
     private async Task HandleLogout()
     {
         await Auth.LogoutAsync();
+    }
+
+    /// <summary>メニュー操作後にモバイル navbar を閉じる（インライン onclick を排除するため外部 JS へ移行）。</summary>
+    private async Task CloseNavOnClick()
+    {
+        try { await JS.InvokeVoidAsync("cista.closeNavbar"); }
+        catch { /* JS 未初期化時は無視 */ }
     }
 
     private void OnAuthStateChanged() => StateHasChanged();

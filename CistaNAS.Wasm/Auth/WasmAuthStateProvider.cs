@@ -132,12 +132,21 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
                 switch (prop.Name)
                 {
                     case "sub":
-                        claims.Add(new Claim(ClaimTypes.NameIdentifier, prop.Value.GetString() ?? ""));
+                    {
+                        // Sub は AuthService が user.UserName を設定（常に存在）。
+                        // JsonWebTokenHandler は ClaimTypes.Name を長いURIで出力し、
+                        // WASM 側の "name" キー検索で拾えない場合があるため Sub から Name も設定。
+                        var v = prop.Value.GetString() ?? "";
+                        claims.Add(new Claim(ClaimTypes.NameIdentifier, v));
+                        claims.Add(new Claim(ClaimTypes.Name, v));
                         break;
-                    case "unique_name" or "name":
+                    }
+                    // サーバーは JsonWebTokenHandler（短縮マッピングなし）でクレームを出力するため、
+                    // ClaimTypes.Name / Role は長い URI キーになる。短縮名と長い URI の両方を受け入れる。
+                    case "unique_name" or "name" or "http://schemas.xml.org/ws/2005/05/identity/claims/name":
                         claims.Add(new Claim(ClaimTypes.Name, prop.Value.GetString() ?? ""));
                         break;
-                    case "role":
+                    case "role" or "http://schemas.microsoft.com/ws/2008/06/identity/claims/role":
                         if (prop.Value.ValueKind == System.Text.Json.JsonValueKind.Array)
                         {
                             foreach (var role in prop.Value.EnumerateArray())
