@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
+using CistaNAS.Wasm.Services;
 using Microsoft.Playwright;
 
 namespace CistaNAS.PlaywrightTests;
@@ -82,7 +83,21 @@ public class FileDownloadTests(PlaywrightWebAppFixture fixture)
         // CSP 違反（eval 等のブロック）がないこと
         Assert.Empty(consoleErrors.Where(e => e.Contains("Content Security Policy", StringComparison.OrdinalIgnoreCase)));
 
-        // NOTE: popup.Url の stream URL 厳密確認は、FileApiClient.GetDownloadUrl の url 構築調査が
-        // 別途必要なため本テストの対象外（popup が開く = cista.openUrl が機能することを検証）。
+        // NOTE: popup.Url の stream URL 厳密確認は、Playwright が <a target=_blank rel=noopener> の
+        // popup URL を同期的に取得できないため対象外。url 構築の正しさは GetDownloadUrl_ReturnsAbsoluteUrl
+        // で検証、popup が開く = cista.openUrl が機能することを検証。
+    }
+
+    /// <summary>GetDownloadUrl が絶対 URL を返すこと（url 構築の単体確認）。</summary>
+    [Fact]
+    public void GetDownloadUrl_ReturnsAbsoluteUrl()
+    {
+        var http = new HttpClient { BaseAddress = new Uri("https://localhost:12345/") };
+        var api = new FileApiClient(http);
+
+        var url = api.GetDownloadUrl("vol", "file.txt", "tok");
+
+        Assert.StartsWith("https://localhost:12345/", url);
+        Assert.Contains("/api/v1/stream/vol/file.txt?token=tok", url);
     }
 }
