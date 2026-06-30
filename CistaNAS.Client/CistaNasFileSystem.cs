@@ -1227,6 +1227,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             {
                 var evict = _chunkLru.Last!.Value;
                 _chunkLru.RemoveLast();
+                if (_chunkPool.TryGetValue(evict, out var evicted))
+                    CryptographicOperations.ZeroMemory(evicted.Data); // 平文チャンクをゼロクリア
                 _chunkPool.Remove(evict);
             }
         }
@@ -1240,6 +1242,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             var toRemove = _chunkPool.Keys.Where(k => k.FileId == fileId).ToList();
             foreach (var k in toRemove)
             {
+                if (_chunkPool.TryGetValue(k, out var entry))
+                    CryptographicOperations.ZeroMemory(entry.Data); // 平文チャンクをゼロクリア
                 _chunkPool.Remove(k);
                 _chunkLru.Remove(k);
             }
