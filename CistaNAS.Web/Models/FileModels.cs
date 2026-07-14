@@ -20,6 +20,9 @@ public sealed class FileMetadata
 
     /// <summary>チャンクモードで保存されているか。</summary>
     public bool IsChunked => ChunkCount > 0;
+
+    /// <summary>チャンクの保存オブジェクト ID。旧カタログではファイル名を使用する。</summary>
+    public string? ChunkObjectId { get; set; }
 }
 
 public sealed record ListFilesResponse(IReadOnlyList<FileMetadata> Files);

@@ -65,7 +65,10 @@ public sealed class LocalStorageProvider : IStorageProvider
         }
         else
         {
-            string prefixDir = Path.Combine(_basePath, prefix.Replace('/', Path.DirectorySeparatorChar));
+            // 一覧取得も Read/Write/Delete と同じパス検証を通す。
+            // ここを直接 Path.Combine すると、絶対パスや .. を含む prefix で
+            // ベースディレクトリ外を列挙できる。
+            string prefixDir = ToFullPath(prefix);
             if (Directory.Exists(prefixDir))
                 ListRecursive(prefixDir, _basePath, results);
         }

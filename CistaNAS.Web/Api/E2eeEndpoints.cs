@@ -144,7 +144,8 @@ public static class E2eeEndpoints
     private static async Task<IResult> UploadChunk(string volumeName, string fileId, int chunkIndex,
         HttpRequest request, VolumeService vs, E2eeFileService e2eeFs, bool replace = false)
     {
-        long len = request.ContentLength ?? 0;
+        if (request.ContentLength is not long len || len < 0)
+            return Results.StatusCode(StatusCodes.Status411LengthRequired);
         try
         {
             await e2eeFs.UploadChunkAsync(volumeName, fileId, chunkIndex, request.Body, len, replace, request.HttpContext.RequestAborted);

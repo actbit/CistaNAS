@@ -483,7 +483,7 @@ public static class E2eeCrypto
 
         hmac.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
 
-        return hmac.Hash[..GcmNonceSize];
+        return hmac.Hash![..GcmNonceSize];
     }
 
     private static byte[] HkdfSha256(byte[] ikm, byte[] salt, byte[] info, int outputLength)

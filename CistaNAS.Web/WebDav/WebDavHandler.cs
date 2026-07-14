@@ -169,7 +169,8 @@ public sealed class WebDavHandler
         if (string.IsNullOrEmpty(name))
             return Results.BadRequest(new { error = "ファイル名が必要です。" });
 
-        long len = request.ContentLength ?? 0;
+        if (request.ContentLength is not long len || len < 0)
+            return Results.StatusCode(StatusCodes.Status411LengthRequired);
         try
         {
             await _fileService.UploadAsync(volumeName, name, request.Body, len, request.HttpContext.RequestAborted);
