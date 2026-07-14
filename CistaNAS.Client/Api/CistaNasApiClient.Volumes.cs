@@ -12,8 +12,7 @@ public static class CistaNasApiClientVolumes
     public static async Task<VolumeInfo> CreateVolumeAsync(this CistaNasApiClient client, string name, string username, string? password = null, bool encrypted = true)
     {
         var http = GetHttp(client);
-        var req = new { name, username, password = (string?)null, encrypted };
-        if (encrypted) req = new { name, username, password = password!, encrypted };
+        var req = new { name, username, password, encrypted };
         var res = await http.PostAsJsonAsync("/api/v1/volumes", req, JsonOpts);
         res.EnsureSuccessStatusCode();
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();

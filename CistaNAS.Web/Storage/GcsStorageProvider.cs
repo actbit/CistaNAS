@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Threading;
 using Google;
 using Google.Cloud.Storage.V1;
@@ -15,7 +14,7 @@ public sealed class GcsStorageProvider : IStorageProvider, IAsyncDisposable
     private readonly StorageClient _client;
     private readonly string _bucket;
     private readonly string _prefix;
-    private static readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.Ordinal);
+    private static readonly TimeSpan LockLease = TimeSpan.FromMinutes(5);
 
     public GcsStorageProvider(string bucketName, string? pathPrefix)
     {
@@ -99,9 +98,38 @@ public sealed class GcsStorageProvider : IStorageProvider, IAsyncDisposable
 
     public async Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default)
     {
-        var semaphore = _locks.GetOrAdd(lockPath, _ => new SemaphoreSlim(1, 1));
-        await semaphore.WaitAsync(ct);
-        return new LockReleaser(semaphore);
+        var key = FullPath(".locks/" + lockPath);
+        var expiry = DateTimeOffset.UtcNow.Add(LockLease).ToUnixTimeMilliseconds().ToString(System.Globalization.CultureInfo.InvariantCulture);
+        while (true)
+        {
+            try
+            {
+                using var body = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(expiry));
+                var obj = await _client.UploadObjectAsync(_bucket, key, "text/plain", body,
+                    new UploadObjectOptions { IfGenerationMatch = 0 }, ct);
+                return new GcsLockReleaser(_client, _bucket, key, obj.Generation);
+            }
+            catch (GoogleApiException ex) when (ex.HttpStatusCode is System.Net.HttpStatusCode.PreconditionFailed or System.Net.HttpStatusCode.Conflict)
+            {
+                try
+                {
+                    var obj = await _client.GetObjectAsync(_bucket, key, cancellationToken: ct);
+                    var existing = await ReadAsync(".locks/" + lockPath, ct);
+                    if (existing is not null && long.TryParse(System.Text.Encoding.UTF8.GetString(existing), out var expiresAt) &&
+                        expiresAt <= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
+                    {
+                        await _client.DeleteObjectAsync(_bucket, key,
+                            new DeleteObjectOptions { IfGenerationMatch = obj.Generation }, ct);
+                        continue;
+                    }
+                }
+                catch (GoogleApiException race) when (race.HttpStatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.PreconditionFailed or System.Net.HttpStatusCode.Conflict)
+                {
+                    continue;
+                }
+                await Task.Delay(100, ct);
+            }
+        }
     }
 
     /// <summary>ロックを辞書から解除。保持中のセマフォ削除によるデッドロックを防ぐため no-op。</summary>
@@ -115,13 +143,18 @@ public sealed class GcsStorageProvider : IStorageProvider, IAsyncDisposable
         _client.Dispose();
     }
 
-    private sealed class LockReleaser(SemaphoreSlim semaphore) : IDisposable
+    private sealed class GcsLockReleaser(StorageClient client, string bucket, string key, long? generation) : IDisposable
     {
         private int _released;
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _released, 1) == 0)
-                semaphore.Release();
+            if (Interlocked.Exchange(ref _released, 1) != 0) return;
+            try
+            {
+                client.DeleteObjectAsync(bucket, key,
+                    new DeleteObjectOptions { IfGenerationMatch = generation }).GetAwaiter().GetResult();
+            }
+            catch (GoogleApiException ex) when (ex.HttpStatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.PreconditionFailed or System.Net.HttpStatusCode.Conflict) { }
         }
     }
 }

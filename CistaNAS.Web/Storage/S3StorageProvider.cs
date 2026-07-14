@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Threading;
 using Amazon.S3;
 using Amazon.S3.Model;
@@ -15,7 +14,7 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
     private readonly IAmazonS3 _client;
     private readonly string _bucket;
     private readonly string _prefix;
-    private static readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.Ordinal);
+    private static readonly TimeSpan LockLease = TimeSpan.FromMinutes(5);
 
     public S3StorageProvider(string bucket, string region, string? endpointOverride, string? pathPrefix)
     {
@@ -134,9 +133,49 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
 
     public async Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default)
     {
-        var semaphore = _locks.GetOrAdd(lockPath, _ => new SemaphoreSlim(1, 1));
-        await semaphore.WaitAsync(ct);
-        return new LockReleaser(semaphore);
+        var key = FullPath(".locks/" + lockPath);
+        var expiry = DateTimeOffset.UtcNow.Add(LockLease).ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
+
+        while (true)
+        {
+            try
+            {
+                var response = await _client.PutObjectAsync(new PutObjectRequest
+                {
+                    BucketName = _bucket,
+                    Key = key,
+                    InputStream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(expiry)),
+                    IfNoneMatch = "*",
+                }, ct);
+                return new S3LockReleaser(_client, _bucket, key, response.ETag);
+            }
+            catch (AmazonS3Exception ex) when (ex.StatusCode is System.Net.HttpStatusCode.PreconditionFailed or System.Net.HttpStatusCode.Conflict)
+            {
+                try
+                {
+                    var metadata = await _client.GetObjectMetadataAsync(_bucket, key, ct);
+                    using var existing = await _client.GetObjectAsync(_bucket, key, ct);
+                    using var reader = new StreamReader(existing.ResponseStream);
+                    var text = await reader.ReadToEndAsync(ct);
+                    if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var expiresAt) &&
+                        expiresAt <= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
+                    {
+                        await _client.DeleteObjectAsync(new DeleteObjectRequest
+                        {
+                            BucketName = _bucket,
+                            Key = key,
+                            IfMatch = metadata.ETag,
+                        }, ct);
+                        continue;
+                    }
+                }
+                catch (AmazonS3Exception staleRace) when (staleRace.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.PreconditionFailed or System.Net.HttpStatusCode.Conflict)
+                {
+                    continue;
+                }
+                await Task.Delay(100, ct);
+            }
+        }
     }
 
     /// <summary>ロックを辞書から解除。保持中のセマフォ削除によるデッドロックを防ぐため no-op。</summary>
@@ -153,13 +192,22 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
         return default;
     }
 
-    private sealed class LockReleaser(SemaphoreSlim semaphore) : IDisposable
+    private sealed class S3LockReleaser(IAmazonS3 client, string bucket, string key, string? etag) : IDisposable
     {
         private int _released;
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _released, 1) == 0)
-                semaphore.Release();
+            if (Interlocked.Exchange(ref _released, 1) != 0) return;
+            try
+            {
+                client.DeleteObjectAsync(new DeleteObjectRequest
+                {
+                    BucketName = bucket,
+                    Key = key,
+                    IfMatch = etag,
+                }).GetAwaiter().GetResult();
+            }
+            catch (AmazonS3Exception ex) when (ex.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.PreconditionFailed or System.Net.HttpStatusCode.Conflict) { }
         }
     }
 }
