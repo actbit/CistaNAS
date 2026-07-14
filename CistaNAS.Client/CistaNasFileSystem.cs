@@ -79,7 +79,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             {
                 _fileKey?.Dispose(); // 古いキーを VirtualUnlock + ゼロクリア
                 _fileKey = new SecureBuffer(key); // VirtualLock でページング退避防止
-                _fileSalt = salt;
+                // 呼び出し側の一時バッファをCleanupでゼロクリアしても、
+                // キャッシュが保持するsaltまで破壊されないよう所有権を分離する。
+                _fileSalt = (byte[])salt.Clone();
             }
         }
 
@@ -246,7 +248,10 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                     if (cache.TryGetFileKey(out var key, out var salt))
                     {
                         _existingFileKey = key;
-                        _existingFileSalt = salt;
+                        // FileCacheの内部バッファをWriteStateと共有しない。
+                        // CleanupではWriteState側のsaltをゼロクリアするため、共有すると
+                        // 保存直後の再読み込みで復号鍵が壊れる。
+                        _existingFileSalt = salt is null ? null : (byte[])salt.Clone();
                     }
                     else if (_existingChunkCount > 0)
                     {
