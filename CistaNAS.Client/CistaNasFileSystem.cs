@@ -646,7 +646,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                             var newKey = E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, newSalt);
 
                             // fileKey が変わった場合はキャッシュをクリアして再構築
-                            if (newKey != fileKey)
+                            if (!CryptographicOperations.FixedTimeEquals(newKey, fileKey))
                             {
                                 cache.SetFileKey(newKey, newSalt);
                                 fileKeyToUse = newKey;
