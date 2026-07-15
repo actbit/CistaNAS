@@ -59,6 +59,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         _isE2ee = false;
     }
 
+
     // ---- 内部クラス: ファイルキャッシュ（メタデータ + fileKey のみ。チャンクはグローバルプールで管理） ----
 
     internal sealed class FileCache
@@ -160,6 +161,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public readonly string? ExistingFileId; // 上書き時の旧ファイルID（E2EE は fileId、非E2EE は plainName または null）
         protected readonly CistaNasFileSystem Fs;
         public long DeclaredSize = -1; // SetEndOfFile で指定されたサイズ
+        protected bool HasPendingChanges;
+        public bool HasPending => HasPendingChanges;
 
         protected WriteState(CistaNasFileSystem fs, string plainName, string? existingFileId)
         {
@@ -171,6 +174,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public abstract long CurrentSize { get; }
         public abstract void Write(byte[] data, int dataOffset, int count, long fileOffset);
         public abstract void SetDeclaredSize(long size);
+
+        public void MarkPersisted() => HasPendingChanges = false;
 
         /// <summary>機密データ（ファイルキー、平文チャンク等）をゼロクリア。Cleanup/アンマウント時に呼ぶ。</summary>
         public virtual void Dispose() { }
@@ -206,6 +211,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             byte[] copy = new byte[count];
             Buffer.BlockCopy(data, dataOffset, copy, 0, count);
             _ranges.Add((fileOffset, copy));
+            HasPendingChanges = true;
             long end = fileOffset + count;
             if (end > _maxWritten) _maxWritten = end;
         }
@@ -213,6 +219,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public override void SetDeclaredSize(long size)
         {
             DeclaredSize = size;
+            HasPendingChanges = true;
             if (size > _maxWritten) _maxWritten = size;
         }
 
@@ -307,6 +314,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 long srcStart = Math.Max(0, chunkStart - fileOffset);
                 Buffer.BlockCopy(data, dataOffset + (int)srcStart, chunk, (int)relStart, copyLen);
                 _dirtyChunks[ci] = chunk;
+                HasPendingChanges = true;
             }
             if (endOffset > _maxWritten) _maxWritten = endOffset;
         }
@@ -314,6 +322,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public override void SetDeclaredSize(long size)
         {
             DeclaredSize = size;
+            HasPendingChanges = true;
             if (size > _maxWritten) _maxWritten = size;
         }
 
@@ -753,16 +762,43 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
         if (info.Context is WriteState ws)
         {
-            ws.Write(buffer, 0, buffer.Length, offset);
-            bytesWritten = buffer.Length;
-            return DokanResult.Success;
+            try
+            {
+                ws.Write(buffer, 0, buffer.Length, offset);
+                // 既存E2EEファイルはdirtyチャンクだけを同期保存してから
+                // Windowsへ書き込み成功を返す。Cleanupまで遅延させると、
+                // OSキャッシュがサーバー未反映の内容を保持するため。
+                if (ws.ExistingFileId is not null)
+                    UploadWriteState(ws);
+                bytesWritten = buffer.Length;
+                return DokanResult.Success;
+            }
+            catch
+            {
+                return DokanResult.InternalError;
+            }
         }
 
         // 読み取り専用ハンドルへの書き込み
         return DokanResult.AccessDenied;
     }
 
-    public NtStatus FlushFileBuffers(string fileName, IDokanFileInfo info) => DokanResult.Success;
+    public NtStatus FlushFileBuffers(string fileName, IDokanFileInfo info)
+    {
+        if (info.Context is not WriteState ws || ws.ExistingFileId is null || !ws.HasPending)
+            return DokanResult.Success;
+
+        try
+        {
+            UploadWriteState(ws);
+            ws.MarkPersisted();
+            return DokanResult.Success;
+        }
+        catch
+        {
+            return DokanResult.InternalError;
+        }
+    }
 
     public NtStatus GetFileInformation(string fileName, out FileInformation fileInfo, IDokanFileInfo info)
     {
@@ -1027,6 +1063,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
     internal void UploadWriteState(WriteState ws)
     {
+        if (!ws.HasPending) return;
+
         // 例外はそのまま上位（Cleanup）に伝播させる。Cleanup が void 制約でエラーを飲む。
         switch (ws)
         {
@@ -1040,6 +1078,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                     UploadE2eeDiff(e2ee);
                 break;
         }
+
+        ws.MarkPersisted();
 
         _listingCache.Invalidate();
         lock (_statsLock) { _cachedStats = null; }
@@ -1217,7 +1257,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         lock (_chunkPoolLock)
         {
             var key = (fileId, chunkIndex);
-            var buf = new SecureBuffer(data);
+            // プールと呼び出し側のWriteStateで所有権を共有しない。
+            // Cleanup時の平文ゼロクリアでプールまで破壊されるのを防ぐ。
+            var buf = new SecureBuffer((byte[])data.Clone());
             if (_chunkPool.ContainsKey(key))
             {
                 _chunkLru.Remove(key);
