@@ -203,7 +203,8 @@ public static class ApiEndpoints
             try
             {
                 string fileName = PathSanitizer.SanitizeFileName(filePath);
-                long len = ctx.Request.ContentLength ?? 0;
+                if (ctx.Request.ContentLength is not long len || len < 0)
+                    return Results.StatusCode(StatusCodes.Status411LengthRequired);
                 var stream = ctx.Request.Body;
                 var meta = await fs.UploadAsync(volumeName, fileName, stream, len, ctx.RequestAborted);
                 return Results.Ok(meta);
@@ -220,7 +221,8 @@ public static class ApiEndpoints
             try
             {
                 string fileName = PathSanitizer.SanitizeFileName(filePath);
-                long len = ctx.Request.ContentLength ?? 0;
+                if (ctx.Request.ContentLength is not long len || len < 0)
+                    return Results.StatusCode(StatusCodes.Status411LengthRequired);
                 var stream = ctx.Request.Body;
                 var meta = await fs.PatchRangeAsync(volumeName, fileName, offset, stream, len, ctx.RequestAborted);
                 return Results.Ok(meta);

@@ -327,6 +327,7 @@ public sealed class FileService
             {
                 var catalog = await LoadCatalogAsync(volumeName, ct);
                 catalog.Files.TryGetValue(fileName, out var existing);
+                string objectId = existing?.ChunkObjectId ?? fileName;
 
                 var chunkSizes = existing?.ChunkSizes ?? new List<int>();
                 long existingLength = existing?.Length ?? 0;
@@ -358,7 +359,7 @@ public sealed class FileService
                     byte[] plain = new byte[curPlainSize];
                     if (encrypted && isExisting && chunkSizes[ci] > 0)
                     {
-                        byte[]? enc = await _chunkStore.ReadChunkAsync(volumeName, fileName, ci, ct);
+                        byte[]? enc = await _chunkStore.ReadChunkAsync(volumeName, objectId, ci, ct);
                         if (enc is not null)
                         {
                             int origLen = Math.Min(chunkSizes[ci], curPlainSize);
@@ -382,7 +383,7 @@ public sealed class FileService
                         ? ChunkEncryptor.EncryptChunk(masterKey!, algorithm, ci, sectorSize, chunkSize, plain)
                         : plain;
                     using var ms = new MemoryStream(stored);
-                    await _chunkStore.WriteChunkAsync(volumeName, fileName, ci, ms, ct);
+                     await _chunkStore.WriteChunkAsync(volumeName, objectId, ci, ms, ct);
 
                     while (chunkSizes.Count <= ci) chunkSizes.Add(0);
                     chunkSizes[ci] = curPlainSize;
@@ -395,6 +396,7 @@ public sealed class FileService
                     Length = newLength,
                     ChunkCount = lastNeeded + 1,
                     ChunkSizes = chunkSizes,
+                    ChunkObjectId = objectId,
                     CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
                     ModifiedAt = DateTimeOffset.UtcNow,
                 };
@@ -442,13 +444,9 @@ public sealed class FileService
         {
             var catalog = await LoadCatalogAsync(volumeName, ct);
             catalog.Files.TryGetValue(fileName, out var existing);
-
-            // 既存ファイルのチャンクを削除（上書き時）
-            if (existing is not null && existing.IsChunked)
-            {
-                try { await _chunkStore.DeleteChunksAsync(volumeName, fileName, ct); }
-                catch (Exception) { /* ベストエフォート */ }
-            }
+            // 新規アップロードは別オブジェクトへ書き込み、カタログ切り替えを
+            // 最後に行う。既存ファイルの旧オブジェクトは失敗時も保持する。
+            string objectId = $"{fileName}.upload-{Guid.NewGuid():N}";
 
             var chunkSizes = new List<int>();
             byte[] buffer = new byte[chunkSize];
@@ -474,7 +472,7 @@ public sealed class FileService
 
                 // S3 にチャンクを保存
                 using var ms = new MemoryStream(chunkData);
-                await _chunkStore.WriteChunkAsync(volumeName, fileName, chunkIndex, ms, ct);
+                await _chunkStore.WriteChunkAsync(volumeName, objectId, chunkIndex, ms, ct);
 
                 chunkSizes.Add(read);
                 chunkIndex++;
@@ -488,6 +486,7 @@ public sealed class FileService
                 Length = contentLength - remaining, // 実際に読み取ったバイト数
                 ChunkCount = chunkSizes.Count,
                 ChunkSizes = chunkSizes,
+                ChunkObjectId = objectId,
                 CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
                 ModifiedAt = DateTimeOffset.UtcNow,
             };
@@ -495,6 +494,13 @@ public sealed class FileService
             await SaveCatalogAsync(volumeName, catalog, ct);
 
             await _journalService.CommitAsync(volumeName, opId, ct);
+
+            if (existing is not null)
+            {
+                string oldObjectId = existing.ChunkObjectId ?? fileName;
+                try { await _chunkStore.DeleteChunksAsync(volumeName, oldObjectId, ct); }
+                catch (Exception) { /* ベストエフォート */ }
+            }
             return meta;
         }
         finally
@@ -554,15 +560,15 @@ public sealed class FileService
         Stream chunkedStream;
         if (header.Encrypted && masterKey is not null)
         {
-            chunkedStream = new ChunkedReadStream(
-                _chunkStore, volumeName, fileName, masterKey,
+                chunkedStream = new ChunkedReadStream(
+                    _chunkStore, volumeName, meta.ChunkObjectId ?? fileName, masterKey,
                 header.EffectiveCipherAlgorithm,
                 sectorSize, chunkSize, meta.ChunkSizes);
         }
         else
         {
             // 非暗号化: ChunkedReadStream の代わりに MemoryChunkedStream を使用
-            chunkedStream = new MemoryChunkedStream(_chunkStore, volumeName, fileName, meta.ChunkSizes);
+            chunkedStream = new MemoryChunkedStream(_chunkStore, volumeName, meta.ChunkObjectId ?? fileName, meta.ChunkSizes);
         }
 
         return new FileDownloadResponse(new GateReadStream(chunkedStream, readLock), meta.Name, meta.Length);
@@ -584,11 +590,13 @@ public sealed class FileService
             }, ct);
 
             SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+            FileMetadata? existing = null;
             await catLock.WaitAsync(ct);
             try
             {
                 var catalog = await LoadCatalogAsync(volumeName, ct);
-                if (!catalog.Files.Remove(fileName))
+                if (!catalog.Files.TryGetValue(fileName, out existing)
+                    || !catalog.Files.Remove(fileName))
                     throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
 
                 await SaveCatalogAsync(volumeName, catalog, ct);
@@ -601,7 +609,8 @@ public sealed class FileService
             // チャンクモード: S3 からチャンクを削除（リトライ付き）
             if (isChunkMode)
             {
-                await _chunkStore.DeleteChunksWithRetryAsync(volumeName, fileName, ct);
+                await _chunkStore.DeleteChunksWithRetryAsync(
+                    volumeName, existing?.ChunkObjectId ?? fileName, ct);
             }
 
             await _journalService.CommitAsync(volumeName, opId, ct);
@@ -643,7 +652,8 @@ public sealed class FileService
                 if (!meta.IsChunked) continue;
                 try
                 {
-                    var indices = await _chunkStore.ListChunksAsync(volumeName, fileName, ct);
+                    var indices = await _chunkStore.ListChunksAsync(
+                        volumeName, meta.ChunkObjectId ?? fileName, ct);
                     if (indices.Count < meta.ChunkCount)
                         brokenFiles.Add(fileName);
                 }

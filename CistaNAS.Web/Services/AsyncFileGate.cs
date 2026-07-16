@@ -113,11 +113,21 @@ internal sealed class AsyncFileGate : IDisposable
 
     private sealed class ReadReleaser(AsyncFileGate gate) : IDisposable
     {
-        public void Dispose() => gate.ExitRead();
+        private int _disposed;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                gate.ExitRead();
+        }
     }
 
     private sealed class WriteReleaser(AsyncFileGate gate) : IDisposable
     {
-        public void Dispose() => gate.ExitWrite();
+        private int _disposed;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                gate.ExitWrite();
+        }
     }
 }

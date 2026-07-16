@@ -52,14 +52,23 @@ public class E2eeEdgeCaseTests(AspireFixture fixture)
         return (volName, masterKey);
     }
 
-    /// <summary>ファイルを作成し fileId を返す。</summary>
-    private static async Task<string> CreateFileAsync(HttpClient c, string vol, string name, long encLen, int chunkCount)
+    /// <summary>ファイルを作成し、初期書き込みリースとともに返す。</summary>
+    private static async Task<(string FileId, string WriteLease)> CreateFileAsync(
+        HttpClient c, string vol, string name, long encLen, int chunkCount)
     {
         var resp = await c.PostAsJsonAsync($"/api/v1/e2ee/{vol}/create-file",
             new { encryptedName = name, encryptedLength = encLen, chunkCount });
         Assert.True(resp.IsSuccessStatusCode, $"create-file failed: {resp.StatusCode}");
         var json = await resp.Content.ReadFromJsonAsync<JsonElement>();
-        return json.GetProperty("fileId").GetString()!;
+        return (json.GetProperty("fileId").GetString()!, json.GetProperty("writeLeaseToken").GetString()!);
+    }
+
+    private static HttpRequestMessage WithWriteLease(HttpMethod method, string uri, string token,
+        HttpContent? content = null)
+    {
+        var request = new HttpRequestMessage(method, uri) { Content = content };
+        request.Headers.Add("X-CistaNAS-Write-Lease", token);
+        return request;
     }
 
     /// <summary>chunk-hash を取得し (hash, revision) を返す。</summary>
@@ -97,14 +106,15 @@ public class E2eeEdgeCaseTests(AspireFixture fixture)
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
     }
 
-    /// <summary>存在しない fileId の削除は 404。</summary>
+    /// <summary>存在しない fileId の書き込みリース取得は 404。</summary>
     [Fact]
-    public async Task DeleteFile_NonExistent_Returns404()
+    public async Task AcquireWriteLease_NonExistent_Returns404()
     {
         using var c = CreateAuthClient();
         string vol = (await CreateVolumeAsync(c, "edge-del404")).VolName;
 
-        var resp = await c.DeleteAsync($"/api/v1/e2ee/{vol}/files/nonexistent-file-id");
+        string fileId = Guid.NewGuid().ToString("N");
+        var resp = await c.PostAsync($"/api/v1/e2ee/{vol}/files/{fileId}/write-lease", null);
 
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
     }
@@ -115,7 +125,7 @@ public class E2eeEdgeCaseTests(AspireFixture fixture)
     {
         using var c = CreateAuthClient();
         string vol = (await CreateVolumeAsync(c, "edge-hash404")).VolName;
-        string fileId = await CreateFileAsync(c, vol, "enc-missing-chunk", 100, 1);
+        var (fileId, _) = await CreateFileAsync(c, vol, "enc-missing-chunk", 100, 1);
 
         var resp = await c.GetAsync($"/api/v1/e2ee/{vol}/chunk-hash/{fileId}/0");
 
@@ -138,11 +148,13 @@ public class E2eeEdgeCaseTests(AspireFixture fixture)
 
         // 初回アップロード (replace なし) → revision 0
         byte[] enc0 = E2eeCrypto.EncryptChunk(plain, fileKey, 0, fileSalt, isFirstChunk: true);
-        string fileId = await CreateFileAsync(c, vol, "enc-replace", enc0.Length, 1);
+        var (fileId, writeLease) = await CreateFileAsync(c, vol, "enc-replace", enc0.Length, 1);
         using (var content0 = new ByteArrayContent(enc0))
+        using (var request0 = WithWriteLease(HttpMethod.Post,
+            $"/api/v1/e2ee/{vol}/upload-chunk/{fileId}/0", writeLease, content0))
         {
             content0.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-            var r0 = await c.PostAsync($"/api/v1/e2ee/{vol}/upload-chunk/{fileId}/0", content0);
+            var r0 = await c.SendAsync(request0);
             Assert.True(r0.IsSuccessStatusCode, $"initial upload failed: {r0.StatusCode}");
         }
         var (hash0, rev0) = await GetChunkHashAsync(c, vol, fileId, 0);
@@ -152,9 +164,11 @@ public class E2eeEdgeCaseTests(AspireFixture fixture)
         // 差分上書き (replace=true) → revision 1
         byte[] enc1 = E2eeCrypto.EncryptChunk(plain, fileKey, 0, fileSalt, isFirstChunk: true, revision: 1);
         using (var content1 = new ByteArrayContent(enc1))
+        using (var request1 = WithWriteLease(HttpMethod.Post,
+            $"/api/v1/e2ee/{vol}/upload-chunk/{fileId}/0?replace=true", writeLease, content1))
         {
             content1.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-            var r1 = await c.PostAsync($"/api/v1/e2ee/{vol}/upload-chunk/{fileId}/0?replace=true", content1);
+            var r1 = await c.SendAsync(request1);
             Assert.True(r1.IsSuccessStatusCode, $"replace upload failed: {r1.StatusCode}");
         }
         var (hash1, rev1) = await GetChunkHashAsync(c, vol, fileId, 0);
@@ -178,10 +192,12 @@ public class E2eeEdgeCaseTests(AspireFixture fixture)
     {
         using var c = CreateAuthClient();
         string vol = (await CreateVolumeAsync(c, "edge-finalize")).VolName;
-        string fileId = await CreateFileAsync(c, vol, "enc-finalize", 2048, 1);
+        var (fileId, writeLease) = await CreateFileAsync(c, vol, "enc-finalize", 2048, 1);
 
-        var resp = await c.PatchAsJsonAsync($"/api/v1/e2ee/{vol}/finalize-file/{fileId}",
-            new { actualEncryptedLength = 1500 });
+        using var finalizeContent = JsonContent.Create(new { actualEncryptedLength = 1500 });
+        using var finalizeRequest = WithWriteLease(HttpMethod.Patch,
+            $"/api/v1/e2ee/{vol}/finalize-file/{fileId}", writeLease, finalizeContent);
+        var resp = await c.SendAsync(finalizeRequest);
         Assert.True(resp.IsSuccessStatusCode, $"finalize failed: {resp.StatusCode}");
 
         var listResp = await c.GetAsync($"/api/v1/e2ee/{vol}/files");

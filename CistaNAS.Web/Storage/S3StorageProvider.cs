@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Threading;
 using Amazon.S3;
 using Amazon.S3.Model;
@@ -15,7 +14,7 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
     private readonly IAmazonS3 _client;
     private readonly string _bucket;
     private readonly string _prefix;
-    private static readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.Ordinal);
+    private static readonly TimeSpan LockLease = TimeSpan.FromMinutes(5);
 
     public S3StorageProvider(string bucket, string region, string? endpointOverride, string? pathPrefix)
     {
@@ -134,9 +133,49 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
 
     public async Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default)
     {
-        var semaphore = _locks.GetOrAdd(lockPath, _ => new SemaphoreSlim(1, 1));
-        await semaphore.WaitAsync(ct);
-        return new LockReleaser(semaphore);
+        var key = FullPath(".locks/" + lockPath);
+        while (true)
+        {
+            try
+            {
+                var expiry = DateTimeOffset.UtcNow.Add(LockLease).ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
+                using var body = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(expiry));
+                var response = await _client.PutObjectAsync(new PutObjectRequest
+                {
+                    BucketName = _bucket,
+                    Key = key,
+                    InputStream = body,
+                    IfNoneMatch = "*",
+                }, ct);
+                return new S3LockReleaser(_client, _bucket, key, response.ETag);
+            }
+            catch (AmazonS3Exception ex) when (ex.StatusCode is System.Net.HttpStatusCode.PreconditionFailed or System.Net.HttpStatusCode.Conflict)
+            {
+                try
+                {
+                    var metadata = await _client.GetObjectMetadataAsync(_bucket, key, ct);
+                    using var existing = await _client.GetObjectAsync(_bucket, key, ct);
+                    using var reader = new StreamReader(existing.ResponseStream);
+                    var text = await reader.ReadToEndAsync(ct);
+                    if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var expiresAt) &&
+                        expiresAt <= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
+                    {
+                        await _client.DeleteObjectAsync(new DeleteObjectRequest
+                        {
+                            BucketName = _bucket,
+                            Key = key,
+                            IfMatch = metadata.ETag,
+                        }, ct);
+                        continue;
+                    }
+                }
+                catch (AmazonS3Exception staleRace) when (staleRace.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.PreconditionFailed or System.Net.HttpStatusCode.Conflict)
+                {
+                    continue;
+                }
+                await Task.Delay(100, ct);
+            }
+        }
     }
 
     /// <summary>ロックを辞書から解除。保持中のセマフォ削除によるデッドロックを防ぐため no-op。</summary>
@@ -153,13 +192,77 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
         return default;
     }
 
-    private sealed class LockReleaser(SemaphoreSlim semaphore) : IDisposable
+    private sealed class S3LockReleaser : IDisposable
     {
+        private readonly IAmazonS3 _client;
+        private readonly string _bucket;
+        private readonly string _key;
+        private readonly SemaphoreSlim _gate = new(1, 1);
+        private readonly Timer _renewal;
+        private string? _etag;
         private int _released;
+
+        public S3LockReleaser(IAmazonS3 client, string bucket, string key, string? etag)
+        {
+            _client = client;
+            _bucket = bucket;
+            _key = key;
+            _etag = etag;
+            _renewal = new Timer(_ => _ = RenewAsync(), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+        }
+
+        private async Task RenewAsync()
+        {
+            try
+            {
+                await _gate.WaitAsync();
+                try
+                {
+                    if (Volatile.Read(ref _released) != 0) return;
+                    var expiry = DateTimeOffset.UtcNow.Add(LockLease).ToUnixTimeMilliseconds()
+                        .ToString(CultureInfo.InvariantCulture);
+                    using var body = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(expiry));
+                    var response = await _client.PutObjectAsync(new PutObjectRequest
+                    {
+                        BucketName = _bucket,
+                        Key = _key,
+                        InputStream = body,
+                        IfMatch = _etag,
+                    });
+                    _etag = response.ETag;
+                }
+                finally
+                {
+                    _gate.Release();
+                }
+            }
+            catch
+            {
+                // 一時障害は次の更新で再試行する。条件不一致なら所有権を失っているため
+                // Dispose時の条件付き削除も失敗し、他所有者のロックは削除しない。
+            }
+        }
+
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _released, 1) == 0)
-                semaphore.Release();
+            if (Interlocked.Exchange(ref _released, 1) != 0) return;
+            _renewal.Dispose();
+            _gate.Wait();
+            try
+            {
+                _client.DeleteObjectAsync(new DeleteObjectRequest
+                {
+                    BucketName = _bucket,
+                    Key = _key,
+                    IfMatch = _etag,
+                }).GetAwaiter().GetResult();
+            }
+            catch (AmazonS3Exception ex) when (ex.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.PreconditionFailed or System.Net.HttpStatusCode.Conflict) { }
+            finally
+            {
+                _gate.Release();
+                _gate.Dispose();
+            }
         }
     }
 }

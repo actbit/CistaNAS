@@ -99,6 +99,7 @@ public sealed class EncryptionSettingsService
     /// <summary>UpdateEncryptionSettingsRequest から VolumeOptions を構築して保存（ChunkStorage/ServerChunkSize は現状維持）。</summary>
     public void UpdateVolumeOptions(UpdateEncryptionSettingsRequest body)
     {
+        Validate(body);
         var current = CurrentVolumeOptions();
         var updated = new VolumeOptions
         {
@@ -110,6 +111,20 @@ public sealed class EncryptionSettingsService
             ServerChunkSize = current.ServerChunkSize,
         };
         SaveVolumeOptions(updated);
+    }
+
+    private static void Validate(UpdateEncryptionSettingsRequest body)
+    {
+        if (body.SectorSize is < 512 or > 4096 || body.SectorSize % 16 != 0)
+            throw new ArgumentOutOfRangeException(nameof(body.SectorSize));
+        if (body.KdfIterations is < 600_000 or > 10_000_000)
+            throw new ArgumentOutOfRangeException(nameof(body.KdfIterations));
+        if (body.E2eeChunkSize is < 65_536 or > 16_777_216)
+            throw new ArgumentOutOfRangeException(nameof(body.E2eeChunkSize));
+        if (!string.Equals(body.DefaultEncryptionMode, "server", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(body.DefaultEncryptionMode, "e2ee", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(body.DefaultEncryptionMode, "none", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("暗号化モードが不正です。", nameof(body.DefaultEncryptionMode));
     }
 
     /// <summary>AuthOptions を cista-settings.json に保存する。</summary>

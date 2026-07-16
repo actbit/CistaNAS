@@ -183,8 +183,13 @@ public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output
         Assert.Equal(HttpStatusCode.Created, createFileResp.StatusCode);
         var cfJson = await createFileResp.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>();
         string fileId = cfJson.GetProperty("fileId").GetString()!;
+        string writeLease = cfJson.GetProperty("writeLeaseToken").GetString()!;
 
-        await authClient.PostAsync($"/api/v1/e2ee/{volName}/upload-chunk/{fileId}/0", new ByteArrayContent(encData));
+        using var upload = new HttpRequestMessage(HttpMethod.Post,
+            $"/api/v1/e2ee/{volName}/upload-chunk/{fileId}/0")
+        { Content = new ByteArrayContent(encData) };
+        upload.Headers.Add("X-CistaNAS-Write-Lease", writeLease);
+        await authClient.SendAsync(upload);
 
         var downloadResp = await authClient.GetAsync($"/api/v1/e2ee/{volName}/download-chunk/{fileId}/0");
         byte[] downloaded = await downloadResp.Content.ReadAsByteArrayAsync();
@@ -234,10 +239,10 @@ public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output
         ];
 
         long totalLen = encChunks.Sum(c => c.Length);
-        string fileId = await Api.CreateFileAsync(volName, "multi-chunk-s3", totalLen, 3);
+        var (fileId, writeLease) = await Api.CreateFileAsync(volName, "multi-chunk-s3", totalLen, 3);
 
         for (int i = 0; i < 3; i++)
-            await Api.UploadChunkAsync(volName, fileId, i, encChunks[i]);
+            await Api.UploadChunkAsync(volName, fileId, i, encChunks[i], writeLease);
 
         // 全チャンク復号検証
         for (int i = 0; i < 3; i++)
@@ -246,6 +251,8 @@ public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output
             byte[] decrypted = E2eeCrypto.DecryptChunk(downloaded, fileKey, i, fileSalt);
             Assert.Equal(plainChunks[i], decrypted);
         }
+
+        await Api.ReleaseWriteLeaseAsync(volName, fileId, writeLease);
 
         CryptographicOperations.ZeroMemory(clientMasterKey);
         output.WriteLine($"S3 E2EE マルチチャンク成功: ボリューム={volName}");

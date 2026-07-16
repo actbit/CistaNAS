@@ -1,8 +1,8 @@
-using System.Collections.Concurrent;
 using System.Threading;
 using Azure;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
+using Azure.Storage.Blobs.Specialized;
 
 namespace CistaNAS.Web.Storage;
 
@@ -14,8 +14,6 @@ public sealed class AzureBlobStorageProvider : IStorageProvider
 {
     private readonly BlobContainerClient _container;
     private readonly string _prefix;
-    private static readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.Ordinal);
-
     /// <summary>コンテナの初期化タスク（遅延実行）。</summary>
     private readonly Task _init;
 
@@ -101,9 +99,22 @@ public sealed class AzureBlobStorageProvider : IStorageProvider
     public async Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default)
     {
         await _init;
-        var semaphore = _locks.GetOrAdd(lockPath, _ => new SemaphoreSlim(1, 1));
-        await semaphore.WaitAsync(ct);
-        return new LockReleaser(semaphore);
+        var blob = _container.GetBlobClient(FullPath(".locks/" + lockPath));
+        try { await blob.UploadAsync(BinaryData.FromString("lock"), overwrite: false, ct); }
+        catch (RequestFailedException ex) when (ex.Status == 409) { }
+        var lease = blob.GetBlobLeaseClient();
+        while (true)
+        {
+            try
+            {
+                await lease.AcquireAsync(TimeSpan.FromSeconds(60), conditions: null, cancellationToken: ct);
+                return new BlobLeaseReleaser(lease);
+            }
+            catch (RequestFailedException ex) when (ex.Status == 409)
+            {
+                await Task.Delay(100, ct);
+            }
+        }
     }
 
     /// <summary>ロックを辞書から解除。保持中のセマフォ削除によるデッドロックを防ぐため no-op。</summary>
@@ -112,13 +123,19 @@ public sealed class AzureBlobStorageProvider : IStorageProvider
         // セマフォはプロセス存続期間中辞書に残る。
     }
 
-    private sealed class LockReleaser(SemaphoreSlim semaphore) : IDisposable
+    private sealed class BlobLeaseReleaser(BlobLeaseClient lease) : IDisposable
     {
+        private readonly Timer _renewal = new(async _ =>
+        {
+            try { await lease.RenewAsync(); }
+            catch { /* 一時障害は次回更新で再試行する。Timerコールバックから例外を漏らさない。 */ }
+        }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
         private int _released;
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _released, 1) == 0)
-                semaphore.Release();
+            if (Interlocked.Exchange(ref _released, 1) != 0) return;
+            _renewal.Dispose();
+            try { lease.Release(); } catch (RequestFailedException) { }
         }
     }
 }

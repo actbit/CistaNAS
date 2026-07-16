@@ -20,13 +20,33 @@ public sealed class E2eeApiClient
         return (await response.Content.ReadFromJsonAsync<E2eeFileEntry>())!;
     }
 
+    public async Task<string> AcquireWriteLeaseAsync(string volumeName, string fileId)
+    {
+        using var response = await _http.PostAsync(
+            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/files/{Uri.EscapeDataString(fileId)}/write-lease", null);
+        response.EnsureSuccessStatusCode();
+        var lease = await response.Content.ReadFromJsonAsync<WriteLeaseResponse>();
+        return lease?.Token ?? throw new InvalidDataException("書き込みリースtokenがありません。");
+    }
+
+    public async Task ReleaseWriteLeaseAsync(string volumeName, string fileId, string token)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Delete,
+            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/files/{Uri.EscapeDataString(fileId)}/write-lease");
+        request.Headers.Add("X-CistaNAS-Write-Lease", token);
+        using var response = await _http.SendAsync(request);
+        response.EnsureSuccessStatusCode();
+    }
+
     /// <summary>チャンクアップロード。</summary>
-    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, byte[] data)
+    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, byte[] data, string writeLeaseToken)
     {
         using var content = new ByteArrayContent(data);
-        var response = await _http.PostAsync(
-            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/upload-chunk/{Uri.EscapeDataString(fileId)}/{chunkIndex}",
-            content);
+        using var request = new HttpRequestMessage(HttpMethod.Post,
+            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/upload-chunk/{Uri.EscapeDataString(fileId)}/{chunkIndex}")
+        { Content = content };
+        request.Headers.Add("X-CistaNAS-Write-Lease", writeLeaseToken);
+        using var response = await _http.SendAsync(request);
         response.EnsureSuccessStatusCode();
     }
 
@@ -51,11 +71,13 @@ public sealed class E2eeApiClient
     }
 
     /// <summary>ファイルファイナライズ。</summary>
-    public async Task FinalizeFileAsync(string volumeName, string fileId, long actualEncryptedLength)
+    public async Task FinalizeFileAsync(string volumeName, string fileId, long actualEncryptedLength, string writeLeaseToken)
     {
-        var response = await _http.PatchAsync(
-            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/finalize-file/{Uri.EscapeDataString(fileId)}",
-            JsonContent.Create(new E2eeFinalizeFileRequest(actualEncryptedLength)));
+        using var request = new HttpRequestMessage(HttpMethod.Patch,
+            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/finalize-file/{Uri.EscapeDataString(fileId)}")
+        { Content = JsonContent.Create(new E2eeFinalizeFileRequest(actualEncryptedLength)) };
+        request.Headers.Add("X-CistaNAS-Write-Lease", writeLeaseToken);
+        using var response = await _http.SendAsync(request);
         response.EnsureSuccessStatusCode();
     }
 
@@ -68,10 +90,12 @@ public sealed class E2eeApiClient
     }
 
     /// <summary>ファイル削除。</summary>
-    public async Task DeleteFileAsync(string volumeName, string fileId)
+    public async Task DeleteFileAsync(string volumeName, string fileId, string writeLeaseToken)
     {
-        var response = await _http.DeleteAsync(
+        using var request = new HttpRequestMessage(HttpMethod.Delete,
             $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/files/{Uri.EscapeDataString(fileId)}");
+        request.Headers.Add("X-CistaNAS-Write-Lease", writeLeaseToken);
+        using var response = await _http.SendAsync(request);
         response.EnsureSuccessStatusCode();
     }
 
@@ -104,4 +128,5 @@ public sealed class E2eeApiClient
 
     private sealed record HashResponse(string Hash);
     private sealed record InvitationIdResponse(string InvitationId);
+    private sealed record WriteLeaseResponse(string Token, DateTimeOffset ExpiresAt);
 }

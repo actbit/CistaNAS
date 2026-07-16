@@ -73,7 +73,9 @@ public sealed class E2eeFileService
     /// <summary>ファイルエントリを作成し、FileId を返す。</summary>
     public async Task<E2eeFileEntry> CreateFileAsync(string volumeName, E2eeCreateFileRequest request, string ownerUsername, CancellationToken ct = default)
     {
-        GetE2eeHeader(volumeName);
+        var header = GetE2eeHeader(volumeName);
+        if (request.EncryptedLength < 0 || request.ChunkCount <= 0)
+            throw new FileServiceException("ファイルサイズまたはチャンク数が不正です。");
 
         var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
         await volGate.WaitAsync(ct);
@@ -94,17 +96,16 @@ public sealed class E2eeFileService
             //  - チャンクモード (IsChunkMode=true): チャンクは IChunkStore に格納され
             //    volume.dat は使用されない (Offset 値はメタデータとしてのみ保持)。
             //
-            // 注: ChunkSizes はアップロード後に actual written bytes で更新されるが、
-            // CreateFileAsync 段階では EncryptedLength を基数とする。
-            // ローカルモードで EncryptedLength が実際の暗号化サイズと一致しない場合は
-            // オフセットがずれる可能性がある（UploadChunkAsync 呼び出し前に確定するため）。
+            // ローカルモードでは作成時点で物理領域を予約する。EncryptedLength は
+            // クライアント申告値であり、実際のチャンク長と異なる可能性があるため、
+            // それをそのまま次のファイルの開始位置に使うとファイル同士が重なる。
             long offset = 0;
             if (!_volumeService.IsChunkMode(volumeName))
             {
                 foreach (var existing in catalog.Files.Values)
                 {
-                    // EncryptedLength を基数としてオフセットを算出（EncryptedLength はチャンク总数+tags）
-                    long end = existing.Offset + existing.EncryptedLength;
+                    long reserved = GetReservedEncryptedLength(header, existing.ChunkCount, existing.EncryptedLength);
+                    long end = checked(existing.Offset + reserved);
                     if (end > offset) offset = end;
                 }
             }
@@ -121,6 +122,8 @@ public sealed class E2eeFileService
                 OwnerUsername = ownerUsername,
             };
 
+            await EnsureQuotaAsync(volumeName, ownerUsername, entry,
+                entry.EncryptedLength, entry.ChunkCount, ct);
             catalog.Files[fileId] = entry;
             await SaveCatalogAsync(volumeName, catalog, ct);
 
@@ -183,7 +186,8 @@ public sealed class E2eeFileService
 
                 // Content-Length（クライアント設定で信頼できない）による巨大バッファ割り当て DoS を防ぐ。
                 // E2EE チャンクの暗号文 = 平文チャンク + salt(16, 先頭のみ) + tag(16) + 余裕。
-                long maxEncChunkBytes = header.ChunkSize + 32 + 64;
+                long maxEncChunkBytes = (long)header.ChunkSize + TagSize
+                    + (chunkIndex == 0 ? SaltSize : 0);
                 if (dataLength < 0 || dataLength > maxEncChunkBytes)
                     throw new FileServiceException($"チャンクデータ長 ({dataLength}) が上限 ({maxEncChunkBytes} バイト) を超えています。");
 
@@ -362,6 +366,11 @@ public sealed class E2eeFileService
                 var catalog = await LoadCatalogAsync(volumeName, ct);
                 if (!catalog.Files.TryGetValue(fileId, out var entry))
                     throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+                int requestedChunkCount = request.ChunkCount ?? entry.ChunkCount;
+                if (requestedChunkCount < 0 || requestedChunkCount > entry.ChunkCount)
+                    throw new FileServiceException("チャンク数が不正です。");
+                await EnsureQuotaAsync(volumeName, entry.OwnerUsername, entry,
+                    request.ActualEncryptedLength, requestedChunkCount, ct);
                 entry.EncryptedLength = request.ActualEncryptedLength;
                 entry.ModifiedAt = DateTimeOffset.UtcNow;
 
@@ -384,6 +393,34 @@ public sealed class E2eeFileService
         }
     }
 
+    private static long GetReservedEncryptedLength(VolumeHeader header, int chunkCount, long declaredLength)
+    {
+        if (chunkCount < 0) throw new FileServiceException("チャンク数が不正です。");
+        long capacity = checked((long)SaltSize + (long)chunkCount * (header.ChunkSize + TagSize));
+        return Math.Max(capacity, declaredLength);
+    }
+
+    private async Task EnsureQuotaAsync(string volumeName, string username, E2eeFileEntry current,
+        long encryptedLength, int chunkCount, CancellationToken ct)
+    {
+        var (header, _) = _volumeService.GetMounted(volumeName);
+        if (!header.UserQuotas.TryGetValue(username, out var quota) || quota <= 0)
+            return;
+
+        var catalog = await LoadCatalogAsync(volumeName, ct);
+        long used = 0;
+        foreach (var entry in catalog.Files.Values)
+        {
+            if (entry.FileId == current.FileId) continue;
+            if (entry.OwnerUsername == username || string.IsNullOrEmpty(entry.OwnerUsername))
+                used = checked(used + ComputePlainSize(entry.EncryptedLength, entry.ChunkCount));
+        }
+
+        long requested = ComputePlainSize(encryptedLength, chunkCount);
+        if (checked(used + requested) > quota)
+            throw new FileServiceException("ユーザーのクォータを超えています。");
+    }
+
     /// <summary>ファイル一覧を返す。</summary>
     public async Task<E2eeListFilesResponse> ListFilesAsync(string volumeName, CancellationToken ct = default)
     {
@@ -400,6 +437,14 @@ public sealed class E2eeFileService
         }
 
         return new E2eeListFilesResponse(catalog.Files.Values.OrderBy(f => f.CreatedAt).ToList());
+    }
+
+    /// <summary>指定した E2EE ファイルIDが現在のカタログに存在するか確認する。</summary>
+    public async Task<bool> ExistsAsync(string volumeName, string fileId, CancellationToken ct = default)
+    {
+        GetE2eeHeader(volumeName);
+        var catalog = await LoadCatalogAsync(volumeName, ct);
+        return catalog.Files.ContainsKey(fileId);
     }
 
     /// <summary>ファイルを削除。</summary>
