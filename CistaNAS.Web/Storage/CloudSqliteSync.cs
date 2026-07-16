@@ -1,4 +1,5 @@
 using CistaNAS.Web.Configuration;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Hosting;
 
 namespace CistaNAS.Web.Storage;
@@ -119,5 +120,22 @@ public sealed class CloudSqliteSync : IHostedService, IDisposable
         // 永続ファイルは Dispose で削除されない。失敗時はテンポラリも保持し次回起動で復旧。
         if (_isTemp && lastError is null)
             Dispose();
+    }
+}
+
+/// <summary>EF のコミット成功後にクラウド SQLite 同期を dirty にする。</summary>
+public sealed class CloudSqliteSaveChangesInterceptor(CloudSqliteSync sync) : SaveChangesInterceptor
+{
+    public override int SavedChanges(SaveChangesCompletedEventData eventData, int result)
+    {
+        sync.MarkDirty();
+        return base.SavedChanges(eventData, result);
+    }
+
+    public override ValueTask<int> SavedChangesAsync(
+        SaveChangesCompletedEventData eventData, int result, CancellationToken cancellationToken = default)
+    {
+        sync.MarkDirty();
+        return base.SavedChangesAsync(eventData, result, cancellationToken);
     }
 }

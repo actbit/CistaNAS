@@ -90,22 +90,51 @@ public sealed class CistaNasApiClient
         };
     }
 
-    public async Task<string> CreateFileAsync(string volumeName, string encryptedName, long encryptedLength, int chunkCount)
+    public async Task<(string FileId, string WriteLeaseToken)> CreateFileAsync(
+        string volumeName, string encryptedName, long encryptedLength, int chunkCount)
     {
         var req = new { encryptedName, encryptedLength, chunkCount };
         var res = await _http.PostAsJsonAsync($"/api/v1/e2ee/{volumeName}/create-file", req, JsonOpts);
         res.EnsureSuccessStatusCode();
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();
-        return json.GetProperty("fileId").GetString()!;
+        return (json.GetProperty("fileId").GetString()!, json.GetProperty("writeLeaseToken").GetString()!);
     }
 
-    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, byte[] data, bool replace = false)
+    public async Task<string> AcquireWriteLeaseAsync(string volumeName, string fileId)
+    {
+        var res = await _http.PostAsync($"/api/v1/e2ee/{volumeName}/files/{fileId}/write-lease", null);
+        res.EnsureSuccessStatusCode();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        return json.GetProperty("token").GetString()!;
+    }
+
+    public async Task RenewWriteLeaseAsync(string volumeName, string fileId, string token)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post,
+            $"/api/v1/e2ee/{volumeName}/files/{fileId}/write-lease/renew");
+        request.Headers.Add("X-CistaNAS-Write-Lease", token);
+        var res = await _http.SendAsync(request);
+        res.EnsureSuccessStatusCode();
+    }
+
+    public async Task ReleaseWriteLeaseAsync(string volumeName, string fileId, string token)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Delete,
+            $"/api/v1/e2ee/{volumeName}/files/{fileId}/write-lease");
+        request.Headers.Add("X-CistaNAS-Write-Lease", token);
+        var res = await _http.SendAsync(request);
+        res.EnsureSuccessStatusCode();
+    }
+
+    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, byte[] data, string writeLeaseToken, bool replace = false)
     {
         var content = new ByteArrayContent(data);
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
         var query = replace ? "?replace=true" : "";
-        var res = await _http.PostAsync(
-            $"/api/v1/e2ee/{volumeName}/upload-chunk/{fileId}/{chunkIndex}{query}", content);
+        using var request = new HttpRequestMessage(HttpMethod.Post,
+            $"/api/v1/e2ee/{volumeName}/upload-chunk/{fileId}/{chunkIndex}{query}") { Content = content };
+        request.Headers.Add("X-CistaNAS-Write-Lease", writeLeaseToken);
+        var res = await _http.SendAsync(request);
         res.EnsureSuccessStatusCode();
     }
 
@@ -136,16 +165,21 @@ public sealed class CistaNasApiClient
         return (hash, revision);
     }
 
-    public async Task FinalizeFileAsync(string volumeName, string fileId, long actualLength, int? chunkCount = null)
+    public async Task FinalizeFileAsync(string volumeName, string fileId, long actualLength, string writeLeaseToken, int? chunkCount = null)
     {
         var req = new { actualEncryptedLength = actualLength, chunkCount };
-        var res = await _http.PatchAsJsonAsync($"/api/v1/e2ee/{volumeName}/finalize-file/{fileId}", req, JsonOpts);
+        using var request = new HttpRequestMessage(HttpMethod.Patch,
+            $"/api/v1/e2ee/{volumeName}/finalize-file/{fileId}") { Content = JsonContent.Create(req, options: JsonOpts) };
+        request.Headers.Add("X-CistaNAS-Write-Lease", writeLeaseToken);
+        var res = await _http.SendAsync(request);
         res.EnsureSuccessStatusCode();
     }
 
-    public async Task DeleteFileAsync(string volumeName, string fileId)
+    public async Task DeleteFileAsync(string volumeName, string fileId, string writeLeaseToken)
     {
-        var res = await _http.DeleteAsync($"/api/v1/e2ee/{volumeName}/files/{fileId}");
+        using var request = new HttpRequestMessage(HttpMethod.Delete, $"/api/v1/e2ee/{volumeName}/files/{fileId}");
+        request.Headers.Add("X-CistaNAS-Write-Lease", writeLeaseToken);
+        var res = await _http.SendAsync(request);
         res.EnsureSuccessStatusCode();
     }
 

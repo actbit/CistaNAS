@@ -166,9 +166,13 @@ public class AspireHttpTests(AspireFixture fixture)
         Assert.Equal(HttpStatusCode.Created, createFileResp.StatusCode);
         var cfJson = await createFileResp.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>();
         string fileId = cfJson.GetProperty("fileId").GetString()!;
+        string writeLease = cfJson.GetProperty("writeLeaseToken").GetString()!;
 
-        await authClient.PostAsync($"/api/v1/e2ee/{volName}/upload-chunk/{fileId}/0",
-            new ByteArrayContent(encData));
+        using var upload = new HttpRequestMessage(HttpMethod.Post,
+            $"/api/v1/e2ee/{volName}/upload-chunk/{fileId}/0")
+        { Content = new ByteArrayContent(encData) };
+        upload.Headers.Add("X-CistaNAS-Write-Lease", writeLease);
+        await authClient.SendAsync(upload);
 
         var downloadResp = await authClient.GetAsync($"/api/v1/e2ee/{volName}/download-chunk/{fileId}/0");
         byte[] downloaded = await downloadResp.Content.ReadAsByteArrayAsync();
@@ -221,10 +225,10 @@ public class ApiClientTests(AspireFixture fixture)
         byte[] plainData = RandomNumberGenerator.GetBytes(2000);
         byte[] encData = E2eeCrypto.EncryptChunk(plainData, fileKey, 0, fileSalt, isFirstChunk: true);
 
-        string fileId = await Api.CreateFileAsync(volName, "enc-test-file", encData.Length, 1);
+        var (fileId, writeLease) = await Api.CreateFileAsync(volName, "enc-test-file", encData.Length, 1);
         Assert.False(string.IsNullOrEmpty(fileId));
 
-        await Api.UploadChunkAsync(volName, fileId, 0, encData);
+        await Api.UploadChunkAsync(volName, fileId, 0, encData, writeLease);
         var (downloaded, _) = await Api.DownloadChunkAsync(volName, fileId, 0);
 
         byte[] decrypted = E2eeCrypto.DecryptChunk(downloaded, fileKey, 0, out var extractedSalt);
@@ -235,7 +239,8 @@ public class ApiClientTests(AspireFixture fixture)
         Assert.Single(files);
         Assert.Equal(fileId, files[0].FileId);
 
-        await Api.DeleteFileAsync(volName, fileId);
+        await Api.DeleteFileAsync(volName, fileId, writeLease);
+        await Api.ReleaseWriteLeaseAsync(volName, fileId, writeLease);
         Assert.Empty(await Api.ListFilesAsync(volName));
 
         CryptographicOperations.ZeroMemory(clientMasterKey);
@@ -268,14 +273,15 @@ public class ApiClientTests(AspireFixture fixture)
         byte[] dummyData = RandomNumberGenerator.GetBytes(100);
         byte[] encData = E2eeCrypto.EncryptChunk(dummyData, fileKey, 0, fileSalt, isFirstChunk: true);
 
-        string fileId = await Api.CreateFileAsync(volName, encName, encData.Length, 1);
-        await Api.UploadChunkAsync(volName, fileId, 0, encData);
+        var (fileId, writeLease) = await Api.CreateFileAsync(volName, encName, encData.Length, 1);
+        await Api.UploadChunkAsync(volName, fileId, 0, encData, writeLease);
 
         var files = await Api.ListFilesAsync(volName);
         Assert.Single(files);
 
         string decName = E2eeCrypto.DecryptFilename(files[0].EncryptedName, clientMasterKey);
         Assert.Equal(plainName, decName);
+        await Api.ReleaseWriteLeaseAsync(volName, fileId, writeLease);
 
         CryptographicOperations.ZeroMemory(clientMasterKey);
     }
@@ -316,10 +322,10 @@ public class ApiClientTests(AspireFixture fixture)
         ];
 
         long totalLen = encChunks.Sum(c => c.Length);
-        string fileId = await Api.CreateFileAsync(volName, "multi-chunk-file", totalLen, 3);
+        var (fileId, writeLease) = await Api.CreateFileAsync(volName, "multi-chunk-file", totalLen, 3);
 
         for (int i = 0; i < 3; i++)
-            await Api.UploadChunkAsync(volName, fileId, i, encChunks[i]);
+            await Api.UploadChunkAsync(volName, fileId, i, encChunks[i], writeLease);
 
         // チャンク0からfileSaltを取得
         var (downloaded0, _) = await Api.DownloadChunkAsync(volName, fileId, 0);
@@ -333,6 +339,8 @@ public class ApiClientTests(AspireFixture fixture)
             byte[] decrypted = E2eeCrypto.DecryptChunk(downloaded, fileKey, i, salt0);
             Assert.Equal(plainChunks[i], decrypted);
         }
+
+        await Api.ReleaseWriteLeaseAsync(volName, fileId, writeLease);
 
         CryptographicOperations.ZeroMemory(clientMasterKey);
     }

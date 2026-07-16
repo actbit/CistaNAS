@@ -15,6 +15,7 @@ namespace CistaNAS.Web.Services;
 public sealed class AccountService(
     UserManager<ApplicationUser> userManager,
     RoleManager<ApplicationRole> roleManager,
+    AppDbContext db,
     ILogger<AccountService> logger,
     IServiceScopeFactory scopeFactory)
 {
@@ -158,11 +159,11 @@ public sealed class AccountService(
 
     public async Task CreateInitialAdminAsync(string username, string password)
     {
+        await using var transaction = await db.Database.BeginTransactionAsync();
         if (await userManager.Users.AnyAsync())
             throw new InvalidOperationException("ユーザーが既に存在します。");
 
         await EnsureRoleAsync("admin");
-
         var user = new ApplicationUser { UserName = username };
         var result = await userManager.CreateAsync(user, password);
         if (!result.Succeeded)
@@ -170,8 +171,8 @@ public sealed class AccountService(
 
         var roleResult = await userManager.AddToRoleAsync(user, "admin");
         if (!roleResult.Succeeded)
-            logger.LogWarning("初期管理者 '{Username}' への admin ロール割り当てに失敗: {Errors}",
-                username, string.Join(", ", roleResult.Errors.Select(e => e.Description)));
+            throw new InvalidOperationException(string.Join(", ", roleResult.Errors.Select(e => e.Description)));
+        await transaction.CommitAsync();
     }
 
     public async Task<bool> CheckPasswordAsync(ApplicationUser user, string password)

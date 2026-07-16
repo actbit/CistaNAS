@@ -44,6 +44,7 @@ public static class ServiceCollectionExtensions
         services.AddScoped<JournalService>();
         services.AddScoped<FileService>();
         services.AddScoped<E2eeFileService>();
+        services.AddSingleton<E2eeWriteLeaseService>();
 
         // Blazor 認証状態
         services.AddScoped<AuthenticationStateService>();
@@ -78,7 +79,10 @@ public static class ServiceCollectionExtensions
                 services.AddSingleton(sync);
                 services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<CloudSqliteSync>());
                 services.AddDbContext<AppDbContext>(o =>
-                o.UseSqlite($"Data Source={sync.LocalDbPath};Mode=ReadWriteCreate;Cache=Shared"));
+                {
+                    o.UseSqlite($"Data Source={sync.LocalDbPath};Mode=ReadWriteCreate;Cache=Shared");
+                    o.AddInterceptors(new CloudSqliteSaveChangesInterceptor(sync));
+                });
                 break;
             }
 

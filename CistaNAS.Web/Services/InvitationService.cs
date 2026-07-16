@@ -54,11 +54,14 @@ public sealed class InvitationService : BackgroundService
         ArgumentException.ThrowIfNullOrEmpty(nonce);
         if (!_invitations.TryGetValue(invitationId.ToLowerInvariant(), out var record))
             throw new InvalidOperationException("招待が見つかりません。");
-        if (record.AcceptedAt.HasValue)
-            throw new InvalidOperationException("この招待は既に使用されています。");
-        record.EncryptedPublicKey = encryptedPublicKey;
-        record.Nonce = nonce;
-        record.AcceptedAt = DateTimeOffset.UtcNow;
+        lock (record)
+        {
+            if (record.AcceptedAt.HasValue)
+                throw new InvalidOperationException("この招待は既に使用されています。");
+            record.EncryptedPublicKey = encryptedPublicKey;
+            record.Nonce = nonce;
+            record.AcceptedAt = DateTimeOffset.UtcNow;
+        }
     }
 
     /// <summary>招待を削除（受諾完了後）。</summary>
