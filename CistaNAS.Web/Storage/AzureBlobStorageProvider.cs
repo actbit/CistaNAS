@@ -127,7 +127,8 @@ public sealed class AzureBlobStorageProvider : IStorageProvider
     {
         private readonly Timer _renewal = new(async _ =>
         {
-            try { await lease.RenewAsync(); } catch (RequestFailedException) { }
+            try { await lease.RenewAsync(); }
+            catch { /* 一時障害は次回更新で再試行する。Timerコールバックから例外を漏らさない。 */ }
         }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
         private int _released;
         public void Dispose()

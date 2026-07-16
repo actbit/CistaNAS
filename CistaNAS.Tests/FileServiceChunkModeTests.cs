@@ -3,6 +3,7 @@ using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
 using CistaNAS.Web.Identity;
+using CistaNAS.Web.Models;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -180,17 +181,19 @@ public class FileServiceChunkModeTests : IAsyncDisposable
         var chunkStore = _sp.GetRequiredService<IChunkStore>();
 
         byte[] data = RandomNumberGenerator.GetBytes(100000);
+        FileMetadata uploaded;
         using (var ms = new MemoryStream(data))
-            await fs.UploadAsync(vol, "todelete.bin", ms, data.Length);
+            uploaded = await fs.UploadAsync(vol, "todelete.bin", ms, data.Length);
+        string objectId = Assert.IsType<string>(uploaded.ChunkObjectId);
 
         // チャンクが存在することを確認
-        var chunksBefore = await chunkStore.ListChunksAsync(vol, "todelete.bin");
+        var chunksBefore = await chunkStore.ListChunksAsync(vol, objectId);
         Assert.NotEmpty(chunksBefore);
 
         await fs.DeleteAsync(vol, "todelete.bin");
 
         // チャンクが削除されていること
-        var chunksAfter = await chunkStore.ListChunksAsync(vol, "todelete.bin");
+        var chunksAfter = await chunkStore.ListChunksAsync(vol, objectId);
         Assert.Empty(chunksAfter);
     }
 

@@ -248,16 +248,13 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         {
             if (existingFileId is not null)
             {
-                WriteLeaseToken = fs._api.AcquireWriteLeaseAsync(fs._volumeName, existingFileId).GetAwaiter().GetResult();
-                _leaseRenewal = new Timer(_ =>
+                string leaseToken = fs._api.AcquireWriteLeaseAsync(fs._volumeName, existingFileId).GetAwaiter().GetResult();
+                try
                 {
-                    try { fs._api.RenewWriteLeaseAsync(fs._volumeName, existingFileId, WriteLeaseToken).GetAwaiter().GetResult(); }
-                    catch { /* 次の保存時にサーバーが期限切れを返す */ }
-                }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+                    var cache = fs.GetOrCreateCache(existingFileId);
+                    if (cache is null)
+                        throw new IOException("既存E2EEファイルのメタデータを取得できませんでした。");
 
-                var cache = fs.GetOrCreateCache(existingFileId);
-                if (cache is not null)
-                {
                     _existingChunkCount = cache.ChunkCount;
                     _existingPlainLength = cache.PlainLength;
                     if (cache.TryGetFileKey(out var key, out var salt))
@@ -270,21 +267,31 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                     }
                     else if (_existingChunkCount > 0)
                     {
-                        // fileKey 未設定 → chunk0 の salt から導出（差分保存の RMW で既存チャンク復号に必要）
-                        try
-                        {
-                            var (enc0, _) = fs._api.DownloadChunkAsync(fs._volumeName, existingFileId, 0).GetAwaiter().GetResult();
-                            if (enc0.Length > E2eeCrypto.SaltSize)
-                            {
-                                var salt0 = new byte[E2eeCrypto.SaltSize];
-                                Buffer.BlockCopy(enc0, 0, salt0, 0, E2eeCrypto.SaltSize);
-                                _existingFileKey = E2eeCrypto.DeriveFileKey(fs._masterKey!.Buffer, salt0);
-                                _existingFileSalt = salt0;
-                                cache.SetFileKey(_existingFileKey, _existingFileSalt);
-                            }
-                        }
-                        catch { /* ベストエフォート: 導出失敗時は新規チャンク扱い */ }
+                        // 部分更新のRMWには既存鍵が必須。取得失敗を新規チャンク扱いすると
+                        // 未変更部分をゼロで上書きするため、書き込み開始自体を失敗させる。
+                        var (enc0, _) = fs._api.DownloadChunkAsync(fs._volumeName, existingFileId, 0).GetAwaiter().GetResult();
+                        if (enc0.Length <= E2eeCrypto.SaltSize)
+                            throw new InvalidDataException("既存E2EEファイルの先頭チャンクが不正です。");
+
+                        var salt0 = new byte[E2eeCrypto.SaltSize];
+                        Buffer.BlockCopy(enc0, 0, salt0, 0, E2eeCrypto.SaltSize);
+                        _existingFileKey = E2eeCrypto.DeriveFileKey(fs._masterKey!.Buffer, salt0);
+                        _existingFileSalt = salt0;
+                        cache.SetFileKey(_existingFileKey, _existingFileSalt);
                     }
+
+                    WriteLeaseToken = leaseToken;
+                    _leaseRenewal = new Timer(_ =>
+                    {
+                        try { fs._api.RenewWriteLeaseAsync(fs._volumeName, existingFileId, leaseToken).GetAwaiter().GetResult(); }
+                        catch { /* 次の保存時にサーバーが期限切れを返す */ }
+                    }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+                }
+                catch
+                {
+                    try { fs._api.ReleaseWriteLeaseAsync(fs._volumeName, existingFileId, leaseToken).GetAwaiter().GetResult(); }
+                    catch { }
+                    throw;
                 }
             }
         }
@@ -1155,13 +1162,13 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         long plainLength = ws.CurrentSize;
         int chunkCount = plainLength == 0 ? 1 : (int)((plainLength + _chunkSize - 1) / _chunkSize);
         long encLength = 16L + plainLength + (long)chunkCount * 16;
-        string fileId = _api.CreateFileAsync(_volumeName, encName, encLength, chunkCount).GetAwaiter().GetResult();
+        var (fileId, initialWriteLease) = _api.CreateFileAsync(
+            _volumeName, encName, encLength, chunkCount).GetAwaiter().GetResult();
 
-        string? writeLease = null;
+        string? writeLease = initialWriteLease;
         bool finalized = false;
         try
         {
-            writeLease = _api.AcquireWriteLeaseAsync(_volumeName, fileId).GetAwaiter().GetResult();
             long written = 0;
             for (int i = 0; i < chunkCount; i++)
             {

@@ -52,7 +52,9 @@ public class DokanUploadWriteStateTests
             if (uri.Contains("create-file"))
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
                 {
-                    Content = new StringContent($"{{\"fileId\":\"{CreatedFileId}\"}}", Encoding.UTF8, "application/json")
+                    Content = new StringContent(
+                        $"{{\"fileId\":\"{CreatedFileId}\",\"writeLeaseToken\":\"test-write-lease\"}}",
+                        Encoding.UTF8, "application/json")
                 });
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("") });
         }

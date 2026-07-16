@@ -99,11 +99,11 @@ public sealed class GcsStorageProvider : IStorageProvider, IAsyncDisposable
     public async Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default)
     {
         var key = FullPath(".locks/" + lockPath);
-        var expiry = DateTimeOffset.UtcNow.Add(LockLease).ToUnixTimeMilliseconds().ToString(System.Globalization.CultureInfo.InvariantCulture);
         while (true)
         {
             try
             {
+                var expiry = DateTimeOffset.UtcNow.Add(LockLease).ToUnixTimeMilliseconds().ToString(System.Globalization.CultureInfo.InvariantCulture);
                 using var body = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(expiry));
                 var obj = await _client.UploadObjectAsync(_bucket, key, "text/plain", body,
                     new UploadObjectOptions { IfGenerationMatch = 0 }, ct);
@@ -143,18 +143,67 @@ public sealed class GcsStorageProvider : IStorageProvider, IAsyncDisposable
         _client.Dispose();
     }
 
-    private sealed class GcsLockReleaser(StorageClient client, string bucket, string key, long? generation) : IDisposable
+    private sealed class GcsLockReleaser : IDisposable
     {
+        private readonly StorageClient _client;
+        private readonly string _bucket;
+        private readonly string _key;
+        private readonly SemaphoreSlim _gate = new(1, 1);
+        private readonly Timer _renewal;
+        private long? _generation;
         private int _released;
+
+        public GcsLockReleaser(StorageClient client, string bucket, string key, long? generation)
+        {
+            _client = client;
+            _bucket = bucket;
+            _key = key;
+            _generation = generation;
+            _renewal = new Timer(_ => _ = RenewAsync(), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+        }
+
+        private async Task RenewAsync()
+        {
+            try
+            {
+                await _gate.WaitAsync();
+                try
+                {
+                    if (Volatile.Read(ref _released) != 0) return;
+                    var expiry = DateTimeOffset.UtcNow.Add(LockLease).ToUnixTimeMilliseconds()
+                        .ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    using var body = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(expiry));
+                    var obj = await _client.UploadObjectAsync(_bucket, _key, "text/plain", body,
+                        new UploadObjectOptions { IfGenerationMatch = _generation });
+                    _generation = obj.Generation;
+                }
+                finally
+                {
+                    _gate.Release();
+                }
+            }
+            catch
+            {
+                // 一時障害は次回更新で再試行する。世代不一致時は他所有者を変更しない。
+            }
+        }
+
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _released, 1) != 0) return;
+            _renewal.Dispose();
+            _gate.Wait();
             try
             {
-                client.DeleteObjectAsync(bucket, key,
-                    new DeleteObjectOptions { IfGenerationMatch = generation }).GetAwaiter().GetResult();
+                _client.DeleteObjectAsync(_bucket, _key,
+                    new DeleteObjectOptions { IfGenerationMatch = _generation }).GetAwaiter().GetResult();
             }
             catch (GoogleApiException ex) when (ex.HttpStatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.PreconditionFailed or System.Net.HttpStatusCode.Conflict) { }
+            finally
+            {
+                _gate.Release();
+                _gate.Dispose();
+            }
         }
     }
 }

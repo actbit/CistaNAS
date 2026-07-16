@@ -94,6 +94,7 @@ public sealed class E2eeFileEntry
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset ModifiedAt { get; set; }
     public string OwnerUsername { get; set; } = "";
+    public string? WriteLeaseToken { get; set; }
 }
 
 public sealed record E2eeVolumeStats(long TotalUsedBytes, long UserUsedBytes, long UserQuotaBytes, int TotalFiles, int UserFiles);

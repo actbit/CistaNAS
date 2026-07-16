@@ -90,13 +90,14 @@ public sealed class CistaNasApiClient
         };
     }
 
-    public async Task<string> CreateFileAsync(string volumeName, string encryptedName, long encryptedLength, int chunkCount)
+    public async Task<(string FileId, string WriteLeaseToken)> CreateFileAsync(
+        string volumeName, string encryptedName, long encryptedLength, int chunkCount)
     {
         var req = new { encryptedName, encryptedLength, chunkCount };
         var res = await _http.PostAsJsonAsync($"/api/v1/e2ee/{volumeName}/create-file", req, JsonOpts);
         res.EnsureSuccessStatusCode();
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();
-        return json.GetProperty("fileId").GetString()!;
+        return (json.GetProperty("fileId").GetString()!, json.GetProperty("writeLeaseToken").GetString()!);
     }
 
     public async Task<string> AcquireWriteLeaseAsync(string volumeName, string fileId)
@@ -137,14 +138,6 @@ public sealed class CistaNasApiClient
         res.EnsureSuccessStatusCode();
     }
 
-    /// <summary>互換用の単発アップロード。呼び出し単位で短い書き込みリースを取得する。</summary>
-    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, byte[] data, bool replace = false)
-    {
-        string token = await AcquireWriteLeaseAsync(volumeName, fileId);
-        try { await UploadChunkAsync(volumeName, fileId, chunkIndex, data, token, replace); }
-        finally { await ReleaseWriteLeaseAsync(volumeName, fileId, token); }
-    }
-
     public async Task<(byte[] Data, int Revision)> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex)
     {
         var res = await _http.GetAsync($"/api/v1/e2ee/{volumeName}/download-chunk/{fileId}/{chunkIndex}");
@@ -182,26 +175,12 @@ public sealed class CistaNasApiClient
         res.EnsureSuccessStatusCode();
     }
 
-    public async Task FinalizeFileAsync(string volumeName, string fileId, long actualLength, int? chunkCount = null)
-    {
-        string token = await AcquireWriteLeaseAsync(volumeName, fileId);
-        try { await FinalizeFileAsync(volumeName, fileId, actualLength, token, chunkCount); }
-        finally { await ReleaseWriteLeaseAsync(volumeName, fileId, token); }
-    }
-
     public async Task DeleteFileAsync(string volumeName, string fileId, string writeLeaseToken)
     {
         using var request = new HttpRequestMessage(HttpMethod.Delete, $"/api/v1/e2ee/{volumeName}/files/{fileId}");
         request.Headers.Add("X-CistaNAS-Write-Lease", writeLeaseToken);
         var res = await _http.SendAsync(request);
         res.EnsureSuccessStatusCode();
-    }
-
-    public async Task DeleteFileAsync(string volumeName, string fileId)
-    {
-        string token = await AcquireWriteLeaseAsync(volumeName, fileId);
-        try { await DeleteFileAsync(volumeName, fileId, token); }
-        finally { await ReleaseWriteLeaseAsync(volumeName, fileId, token); }
     }
 
     public async Task<List<E2eeFileEntry>> ListFilesAsync(string volumeName)

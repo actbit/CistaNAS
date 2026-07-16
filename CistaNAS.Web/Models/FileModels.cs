@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using System.Text.Json.Serialization;
 using CistaNAS.Web.Volume;
 
 namespace CistaNAS.Web.Models;
@@ -64,6 +65,10 @@ public sealed class E2eeFileEntry
 
     /// <summary>ファイルを作成したユーザー（JWT から抽出）。</summary>
     public string OwnerUsername { get; set; } = "";
+
+    /// <summary>作成APIの応答でのみ返す初期書き込みリース。カタログには保存しない。</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WriteLeaseToken { get; set; }
 }
 
 public sealed record E2eeCreateFileRequest(

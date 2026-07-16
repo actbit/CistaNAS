@@ -439,6 +439,14 @@ public sealed class E2eeFileService
         return new E2eeListFilesResponse(catalog.Files.Values.OrderBy(f => f.CreatedAt).ToList());
     }
 
+    /// <summary>指定した E2EE ファイルIDが現在のカタログに存在するか確認する。</summary>
+    public async Task<bool> ExistsAsync(string volumeName, string fileId, CancellationToken ct = default)
+    {
+        GetE2eeHeader(volumeName);
+        var catalog = await LoadCatalogAsync(volumeName, ct);
+        return catalog.Files.ContainsKey(fileId);
+    }
+
     /// <summary>ファイルを削除。</summary>
     public async Task DeleteFileAsync(string volumeName, string fileId, CancellationToken ct = default)
     {

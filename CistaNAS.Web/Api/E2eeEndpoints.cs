@@ -133,17 +133,32 @@ public static class E2eeEndpoints
         }
     }
 
-    private static async Task<IResult> CreateFile(string volumeName, E2eeCreateFileRequest req, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
+    private static async Task<IResult> CreateFile(string volumeName, E2eeCreateFileRequest req, HttpContext ctx,
+        VolumeService vs, E2eeFileService e2eeFs, E2eeWriteLeaseService leases)
     {
         string username = ctx.User.Identity?.Name ?? "";
+        E2eeFileEntry? entry = null;
         try
         {
-            var entry = await e2eeFs.CreateFileAsync(volumeName, req, username, ctx.RequestAborted);
+            entry = await e2eeFs.CreateFileAsync(volumeName, req, username, ctx.RequestAborted);
+            var lease = await leases.AcquireAsync(volumeName, entry.FileId, ctx.RequestAborted);
+            entry.WriteLeaseToken = lease.Token;
             return Results.Created($"/api/v1/e2ee/{volumeName}/upload-chunk/{entry.FileId}/0", entry);
         }
         catch (FileServiceException ex)
         {
             return Results.BadRequest(new { error = ex.Message });
+        }
+        catch
+        {
+            // レスポンスを返す前のリース取得失敗では fileId はクライアントに未公開。
+            // 作成済みカタログエントリを回収して孤児ファイルを残さない。
+            if (entry is not null)
+            {
+                try { await e2eeFs.DeleteFileAsync(volumeName, entry.FileId, CancellationToken.None); }
+                catch { }
+            }
+            throw;
         }
     }
 
@@ -154,8 +169,10 @@ public static class E2eeEndpoints
             return Results.StatusCode(StatusCodes.Status411LengthRequired);
         try
         {
-            await leases.ValidateAndRenewAsync(volumeName, fileId, request.Headers[E2eeWriteLeaseService.HeaderName], request.HttpContext.RequestAborted);
-            await e2eeFs.UploadChunkAsync(volumeName, fileId, chunkIndex, request.Body, len, replace, request.HttpContext.RequestAborted);
+            await leases.RunWithLeaseAsync(volumeName, fileId,
+                request.Headers[E2eeWriteLeaseService.HeaderName],
+                ct => e2eeFs.UploadChunkAsync(volumeName, fileId, chunkIndex, request.Body, len, replace, ct),
+                request.HttpContext.RequestAborted);
             return Results.Ok();
         }
         catch (FileServiceException ex)
@@ -194,8 +211,9 @@ public static class E2eeEndpoints
     {
         try
         {
-            await leases.ValidateAndRenewAsync(volumeName, fileId, ctx.Request.Headers[E2eeWriteLeaseService.HeaderName], ctx.RequestAborted);
-            await e2eeFs.FinalizeFileAsync(volumeName, fileId, req, ctx.RequestAborted);
+            await leases.RunWithLeaseAsync(volumeName, fileId,
+                ctx.Request.Headers[E2eeWriteLeaseService.HeaderName],
+                ct => e2eeFs.FinalizeFileAsync(volumeName, fileId, req, ct), ctx.RequestAborted);
             return Results.Ok();
         }
         catch (FileServiceException ex)
@@ -212,8 +230,9 @@ public static class E2eeEndpoints
     {
         try
         {
-            await leases.ValidateAndRenewAsync(volumeName, fileId, ctx.Request.Headers[E2eeWriteLeaseService.HeaderName], ctx.RequestAborted);
-            await e2eeFs.DeleteFileAsync(volumeName, fileId, ctx.RequestAborted);
+            await leases.RunWithLeaseAsync(volumeName, fileId,
+                ctx.Request.Headers[E2eeWriteLeaseService.HeaderName],
+                ct => e2eeFs.DeleteFileAsync(volumeName, fileId, ct), ctx.RequestAborted);
             return Results.NoContent();
         }
         catch (FileServiceException ex)
@@ -226,16 +245,41 @@ public static class E2eeEndpoints
         }
     }
 
-    private static async Task<IResult> AcquireWriteLease(string volumeName, string fileId, HttpContext ctx, E2eeWriteLeaseService leases)
+    private static async Task<IResult> AcquireWriteLease(string volumeName, string fileId, HttpContext ctx,
+        E2eeFileService e2eeFs, E2eeWriteLeaseService leases)
     {
+        WriteLease? lease = null;
         try
         {
-            var lease = await leases.AcquireAsync(volumeName, fileId, ctx.RequestAborted);
+            lease = await leases.AcquireAsync(volumeName, fileId, ctx.RequestAborted);
+            if (!await e2eeFs.ExistsAsync(volumeName, fileId, ctx.RequestAborted))
+            {
+                await leases.ReleaseAsync(volumeName, fileId, lease.Token, CancellationToken.None);
+                return Results.NotFound(new { error = "ファイルが見つかりません。" });
+            }
             return Results.Ok(lease);
+        }
+        catch (FileServiceException ex)
+        {
+            if (lease is not null)
+            {
+                try { await leases.ReleaseAsync(volumeName, fileId, lease.Token, CancellationToken.None); }
+                catch { }
+            }
+            return Results.BadRequest(new { error = ex.Message });
         }
         catch (E2eeWriteLeaseException ex)
         {
             return Results.Json(new { error = ex.Message }, statusCode: ex.StatusCode);
+        }
+        catch
+        {
+            if (lease is not null)
+            {
+                try { await leases.ReleaseAsync(volumeName, fileId, lease.Token, CancellationToken.None); }
+                catch { }
+            }
+            throw;
         }
     }
 

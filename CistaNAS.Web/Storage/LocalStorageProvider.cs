@@ -76,23 +76,32 @@ public sealed class LocalStorageProvider : IStorageProvider
         return Task.FromResult<IReadOnlyList<string>>(results);
     }
 
-    public Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default)
+    public async Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default)
     {
         string fullPath = ToFullPath(lockPath);
         Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-        FileStream? lockStream = null;
-        try
+        while (true)
         {
-            lockStream = new FileStream(fullPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                lockStream.Lock(0, 1);
+            ct.ThrowIfCancellationRequested();
+            FileStream? lockStream = null;
+            try
+            {
+                lockStream = new FileStream(fullPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                    lockStream.Lock(0, 1);
+                return new FileLockReleaser(lockStream);
+            }
+            catch (IOException)
+            {
+                lockStream?.Dispose();
+                await Task.Delay(50, ct);
+            }
+            catch
+            {
+                lockStream?.Dispose();
+                throw;
+            }
         }
-        catch
-        {
-            lockStream?.Dispose();
-            throw;
-        }
-        return Task.FromResult<IDisposable>(new FileLockReleaser(lockStream));
     }
 
     /// <summary>ローカルファイルベースのロックは削除不要（インターフェース実装のみ）。</summary>
@@ -151,8 +160,11 @@ public sealed class LocalStorageProvider : IStorageProvider
 
     private sealed class FileLockReleaser(FileStream fs) : IDisposable
     {
+        private int _released;
+
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _released, 1) != 0) return;
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 try { fs.Unlock(0, 1); } catch (IOException) { }
             fs.Dispose();

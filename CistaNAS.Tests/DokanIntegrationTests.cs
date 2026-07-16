@@ -299,7 +299,7 @@ public class DokanIntegrationTests
                     EncryptedLength = body.GetProperty("encryptedLength").GetInt64(),
                     ChunkCount = body.GetProperty("chunkCount").GetInt32(),
                 };
-                return OkJson($"{{\"fileId\":\"{fileId}\"}}");
+                return OkJson($"{{\"fileId\":\"{fileId}\",\"writeLeaseToken\":\"test-write-lease\"}}");
             }
 
             if (method == "POST" && seg.Length > 2 && seg[0] == "upload-chunk")
