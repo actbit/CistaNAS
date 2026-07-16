@@ -279,6 +279,15 @@ public class DokanIntegrationTests
             var seg = pathPart.Split('/', StringSplitOptions.RemoveEmptyEntries);
             string query = rest.Contains('?') ? rest[(rest.IndexOf('?') + 1)..] : "";
 
+            if (seg.Length == 3 && seg[0] == "files" && seg[2] == "write-lease")
+            {
+                if (method == "POST") return OkJson("{\"token\":\"test-write-lease\"}");
+                if (method == "DELETE") return new HttpResponseMessage(HttpStatusCode.NoContent);
+            }
+
+            if (method == "POST" && seg.Length == 4 && seg[0] == "files" && seg[2] == "write-lease" && seg[3] == "renew")
+                return new HttpResponseMessage(HttpStatusCode.NoContent);
+
             if (method == "POST" && seg.Length > 0 && seg[0] == "create-file")
             {
                 var body = await request.Content!.ReadFromJsonAsync<JsonElement>(ct);

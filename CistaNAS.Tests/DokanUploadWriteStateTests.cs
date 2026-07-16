@@ -38,6 +38,15 @@ public class DokanUploadWriteStateTests
         {
             var uri = request.RequestUri!.ToString()!;
             Requests.Add((request.Method.Method, uri));
+            if (uri.Contains("/write-lease", StringComparison.Ordinal))
+            {
+                if (request.Method == HttpMethod.Post && !uri.EndsWith("/renew", StringComparison.Ordinal))
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("{\"token\":\"test-write-lease\"}", Encoding.UTF8, "application/json")
+                    });
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+            }
             if (uri.Contains("upload-chunk"))
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError));
             if (uri.Contains("create-file"))

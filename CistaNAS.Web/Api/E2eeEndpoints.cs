@@ -23,6 +23,12 @@ public static class E2eeEndpoints
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
         e2ee.MapPost("/{volumeName}/create-file", CreateFile)
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapPost("/{volumeName}/files/{fileId}/write-lease", AcquireWriteLease)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapPost("/{volumeName}/files/{fileId}/write-lease/renew", RenewWriteLease)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapDelete("/{volumeName}/files/{fileId}/write-lease", ReleaseWriteLease)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
         e2ee.MapPost("/{volumeName}/upload-chunk/{fileId}/{chunkIndex}", UploadChunk)
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
         e2ee.MapGet("/{volumeName}/download-chunk/{fileId}/{chunkIndex}", DownloadChunk)
@@ -142,18 +148,23 @@ public static class E2eeEndpoints
     }
 
     private static async Task<IResult> UploadChunk(string volumeName, string fileId, int chunkIndex,
-        HttpRequest request, VolumeService vs, E2eeFileService e2eeFs, bool replace = false)
+        HttpRequest request, VolumeService vs, E2eeFileService e2eeFs, E2eeWriteLeaseService leases, bool replace = false)
     {
         if (request.ContentLength is not long len || len < 0)
             return Results.StatusCode(StatusCodes.Status411LengthRequired);
         try
         {
+            await leases.ValidateAndRenewAsync(volumeName, fileId, request.Headers[E2eeWriteLeaseService.HeaderName], request.HttpContext.RequestAborted);
             await e2eeFs.UploadChunkAsync(volumeName, fileId, chunkIndex, request.Body, len, replace, request.HttpContext.RequestAborted);
             return Results.Ok();
         }
         catch (FileServiceException ex)
         {
             return Results.BadRequest(new { error = ex.Message });
+        }
+        catch (E2eeWriteLeaseException ex)
+        {
+            return Results.Json(new { error = ex.Message }, statusCode: ex.StatusCode);
         }
     }
 
@@ -179,10 +190,11 @@ public static class E2eeEndpoints
             : Results.NotFound(new { error = "チャンクハッシュが見つかりません。" });
     }
 
-    private static async Task<IResult> FinalizeFile(string volumeName, string fileId, E2eeFinalizeFileRequest req, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
+    private static async Task<IResult> FinalizeFile(string volumeName, string fileId, E2eeFinalizeFileRequest req, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs, E2eeWriteLeaseService leases)
     {
         try
         {
+            await leases.ValidateAndRenewAsync(volumeName, fileId, ctx.Request.Headers[E2eeWriteLeaseService.HeaderName], ctx.RequestAborted);
             await e2eeFs.FinalizeFileAsync(volumeName, fileId, req, ctx.RequestAborted);
             return Results.Ok();
         }
@@ -190,18 +202,66 @@ public static class E2eeEndpoints
         {
             return Results.BadRequest(new { error = ex.Message });
         }
+        catch (E2eeWriteLeaseException ex)
+        {
+            return Results.Json(new { error = ex.Message }, statusCode: ex.StatusCode);
+        }
     }
 
-    private static async Task<IResult> DeleteFile(string volumeName, string fileId, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs)
+    private static async Task<IResult> DeleteFile(string volumeName, string fileId, HttpContext ctx, VolumeService vs, E2eeFileService e2eeFs, E2eeWriteLeaseService leases)
     {
         try
         {
+            await leases.ValidateAndRenewAsync(volumeName, fileId, ctx.Request.Headers[E2eeWriteLeaseService.HeaderName], ctx.RequestAborted);
             await e2eeFs.DeleteFileAsync(volumeName, fileId, ctx.RequestAborted);
             return Results.NoContent();
         }
         catch (FileServiceException ex)
         {
             return Results.NotFound(new { error = ex.Message });
+        }
+        catch (E2eeWriteLeaseException ex)
+        {
+            return Results.Json(new { error = ex.Message }, statusCode: ex.StatusCode);
+        }
+    }
+
+    private static async Task<IResult> AcquireWriteLease(string volumeName, string fileId, HttpContext ctx, E2eeWriteLeaseService leases)
+    {
+        try
+        {
+            var lease = await leases.AcquireAsync(volumeName, fileId, ctx.RequestAborted);
+            return Results.Ok(lease);
+        }
+        catch (E2eeWriteLeaseException ex)
+        {
+            return Results.Json(new { error = ex.Message }, statusCode: ex.StatusCode);
+        }
+    }
+
+    private static async Task<IResult> RenewWriteLease(string volumeName, string fileId, HttpContext ctx, E2eeWriteLeaseService leases)
+    {
+        try
+        {
+            await leases.ValidateAndRenewAsync(volumeName, fileId, ctx.Request.Headers[E2eeWriteLeaseService.HeaderName], ctx.RequestAborted);
+            return Results.NoContent();
+        }
+        catch (E2eeWriteLeaseException ex)
+        {
+            return Results.Json(new { error = ex.Message }, statusCode: ex.StatusCode);
+        }
+    }
+
+    private static async Task<IResult> ReleaseWriteLease(string volumeName, string fileId, HttpContext ctx, E2eeWriteLeaseService leases)
+    {
+        try
+        {
+            await leases.ReleaseAsync(volumeName, fileId, ctx.Request.Headers[E2eeWriteLeaseService.HeaderName], ctx.RequestAborted);
+            return Results.NoContent();
+        }
+        catch (E2eeWriteLeaseException ex)
+        {
+            return Results.Json(new { error = ex.Message }, statusCode: ex.StatusCode);
         }
     }
 
