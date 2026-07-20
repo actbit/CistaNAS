@@ -108,4 +108,55 @@ public sealed class E2eeWriteLeaseServiceTests
             catch { }
         }
     }
+
+    [Fact]
+    public async Task RunWithLeaseAsync_RenewalFailure_WaitsForOperationToStop()
+    {
+        string dataRoot = Path.Combine(Path.GetTempPath(), "cista-write-lease-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dataRoot);
+        try
+        {
+            var storage = new FailLeaseRenewalStorage(new LocalStorageProvider(dataRoot));
+            var leases = new E2eeWriteLeaseService(storage,
+                leaseDuration: TimeSpan.FromMilliseconds(500),
+                renewalInterval: TimeSpan.FromMilliseconds(50));
+            string fileId = Guid.NewGuid().ToString("N");
+            var lease = await leases.AcquireAsync("test-volume", fileId);
+            var operationMayStop = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task run = leases.RunWithLeaseAsync("test-volume", fileId, lease.Token,
+                async _ =>
+                {
+                    storage.FailLeaseWrites = true;
+                    await operationMayStop.Task;
+                });
+
+            await Task.Delay(150);
+            Assert.False(run.IsCompleted);
+
+            operationMayStop.SetResult();
+            await Assert.ThrowsAsync<IOException>(() => run);
+        }
+        finally
+        {
+            try { Directory.Delete(dataRoot, recursive: true); }
+            catch { }
+        }
+    }
+
+    private sealed class FailLeaseRenewalStorage(IStorageProvider inner) : IStorageProvider
+    {
+        public bool FailLeaseWrites { get; set; }
+
+        public Task<byte[]?> ReadAsync(string path, CancellationToken ct = default) => inner.ReadAsync(path, ct);
+        public Task WriteAsync(string path, Stream data, CancellationToken ct = default) => inner.WriteAsync(path, data, ct);
+        public Task WriteAtomicAsync(string path, Stream data, CancellationToken ct = default)
+            => FailLeaseWrites && path.StartsWith(".write-leases/", StringComparison.Ordinal)
+                ? Task.FromException(new IOException("simulated lease renewal failure"))
+                : inner.WriteAtomicAsync(path, data, ct);
+        public Task DeleteAsync(string path, CancellationToken ct = default) => inner.DeleteAsync(path, ct);
+        public Task<bool> ExistsAsync(string path, CancellationToken ct = default) => inner.ExistsAsync(path, ct);
+        public Task<IReadOnlyList<string>> ListAsync(string? prefix = null, CancellationToken ct = default) => inner.ListAsync(prefix, ct);
+        public Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default) => inner.AcquireLockAsync(lockPath, ct);
+        public void RemoveLock(string lockPath) => inner.RemoveLock(lockPath);
+    }
 }

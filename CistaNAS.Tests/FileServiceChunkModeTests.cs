@@ -18,6 +18,17 @@ namespace CistaNAS.Tests;
 /// </summary>
 public class FileServiceChunkModeTests : IAsyncDisposable
 {
+    private sealed class ThrowAfterFirstReadStream(byte[] data) : MemoryStream(data)
+    {
+        private int _reads;
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref _reads) > 1)
+                throw new IOException("simulated upload interruption");
+            return base.ReadAsync(buffer, cancellationToken);
+        }
+    }
+
     private readonly string _dataRoot;
     private readonly IServiceProvider _sp;
     private readonly VolumeService _vs;
@@ -174,6 +185,21 @@ public class FileServiceChunkModeTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task Upload_ChunkMode_FailureRemovesTemporaryChunks()
+    {
+        string vol = await MountEncryptedVol("chunk-failure-cleanup");
+        var fs = GetFileService();
+        var storage = _sp.GetRequiredService<IStorageProvider>();
+        byte[] data = RandomNumberGenerator.GetBytes(100000);
+        await using var interrupted = new ThrowAfterFirstReadStream(data);
+
+        await Assert.ThrowsAsync<IOException>(() =>
+            fs.UploadAsync(vol, "failed.bin", interrupted, data.Length));
+
+        Assert.Empty(await storage.ListAsync($"{vol}/chunks"));
+    }
+
+    [Fact]
     public async Task Delete_ChunkMode_CleansChunks()
     {
         string vol = await MountEncryptedVol("chunk-delete");
@@ -195,6 +221,38 @@ public class FileServiceChunkModeTests : IAsyncDisposable
         // チャンクが削除されていること
         var chunksAfter = await chunkStore.ListChunksAsync(vol, objectId);
         Assert.Empty(chunksAfter);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Patch_ChunkMode_UsesCopyOnWriteAndPreservesUntouchedBytes(bool encrypted)
+    {
+        string vol = "chunk-patch-" + encrypted.ToString().ToLowerInvariant();
+        await _vs.CreateAsync(vol, "testuser", "testpw", encrypted);
+        var fs = GetFileService();
+        var chunkStore = _sp.GetRequiredService<IChunkStore>();
+        byte[] original = RandomNumberGenerator.GetBytes(65536 * 2 + 123);
+
+        FileMetadata uploaded;
+        using (var input = new MemoryStream(original))
+            uploaded = await fs.UploadAsync(vol, "patch.bin", input, original.Length);
+
+        byte[] patch = RandomNumberGenerator.GetBytes(70000);
+        byte[] expected = original.ToArray();
+        patch.CopyTo(expected, 32000);
+        FileMetadata updated;
+        using (var input = new MemoryStream(patch))
+            updated = await fs.PatchRangeAsync(vol, "patch.bin", 32000, input, patch.Length);
+
+        Assert.NotEqual(uploaded.ChunkObjectId, updated.ChunkObjectId);
+        Assert.Empty(await chunkStore.ListChunksAsync(vol, Assert.IsType<string>(uploaded.ChunkObjectId)));
+
+        var download = await fs.DownloadAsync(vol, "patch.bin");
+        await using var stream = download.Stream;
+        byte[] actual = new byte[download.Length];
+        await stream.ReadExactlyAsync(actual);
+        Assert.Equal(expected, actual);
     }
 
     [Fact]

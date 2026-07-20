@@ -581,4 +581,39 @@ public class DokanIntegrationTests
             instance.Dispose();
         }
     }
+
+    [Fact]
+    public async Task E2ee_ExtendAcrossChunkBoundary_UsesRevisionZeroForNewChunk()
+    {
+        var storage = new E2eeStorageHandler();
+        byte[] masterKey = RandomNumberGenerator.GetBytes(32);
+        var api = new CistaNasApiClient(new HttpClient(storage) { BaseAddress = new Uri("http://test/") });
+        const int chunkSize = 4096;
+        var fs = new CistaNasFileSystem(api, masterKey, "vol", chunkSize: chunkSize);
+
+        char drive = FindFreeDrive();
+        string mountPoint = $"{drive}:\\";
+        var (dokan, instance, loop) = Mount(fs, mountPoint);
+        await WaitForMountAsync(mountPoint);
+        try
+        {
+            byte[] initial = RandomNumberGenerator.GetBytes(chunkSize);
+            File.WriteAllBytes(mountPoint + "extend.txt", initial);
+            byte[] appended = RandomNumberGenerator.GetBytes(100);
+            using (var stream = new FileStream(mountPoint + "extend.txt", FileMode.Open, FileAccess.Write))
+            {
+                stream.Position = chunkSize;
+                stream.Write(appended);
+            }
+
+            byte[] actual = File.ReadAllBytes(mountPoint + "extend.txt");
+            Assert.Equal(initial.Concat(appended).ToArray(), actual);
+        }
+        finally
+        {
+            dokan.RemoveMountPoint(mountPoint);
+            await loop;
+            instance.Dispose();
+        }
+    }
 }

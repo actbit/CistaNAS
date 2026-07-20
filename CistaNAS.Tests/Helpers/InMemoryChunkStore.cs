@@ -41,7 +41,9 @@ public sealed class InMemoryChunkStore : IChunkStore
 
     public Task DeleteChunksAsync(string volumeName, string objectId, CancellationToken ct = default)
     {
-        foreach (var key in _chunks.Keys.Where(k => k.vol == volumeName && k.obj == objectId).ToList())
+        string childPrefix = objectId + "/";
+        foreach (var key in _chunks.Keys.Where(k => k.vol == volumeName
+            && (k.obj == objectId || k.obj.StartsWith(childPrefix, StringComparison.Ordinal))).ToList())
             _chunks.Remove(key);
         return Task.CompletedTask;
     }

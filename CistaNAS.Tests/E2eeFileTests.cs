@@ -104,6 +104,7 @@ public class E2eeFileTests : IAsyncDisposable
         byte[] enc0 = E2eeCrypto.EncryptChunk(plain, fileKey, 0, fileSalt, isFirstChunk: true);
         using (var ms = new MemoryStream(enc0))
             await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0, ms, enc0.Length, replace: false);
+        string firstObjectId = Assert.Single((await e2eeFs.ListFilesAsync(vol)).Files).ChunkObjectIds[0];
         var (_, rev0) = await e2eeFs.GetChunkHashAsync(vol, entry.FileId, 0);
         Assert.Equal(0, rev0);
 
@@ -114,6 +115,9 @@ public class E2eeFileTests : IAsyncDisposable
         var (hash1, rev1) = await e2eeFs.GetChunkHashAsync(vol, entry.FileId, 0);
         Assert.Equal(1, rev1);
         Assert.NotNull(hash1);
+        string secondObjectId = Assert.Single((await e2eeFs.ListFilesAsync(vol)).Files).ChunkObjectIds[0];
+        Assert.NotEqual(firstObjectId, secondObjectId);
+        Assert.Empty(await _sp.GetRequiredService<IChunkStore>().ListChunksAsync(vol, firstObjectId));
 
         // さらに上書き（replace=true）→ revision=2
         byte[] enc2 = E2eeCrypto.EncryptChunk(plain, fileKey, 0, fileSalt, isFirstChunk: true, revision: 2);
@@ -121,6 +125,28 @@ public class E2eeFileTests : IAsyncDisposable
             await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0, ms2, enc2.Length, replace: true);
         var (_, rev2) = await e2eeFs.GetChunkHashAsync(vol, entry.FileId, 0);
         Assert.Equal(2, rev2);
+    }
+
+    [Fact]
+    public async Task UploadChunk_CatalogFailure_DoesNotPublishOrphanGeneration()
+    {
+        string vol = await MountE2eeAsync("test-cow-failure");
+        var normalService = GetE2eeFileService();
+        var entry = await normalService.CreateFileAsync(vol,
+            new E2eeCreateFileRequest("enc-failure", 100, 1), "testuser");
+        var storage = _sp.GetRequiredService<IStorageProvider>();
+        var chunkStore = _sp.GetRequiredService<IChunkStore>();
+        var failingStorage = new FailCatalogWriteStorage(storage) { FailCatalogWrites = true };
+        var failingService = new E2eeFileService(_volumeService, failingStorage, chunkStore,
+            _sp.GetRequiredService<IOptions<CistaNasOptions>>());
+
+        using var content = new MemoryStream(RandomNumberGenerator.GetBytes(100));
+        await Assert.ThrowsAsync<IOException>(() =>
+            failingService.UploadChunkAsync(vol, entry.FileId, 0, content, 100));
+
+        var unchanged = Assert.Single((await normalService.ListFilesAsync(vol)).Files);
+        Assert.Empty(unchanged.ChunkSizes);
+        Assert.Empty(await storage.ListAsync($"{vol}/chunks/{entry.FileId}/versions/"));
     }
 
     [Fact]
@@ -154,13 +180,29 @@ public class E2eeFileTests : IAsyncDisposable
     {
         string vol = await MountE2eeAsync("test-finalize");
         var e2eeFs = GetE2eeFileService();
-        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc", 2048, 2), "testuser");
+        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc", 1500, 1), "testuser");
+        using (var content = new MemoryStream(new byte[1500]))
+            await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0, content, 1500);
 
         await e2eeFs.FinalizeFileAsync(vol, entry.FileId, new E2eeFinalizeFileRequest(1500));
 
         var list = await e2eeFs.ListFilesAsync(vol);
         Assert.Single(list.Files);
         Assert.Equal(1500, list.Files[0].EncryptedLength);
+    }
+
+    [Fact]
+    public async Task FinalizeFile_RejectsLengthDifferentFromStoredChunks()
+    {
+        string vol = await MountE2eeAsync("test-finalize-mismatch");
+        var e2eeFs = GetE2eeFileService();
+        var entry = await e2eeFs.CreateFileAsync(vol,
+            new E2eeCreateFileRequest("enc", 100, 1), "testuser");
+        using (var content = new MemoryStream(new byte[100]))
+            await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0, content, 100);
+
+        await Assert.ThrowsAsync<FileServiceException>(() => e2eeFs.FinalizeFileAsync(
+            vol, entry.FileId, new E2eeFinalizeFileRequest(32)));
     }
 
     [Fact]
@@ -191,6 +233,22 @@ public class E2eeFileTests : IAsyncDisposable
         });
 
         return name;
+    }
+
+    private sealed class FailCatalogWriteStorage(IStorageProvider inner) : IStorageProvider
+    {
+        public bool FailCatalogWrites { get; set; }
+        public Task<byte[]?> ReadAsync(string path, CancellationToken ct = default) => inner.ReadAsync(path, ct);
+        public Task WriteAsync(string path, Stream data, CancellationToken ct = default) => inner.WriteAsync(path, data, ct);
+        public Task WriteAtomicAsync(string path, Stream data, CancellationToken ct = default)
+            => FailCatalogWrites && path.EndsWith("/catalog-e2ee.json", StringComparison.Ordinal)
+                ? Task.FromException(new IOException("simulated catalog write failure"))
+                : inner.WriteAtomicAsync(path, data, ct);
+        public Task DeleteAsync(string path, CancellationToken ct = default) => inner.DeleteAsync(path, ct);
+        public Task<bool> ExistsAsync(string path, CancellationToken ct = default) => inner.ExistsAsync(path, ct);
+        public Task<IReadOnlyList<string>> ListAsync(string? prefix = null, CancellationToken ct = default) => inner.ListAsync(prefix, ct);
+        public Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default) => inner.AcquireLockAsync(lockPath, ct);
+        public void RemoveLock(string lockPath) => inner.RemoveLock(lockPath);
     }
 
     public async ValueTask DisposeAsync()
