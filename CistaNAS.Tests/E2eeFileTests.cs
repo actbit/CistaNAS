@@ -154,13 +154,29 @@ public class E2eeFileTests : IAsyncDisposable
     {
         string vol = await MountE2eeAsync("test-finalize");
         var e2eeFs = GetE2eeFileService();
-        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc", 2048, 2), "testuser");
+        var entry = await e2eeFs.CreateFileAsync(vol, new E2eeCreateFileRequest("enc", 1500, 1), "testuser");
+        using (var content = new MemoryStream(new byte[1500]))
+            await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0, content, 1500);
 
         await e2eeFs.FinalizeFileAsync(vol, entry.FileId, new E2eeFinalizeFileRequest(1500));
 
         var list = await e2eeFs.ListFilesAsync(vol);
         Assert.Single(list.Files);
         Assert.Equal(1500, list.Files[0].EncryptedLength);
+    }
+
+    [Fact]
+    public async Task FinalizeFile_RejectsLengthDifferentFromStoredChunks()
+    {
+        string vol = await MountE2eeAsync("test-finalize-mismatch");
+        var e2eeFs = GetE2eeFileService();
+        var entry = await e2eeFs.CreateFileAsync(vol,
+            new E2eeCreateFileRequest("enc", 100, 1), "testuser");
+        using (var content = new MemoryStream(new byte[100]))
+            await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0, content, 100);
+
+        await Assert.ThrowsAsync<FileServiceException>(() => e2eeFs.FinalizeFileAsync(
+            vol, entry.FileId, new E2eeFinalizeFileRequest(32)));
     }
 
     [Fact]

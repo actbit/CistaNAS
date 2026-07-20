@@ -10,6 +10,27 @@ namespace CistaNAS.Tests;
 /// </summary>
 public class CloudSqliteSyncTests
 {
+    private sealed class FailOnceStorageProvider : IStorageProvider
+    {
+        private readonly LocalStorageProvider _inner;
+        private int _writes;
+        public FailOnceStorageProvider(string path) => _inner = new LocalStorageProvider(path);
+        public int WriteAttempts => Volatile.Read(ref _writes);
+        public Task<byte[]?> ReadAsync(string blobPath, CancellationToken ct = default) => _inner.ReadAsync(blobPath, ct);
+        public Task WriteAsync(string blobPath, Stream content, CancellationToken ct = default) => _inner.WriteAsync(blobPath, content, ct);
+        public Task WriteAtomicAsync(string blobPath, Stream content, CancellationToken ct = default)
+        {
+            if (Interlocked.Increment(ref _writes) == 1)
+                throw new IOException("first write fails");
+            return _inner.WriteAtomicAsync(blobPath, content, ct);
+        }
+        public Task DeleteAsync(string blobPath, CancellationToken ct = default) => _inner.DeleteAsync(blobPath, ct);
+        public Task<bool> ExistsAsync(string blobPath, CancellationToken ct = default) => _inner.ExistsAsync(blobPath, ct);
+        public Task<IReadOnlyList<string>> ListAsync(string? prefix = null, CancellationToken ct = default) => _inner.ListAsync(prefix, ct);
+        public Task<IDisposable> AcquireLockAsync(string lockPath, CancellationToken ct = default) => _inner.AcquireLockAsync(lockPath, ct);
+        public void RemoveLock(string lockPath) => _inner.RemoveLock(lockPath);
+    }
+
     /// <summary>全操作が失敗するストレージ（シャットダウンアップロード失敗をシミュレート）。</summary>
     private sealed class FaultyStorageProvider : IStorageProvider
     {
@@ -115,6 +136,34 @@ public class CloudSqliteSyncTests
             var cloudData = await storage.ReadAsync("test.db");
             Assert.NotNull(cloudData);
             Assert.Equal("NEW-DATA"u8.ToArray(), cloudData);
+        }
+        finally
+        {
+            try { Directory.Delete(localDir, true); } catch { }
+            try { Directory.Delete(cloudDir, true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task UploadIfDirtyAsync_FailureRemainsDirtyForRetry()
+    {
+        var localDir = NewTempDir();
+        var cloudDir = NewTempDir();
+        try
+        {
+            var storage = new FailOnceStorageProvider(cloudDir);
+            var sync = new CloudSqliteSync(storage,
+                new StorageOptions { VolumeDataPath = localDir },
+                new DatabaseOptions { BlobKey = "test.db" });
+            byte[] expected = "RETRY-ME"u8.ToArray();
+            await File.WriteAllBytesAsync(sync.LocalDbPath, expected);
+            sync.MarkDirty();
+
+            await Assert.ThrowsAsync<IOException>(() => sync.UploadIfDirtyAsync());
+            await sync.UploadIfDirtyAsync();
+
+            Assert.Equal(2, storage.WriteAttempts);
+            Assert.Equal(expected, await storage.ReadAsync("test.db"));
         }
         finally
         {

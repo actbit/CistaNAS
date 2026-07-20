@@ -71,19 +71,32 @@ public sealed class E2eeFileService
     }
 
     /// <summary>ファイルエントリを作成し、FileId を返す。</summary>
-    public async Task<E2eeFileEntry> CreateFileAsync(string volumeName, E2eeCreateFileRequest request, string ownerUsername, CancellationToken ct = default)
+    public async Task<E2eeFileEntry> CreateFileAsync(string volumeName, E2eeCreateFileRequest request,
+        string ownerUsername, CancellationToken ct = default, string? preallocatedFileId = null)
     {
         var header = GetE2eeHeader(volumeName);
-        if (request.EncryptedLength < 0 || request.ChunkCount <= 0)
+        if (request.EncryptedLength < 0 || request.ChunkCount is <= 0 or > 100_000)
             throw new FileServiceException("ファイルサイズまたはチャンク数が不正です。");
+        long minimumEncryptedLength = checked((long)SaltSize + (long)request.ChunkCount * TagSize);
+        long maximumEncryptedLength = checked(minimumEncryptedLength
+            + (long)request.ChunkCount * header.ChunkSize);
+        if (request.EncryptedLength < minimumEncryptedLength
+            || request.EncryptedLength > maximumEncryptedLength)
+            throw new FileServiceException("暗号化後ファイルサイズがチャンク構成と一致しません。");
 
         var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
         await volGate.WaitAsync(ct);
         try
         {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
             var catalog = await LoadCatalogAsync(volumeName, ct);
 
-            string fileId = Guid.NewGuid().ToString("N");
+            string fileId = preallocatedFileId ?? Guid.NewGuid().ToString("N");
+            if (!Guid.TryParseExact(fileId, "N", out var parsedFileId)
+                || !string.Equals(fileId, parsedFileId.ToString("N"), StringComparison.Ordinal))
+                throw new FileServiceException("fileIdが不正です。");
+            if (catalog.Files.ContainsKey(fileId))
+                throw new FileServiceException("fileIdが重複しています。");
 
             // 次のオフセットはカタログから算出する。
             // 旧実装は new FileInfo(dataPath).Length を使っていたが、
@@ -149,6 +162,7 @@ public sealed class E2eeFileService
         await volGate.WaitAsync(ct);
         try
         {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
             var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
             using (await gate.EnterWriteAsync(ct))
             {
@@ -191,28 +205,24 @@ public sealed class E2eeFileService
                 if (dataLength < 0 || dataLength > maxEncChunkBytes)
                     throw new FileServiceException($"チャンクデータ長 ({dataLength}) が上限 ({maxEncChunkBytes} バイト) を超えています。");
 
-                // 暗号化チャンクの SHA-256 ハッシュをアップロードと同時に計算
-                using var sha = System.Security.Cryptography.IncrementalHash.CreateHash(
-                    System.Security.Cryptography.HashAlgorithmName.SHA256);
+                byte[] chunkData = new byte[checked((int)dataLength)];
+                int totalRead = 0;
+                while (totalRead < chunkData.Length)
+                {
+                    int read = await data.ReadAsync(chunkData.AsMemory(totalRead), ct);
+                    if (read == 0) break;
+                    totalRead += read;
+                }
+                if (totalRead != chunkData.Length)
+                    throw new FileServiceException("リクエスト本文がContent-Lengthより短いです。");
+
+                string hashHex = Convert.ToHexString(
+                    System.Security.Cryptography.SHA256.HashData(chunkData));
 
                 if (_volumeService.IsChunkMode(volumeName))
                 {
-                    // チャンクモード: データを全て読み込んでから書き込み
-                    byte[] chunkData = new byte[dataLength];
-                    int totalRead = 0;
-                    while (totalRead < dataLength)
-                    {
-                        int read = await data.ReadAsync(chunkData.AsMemory(totalRead, (int)dataLength - totalRead), ct);
-                        if (read == 0) break;
-                        totalRead += read;
-                    }
-
-                    sha.AppendData(chunkData, 0, totalRead);
-                    await _chunkStore.WriteChunkAsync(volumeName, fileId, chunkIndex, new MemoryStream(chunkData, 0, totalRead), ct);
-
-                    while (entry.ChunkSizes.Count <= chunkIndex)
-                        entry.ChunkSizes.Add(0);
-                    entry.ChunkSizes[chunkIndex] = totalRead;
+                    using var chunkStream = new MemoryStream(chunkData, writable: false);
+                    await _chunkStore.WriteChunkAsync(volumeName, fileId, chunkIndex, chunkStream, ct);
                 }
                 else
                 {
@@ -223,29 +233,15 @@ public sealed class E2eeFileService
                     string dataPath = GetDataPath(volumeName);
                     using var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
                     fs.Seek(chunkOffset, SeekOrigin.Begin);
-
-                    long written = 0;
-                    byte[] buffer = new byte[81920];
-                    long remaining = dataLength;
-                    while (remaining > 0)
-                    {
-                        int toRead = (int)Math.Min(buffer.Length, remaining);
-                        int read = await data.ReadAsync(buffer.AsMemory(0, toRead), ct);
-                        if (read == 0) break;
-                        sha.AppendData(buffer, 0, read);
-                        await fs.WriteAsync(buffer.AsMemory(0, read), ct);
-                        written += read;
-                        remaining -= read;
-                    }
-                    fs.Flush();
-
-                    while (entry.ChunkSizes.Count <= chunkIndex)
-                        entry.ChunkSizes.Add(0);
-                    entry.ChunkSizes[chunkIndex] = (int)written;
+                    await fs.WriteAsync(chunkData, ct);
+                    await fs.FlushAsync(ct);
                 }
 
+                while (entry.ChunkSizes.Count <= chunkIndex)
+                    entry.ChunkSizes.Add(0);
+                entry.ChunkSizes[chunkIndex] = chunkData.Length;
+
                 // ハッシュをカタログに保存
-                string hashHex = Convert.ToHexString(sha.GetHashAndReset());
                 while (entry.ChunkHashes.Count <= chunkIndex)
                     entry.ChunkHashes.Add("");
                 entry.ChunkHashes[chunkIndex] = hashHex;
@@ -360,6 +356,7 @@ public sealed class E2eeFileService
         await volGate.WaitAsync(ct);
         try
         {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
             var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
             using (await gate.EnterWriteAsync(ct))
             {
@@ -367,11 +364,20 @@ public sealed class E2eeFileService
                 if (!catalog.Files.TryGetValue(fileId, out var entry))
                     throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
                 int requestedChunkCount = request.ChunkCount ?? entry.ChunkCount;
-                if (requestedChunkCount < 0 || requestedChunkCount > entry.ChunkCount)
+                if (requestedChunkCount <= 0 || requestedChunkCount > entry.ChunkCount
+                    || entry.ChunkSizes.Count < requestedChunkCount)
                     throw new FileServiceException("チャンク数が不正です。");
+                long actualStoredLength = 0;
+                for (int i = 0; i < requestedChunkCount; i++)
+                    actualStoredLength = checked(actualStoredLength + entry.ChunkSizes[i]);
+                if (request.ActualEncryptedLength != actualStoredLength)
+                    throw new FileServiceException("暗号化後ファイルサイズが保存済みチャンク長と一致しません。");
+                long plainLength = ComputePlainSize(actualStoredLength, requestedChunkCount);
+                if (plainLength > MaxPlainSize)
+                    throw new FileServiceException("ファイルサイズは1PB以下である必要があります。");
                 await EnsureQuotaAsync(volumeName, entry.OwnerUsername, entry,
-                    request.ActualEncryptedLength, requestedChunkCount, ct);
-                entry.EncryptedLength = request.ActualEncryptedLength;
+                    actualStoredLength, requestedChunkCount, ct);
+                entry.EncryptedLength = actualStoredLength;
                 entry.ModifiedAt = DateTimeOffset.UtcNow;
 
                 // ファイル長変更（縮小）時のチャンク数調整（論理切り詰め）。
@@ -457,6 +463,7 @@ public sealed class E2eeFileService
         await volGate.WaitAsync(ct);
         try
         {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
             var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
             using (await gate.EnterWriteAsync(ct))
             {
@@ -550,6 +557,9 @@ public sealed class E2eeFileService
         ms.Position = 0;
         await _storage.WriteAtomicAsync($"{volumeName}/catalog-e2ee.json", ms, ct);
     }
+
+    private Task<IDisposable> AcquireCatalogLockAsync(string volumeName, CancellationToken ct)
+        => _storage.AcquireLockAsync($"catalog-e2ee/{Uri.EscapeDataString(volumeName)}", ct);
 
     private string GetDataPath(string volumeName)
         => Path.Combine(_volumeDataPath, volumeName, "volume.dat");

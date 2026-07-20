@@ -279,6 +279,14 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                         _existingFileSalt = salt0;
                         cache.SetFileKey(_existingFileKey, _existingFileSalt);
                     }
+                    else
+                    {
+                        // 旧クライアントが空ファイルを ChunkCount=0 で確定したカタログとの互換性。
+                        // 次回保存時に新しいsaltを持つ空chunk 0を作り、現行形式へ移行する。
+                        _existingFileSalt = E2eeCrypto.GenerateFileSalt();
+                        _existingFileKey = E2eeCrypto.DeriveFileKey(fs._masterKey!.Buffer, _existingFileSalt);
+                        cache.SetFileKey(_existingFileKey, _existingFileSalt);
+                    }
 
                     WriteLeaseToken = leaseToken;
                     _leaseRenewal = new Timer(_ =>
@@ -370,6 +378,46 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             }
             // 新規チャンク: chunkSize のゼロ
             return new byte[chunkSize];
+        }
+
+        public void PrepareForPersist()
+        {
+            long targetLength = CurrentSize;
+            int targetChunkCount = targetLength == 0
+                ? 1
+                : checked((int)((targetLength + Fs._chunkSize - 1) / Fs._chunkSize));
+
+            for (int ci = 0; ci < targetChunkCount; ci++)
+            {
+                int desiredLength = (int)Math.Min(Fs._chunkSize,
+                    Math.Max(0, targetLength - (long)ci * Fs._chunkSize));
+                long oldRemaining = _existingPlainLength - (long)ci * Fs._chunkSize;
+                int oldLength = ci < _existingChunkCount
+                    ? (int)Math.Min(Fs._chunkSize, Math.Max(0, oldRemaining))
+                    : -1;
+
+                if (_dirtyChunks.TryGetValue(ci, out var dirty))
+                {
+                    if (dirty.Length != desiredLength)
+                    {
+                        byte[] resized = ResizeChunk(dirty, desiredLength);
+                        CryptographicOperations.ZeroMemory(dirty);
+                        _dirtyChunks[ci] = resized;
+                    }
+                    continue;
+                }
+
+                if (ci >= _existingChunkCount)
+                {
+                    _dirtyChunks[ci] = new byte[desiredLength];
+                }
+                else if (oldLength != desiredLength)
+                {
+                    byte[] existing = GetOrLoadChunk(ci);
+                    _dirtyChunks[ci] = ResizeChunk(existing, desiredLength);
+                    CryptographicOperations.ZeroMemory(existing);
+                }
+            }
         }
     }
 
@@ -1230,8 +1278,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         byte[] fileSalt = ws.ExistingFileSalt!;
         byte[] fileKey = ws.ExistingFileKey!;
 
+        ws.PrepareForPersist();
         long newPlainLength = ws.CurrentSize;
-        int newChunkCount = newPlainLength == 0 ? 0 : (int)((newPlainLength + _chunkSize - 1) / _chunkSize);
+        int newChunkCount = newPlainLength == 0 ? 1 : (int)((newPlainLength + _chunkSize - 1) / _chunkSize);
 
         // 汚れたチャンクだけ再暗号化して replace（未変更チャンクは維持 → 末尾保持）。
         foreach (var (ci, chunk) in ws.DirtyChunks)
@@ -1241,11 +1290,11 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             byte[] toEncrypt = chunk.Length == chunkLen ? chunk : ResizeChunk(chunk, chunkLen);
 
             // 現在 revision を取得し +1 で暗号化（AES-GCM の nonce 再利用回避）
-            int currentRev = 0;
-            try { var (_, rev) = _api.GetChunkHashAsync(_volumeName, fileId, ci).GetAwaiter().GetResult(); currentRev = rev; }
-            catch { }
+            var (_, currentRev) = _api.GetChunkHashAsync(_volumeName, fileId, ci).GetAwaiter().GetResult();
+            int nextRevision = ci < ws.ExistingChunkCount ? currentRev + 1 : 0;
 
-            byte[] encChunk = E2eeCrypto.EncryptChunk(toEncrypt, fileKey, ci, fileSalt, isFirstChunk: ci == 0, revision: currentRev + 1);
+            byte[] encChunk = E2eeCrypto.EncryptChunk(toEncrypt, fileKey, ci, fileSalt,
+                isFirstChunk: ci == 0, revision: nextRevision);
             _api.UploadChunkAsync(_volumeName, fileId, ci, encChunk, ws.WriteLeaseToken!, replace: true).GetAwaiter().GetResult();
 
             // チャンクプールのキャッシュを更新（新しい暗号文ハッシュで）
@@ -1253,10 +1302,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         }
 
         // FinalizeFile で長さ確定（縮小時は ChunkCount 指定で論理切り詰め）
-        int finalizeChunkCount = Math.Max(1, newChunkCount);
+        int finalizeChunkCount = newChunkCount;
         long encLength = 16L + newPlainLength + (long)finalizeChunkCount * 16;
-        int? chunkCountParam = newChunkCount < ws.ExistingChunkCount ? newChunkCount : null;
-        _api.FinalizeFileAsync(_volumeName, fileId, encLength, ws.WriteLeaseToken!, chunkCountParam).GetAwaiter().GetResult();
+        _api.FinalizeFileAsync(_volumeName, fileId, encLength, ws.WriteLeaseToken!, finalizeChunkCount).GetAwaiter().GetResult();
 
         // キャッシュ更新
         if (_cache.TryGetValue(fileId, out var cache))

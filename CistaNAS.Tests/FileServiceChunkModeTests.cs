@@ -18,6 +18,17 @@ namespace CistaNAS.Tests;
 /// </summary>
 public class FileServiceChunkModeTests : IAsyncDisposable
 {
+    private sealed class ThrowAfterFirstReadStream(byte[] data) : MemoryStream(data)
+    {
+        private int _reads;
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref _reads) > 1)
+                throw new IOException("simulated upload interruption");
+            return base.ReadAsync(buffer, cancellationToken);
+        }
+    }
+
     private readonly string _dataRoot;
     private readonly IServiceProvider _sp;
     private readonly VolumeService _vs;
@@ -171,6 +182,21 @@ public class FileServiceChunkModeTests : IAsyncDisposable
         byte[] result = new byte[50000];
         await dlStream.ReadExactlyAsync(result);
         Assert.Equal(data2, result);
+    }
+
+    [Fact]
+    public async Task Upload_ChunkMode_FailureRemovesTemporaryChunks()
+    {
+        string vol = await MountEncryptedVol("chunk-failure-cleanup");
+        var fs = GetFileService();
+        var storage = _sp.GetRequiredService<IStorageProvider>();
+        byte[] data = RandomNumberGenerator.GetBytes(100000);
+        await using var interrupted = new ThrowAfterFirstReadStream(data);
+
+        await Assert.ThrowsAsync<IOException>(() =>
+            fs.UploadAsync(vol, "failed.bin", interrupted, data.Length));
+
+        Assert.Empty(await storage.ListAsync($"{vol}/chunks"));
     }
 
     [Fact]

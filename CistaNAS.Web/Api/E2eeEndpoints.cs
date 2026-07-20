@@ -137,25 +137,31 @@ public static class E2eeEndpoints
         VolumeService vs, E2eeFileService e2eeFs, E2eeWriteLeaseService leases)
     {
         string username = ctx.User.Identity?.Name ?? "";
-        E2eeFileEntry? entry = null;
+        string fileId = Guid.NewGuid().ToString("N");
+        WriteLease? lease = null;
         try
         {
-            entry = await e2eeFs.CreateFileAsync(volumeName, req, username, ctx.RequestAborted);
-            var lease = await leases.AcquireAsync(volumeName, entry.FileId, ctx.RequestAborted);
+            // fileIdを公開する前にリースを確保し、作成→取得の競合窓をなくす。
+            lease = await leases.AcquireAsync(volumeName, fileId, ctx.RequestAborted);
+            var entry = await e2eeFs.CreateFileAsync(volumeName, req, username,
+                ctx.RequestAborted, fileId);
             entry.WriteLeaseToken = lease.Token;
             return Results.Created($"/api/v1/e2ee/{volumeName}/upload-chunk/{entry.FileId}/0", entry);
         }
         catch (FileServiceException ex)
         {
+            if (lease is not null)
+            {
+                try { await leases.ReleaseAsync(volumeName, fileId, lease.Token, CancellationToken.None); }
+                catch { }
+            }
             return Results.BadRequest(new { error = ex.Message });
         }
         catch
         {
-            // レスポンスを返す前のリース取得失敗では fileId はクライアントに未公開。
-            // 作成済みカタログエントリを回収して孤児ファイルを残さない。
-            if (entry is not null)
+            if (lease is not null)
             {
-                try { await e2eeFs.DeleteFileAsync(volumeName, entry.FileId, CancellationToken.None); }
+                try { await leases.ReleaseAsync(volumeName, fileId, lease.Token, CancellationToken.None); }
                 catch { }
             }
             throw;

@@ -110,6 +110,7 @@ public sealed class FileService
         await catLock.WaitAsync(ct);
         try
         {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
             var catalog = await LoadCatalogAsync(volumeName, ct);
             catalog.Files.TryGetValue(fileName, out var existing);
 
@@ -228,6 +229,7 @@ public sealed class FileService
         await catLock.WaitAsync(ct);
         try
         {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
             var catalog = await LoadCatalogAsync(volumeName, ct);
             catalog.Files.TryGetValue(fileName, out var existing);
 
@@ -325,6 +327,7 @@ public sealed class FileService
             await catLock.WaitAsync(ct);
             try
             {
+                using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
                 var catalog = await LoadCatalogAsync(volumeName, ct);
                 catalog.Files.TryGetValue(fileName, out var existing);
                 string objectId = existing?.ChunkObjectId ?? fileName;
@@ -440,13 +443,16 @@ public sealed class FileService
 
         SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
         await catLock.WaitAsync(ct);
+        string? objectId = null;
+        bool catalogPublished = false;
         try
         {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
             var catalog = await LoadCatalogAsync(volumeName, ct);
             catalog.Files.TryGetValue(fileName, out var existing);
             // 新規アップロードは別オブジェクトへ書き込み、カタログ切り替えを
             // 最後に行う。既存ファイルの旧オブジェクトは失敗時も保持する。
-            string objectId = $"{fileName}.upload-{Guid.NewGuid():N}";
+            objectId = $"{fileName}.upload-{Guid.NewGuid():N}";
 
             var chunkSizes = new List<int>();
             byte[] buffer = new byte[chunkSize];
@@ -492,6 +498,7 @@ public sealed class FileService
             };
             catalog.Files[fileName] = meta;
             await SaveCatalogAsync(volumeName, catalog, ct);
+            catalogPublished = true;
 
             await _journalService.CommitAsync(volumeName, opId, ct);
 
@@ -502,6 +509,17 @@ public sealed class FileService
                 catch (Exception) { /* ベストエフォート */ }
             }
             return meta;
+        }
+        catch
+        {
+            // カタログ切り替え前に失敗した一時オブジェクトは参照元がなく、
+            // ジャーナルからもIDを復元できないため、ここで確実に回収する。
+            if (!catalogPublished && objectId is not null)
+            {
+                try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, objectId, CancellationToken.None); }
+                catch { }
+            }
+            throw;
         }
         finally
         {
@@ -594,6 +612,7 @@ public sealed class FileService
             await catLock.WaitAsync(ct);
             try
             {
+                using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
                 var catalog = await LoadCatalogAsync(volumeName, ct);
                 if (!catalog.Files.TryGetValue(fileName, out existing)
                     || !catalog.Files.Remove(fileName))
@@ -635,6 +654,7 @@ public sealed class FileService
         await catLock.WaitAsync(ct);
         try
         {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
             // 削除済みエントリはカタログから取り除く
             var catalog = await LoadCatalogAsync(volumeName, ct);
             foreach (var entry in pending)
@@ -722,4 +742,7 @@ public sealed class FileService
         ms.Position = 0;
         await _storage.WriteAtomicAsync($"{volumeName}/catalog.json", ms, ct);
     }
+
+    private Task<IDisposable> AcquireCatalogLockAsync(string volumeName, CancellationToken ct)
+        => _storage.AcquireLockAsync($"catalog/{Uri.EscapeDataString(volumeName)}", ct);
 }

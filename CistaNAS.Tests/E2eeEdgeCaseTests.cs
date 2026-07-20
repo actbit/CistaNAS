@@ -192,7 +192,15 @@ public class E2eeEdgeCaseTests(AspireFixture fixture)
     {
         using var c = CreateAuthClient();
         string vol = (await CreateVolumeAsync(c, "edge-finalize")).VolName;
-        var (fileId, writeLease) = await CreateFileAsync(c, vol, "enc-finalize", 2048, 1);
+        byte[] storedChunk = RandomNumberGenerator.GetBytes(1500);
+        var (fileId, writeLease) = await CreateFileAsync(c, vol, "enc-finalize", storedChunk.Length, 1);
+        using (var uploadContent = new ByteArrayContent(storedChunk))
+        using (var uploadRequest = WithWriteLease(HttpMethod.Post,
+            $"/api/v1/e2ee/{vol}/upload-chunk/{fileId}/0", writeLease, uploadContent))
+        {
+            var upload = await c.SendAsync(uploadRequest);
+            Assert.True(upload.IsSuccessStatusCode, $"upload failed: {upload.StatusCode}");
+        }
 
         using var finalizeContent = JsonContent.Create(new { actualEncryptedLength = 1500 });
         using var finalizeRequest = WithWriteLease(HttpMethod.Patch,

@@ -71,9 +71,20 @@ public sealed class CloudSqliteSync : IHostedService, IDisposable
     /// <summary>変更があればオブジェクトストレージにアップロードする。</summary>
     public async Task UploadIfDirtyAsync(CancellationToken ct = default)
     {
-        if (Interlocked.CompareExchange(ref _dirty, 0, 1) == 0) return;
-        await using var fs = File.OpenRead(_localPath);
-        await _storage.WriteAtomicAsync(_blobKey, fs, ct);
+        // アップロード開始時に dirty を引き取る。処理中に新しい変更が発生した場合は
+        // MarkDirty が再び 1 にするため、次回の同期対象として残る。
+        if (Interlocked.Exchange(ref _dirty, 0) == 0) return;
+        try
+        {
+            await using var fs = File.OpenRead(_localPath);
+            await _storage.WriteAtomicAsync(_blobKey, fs, ct);
+        }
+        catch
+        {
+            // 失敗した変更を次のリトライで必ず再送する。
+            Interlocked.Exchange(ref _dirty, 1);
+            throw;
+        }
     }
 
     private int _disposed;
