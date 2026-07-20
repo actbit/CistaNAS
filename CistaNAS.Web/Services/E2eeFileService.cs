@@ -219,10 +219,15 @@ public sealed class E2eeFileService
                 string hashHex = Convert.ToHexString(
                     System.Security.Cryptography.SHA256.HashData(chunkData));
 
+                string? newChunkObjectId = null;
+                string? oldChunkObjectId = null;
+
                 if (_volumeService.IsChunkMode(volumeName))
                 {
+                    oldChunkObjectId = GetChunkObjectId(entry, chunkIndex);
+                    newChunkObjectId = $"{fileId}/versions/{Guid.NewGuid():N}";
                     using var chunkStream = new MemoryStream(chunkData, writable: false);
-                    await _chunkStore.WriteChunkAsync(volumeName, fileId, chunkIndex, chunkStream, ct);
+                    await _chunkStore.WriteChunkAsync(volumeName, newChunkObjectId, chunkIndex, chunkStream, ct);
                 }
                 else
                 {
@@ -254,7 +259,35 @@ public sealed class E2eeFileService
                     ? entry.ChunkRevisions[chunkIndex] + 1
                     : 0;
 
-                await SaveCatalogAsync(volumeName, catalog, ct);
+                if (newChunkObjectId is not null)
+                {
+                    while (entry.ChunkObjectIds.Count <= chunkIndex)
+                        entry.ChunkObjectIds.Add("");
+                    entry.ChunkObjectIds[chunkIndex] = newChunkObjectId;
+                }
+
+                try
+                {
+                    await SaveCatalogAsync(volumeName, catalog, ct);
+                }
+                catch
+                {
+                    if (newChunkObjectId is not null)
+                    {
+                        try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, newChunkObjectId, CancellationToken.None); }
+                        catch { }
+                    }
+                    throw;
+                }
+
+                // 旧形式は全チャンクが FileId 配下にあるため、個別移行時には削除しない。
+                if (oldChunkObjectId is not null
+                    && oldChunkObjectId != fileId
+                    && oldChunkObjectId != newChunkObjectId)
+                {
+                    try { await _chunkStore.DeleteChunksAsync(volumeName, oldChunkObjectId, ct); }
+                    catch { /* 新世代は公開済み。旧世代の削除はベストエフォート。 */ }
+                }
             }
         }
         finally
@@ -289,7 +322,8 @@ public sealed class E2eeFileService
 
             if (_volumeService.IsChunkMode(volumeName))
             {
-                byte[]? chunkData = await _chunkStore.ReadChunkAsync(volumeName, fileId, chunkIndex, ct);
+                string chunkObjectId = GetChunkObjectId(entry, chunkIndex);
+                byte[]? chunkData = await _chunkStore.ReadChunkAsync(volumeName, chunkObjectId, chunkIndex, ct);
                 if (chunkData is null)
                     throw new FileServiceException($"チャンク {chunkIndex} が見つかりません。");
                 return (new GateReadStream(new MemoryStream(chunkData), readLock), chunkData.Length, revision);
@@ -379,18 +413,32 @@ public sealed class E2eeFileService
                     actualStoredLength, requestedChunkCount, ct);
                 entry.EncryptedLength = actualStoredLength;
                 entry.ModifiedAt = DateTimeOffset.UtcNow;
+                List<string> removedObjectIds = [];
 
                 // ファイル長変更（縮小）時のチャンク数調整（論理切り詰め）。
                 // チャンクモードの物理チャンク削除はベストエフォート（カタログ整合性を優先）。
                 if (request.ChunkCount is int newCc && newCc >= 0 && newCc < entry.ChunkCount)
                 {
+                    for (int i = newCc; i < entry.ChunkObjectIds.Count; i++)
+                    {
+                        string objectId = entry.ChunkObjectIds[i];
+                        if (!string.IsNullOrWhiteSpace(objectId) && objectId != fileId)
+                            removedObjectIds.Add(objectId);
+                    }
                     entry.ChunkCount = newCc;
                     if (entry.ChunkSizes.Count > newCc) entry.ChunkSizes.RemoveRange(newCc, entry.ChunkSizes.Count - newCc);
                     if (entry.ChunkHashes.Count > newCc) entry.ChunkHashes.RemoveRange(newCc, entry.ChunkHashes.Count - newCc);
                     if (entry.ChunkRevisions.Count > newCc) entry.ChunkRevisions.RemoveRange(newCc, entry.ChunkRevisions.Count - newCc);
+                    if (entry.ChunkObjectIds.Count > newCc) entry.ChunkObjectIds.RemoveRange(newCc, entry.ChunkObjectIds.Count - newCc);
                 }
 
                 await SaveCatalogAsync(volumeName, catalog, ct);
+
+                foreach (string objectId in removedObjectIds.Distinct(StringComparer.Ordinal))
+                {
+                    try { await _chunkStore.DeleteChunksAsync(volumeName, objectId, ct); }
+                    catch { /* 切り詰めは公開済み。旧世代の削除はベストエフォート。 */ }
+                }
             }
         }
         finally
@@ -405,6 +453,11 @@ public sealed class E2eeFileService
         long capacity = checked((long)SaltSize + (long)chunkCount * (header.ChunkSize + TagSize));
         return Math.Max(capacity, declaredLength);
     }
+
+    private static string GetChunkObjectId(E2eeFileEntry entry, int chunkIndex)
+        => chunkIndex < entry.ChunkObjectIds.Count && !string.IsNullOrWhiteSpace(entry.ChunkObjectIds[chunkIndex])
+            ? entry.ChunkObjectIds[chunkIndex]
+            : entry.FileId;
 
     private async Task EnsureQuotaAsync(string volumeName, string username, E2eeFileEntry current,
         long encryptedLength, int chunkCount, CancellationToken ct)

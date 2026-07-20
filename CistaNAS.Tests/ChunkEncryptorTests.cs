@@ -162,8 +162,8 @@ public class ChunkEncryptorTests
         byte[] c0 = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.ChaCha20, 0, sectorSize, chunkSize, plain);
         byte[] c1 = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.ChaCha20, 0, sectorSize, chunkSize, plain);
 
-        // 同じ sectorIndex + 同じ平文 → 同じ暗号文（決定論的）
-        Assert.Equal(c0, c1);
+        // 同じチャンクを書き直してもランダム nonce により暗号文は再利用されない。
+        Assert.NotEqual(c0, c1);
 
         // sectorIndex を変えると暗号文も変わる
         byte[] c2 = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.ChaCha20, 1, sectorSize, chunkSize, plain);
@@ -183,5 +183,50 @@ public class ChunkEncryptorTests
         byte[] dec = ChunkEncryptor.DecryptChunk(key, CipherAlgorithm.ChaCha20, 0, sectorSize, chunkSize, cipher, plain.Length);
 
         Assert.Equal(plain, dec);
+        Assert.NotEqual(plain, cipher);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(64)]
+    [InlineData(4095)]
+    [InlineData(4097)]
+    public void ChaCha20_PartialSector_IsEncryptedAndAuthenticated(int length)
+    {
+        byte[] key = MasterKey();
+        byte[] plain = RandomNumberGenerator.GetBytes(length);
+
+        byte[] cipher = ChunkEncryptor.EncryptChunk(
+            key, CipherAlgorithm.ChaCha20, 0, 4096, 4194304, plain);
+        byte[] dec = ChunkEncryptor.DecryptChunk(
+            key, CipherAlgorithm.ChaCha20, 0, 4096, 4194304, cipher, plain.Length);
+
+        Assert.Equal(plain, dec);
+        Assert.False(cipher.AsSpan(20, plain.Length).SequenceEqual(plain));
+        Assert.True(cipher.Length >= plain.Length + 36);
+    }
+
+    [Fact]
+    public void ChaCha20_Rewrite_UsesFreshNonce()
+    {
+        byte[] key = MasterKey();
+        byte[] plain = RandomNumberGenerator.GetBytes(4096);
+
+        byte[] first = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.ChaCha20, 0, 4096, 4194304, plain);
+        byte[] second = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.ChaCha20, 0, 4096, 4194304, plain);
+
+        Assert.NotEqual(first, second);
+    }
+
+    [Fact]
+    public void ChaCha20_TamperedCiphertext_IsRejected()
+    {
+        byte[] key = MasterKey();
+        byte[] plain = RandomNumberGenerator.GetBytes(123);
+        byte[] cipher = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.ChaCha20, 0, 4096, 4194304, plain);
+        cipher[25] ^= 0x80;
+
+        Assert.Throws<CryptographicException>(() => ChunkEncryptor.DecryptChunk(
+            key, CipherAlgorithm.ChaCha20, 0, 4096, 4194304, cipher, plain.Length));
     }
 }

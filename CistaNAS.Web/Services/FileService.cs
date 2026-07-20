@@ -307,6 +307,9 @@ public sealed class FileService
     /// <summary>チャンクモードの部分書き込み本体。該当チャンクを RMW（復号→部分更新→再暗号化）して S3 に上書き。</summary>
     private async Task<FileMetadata> PatchChunkedAsync(string volumeName, string fileName, long offset, Stream content, long contentLength, CancellationToken ct)
     {
+        if (contentLength > int.MaxValue)
+            throw new FileServiceException("差分書き込みは2GiB以下である必要があります。");
+
         var (header, masterKey) = _volumeService.GetMountedKeys(volumeName);
         int chunkSize = header.EffectiveServerChunkSize;
         int sectorSize = header.EffectiveSectorSize;
@@ -325,22 +328,54 @@ public sealed class FileService
 
             SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
             await catLock.WaitAsync(ct);
+            string? newObjectId = null;
+            bool catalogPublished = false;
             try
             {
                 using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
                 var catalog = await LoadCatalogAsync(volumeName, ct);
                 catalog.Files.TryGetValue(fileName, out var existing);
-                string objectId = existing?.ChunkObjectId ?? fileName;
 
-                var chunkSizes = existing?.ChunkSizes ?? new List<int>();
+                if (contentLength == 0)
+                {
+                    if (existing is not null)
+                    {
+                        await _journalService.CommitAsync(volumeName, opId, ct);
+                        return existing;
+                    }
+
+                    newObjectId = $"{fileName}.patch-{Guid.NewGuid():N}";
+                    var empty = new FileMetadata
+                    {
+                        Name = fileName,
+                        Offset = 0,
+                        Length = 0,
+                        ChunkCount = 0,
+                        ChunkSizes = [],
+                        ChunkObjectId = newObjectId,
+                        CreatedAt = DateTimeOffset.UtcNow,
+                        ModifiedAt = DateTimeOffset.UtcNow,
+                    };
+                    catalog.Files[fileName] = empty;
+                    await SaveCatalogAsync(volumeName, catalog, ct);
+                    catalogPublished = true;
+                    await _journalService.CommitAsync(volumeName, opId, ct);
+                    return empty;
+                }
+
+                string oldObjectId = existing?.ChunkObjectId ?? fileName;
+                newObjectId = $"{fileName}.patch-{Guid.NewGuid():N}";
+
+                var chunkSizes = existing is null ? new List<int>() : new List<int>(existing.ChunkSizes);
                 long existingLength = existing?.Length ?? 0;
-                long newLength = Math.Max(existingLength, offset + contentLength);
-                int firstChunk = (int)(offset / chunkSize);
-                int lastChunk = (int)((offset + contentLength - 1) / chunkSize);
-                int lastNeeded = (int)((newLength - 1) / chunkSize);
+                long writeEnd = checked(offset + contentLength);
+                long newLength = Math.Max(existingLength, writeEnd);
+                int firstChunk = checked((int)(offset / chunkSize));
+                int lastChunk = checked((int)((writeEnd - 1) / chunkSize));
+                int lastNeeded = checked((int)((newLength - 1) / chunkSize));
 
                 // 書き込みデータを一時バッファへ（差分編集なので通常小さい）
-                byte[] contentData = new byte[contentLength];
+                byte[] contentData = new byte[checked((int)contentLength)];
                 int totalRead = 0;
                 while (totalRead < contentLength)
                 {
@@ -348,27 +383,39 @@ public sealed class FileService
                     if (n == 0) break;
                     totalRead += n;
                 }
+                if (totalRead != contentLength)
+                    throw new FileServiceException("リクエスト本文がContent-Lengthより短いです。");
 
                 for (int ci = 0; ci <= lastNeeded; ci++)
                 {
                     bool inWriteRange = ci >= firstChunk && ci <= lastChunk;
                     bool isExisting = ci < chunkSizes.Count;
-                    // 既存チャンクで書き込み範囲外 → 维持（再書き込みしない）
-                    if (!inWriteRange && isExisting) continue;
+                    byte[]? oldStored = isExisting
+                        ? await _chunkStore.ReadChunkAsync(volumeName, oldObjectId, ci, ct)
+                        : null;
+                    if (isExisting && oldStored is null)
+                        throw new FileServiceException($"既存チャンク {ci} が見つかりません。");
+
+                    // 新しいオブジェクトへ全チャンクをコピーしてからカタログを切り替える。
+                    // 範囲外チャンクは暗号文のままコピーできる。
+                    if (!inWriteRange && oldStored is not null)
+                    {
+                        using var copyStream = new MemoryStream(oldStored, writable: false);
+                        await _chunkStore.WriteChunkAsync(volumeName, newObjectId, ci, copyStream, ct);
+                        continue;
+                    }
 
                     int curPlainSize = (int)Math.Min(chunkSize, newLength - (long)ci * chunkSize);
                     if (curPlainSize <= 0) break;
 
                     byte[] plain = new byte[curPlainSize];
-                    if (encrypted && isExisting && chunkSizes[ci] > 0)
+                    if (oldStored is not null && chunkSizes[ci] > 0)
                     {
-                        byte[]? enc = await _chunkStore.ReadChunkAsync(volumeName, objectId, ci, ct);
-                        if (enc is not null)
-                        {
-                            int origLen = Math.Min(chunkSizes[ci], curPlainSize);
-                            var dec = ChunkEncryptor.DecryptChunk(masterKey!, algorithm, ci, sectorSize, chunkSize, enc, origLen);
-                            Array.Copy(dec, plain, Math.Min(dec.Length, plain.Length));
-                        }
+                        int origLen = Math.Min(chunkSizes[ci], curPlainSize);
+                        byte[] previous = encrypted
+                            ? ChunkEncryptor.DecryptChunk(masterKey!, algorithm, ci, sectorSize, chunkSize, oldStored, origLen)
+                            : oldStored;
+                        Array.Copy(previous, plain, Math.Min(previous.Length, plain.Length));
                     }
 
                     if (inWriteRange)
@@ -386,7 +433,7 @@ public sealed class FileService
                         ? ChunkEncryptor.EncryptChunk(masterKey!, algorithm, ci, sectorSize, chunkSize, plain)
                         : plain;
                     using var ms = new MemoryStream(stored);
-                     await _chunkStore.WriteChunkAsync(volumeName, objectId, ci, ms, ct);
+                    await _chunkStore.WriteChunkAsync(volumeName, newObjectId, ci, ms, ct);
 
                     while (chunkSizes.Count <= ci) chunkSizes.Add(0);
                     chunkSizes[ci] = curPlainSize;
@@ -399,15 +446,31 @@ public sealed class FileService
                     Length = newLength,
                     ChunkCount = lastNeeded + 1,
                     ChunkSizes = chunkSizes,
-                    ChunkObjectId = objectId,
+                    ChunkObjectId = newObjectId,
                     CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
                     ModifiedAt = DateTimeOffset.UtcNow,
                 };
                 catalog.Files[fileName] = meta;
                 await SaveCatalogAsync(volumeName, catalog, ct);
+                catalogPublished = true;
 
                 await _journalService.CommitAsync(volumeName, opId, ct);
+
+                if (existing is not null)
+                {
+                    try { await _chunkStore.DeleteChunksAsync(volumeName, oldObjectId, ct); }
+                    catch { /* カタログは新オブジェクトを参照済み。旧世代の削除はベストエフォート。 */ }
+                }
                 return meta;
+            }
+            catch
+            {
+                if (!catalogPublished && newObjectId is not null)
+                {
+                    try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, newObjectId, CancellationToken.None); }
+                    catch { }
+                }
+                throw;
             }
             finally
             {

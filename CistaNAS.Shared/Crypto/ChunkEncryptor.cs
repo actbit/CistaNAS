@@ -12,6 +12,11 @@ namespace CistaNAS.Shared.Crypto;
 /// </summary>
 public static class ChunkEncryptor
 {
+    private static ReadOnlySpan<byte> ChaCha20V2Magic => "CSTCH20\x02"u8;
+    private static ReadOnlySpan<byte> ChaCha20V2KeyInfo => "cista-chacha20-chunk-key/v2"u8;
+    private const int ChaCha20NonceSize = 12;
+    private const int ChaCha20TagSize = 16;
+
     /// <summary>
     /// 平文チャンクを暗号化する。
     /// </summary>
@@ -50,8 +55,7 @@ public static class ChunkEncryptor
                 break;
 
             case CipherAlgorithm.ChaCha20:
-                ChaCha20Encrypt(masterKey, firstSector, padded, sectorSize);
-                break;
+                return EncryptChaCha20V2(masterKey, padded);
 
             default:
                 throw new ArgumentException($"サポートされていない暗号化アルゴリズム: {algorithm}");
@@ -97,7 +101,10 @@ public static class ChunkEncryptor
                 break;
 
             case CipherAlgorithm.ChaCha20:
-                ChaCha20Decrypt(masterKey, firstSector, padded, sectorSize);
+                if (IsChaCha20V2(ciphertext))
+                    padded = DecryptChaCha20V2(masterKey, ciphertext);
+                else
+                    ChaCha20Decrypt(masterKey, firstSector, padded, sectorSize);
                 break;
 
             default:
@@ -121,11 +128,63 @@ public static class ChunkEncryptor
         return (length + block - 1) / block * block;
     }
 
+    private static byte[] EncryptChaCha20V2(ReadOnlySpan<byte> masterKey, byte[] plaintext)
+    {
+        byte[] key = DeriveChaCha20V2Key(masterKey);
+        byte[] nonce = RandomNumberGenerator.GetBytes(ChaCha20NonceSize);
+        try
+        {
+            var (_, ciphertext, tag) = ChaCha20Poly1305.Encrypt(plaintext, key, nonce);
+            byte[] result = new byte[ChaCha20V2Magic.Length + nonce.Length + ciphertext.Length + tag.Length];
+            int offset = 0;
+            ChaCha20V2Magic.CopyTo(result);
+            offset += ChaCha20V2Magic.Length;
+            nonce.CopyTo(result, offset);
+            offset += nonce.Length;
+            ciphertext.CopyTo(result, offset);
+            offset += ciphertext.Length;
+            tag.CopyTo(result, offset);
+            return result;
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(key);
+        }
+    }
+
+    private static bool IsChaCha20V2(ReadOnlySpan<byte> ciphertext)
+        => ciphertext.Length >= ChaCha20V2Magic.Length + ChaCha20NonceSize + ChaCha20TagSize
+            && ciphertext[..ChaCha20V2Magic.Length].SequenceEqual(ChaCha20V2Magic);
+
+    private static byte[] DecryptChaCha20V2(ReadOnlySpan<byte> masterKey, ReadOnlySpan<byte> stored)
+    {
+        int offset = ChaCha20V2Magic.Length;
+        byte[] nonce = stored.Slice(offset, ChaCha20NonceSize).ToArray();
+        offset += ChaCha20NonceSize;
+        int ciphertextLength = stored.Length - offset - ChaCha20TagSize;
+        byte[] ciphertext = stored.Slice(offset, ciphertextLength).ToArray();
+        byte[] tag = stored[^ChaCha20TagSize..].ToArray();
+        byte[] key = DeriveChaCha20V2Key(masterKey);
+        try
+        {
+            return ChaCha20Poly1305.Decrypt(ciphertext, tag, nonce, key);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(key);
+        }
+    }
+
+    private static byte[] DeriveChaCha20V2Key(ReadOnlySpan<byte> masterKey)
+    {
+        byte[] key = new byte[32];
+        HKDF.DeriveKey(HashAlgorithmName.SHA256, masterKey, key, ReadOnlySpan<byte>.Empty, ChaCha20V2KeyInfo);
+        return key;
+    }
+
     /// <summary>ChaCha20 暗号化（サーバー側実装）。</summary>
     /// <remarks>
-    /// ノンスは HKDF で sectorIndex から導出する（ボリューム内・ボリューム間で衝突しない）。
-    /// サーバー側暗号化のため認証タグは付与しない（サーバーが信頼できる前提）。
-    /// E2EE モードでのデータ完全性保証には ChaCha20-Poly1305 を使用すること。
+    /// 旧保存形式の復号互換用。新規暗号化はランダム nonce と Poly1305 タグを持つ v2 形式を使用する。
     /// </remarks>
     private static void ChaCha20Encrypt(ReadOnlySpan<byte> masterKey, long firstSector, byte[] data, int sectorSize)
     {

@@ -60,6 +60,9 @@ public sealed class E2eeFileEntry
     /// 0=初回（従来フォーマットと後方互換）。要素不足/空は 0 扱い。クライアントは復号時にこの revision を nonce 導出に使う。</summary>
     public List<int> ChunkRevisions { get; set; } = [];
 
+    /// <summary>各チャンクが参照する不変オブジェクトID。要素不足は旧形式の FileId を使用する。</summary>
+    public List<string> ChunkObjectIds { get; set; } = [];
+
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset ModifiedAt { get; set; }
 

@@ -223,6 +223,38 @@ public class FileServiceChunkModeTests : IAsyncDisposable
         Assert.Empty(chunksAfter);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Patch_ChunkMode_UsesCopyOnWriteAndPreservesUntouchedBytes(bool encrypted)
+    {
+        string vol = "chunk-patch-" + encrypted.ToString().ToLowerInvariant();
+        await _vs.CreateAsync(vol, "testuser", "testpw", encrypted);
+        var fs = GetFileService();
+        var chunkStore = _sp.GetRequiredService<IChunkStore>();
+        byte[] original = RandomNumberGenerator.GetBytes(65536 * 2 + 123);
+
+        FileMetadata uploaded;
+        using (var input = new MemoryStream(original))
+            uploaded = await fs.UploadAsync(vol, "patch.bin", input, original.Length);
+
+        byte[] patch = RandomNumberGenerator.GetBytes(70000);
+        byte[] expected = original.ToArray();
+        patch.CopyTo(expected, 32000);
+        FileMetadata updated;
+        using (var input = new MemoryStream(patch))
+            updated = await fs.PatchRangeAsync(vol, "patch.bin", 32000, input, patch.Length);
+
+        Assert.NotEqual(uploaded.ChunkObjectId, updated.ChunkObjectId);
+        Assert.Empty(await chunkStore.ListChunksAsync(vol, Assert.IsType<string>(uploaded.ChunkObjectId)));
+
+        var download = await fs.DownloadAsync(vol, "patch.bin");
+        await using var stream = download.Stream;
+        byte[] actual = new byte[download.Length];
+        await stream.ReadExactlyAsync(actual);
+        Assert.Equal(expected, actual);
+    }
+
     [Fact]
     public async Task Download_ChunkMode_SeekableStream()
     {

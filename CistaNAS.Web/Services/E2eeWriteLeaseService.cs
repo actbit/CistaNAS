@@ -88,6 +88,11 @@ public sealed class E2eeWriteLeaseService
             if (completed == heartbeat)
             {
                 operationCts.Cancel();
+                // キャンセルは協調的なので、書き込み処理が実際に停止するまで待つ。
+                // ここを待たずにリース更新例外を返すと、期限切れ後の次の writer と
+                // キャンセル未完了の旧 writer が並行してストレージを変更し得る。
+                try { await operation; }
+                catch (OperationCanceledException) when (operationCts.IsCancellationRequested) { }
                 await heartbeat;
             }
 
