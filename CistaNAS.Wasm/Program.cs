@@ -34,6 +34,7 @@ builder.Services.AddScoped<FileApiClient>();
 builder.Services.AddScoped<AuthApiClient>();
 builder.Services.AddScoped<AccountApiClient>();
 builder.Services.AddScoped<E2eeApiClient>();
+builder.Services.AddScoped<E2eeFileTransferService>();
 builder.Services.AddScoped<GroupApiClient>();
 builder.Services.AddScoped<EncryptionSettingsClient>();
 builder.Services.AddScoped<ClientVolumeMountService>();
