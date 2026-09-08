@@ -52,7 +52,7 @@ public sealed partial class VolumeService
             if (await _metaStore.ExistsAsync(name))
                 throw new VolumeException($"ボリューム '{name}' は既に存在します。");
 
-            var (header, masterKey) = VolumeHeader.Create(name, username, password, VolOpts.SectorSize, VolOpts.KdfIterations, shouldEncrypt, cipherAlgorithm);
+            var (header, masterKey) = VolumeHeader.Create(name, username, password, VolOpts.SectorSize, VolOpts.ToKdfSpec(), shouldEncrypt, cipherAlgorithm);
 
             // チャンクモード判定: "auto" かつ S3 プロバイダ使用時
             bool chunkMode = ShouldUseChunkMode();

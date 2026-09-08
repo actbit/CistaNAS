@@ -461,7 +461,10 @@ public static class ApiEndpoints
             {
                 DefaultEncryptionMode = vol.DefaultEncryptionMode ?? "server",
                 E2eeChunkSize = vol.E2eeChunkSize > 0 ? vol.E2eeChunkSize : 1048576,
-                KdfIterations = vol.KdfIterations > 0 ? vol.KdfIterations : 310_000,
+                KdfIterations = vol.KdfIterations > 0 ? vol.KdfIterations : 600_000,
+                KdfMemoryKiB = vol.KdfMemoryKiB > 0 ? vol.KdfMemoryKiB : 65536,
+                KdfTimeCost = vol.KdfTimeCost > 0 ? vol.KdfTimeCost : 4,
+                KdfParallelism = vol.KdfParallelism > 0 ? vol.KdfParallelism : 4,
                 SectorSize = vol.SectorSize > 0 ? vol.SectorSize : 4096,
             });
         })

@@ -47,6 +47,7 @@ public sealed record WrappedKeyResponse(
     string? EphemeralPublicKey,
     int ChunkSize);
 
-public sealed record KdfResponse(string Algorithm, int Iterations, string Salt);
+/// <summary>ボリュームヘッダ KdfParams の API 表現。algorithm=="argon2id" は Argon2id+PBKDF2 合成。</summary>
+public sealed record KdfResponse(string Algorithm, int Iterations, int MemoryKiB, int Parallelism, int TimeCost, string Salt);
 
 public sealed record WrappedMasterKeyResponse(string Algorithm, string Nonce, string Ciphertext, string Tag);

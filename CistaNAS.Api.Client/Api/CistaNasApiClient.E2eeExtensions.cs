@@ -118,9 +118,15 @@ public static class CistaNasApiClientE2eeExtensions
         res.EnsureSuccessStatusCode();
     }
 
-    /// <summary>グループ専用 E2EE ボリュームを作成する（オーナー鍵は password ラップ）。</summary>
-    public static async Task<VolumeInfo> CreateGroupVolumeAsync(this CistaNasApiClient client, string groupName,
+    /// <summary>グループ専用 E2EE ボリュームを作成する（オーナー鍵は password ラップ。レガシー PBKDF2）。</summary>
+    public static Task<VolumeInfo> CreateGroupVolumeAsync(this CistaNasApiClient client, string groupName,
         byte[] wrappedNonce, byte[] wrappedCt, byte[] wrappedTag, byte[] kdfSalt, int kdfIterations, int chunkSize = 1048576)
+        => CreateGroupVolumeAsync(client, groupName, wrappedNonce, wrappedCt, wrappedTag, kdfSalt,
+            KdfInfo.LegacyPbkdf2(kdfIterations), chunkSize);
+
+    /// <summary>グループ専用 E2EE ボリュームを作成する（オーナー鍵は password ラップ。KDF スペック指定）。</summary>
+    public static async Task<VolumeInfo> CreateGroupVolumeAsync(this CistaNasApiClient client, string groupName,
+        byte[] wrappedNonce, byte[] wrappedCt, byte[] wrappedTag, byte[] kdfSalt, KdfInfo kdf, int chunkSize = 1048576)
     {
         var http = client._http;
         var req = new
@@ -131,8 +137,11 @@ public static class CistaNasApiClientE2eeExtensions
                 wrapType = "password",
                 kdf = new
                 {
-                    algorithm = "pbkdf2-sha256",
-                    iterations = kdfIterations,
+                    algorithm = kdf.Algorithm,
+                    iterations = kdf.Iterations,
+                    memoryKiB = kdf.MemoryKiB,
+                    timeCost = kdf.TimeCost,
+                    parallelism = kdf.Parallelism,
                     salt = kdfSalt
                 },
                 wrappedMasterKey = new

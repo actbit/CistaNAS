@@ -51,6 +51,9 @@ public sealed class EncryptionSettingsService
             {
                 _options.Volume.SectorSize = persisted.Volume.SectorSize;
                 _options.Volume.KdfIterations = persisted.Volume.KdfIterations;
+                _options.Volume.KdfMemoryKiB = persisted.Volume.KdfMemoryKiB;
+                _options.Volume.KdfTimeCost = persisted.Volume.KdfTimeCost;
+                _options.Volume.KdfParallelism = persisted.Volume.KdfParallelism;
                 _options.Volume.DefaultEncryptionMode = persisted.Volume.DefaultEncryptionMode;
                 _options.Volume.E2eeChunkSize = persisted.Volume.E2eeChunkSize;
                 _options.Volume.ChunkStorage = persisted.Volume.ChunkStorage;
@@ -80,6 +83,9 @@ public sealed class EncryptionSettingsService
             {
                 SectorSize = volume.SectorSize,
                 KdfIterations = volume.KdfIterations,
+                KdfMemoryKiB = volume.KdfMemoryKiB,
+                KdfTimeCost = volume.KdfTimeCost,
+                KdfParallelism = volume.KdfParallelism,
                 DefaultEncryptionMode = volume.DefaultEncryptionMode,
                 E2eeChunkSize = volume.E2eeChunkSize,
                 ChunkStorage = volume.ChunkStorage,
@@ -105,6 +111,9 @@ public sealed class EncryptionSettingsService
         {
             SectorSize = body.SectorSize,
             KdfIterations = body.KdfIterations,
+            KdfMemoryKiB = body.KdfMemoryKiB,
+            KdfTimeCost = body.KdfTimeCost,
+            KdfParallelism = body.KdfParallelism,
             DefaultEncryptionMode = body.DefaultEncryptionMode,
             E2eeChunkSize = body.E2eeChunkSize,
             ChunkStorage = current.ChunkStorage,
@@ -117,8 +126,15 @@ public sealed class EncryptionSettingsService
     {
         if (body.SectorSize is < 512 or > 4096 || body.SectorSize % 16 != 0)
             throw new ArgumentOutOfRangeException(nameof(body.SectorSize));
+        // KdfIterations は合成 KDF の後段 PBKDF2 反復数
         if (body.KdfIterations is < 600_000 or > 10_000_000)
             throw new ArgumentOutOfRangeException(nameof(body.KdfIterations));
+        if (body.KdfMemoryKiB is < 8192 or > 1_048_576)
+            throw new ArgumentOutOfRangeException(nameof(body.KdfMemoryKiB));
+        if (body.KdfTimeCost is < 1 or > 32)
+            throw new ArgumentOutOfRangeException(nameof(body.KdfTimeCost));
+        if (body.KdfParallelism is < 1 or > 16)
+            throw new ArgumentOutOfRangeException(nameof(body.KdfParallelism));
         if (body.E2eeChunkSize is < 65_536 or > 16_777_216)
             throw new ArgumentOutOfRangeException(nameof(body.E2eeChunkSize));
         if (!string.Equals(body.DefaultEncryptionMode, "server", StringComparison.OrdinalIgnoreCase)
@@ -193,6 +209,9 @@ public sealed class EncryptionSettingsService
     {
         public int SectorSize { get; set; }
         public int KdfIterations { get; set; }
+        public int KdfMemoryKiB { get; set; }
+        public int KdfTimeCost { get; set; }
+        public int KdfParallelism { get; set; }
         public string DefaultEncryptionMode { get; set; } = "server";
         public int E2eeChunkSize { get; set; }
         public string ChunkStorage { get; set; } = "local";

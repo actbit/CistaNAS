@@ -32,6 +32,8 @@
     <script src="_framework/blazor.webassembly#[.{fingerprint}].js"></script>
     <script src="js/site.js"></script>
     <script src="js/mediaHelper.js"></script>
+    <!-- hash-wasm (Argon2id, RFC 9106)。wasm は data: URI 埋め込みのため CSP 'wasm-unsafe-eval' で動作 -->
+    <script src="js/argon2.umd.min.js"></script>
     <script type="module" src="js/e2ee.js"></script>
 </body>
 

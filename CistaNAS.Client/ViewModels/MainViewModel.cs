@@ -76,6 +76,9 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty] private string _encDefaultMode = "server";
     [ObservableProperty] private int _encChunkSize = 1048576;
     [ObservableProperty] private int _encKdfIterations = 600_000;
+    [ObservableProperty] private int _encKdfMemoryKiB = 65536;
+    [ObservableProperty] private int _encKdfTimeCost = 4;
+    [ObservableProperty] private int _encKdfParallelism = 4;
     [ObservableProperty] private int _encSectorSize = 4096;
 
     // ---- 設定: E2EE鍵ペア ----
@@ -294,26 +297,28 @@ public partial class MainViewModel : ObservableObject
 
     private async Task CreateE2eeVolumeAsync()
     {
+        // Argon2id+PBKDF2 合成 KDF（サーバー既定スペックと同一）
         byte[] salt = RandomNumberGenerator.GetBytes(16);
-        using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, CreateVolPassword, salt, 600_000));
+        using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, CreateVolPassword, salt, KdfSpec.DefaultArgon2id));
         byte[] masterKey = new byte[32];
         RandomNumberGenerator.Fill(masterKey);
         using var mkBuf = new SecureBuffer(masterKey);
         var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(mkBuf.Buffer, kekBuf.Buffer);
 
-        await _api!.CreateVolumeAsync(CreateVolName, Username!, nonce, ct, tag, salt, 600_000);
+        await _api!.CreateVolumeAsync(CreateVolName, Username!, nonce, ct, tag, salt, KdfInfo.DefaultArgon2id);
     }
 
     private async Task CreateGroupE2eeVolumeAsync()
     {
+        // Argon2id+PBKDF2 合成 KDF（サーバー既定スペックと同一）
         byte[] salt = RandomNumberGenerator.GetBytes(16);
-        using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, CreateVolPassword, salt, 600_000));
+        using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, CreateVolPassword, salt, KdfSpec.DefaultArgon2id));
         byte[] masterKey = new byte[32];
         RandomNumberGenerator.Fill(masterKey);
         using var mkBuf = new SecureBuffer(masterKey);
         var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(mkBuf.Buffer, kekBuf.Buffer);
 
-        await CistaNasApiClientE2eeExtensions.CreateGroupVolumeAsync(_api!, CreateVolName, nonce, ct, tag, salt, 600_000);
+        await CistaNasApiClientE2eeExtensions.CreateGroupVolumeAsync(_api!, CreateVolName, nonce, ct, tag, salt, KdfInfo.DefaultArgon2id);
     }
 
     [RelayCommand]
@@ -498,7 +503,8 @@ public partial class MainViewModel : ObservableObject
 
             // 自分の wrapped key を取得してアンラップ
             var wkInfo = await _api.GetWrappedKeyAsync(SelectedVolume.Name, Username!);
-            using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, GrantGranterPassword, wkInfo.KdfSalt, wkInfo.KdfIterations));
+            using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, GrantGranterPassword, wkInfo.KdfSalt, new KdfSpec(
+                wkInfo.KdfAlgorithm, wkInfo.KdfIterations, wkInfo.KdfMemoryKiB, wkInfo.KdfParallelism, wkInfo.KdfTimeCost)));
             using var mkBuf = new SecureBuffer(E2eeCrypto.UnwrapMasterKey(wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag, kekBuf.Buffer));
 
             // ECIES ラップ (E2eeCrypto を使用) - 相手公開鍵は raw 非圧縮点 65B
@@ -679,6 +685,9 @@ public partial class MainViewModel : ObservableObject
             EncDefaultMode = settings.DefaultEncryptionMode;
             EncChunkSize = settings.E2eeChunkSize;
             EncKdfIterations = settings.KdfIterations;
+            EncKdfMemoryKiB = settings.KdfMemoryKiB;
+            EncKdfTimeCost = settings.KdfTimeCost;
+            EncKdfParallelism = settings.KdfParallelism;
             EncSectorSize = settings.SectorSize;
         }
         catch { }
@@ -695,6 +704,9 @@ public partial class MainViewModel : ObservableObject
                 DefaultEncryptionMode = EncDefaultMode,
                 E2eeChunkSize = EncChunkSize,
                 KdfIterations = EncKdfIterations,
+                KdfMemoryKiB = EncKdfMemoryKiB,
+                KdfTimeCost = EncKdfTimeCost,
+                KdfParallelism = EncKdfParallelism,
                 SectorSize = EncSectorSize,
             };
             await CistaNasApiClientSettings.SaveEncryptionSettingsAsync(_api, settings);

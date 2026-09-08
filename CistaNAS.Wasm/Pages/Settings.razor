@@ -245,9 +245,33 @@ else
                     <div class="form-text">E2EE ボリュームのチャンク分割サイズ。小さいほどストリーミングに有利、大きいほどオーバーヘッドが少ない。</div>
                 </div>
                 <div class="col-12">
-                    <label class="form-label">PBKDF2 反復回数（ボリューム鍵導出）</label>
-                    <input type="number" class="form-control" @bind="_encSettings.KdfIterations" min="10000" step="10000" />
-                    <div class="form-text">現在の設定: @_encSettings.KdfIterations.ToString("N0")。高いほど安全だが遅い。</div>
+                    <label class="form-label">KDF メモリ量（Argon2id、ボリューム鍵導出）</label>
+                    <select class="form-select" @bind="_encSettings.KdfMemoryKiB">
+                        <option value="16384">16 MB（高速・テスト用）</option>
+                        <option value="32768">32 MB</option>
+                        <option value="65536">64 MB（推奨）</option>
+                        <option value="131072">128 MB</option>
+                        <option value="262144">256 MB</option>
+                    </select>
+                    <div class="form-text">Argon2id のメモリ困難性パラメータ。大きいほど GPU/ASIC での総当たり攻撃に強いが、ロック解除が遅くなる。</div>
+                </div>
+                <div class="col-12">
+                    <label class="form-label">KDF 時間コスト t / 並列度 p（Argon2id）</label>
+                    <div class="row g-2">
+                        <div class="col">
+                            <input type="number" class="form-control" @bind="_encSettings.KdfTimeCost" min="1" max="32" />
+                            <div class="form-text">t（パス数）</div>
+                        </div>
+                        <div class="col">
+                            <input type="number" class="form-control" @bind="_encSettings.KdfParallelism" min="1" max="16" />
+                            <div class="form-text">p（レーン数）</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-12">
+                    <label class="form-label">後段 PBKDF2 反復数（Argon2id 合成 KDF のバックストップ）</label>
+                    <input type="number" class="form-control" @bind="_encSettings.KdfIterations" min="600000" step="10000" />
+                    <div class="form-text">現在の設定: @_encSettings.KdfIterations.ToString("N0")。Argon2id 後に追加でかかる CPU コスト。既存ボリュームには影響しない。</div>
                 </div>
                 <div class="col-12">
                     <label class="form-label">セクタサイズ（AES-XTS）</label>
@@ -528,22 +552,29 @@ else
             // 公開鍵をエクスポート
             string pubKeyB64 = await E2ee.ExportPublicKey(pubHandle);
 
-            // 秘密鍵をパスワードで暗号化
+            // 秘密鍵をパスワードで暗号化（Argon2id+PBKDF2 合成 KDF、サーバー設定のパラメータを使用）
+            var encSettings = await EncSettingsApi.GetAsync();
+            var privKdf = E2eeKdfOptions.NewArgon2id(
+                encSettings.KdfIterations, encSettings.KdfMemoryKiB, encSettings.KdfTimeCost, encSettings.KdfParallelism);
             byte[] salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
             string saltB64 = Convert.ToBase64String(salt);
-            var (nonceB64, wrappedB64) = await E2ee.EncryptPrivateKey(privHandle, _keyPassword, saltB64, 600_000);
+            var (nonceB64, wrappedB64) = await E2ee.EncryptPrivateKey(privHandle, _keyPassword, saltB64, privKdf);
 
             // サーバーに公開鍵を登録
             await AccountApi.UpdatePublicKeyAsync(pubKeyB64);
 
-            // 暗号化済み秘密鍵を localStorage に保存
+            // 暗号化済み秘密鍵を localStorage に保存（KDF パラメータも記録。旧スキーマはレガシー PBKDF2 として復号）
             string key = $"e2ee_privkey_{Auth.CurrentUsername}";
             string json = System.Text.Json.JsonSerializer.Serialize(new
             {
                 wrapped = wrappedB64,
                 nonce = nonceB64,
                 salt = saltB64,
-                iterations = 600000
+                iterations = privKdf.Iterations,
+                algorithm = privKdf.Algorithm,
+                memoryKiB = privKdf.MemoryKiB,
+                timeCost = privKdf.TimeCost,
+                parallelism = privKdf.Parallelism,
             });
             await JS.InvokeVoidAsync("localStorage.setItem", key, json);
 

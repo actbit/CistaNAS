@@ -7,6 +7,7 @@
 @inject AccountApiClient AccountApi
 @inject E2eeApiClient E2eeApi
 @inject GroupApiClient GroupApi
+@inject EncryptionSettingsClient EncSettingsApi
 @inject E2eeInterop E2ee
 @inject ClientVolumeMountService MountService
 @inject WasmAuthStateProvider Auth
@@ -492,16 +493,28 @@ else
         await VolumeApi.CreateGroupE2eeAsync(_createModel.Name.Trim(), ownerWrappedKey);
     }
 
+    /// <summary>暗号化設定のキャッシュ（鍵導出スペック取得用）。取得失敗時はクライアント既定値。</summary>
+    private EncryptionSettings? _encSettings;
+    private async Task<EncryptionSettings> GetEncSettingsAsync()
+    {
+        if (_encSettings is not null) return _encSettings;
+        try { _encSettings = await EncSettingsApi.GetAsync(); }
+        catch { _encSettings = new EncryptionSettings(); }
+        return _encSettings;
+    }
+
     /// <summary>
-    /// ブラウザ側 JS Interop でパスワードから KEK 導出 → マスターキー生成 → AES-256-GCM ラップを行い、
-    /// サーバー送信用の UserWrappedKey を構築する。
+    /// ブラウザ側 JS Interop でパスワードから KEK 導出（Argon2id+PBKDF2 合成）→
+    /// マスターキー生成 → AES-256-GCM ラップを行い、サーバー送信用の UserWrappedKey を構築する。
     /// </summary>
     private async Task<UserWrappedKey> CreatePasswordWrappedKeyAsync(
-        string password, string wrapType = "password", int iterations = 600_000)
+        string password, string wrapType = "password")
     {
+        var settings = await GetEncSettingsAsync();
+        var kdf = E2eeKdfOptions.NewArgon2id(settings.KdfIterations, settings.KdfMemoryKiB, settings.KdfTimeCost, settings.KdfParallelism);
         byte[] salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
         string saltB64 = Convert.ToBase64String(salt);
-        string kekHandle = await E2ee.DeriveKek(password, saltB64, iterations, Auth.CurrentUsername);
+        string kekHandle = await E2ee.DeriveKek(password, saltB64, kdf, Auth.CurrentUsername);
         string mkHandle = await E2ee.GenerateMasterKey();
         var (nonceB64, ctB64, tagB64) = await E2ee.WrapMasterKey(mkHandle, kekHandle);
         await E2ee.ClearKey(kekHandle);
@@ -510,7 +523,15 @@ else
         return new UserWrappedKey
         {
             WrapType = wrapType,
-            Kdf = new() { Algorithm = "pbkdf2-sha256", Iterations = iterations, Salt = salt },
+            Kdf = new()
+            {
+                Algorithm = E2eeKdfOptions.Argon2id,
+                Iterations = kdf.Iterations,
+                MemoryKiB = kdf.MemoryKiB,
+                TimeCost = kdf.TimeCost,
+                Parallelism = kdf.Parallelism,
+                Salt = salt,
+            },
             WrappedMasterKey = new()
             {
                 Algorithm = "aes-256-gcm",
@@ -600,7 +621,7 @@ else
                                 privRoot.GetProperty("nonce").GetString()!,
                                 _mountPassword,
                                 privRoot.GetProperty("salt").GetString()!,
-                                privRoot.GetProperty("iterations").GetInt32());
+                                E2eeInterop.ReadPrivKeyKdf(privRoot));
                         }
                         catch
                         {
@@ -620,7 +641,10 @@ else
                     else
                     {
                         kekHandle = await E2ee.DeriveKek(_mountPassword,
-                            wrappedKeyResp.Kdf.Salt, wrappedKeyResp.Kdf.Iterations, Auth.CurrentUsername);
+                            wrappedKeyResp.Kdf.Salt,
+                            new E2eeKdfOptions(wrappedKeyResp.Kdf.Algorithm, wrappedKeyResp.Kdf.Iterations,
+                                wrappedKeyResp.Kdf.MemoryKiB, wrappedKeyResp.Kdf.TimeCost, wrappedKeyResp.Kdf.Parallelism),
+                            Auth.CurrentUsername);
 
                         mkHandle = await E2ee.UnwrapMasterKey(
                             wrappedKeyResp.WrappedMasterKey.Nonce,
@@ -802,7 +826,10 @@ else
             try
             {
                 kekHandle = await E2ee.DeriveKek(_grantGranterPassword,
-                    wrappedKeyResp.Kdf.Salt, wrappedKeyResp.Kdf.Iterations, Auth.CurrentUsername);
+                    wrappedKeyResp.Kdf.Salt,
+                    new E2eeKdfOptions(wrappedKeyResp.Kdf.Algorithm, wrappedKeyResp.Kdf.Iterations,
+                        wrappedKeyResp.Kdf.MemoryKiB, wrappedKeyResp.Kdf.TimeCost, wrappedKeyResp.Kdf.Parallelism),
+                    Auth.CurrentUsername);
 
                 mkHandle = await E2ee.UnwrapMasterKey(
                     wrappedKeyResp.WrappedMasterKey.Nonce,

@@ -1,6 +1,6 @@
 using System.Security.Claims;
-using System.Security.Cryptography;
 using CistaNAS.Web.Configuration;
+using CistaNAS.Web.Crypto;
 using CistaNAS.Web.Identity;
 using CistaNAS.Web.Models;
 using Microsoft.AspNetCore.Identity;
@@ -33,7 +33,7 @@ public sealed class AuthService(
         if (user is null)
         {
             // ユーザーが存在しない場合もダミー計算を実行してタイミングを均一化（ユーザー列挙対策）
-            DummyHash(options.Value.Auth.Pbkdf2Iterations);
+            Argon2Hasher.RunDummy();
             logger.LogWarning("ログイン失敗: ユーザー '{Username}'", username);
             return null;
         }
@@ -138,17 +138,5 @@ public sealed class AuthService(
     public async Task<bool> ChangePasswordAsync(string username, string oldPassword, string newPassword)
     {
         return await accountService.ChangePasswordAsync(username, oldPassword, newPassword);
-    }
-
-    /// <summary>
-    /// ダミー PBKDF2 計算を実行してタイミングを均一化（ユーザー列挙対策）。
-    /// 実認証（Identity の PBKDF2）の iteration に近い回数でダミー計算を実行し、
-    /// ユーザー存在の有無によるタイミング差を最小化。
-    /// 呼び出し毎にランダムソルトを生成し、事前計算攻撃を防止。
-    /// </summary>
-    private static void DummyHash(int iterations)
-    {
-        byte[] salt = RandomNumberGenerator.GetBytes(16);
-        Rfc2898DeriveBytes.Pbkdf2("dummy"u8, salt, iterations, HashAlgorithmName.SHA256, 32);
     }
 }

@@ -1,8 +1,10 @@
+using System.Collections.Concurrent;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
 using CistaNAS.Web.Configuration;
+using CistaNAS.Web.Crypto;
 using CistaNAS.Web.Services;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.Options;
@@ -11,12 +13,20 @@ namespace CistaNAS.Web.WebDav;
 
 /// <summary>
 /// WebDAV クライアント向け Basic 認証ハンドラ。
-/// UserStore に対してパスワードを検証する。
+/// AuthService に対してパスワードを検証する。
+/// Argon2id 検証は 1 回あたり 64 MiB 相当のメモリを消費するため、成功した資格情報を
+/// 短時間キャッシュし（WebDavAuthCacheSeconds、既定 600 秒）、リクエスト毎の再検証を省略する。
 /// </summary>
 public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchemeOptions>
 {
     private readonly AuthService _authService;
-    private readonly int _iterations;
+    private readonly int _cacheSeconds;
+
+    /// <summary>成功資格情報キャッシュ。キー = SHA256(user:pass)（平文保存を避ける）。</summary>
+    private static readonly ConcurrentDictionary<string, CachedAuth> CredentialCache = new();
+    private const int CacheCapacity = 1024;
+
+    private sealed record CachedAuth(ClaimsPrincipal Principal, DateTimeOffset ExpiresAt);
 
     public BasicAuthHandler(
         IOptionsMonitor<AuthenticationSchemeOptions> options,
@@ -27,8 +37,7 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
         : base(options, logger, encoder)
     {
         _authService = authService;
-        // WebDAV Basic 認証は DoS リスク軽減のため、WebDavPbkdf2Iterations を使用 (H-9)
-        _iterations = cistaOptions.Value.Auth.WebDavPbkdf2Iterations;
+        _cacheSeconds = cistaOptions.Value.Auth.WebDavAuthCacheSeconds;
     }
 
     protected override async Task<AuthenticateResult> HandleAuthenticateAsync()
@@ -49,17 +58,29 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
             string username = decoded[..colon];
             string password = decoded[(colon + 1)..];
 
+            // 成功済み資格情報のキャッシュヒット（Argon2id 再検証を省略）
+            string cacheKey = CacheKey(username, password);
+            if (_cacheSeconds > 0
+                && CredentialCache.TryGetValue(cacheKey, out var cached)
+                && cached.ExpiresAt > DateTimeOffset.UtcNow)
+            {
+                return AuthenticateResult.Success(new AuthenticationTicket(cached.Principal, Scheme.Name));
+            }
+
             var loginResponse = await _authService.AuthenticateAsync(username, password);
             if (loginResponse is null)
             {
                 // ユーザーが存在しない場合もダミー計算を実行してタイミングを均一化
-                DummyHash(_iterations);
+                Argon2Hasher.RunDummy();
                 return AuthenticateResult.Fail("Invalid credentials.");
             }
 
             var principal = await _authService.GetPrincipalAsync(username);
             if (principal is null)
                 return AuthenticateResult.Fail("認証後にユーザーが見つかりません。");
+
+            if (_cacheSeconds > 0)
+                StorePrincipal(cacheKey, principal);
 
             var ticket = new AuthenticationTicket(principal, Scheme.Name);
             return AuthenticateResult.Success(ticket);
@@ -70,13 +91,21 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
         }
     }
 
-    private static void DummyHash(int iterations)
+    private static string CacheKey(string username, string password)
+        => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(username + "\n" + password)));
+
+    private void StorePrincipal(string cacheKey, ClaimsPrincipal principal)
     {
-        // 実認証（Identity の PBKDF2）の iteration に近い回数でダミー計算を実行し、
-        // ユーザー存在の有無によるタイミング差を最小化。
-        // 呼び出し毎にランダムソルトを生成し、事前計算攻撃を防止。
-        byte[] salt = RandomNumberGenerator.GetBytes(16);
-        Rfc2898DeriveBytes.Pbkdf2("dummy"u8, salt, iterations, HashAlgorithmName.SHA256, 32);
+        if (CredentialCache.Count >= CacheCapacity)
+        {
+            // 容量オーバー時は期限切れエントリを掃除
+            foreach (var (key, value) in CredentialCache)
+            {
+                if (value.ExpiresAt <= DateTimeOffset.UtcNow)
+                    CredentialCache.TryRemove(key, out _);
+            }
+        }
+        CredentialCache[cacheKey] = new CachedAuth(principal, DateTimeOffset.UtcNow.AddSeconds(_cacheSeconds));
     }
 
     protected override Task HandleChallengeAsync(AuthenticationProperties properties)

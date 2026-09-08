@@ -51,16 +51,16 @@ public sealed partial class CreateVolumeViewModel(AppServices app) : BusyViewMod
     /// </summary>
     private async Task CreateE2eeVolumeAsync(string username, string password)
     {
-        const int kdfIterations = 600_000;
+        // Argon2id+PBKDF2 合成 KDF（サーバー既定スペックと同一）
         byte[] salt = RandomNumberGenerator.GetBytes(E2eeCrypto.SaltSize);
-        byte[] kek = E2eeCrypto.DeriveKek(username, password, salt, kdfIterations);
+        byte[] kek = E2eeCrypto.DeriveKek(username, password, salt, KdfSpec.DefaultArgon2id);
         try
         {
             byte[] masterKey = E2eeCrypto.GenerateMasterKey();
             try
             {
                 (byte[] nonce, byte[] ciphertext, byte[] tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
-                await app.Session.Api.CreateVolumeAsync(VolumeName, username, nonce, ciphertext, tag, salt, kdfIterations);
+                await app.Session.Api.CreateVolumeAsync(VolumeName, username, nonce, ciphertext, tag, salt, KdfInfo.DefaultArgon2id);
             }
             finally
             {

@@ -63,8 +63,16 @@ public sealed class UserWrappedKey
 
 public sealed class KdfParams
 {
+    /// <summary>"argon2id"（Argon2id+PBKDF2 合成）or "pbkdf2-sha256"（レガシー単段）。</summary>
     public string Algorithm { get; set; } = "pbkdf2-sha256";
+    /// <summary>argon2id: 後段 PBKDF2 の反復数。pbkdf2-sha256: PBKDF2 反復数。</summary>
     public int Iterations { get; set; }
+    /// <summary>argon2id 前段のメモリ量（KiB）。レガシー pbkdf2 では 0。</summary>
+    public int MemoryKiB { get; set; }
+    /// <summary>argon2id 前段のパス数（t）。レガシー pbkdf2 では 0。</summary>
+    public int TimeCost { get; set; }
+    /// <summary>argon2id 前段の並列度。レガシー pbkdf2 では 0。</summary>
+    public int Parallelism { get; set; }
     public byte[] Salt { get; set; } = [];
 }
 
@@ -123,11 +131,14 @@ public sealed record WrappedKeyResponse(
     string? EphemeralPublicKey,
     int ChunkSize);
 
-/// <summary>KDF パラメータ（JSON 用、Salt は Base64 文字列）。</summary>
+/// <summary>KDF パラメータ（JSON 用、Salt は Base64 文字列）。argon2id は Argon2id+PBKDF2 合成。</summary>
 public sealed class WrappedKeyKdfJson
 {
     public string Algorithm { get; set; } = "pbkdf2-sha256";
     public int Iterations { get; set; }
+    public int MemoryKiB { get; set; }
+    public int TimeCost { get; set; }
+    public int Parallelism { get; set; }
     public string Salt { get; set; } = "";
 }
 

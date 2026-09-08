@@ -23,14 +23,16 @@ public static class E2eeCrypto
 
     // ---- 鍵導出 ----
 
+    /// <summary>レガシー PBKDF2-SHA256 による KEK 導出（既存 E2EE データの検証専用）。</summary>
     public static byte[] DeriveKek(string username, string password, byte[] salt, int iterations)
-    {
-        byte[] userHash = SHA256.HashData(Encoding.UTF8.GetBytes(username));
-        byte[] combinedSalt = new byte[userHash.Length + salt.Length];
-        Buffer.BlockCopy(userHash, 0, combinedSalt, 0, userHash.Length);
-        Buffer.BlockCopy(salt, 0, combinedSalt, userHash.Length, salt.Length);
-        return Rfc2898DeriveBytes.Pbkdf2(password, combinedSalt, iterations, HashAlgorithmName.SHA256, 32);
-    }
+        => KeyDerivation.DeriveKek(username, password, salt, KdfSpec.LegacyPbkdf2(iterations));
+
+    /// <summary>
+    /// KDF スペックに応じた KEK 導出（Argon2id / レガシー PBKDF2）。
+    /// ソルト規約は e2ee.js deriveKek と共通（SHA256(username) || salt）。
+    /// </summary>
+    public static byte[] DeriveKek(string username, string password, byte[] salt, KdfSpec kdf)
+        => KeyDerivation.DeriveKek(username, password, salt, kdf);
 
     public static byte[] GenerateMasterKey() => RandomNumberGenerator.GetBytes(MasterKeySize);
 

@@ -25,11 +25,14 @@ public sealed class EncryptionSettingsClient
     }
 }
 
-/// <summary>暗号化設定。</summary>
+/// <summary>暗号化設定。Kdf* は新規鍵導出の Argon2id+PBKDF2 合成スペック。</summary>
 public sealed class EncryptionSettings
 {
     public string DefaultEncryptionMode { get; set; } = "server";
     public int E2eeChunkSize { get; set; } = 1048576;
     public int KdfIterations { get; set; } = 600_000;
+    public int KdfMemoryKiB { get; set; } = 65536;
+    public int KdfTimeCost { get; set; } = 4;
+    public int KdfParallelism { get; set; } = 4;
     public int SectorSize { get; set; } = 4096;
 }

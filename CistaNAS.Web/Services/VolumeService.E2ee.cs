@@ -70,7 +70,13 @@ public sealed partial class VolumeService
 
         return new WrappedKeyResponse(
             key.WrapType,
-            new KdfResponse(key.Kdf.Algorithm, key.Kdf.Iterations, Convert.ToBase64String(key.Kdf.Salt)),
+            new KdfResponse(
+                key.Kdf.Algorithm,
+                key.Kdf.Iterations,
+                key.Kdf.MemoryKiB,
+                key.Kdf.Parallelism,
+                key.Kdf.TimeCost,
+                Convert.ToBase64String(key.Kdf.Salt)),
             new WrappedMasterKeyResponse(
                 key.WrappedMasterKey.Algorithm,
                 Convert.ToBase64String(key.WrappedMasterKey.Nonce),

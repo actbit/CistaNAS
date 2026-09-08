@@ -24,8 +24,8 @@ public static class TestHelper
         var opt = new CistaNasOptions
         {
             DataRoot = dataRoot,
-            Volume = volOpts ?? new VolumeOptions { SectorSize = 512, KdfIterations = 10_000 },
-            Auth = new AuthOptions { Pbkdf2Iterations = 10_000 },
+            Volume = volOpts ?? new VolumeOptions { SectorSize = 512, KdfIterations = 10_000, KdfMemoryKiB = 8192, KdfTimeCost = 1, KdfParallelism = 1 },
+            Auth = new AuthOptions { Pbkdf2Iterations = 10_000, Argon2MemoryKiB = 8192, Argon2TimeCost = 1, Argon2Parallelism = 1 },
         };
         var io = Options.Create(opt);
         var services = new ServiceCollection();
@@ -50,7 +50,7 @@ public static class TestHelper
         .AddEntityFrameworkStores<AppDbContext>()
         .AddDefaultTokenProviders();
 
-        services.AddScoped<IPasswordHasher<ApplicationUser>, LegacyPasswordHasher>();
+        services.AddScoped<IPasswordHasher<ApplicationUser>, Argon2PasswordHasher>();
 
         // Storage
         services.AddSingleton<IStorageProvider>(sp =>

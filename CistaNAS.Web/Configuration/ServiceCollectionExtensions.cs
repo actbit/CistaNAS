@@ -121,10 +121,13 @@ public static class ServiceCollectionExtensions
         .AddDefaultTokenProviders();
 
         // Identity V3 PBKDF2 の反復回数を CistaNasOptions と一致させる
-        // （BasicAuthHandler の DummyHash タイミング均一化用）
+        // （既存 V3 ハッシュの検証はハッシュ文字列埋め込み値を使うため影響なし。
+        //   新規ハッシュは Argon2PasswordHasher が Argon2id で生成する）
         services.Configure<PasswordHasherOptions>(o => o.IterationCount = cista.Auth.Pbkdf2Iterations);
 
-        services.AddScoped<IPasswordHasher<ApplicationUser>, LegacyPasswordHasher>();
+        // 新規は Argon2id。旧 pbkdf2-sha256 / Identity V3 は検証時に SuccessRehashNeeded を返し
+        // 次回ログインで Argon2id へ透過再ハッシュされる
+        services.AddScoped<IPasswordHasher<ApplicationUser>, Argon2PasswordHasher>();
     }
 
     private static IStorageProvider CreateStorageProvider(CistaNasOptions cista)

@@ -248,10 +248,36 @@ else
                     </div>
                 </div>
                 <div class="col-12">
-                    <label class="form-label">PBKDF2 反復回数（ボリューム鍵導出）</label>
-                    <input type="number" class="form-control" @bind="_encSettings.KdfIterations" min="10000" step="10000" />
+                    <label class="form-label">KDF メモリ量（Argon2id、ボリューム鍵導出）</label>
+                    <select class="form-select" @bind="_encSettings.KdfMemoryKiB">
+                        <option value="16384">16 MB（高速・テスト用）</option>
+                        <option value="32768">32 MB</option>
+                        <option value="65536">64 MB（推奨）</option>
+                        <option value="131072">128 MB</option>
+                        <option value="262144">256 MB</option>
+                    </select>
                     <div class="form-text">
-                        現在の設定: @_encSettings.KdfIterations.ToString("N0")。高いほど安全だが遅い。
+                        Argon2id のメモリ困難性パラメータ。大きいほど GPU/ASIC での総当たり攻撃に強いが、ロック解除が遅くなる。
+                    </div>
+                </div>
+                <div class="col-12">
+                    <label class="form-label">KDF 時間コスト t / 並列度 p（Argon2id）</label>
+                    <div class="row g-2">
+                        <div class="col">
+                            <input type="number" class="form-control" @bind="_encSettings.KdfTimeCost" min="1" max="32" />
+                            <div class="form-text">t（パス数）</div>
+                        </div>
+                        <div class="col">
+                            <input type="number" class="form-control" @bind="_encSettings.KdfParallelism" min="1" max="16" />
+                            <div class="form-text">p（レーン数）</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-12">
+                    <label class="form-label">後段 PBKDF2 反復数（Argon2id 合成 KDF のバックストップ）</label>
+                    <input type="number" class="form-control" @bind="_encSettings.KdfIterations" min="600000" step="10000" />
+                    <div class="form-text">
+                        現在の設定: @_encSettings.KdfIterations.ToString("N0")。Argon2id 後に追加でかかる CPU コスト。既存ボリュームには影響しない。
                     </div>
                 </div>
                 <div class="col-12">
@@ -361,7 +387,10 @@ else
     {
         public string DefaultEncryptionMode { get; set; } = "server";
         public int E2eeChunkSize { get; set; } = 1048576;
-        public int KdfIterations { get; set; } = 310_000;
+        public int KdfIterations { get; set; } = 600_000;
+        public int KdfMemoryKiB { get; set; } = 65536;
+        public int KdfTimeCost { get; set; } = 4;
+        public int KdfParallelism { get; set; } = 4;
         public int SectorSize { get; set; } = 4096;
     }
 
@@ -503,7 +532,10 @@ else
             var vol = EncSettings.CurrentVolumeOptions();
             _encSettings.DefaultEncryptionMode = vol.DefaultEncryptionMode ?? "server";
             _encSettings.E2eeChunkSize = vol.E2eeChunkSize > 0 ? vol.E2eeChunkSize : 1048576;
-            _encSettings.KdfIterations = vol.KdfIterations > 0 ? vol.KdfIterations : 310_000;
+            _encSettings.KdfIterations = vol.KdfIterations > 0 ? vol.KdfIterations : 600_000;
+            _encSettings.KdfMemoryKiB = vol.KdfMemoryKiB > 0 ? vol.KdfMemoryKiB : 65536;
+            _encSettings.KdfTimeCost = vol.KdfTimeCost > 0 ? vol.KdfTimeCost : 4;
+            _encSettings.KdfParallelism = vol.KdfParallelism > 0 ? vol.KdfParallelism : 4;
             _encSettings.SectorSize = vol.SectorSize > 0 ? vol.SectorSize : 4096;
         }
         catch { }
@@ -519,6 +551,9 @@ else
             {
                 SectorSize = _encSettings.SectorSize,
                 KdfIterations = _encSettings.KdfIterations,
+                KdfMemoryKiB = _encSettings.KdfMemoryKiB,
+                KdfTimeCost = _encSettings.KdfTimeCost,
+                KdfParallelism = _encSettings.KdfParallelism,
                 DefaultEncryptionMode = _encSettings.DefaultEncryptionMode,
                 E2eeChunkSize = _encSettings.E2eeChunkSize,
                 ChunkStorage = current.ChunkStorage,
