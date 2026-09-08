@@ -81,17 +81,17 @@ public sealed class E2eeInterop(IJSRuntime js) : IAsyncDisposable
 
     // ---- チャンク操作 ----
 
-    public async Task<string> EncryptChunk(byte[] plainBytes, string masterKeyHandle, int chunkIndex, string fileSaltBase64, bool isFirstChunk)
+    public async Task<string> EncryptChunk(byte[] plainBytes, string masterKeyHandle, int chunkIndex, string fileSaltBase64, bool isFirstChunk, int revision = 0)
     {
         var mod = await GetModule();
         string plainBase64 = Convert.ToBase64String(plainBytes);
-        return await mod.InvokeAsync<string>("encryptChunk", plainBase64, masterKeyHandle, chunkIndex, fileSaltBase64, isFirstChunk);
+        return await mod.InvokeAsync<string>("encryptChunk", plainBase64, masterKeyHandle, chunkIndex, fileSaltBase64, isFirstChunk, revision);
     }
 
-    public async Task<byte[]> DecryptChunk(string encBase64, string masterKeyHandle, int chunkIndex, string fileSaltBase64)
+    public async Task<byte[]> DecryptChunk(string encBase64, string masterKeyHandle, int chunkIndex, string fileSaltBase64, int revision = 0)
     {
         var mod = await GetModule();
-        string plainBase64 = await mod.InvokeAsync<string>("decryptChunk", encBase64, masterKeyHandle, chunkIndex, fileSaltBase64);
+        string plainBase64 = await mod.InvokeAsync<string>("decryptChunk", encBase64, masterKeyHandle, chunkIndex, fileSaltBase64, revision);
         return Convert.FromBase64String(plainBase64);
     }
 

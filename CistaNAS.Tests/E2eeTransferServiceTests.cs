@@ -98,18 +98,66 @@ public class E2eeTransferServiceTests
         var entry = new E2eeFileEntry { FileId = "f", EncryptedName = "e", EncryptedLength = 100 + 16 + 16 * 2, ChunkCount = 2 };
         Assert.Equal(100, E2eeFileTransferService.ComputePlainLength(entry));
     }
+
+    /// <summary>
+    /// 回帰: Dokan 差分保存で再暗号化されたチャンク（revision >= 1）は nonce 導出に revision が混入する。
+    /// DownloadAsync が revision を無視して revision=0 で復号すると CryptographicException で開けなくなる。
+    /// </summary>
+    [Fact]
+    public async Task Dokan編集済みrevision付きチャンクを復号できる()
+    {
+        (var svc, var server) = CreateService(chunkSize: 1024);
+        byte[] fileSalt = E2eeCrypto.GenerateFileSalt();
+        byte[] fileKey = E2eeCrypto.DeriveFileKey(MasterKey, fileSalt);
+        byte[] plain0 = new byte[1024];
+        Array.Fill(plain0, (byte)0x5A);
+        byte[] plain1 = Encoding.UTF8.GetBytes("edited via dokan mount");
+
+        byte[] enc0 = E2eeCrypto.EncryptChunk(plain0, fileKey, 0, fileSalt, isFirstChunk: true, revision: 0);
+        byte[] enc1 = E2eeCrypto.EncryptChunk(plain1, fileKey, 1, fileSalt, isFirstChunk: false, revision: 1);
+
+        // nonce に revision が効いていることの確認（revision 0 ではチャンク 1 は復号失敗）
+        Assert.ThrowsAny<System.Security.Cryptography.CryptographicException>(
+            () => E2eeCrypto.DecryptChunk(enc1, fileKey, 1, fileSalt, revision: 0));
+
+        string fileId = server.SeedFile((0, enc0, 0), (1, enc1, 1));
+        var entry = new E2eeFileEntry
+        {
+            FileId = fileId,
+            EncryptedName = "enc",
+            EncryptedLength = plain0.Length + plain1.Length + E2eeCrypto.SaltSize + E2eeCrypto.GcmTagSize * 2,
+            ChunkCount = 2,
+        };
+
+        using MemoryStream output = await svc.OpenDecryptedAsync(Volume, entry);
+        byte[] expected = [.. plain0, .. plain1];
+        Assert.Equal(expected, output.ToArray());
+    }
 }
 
 /// <summary>E2EE チャンク転送エンドポイントのインメモリFake。</summary>
 internal sealed class FakeE2eeServer : HttpMessageHandler
 {
     private readonly Dictionary<(string FileId, int Index), byte[]> _chunks = new();
+    private readonly Dictionary<(string FileId, int Index), int> _revisions = new();
     private readonly Dictionary<(string FileId, int Index), string> _leaseHeaders = new();
     private int _nextFileId = 1;
 
     public Dictionary<(string FileId, int Index), string> ChunkLeaseHeaders => _leaseHeaders;
 
     public int GetChunkCount(string fileId) => _chunks.Keys.Count(k => k.FileId == fileId);
+
+    /// <summary>指定 revision で暗号化済みのチャンクを直接シードする（Dokan 差分保存済みファイルの再現用）。</summary>
+    public string SeedFile(params (int Index, byte[] Data, int Revision)[] chunks)
+    {
+        string fileId = $"seed{_nextFileId++}";
+        foreach (var (index, data, revision) in chunks)
+        {
+            _chunks[(fileId, index)] = data;
+            _revisions[(fileId, index)] = revision;
+        }
+        return fileId;
+    }
 
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
     {
@@ -133,6 +181,7 @@ internal sealed class FakeE2eeServer : HttpMessageHandler
                 int index = int.Parse(segments[6]);
                 _leaseHeaders[(fileId, index)] = lease;
                 _chunks[(fileId, index)] = request.Content!.ReadAsByteArrayAsync(ct).GetAwaiter().GetResult();
+                _revisions[(fileId, index)] = 0;
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
             }
 
@@ -143,7 +192,7 @@ internal sealed class FakeE2eeServer : HttpMessageHandler
                 if (!_chunks.TryGetValue((fileId, index), out var data))
                     return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
                 var res = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(data) };
-                res.Headers.Add("X-Chunk-Revision", "0");
+                res.Headers.Add("X-Chunk-Revision", _revisions.GetValueOrDefault((fileId, index)).ToString());
                 return Task.FromResult(res);
             }
 

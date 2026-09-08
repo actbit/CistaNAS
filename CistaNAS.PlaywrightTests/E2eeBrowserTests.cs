@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
+using System.Text;
 using CistaNAS.Shared.Crypto;
 using Microsoft.Playwright;
 
@@ -123,5 +124,66 @@ public class E2eeBrowserTests(PlaywrightWebAppFixture fixture)
         {
             File.Delete(tmpFile);
         }
+    }
+
+    /// <summary>
+    /// e2ee.js のチャンク nonce 導出が C# E2eeCrypto と revision 込みで相互運用できることを検証する。
+    /// Dokan 差分保存で再暗号化されたチャンク（revision >= 1）は nonce に le32 revision が混入する。
+    /// ブラウザ側が X-Chunk-Revision を読めないとそのようなチャンクは復号に失敗する（回帰防止）。
+    /// 双方向を検証: C# 暗号化 (rev=1) → JS 復号、JS 暗号化 (rev=2) → C# 復号。
+    /// </summary>
+    [Fact]
+    public async Task E2ee_JsChunkCrypto_MatchesCsharpForRevisedChunks()
+    {
+        await using var context = await fixture.CreateAuthenticatedContextAsync();
+        var page = await context.NewPageAsync();
+        await page.GotoAsync(fixture.BaseUrl + "/",
+            options: new PageGotoOptions { WaitUntil = WaitUntilState.Load });
+
+        byte[] masterKey = E2eeCrypto.GenerateMasterKey();
+        byte[] kekSalt = RandomNumberGenerator.GetBytes(16);
+        byte[] kek = E2eeCrypto.DeriveKek(PlaywrightWebAppFixture.Username, PlaywrightWebAppFixture.Password, kekSalt, 1000);
+        var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
+        CryptographicOperations.ZeroMemory(kek);
+
+        byte[] fileSalt = RandomNumberGenerator.GetBytes(16);
+        byte[] fileKey = E2eeCrypto.DeriveFileKey(masterKey, fileSalt);
+        byte[] plain = Encoding.UTF8.GetBytes("revision cross-check payload");
+        const int chunkIndex = 1;
+
+        // C# で revision=1 で暗号化（Dokan 差分保存が生成する形式）
+        byte[] encByCsharp = E2eeCrypto.EncryptChunk(plain, fileKey, chunkIndex, fileSalt,
+            isFirstChunk: false, revision: 1);
+
+        // JS 側: KEK 導出 → masterKey アンラップ → revision=1 の C# 暗号文を復号し、
+        // 同一平文を revision=2 で再暗号化して返す
+        string encByJsB64 = await page.EvaluateAsync<string>(@"async (args) => {
+            const mod = await import(args.moduleUrl);
+            const kekHandle = await mod.deriveKek(args.password, args.kekSaltB64, args.iterations, args.username);
+            const mkHandle = await mod.unwrapMasterKey(args.nonceB64, args.ctB64, args.tagB64, kekHandle);
+
+            const plainB64 = await mod.decryptChunk(
+                args.encB64, mkHandle, args.chunkIndex, args.fileSaltB64, 1);
+            return await mod.encryptChunk(
+                plainB64, mkHandle, args.chunkIndex, args.fileSaltB64, false, 2);
+        }", new
+        {
+            moduleUrl = $"{fixture.BaseUrl}/js/e2ee.js",
+            password = PlaywrightWebAppFixture.Password,
+            username = PlaywrightWebAppFixture.Username,
+            kekSaltB64 = Convert.ToBase64String(kekSalt),
+            iterations = 1000,
+            nonceB64 = Convert.ToBase64String(nonce),
+            ctB64 = Convert.ToBase64String(ct),
+            tagB64 = Convert.ToBase64String(tag),
+            encB64 = Convert.ToBase64String(encByCsharp),
+            chunkIndex,
+            fileSaltB64 = Convert.ToBase64String(fileSalt),
+        });
+
+        // JS 復号が正しいことの間接検証を含む: JS の revision=2 暗号文を C# で復号
+        byte[] encByJs = Convert.FromBase64String(encByJsB64);
+        byte[] decrypted = E2eeCrypto.DecryptChunk(encByJs, fileKey, chunkIndex, fileSalt, revision: 2);
+        Assert.Equal(plain, decrypted);
     }
 }

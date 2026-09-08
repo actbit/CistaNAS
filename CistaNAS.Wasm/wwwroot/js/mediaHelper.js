@@ -196,6 +196,9 @@ window.cistaMedia = {
             if (!resp.ok) throw new Error("chunk download failed: " + resp.status + " idx=" + idx);
             const encBuf = await resp.arrayBuffer();
 
+            // revision >= 1 のチャンク（Dokan 差分保存で再暗号化済み）は nonce 導出に revision が必須
+            const revision = parseInt(resp.headers.get("X-Chunk-Revision") || "0", 10) || 0;
+
             // ArrayBuffer → base64
             const bytes = new Uint8Array(encBuf);
             let binary = "";
@@ -204,7 +207,7 @@ window.cistaMedia = {
 
             // Web Crypto で復号
             const plainB64 = await window.cistaE2ee.decryptChunk(
-                encB64, options.masterKeyHandle, idx, options.fileSaltBase64);
+                encB64, options.masterKeyHandle, idx, options.fileSaltBase64, revision);
 
             idx++;
             try { if (options.dotNetRef) options.dotNetRef.invokeMethod("OnProgress", idx); } catch {}
