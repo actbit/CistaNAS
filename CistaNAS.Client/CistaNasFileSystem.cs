@@ -232,6 +232,18 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 CryptographicOperations.ZeroMemory(data);
             _ranges.Clear();
         }
+
+        /// <summary>
+        /// サーバーへの永続化が完了した範囲を解放する（ゼロクリア）。
+        /// 保持し続けると WriteFile のたびに全蓄積レンジが再送され転送量が O(N²) に
+        /// 膨らむため、PATCH 成功後に呼ぶ。以降の書き込みは新しいレンジだけを送る。
+        /// </summary>
+        public void ClearPersistedRanges()
+        {
+            foreach (var (_, data) in _ranges)
+                CryptographicOperations.ZeroMemory(data);
+            _ranges.Clear();
+        }
     }
 
     // E2EE: 汚れたチャンクを RMW（既存チャンク DL→復号→部分更新）で追跡し、Cleanup で汚れたチャンクだけ差分上書きする。
@@ -368,6 +380,19 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 catch { /* 異常終了時はサーバー側の期限切れで回収する */ }
             }
             if (_existingFileSalt is not null) CryptographicOperations.ZeroMemory(_existingFileSalt);
+            foreach (var (_, chunk) in _dirtyChunks)
+                CryptographicOperations.ZeroMemory(chunk);
+            _dirtyChunks.Clear();
+        }
+
+        /// <summary>
+        /// サーバーへの永続化が完了したダーティチャンクを解放する（ゼロクリア）。
+        /// 保持し続けると WriteFile のたびに全蓄積チャンクが再送（+ revision 取分の
+        /// 追加 HTTP）され転送量が O(N²) に膨らむため、差分アップロード成功後に呼ぶ。
+        /// 以降の RMW は GetOrLoadChunk がサーバーから最新を再取得するため正しさは維持される。
+        /// </summary>
+        public void ClearPersistedChunks()
+        {
             foreach (var (_, chunk) in _dirtyChunks)
                 CryptographicOperations.ZeroMemory(chunk);
             _dirtyChunks.Clear();
@@ -1212,6 +1237,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                     Buffer.BlockCopy(data, 0, full, (int)off, data.Length);
             }
             CistaNasApiClientFiles.UploadFileAsync(_api, _volumeName, ws.PlainName, full).GetAwaiter().GetResult();
+            ws.ClearPersistedRanges();
             return;
         }
 
@@ -1221,11 +1247,13 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             return;
         }
 
-        // 各範囲を PATCH（サーバー AesXtsStream がセクタ RMW で安全に部分上書き）
+        // 各範囲を PATCH（サーバー AesXtsStream がセクタ RMW で安全に部分上書き）。
+        // 成功した範囲は解放する（保持すると次の書き込みで全蓄積分が再送される）。
         foreach (var (off, data) in ws.Ranges)
         {
             CistaNasApiClientFiles.PatchFileRangeAsync(_api, _volumeName, ws.PlainName, off, data).GetAwaiter().GetResult();
         }
+        ws.ClearPersistedRanges();
     }
 
     // E2EE 新規ファイル: 新 fileSalt で全チャンク作成（従来方式、Critical-4 ロールバック維持）。
@@ -1340,6 +1368,10 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             cache.ChunkCount = finalizeChunkCount;
             cache.PlainLength = newPlainLength;
         }
+
+        // 全チャンク + FinalizeFile が成功した時点でサーバーに永続化済み。
+        // 蓄積チャンクを保持すると次の書き込みで全量が再送されるため解放する。
+        ws.ClearPersistedChunks();
     }
 
     private static byte[] ResizeChunk(byte[] chunk, int newLen)

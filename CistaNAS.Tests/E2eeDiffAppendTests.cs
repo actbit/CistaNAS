@@ -32,6 +32,9 @@ public class E2eeDiffAppendTests
         /// <summary>差分アップロードされた暗号文（チャンクインデックス → 暗号文）。</summary>
         public Dictionary<int, byte[]> UploadedChunks { get; } = new();
 
+        /// <summary>upload-chunk リクエストの総数（再送検出用）。</summary>
+        public int UploadCount { get; private set; }
+
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             string path = request.RequestUri!.AbsolutePath;
@@ -94,6 +97,7 @@ public class E2eeDiffAppendTests
             {
                 int index = int.Parse(segments[6]);
                 UploadedChunks[index] = request.Content!.ReadAsByteArrayAsync(ct).GetAwaiter().GetResult();
+                UploadCount++;
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
             }
 
@@ -194,6 +198,40 @@ public class E2eeDiffAppendTests
         plain[ChunkSize..].CopyTo(expected, 0);
         data.CopyTo(expected, 5200 - ChunkSize);
         byte[] decrypted = E2eeCrypto.DecryptChunk(uploaded!, fileKey, 1, fileSalt, revision: 1);
+        Assert.Equal(expected, decrypted);
+    }
+
+    [Fact]
+    public void 永続化済みチャンクは次回の差分保存で再送されない()
+    {
+        // 回帰: アップロード済みダーティチャンクを保持し続けると、WriteFile のたびに
+        // 全蓄積チャンクが再送され転送量が O(N²) に膨らむ。永続化済みチャンクは
+        // 解放し、2 回目の保存では新規ダーティチャンクだけを送る。
+        var (fs, server, fileSalt, fileKey, plain) = CreateExistingFile(5000);
+        byte[] write1 = Enumerable.Range(0, 100).Select(i => (byte)(10 + i)).ToArray();
+        byte[] write2 = Enumerable.Range(0, 100).Select(i => (byte)(200 + i)).ToArray();
+
+        var ws = new CistaNasFileSystem.E2eeChunkWriteState(fs, PlainName, FakeExistingE2eeFileServer.FileId);
+        try
+        {
+            ws.Write(write1, 0, write1.Length, 0);
+            fs.UploadWriteState(ws);
+
+            // 1 回目: チャンク 0 のみ送信
+            Assert.Equal(1, server.UploadCount);
+            Assert.Equal([0], server.UploadedChunks.Keys);
+
+            ws.Write(write2, 0, write2.Length, ChunkSize);
+            fs.UploadWriteState(ws);
+        }
+        finally { ws.Dispose(); }
+
+        // 2 回目: 新規ダーティのチャンク 1 のみが送られ、永続化済みチャンク 0 は再送されない
+        Assert.Equal(2, server.UploadCount);
+        Assert.Equal([0, 1], server.UploadedChunks.Keys);
+
+        byte[] expected = [.. write2, .. plain[4196..]];
+        byte[] decrypted = E2eeCrypto.DecryptChunk(server.UploadedChunks[1], fileKey, 1, fileSalt, revision: 1);
         Assert.Equal(expected, decrypted);
     }
 }
