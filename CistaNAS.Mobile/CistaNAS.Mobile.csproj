@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- CistaNAS Android アプリ (Avalonia ヘッド)。ロジックは CistaNAS.Mobile.Core に集約。 -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-android</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <SupportedOSPlatformVersion>24</SupportedOSPlatformVersion>
+    <ApplicationId>com.cistanas.mobile</ApplicationId>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>1.0.0</ApplicationDisplayVersion>
+    <AndroidManifest>AndroidManifest.xml</AndroidManifest>
+    <!-- 開発中は apk。配布時は aab に変更する。 -->
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+    <RuntimeIdentifier Condition="'$(Configuration)' == 'Debug'">android-arm64</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.0.4" />
+    <PackageReference Include="Avalonia.Android" Version="12.0.4" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.0.4" />
+    <!-- FileProvider (外部アプリへのキャッシュファイル渡し) 用の androidx.core は
+         Avalonia.Android -> Xamarin.AndroidX.AppCompat 経由で推移的に参照される -->
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CistaNAS.Mobile.Core\CistaNAS.Mobile.Core.csproj" />
+  </ItemGroup>
+
+</Project>

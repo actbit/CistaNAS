@@ -1,0 +1,21 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:CistaNAS.Mobile.Core.ViewModels"
+             x:Class="CistaNAS.Mobile.Views.ConnectView"
+             x:DataType="vm:ConnectViewModel">
+  <ScrollViewer Padding="24,32">
+    <StackPanel Spacing="16" MaxWidth="480" HorizontalAlignment="Stretch">
+      <TextBlock Text="CistaNAS サーバーに接続" FontSize="22" FontWeight="SemiBold" />
+      <TextBlock Text="NAS のアドレスを入力してください (例: http://192.168.1.10:5000)"
+                 TextWrapping="Wrap" Foreground="Gray" />
+      <TextBox Text="{Binding ServerUrl}" Watermark="http://192.168.1.10:5000" />
+
+      <Button Content="接続" Command="{Binding ConnectCommand}" HorizontalAlignment="Left"
+              Padding="24,10" />
+
+      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />
+      <TextBlock Text="{Binding Error}" IsVisible="{Binding Error, Converter={x:Static ObjectConverters.IsNotNull}}"
+                 Foreground="Crimson" TextWrapping="Wrap" />
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>

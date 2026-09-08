@@ -3,6 +3,7 @@
   <Project Path="CistaNAS.AppHost/CistaNAS.AppHost.csproj" />
   <Project Path="CistaNAS.Client/CistaNAS.Client.csproj" />
   <Project Path="CistaNAS.Mobile.Core/CistaNAS.Mobile.Core.csproj" />
+  <Project Path="CistaNAS.Mobile/CistaNAS.Mobile.csproj" />
   <Project Path="CistaNAS.ServiceDefaults/CistaNAS.ServiceDefaults.csproj" />
   <Project Path="CistaNAS.Shared/CistaNAS.Shared.csproj" />
   <Project Path="CistaNAS.Tests/CistaNAS.Tests.csproj" />

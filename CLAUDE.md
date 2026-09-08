@@ -11,7 +11,10 @@
 | `CistaNAS.Wasm` | Blazor WebAssembly フロントエンド（ブラウザ側 E2EE 暗号化）。`Web` が配信 |
 | `CistaNAS.ServiceDefaults` | Aspire 共通設定（テレメトリ・ヘルスチェック・サービスディスカバリ） |
 | `CistaNAS.Client` | Windows 用 Dokan マウントクライアント（Avalonia + DokanNet） |
-| `CistaNAS.Shared` | 暗号化プリミティブ（Web / Client / Wasm で共有） |
+| `CistaNAS.Api.Client` | REST クライアント一式（`CistaNAS.Client` から抽出。Client / Mobile で共有。namespace は `CistaNAS.Client.Api` のまま） |
+| `CistaNAS.Mobile.Core` | Android モバイルアプリのロジック層（ViewModel・E2EE セッション・転送。UI 非依存で `CistaNAS.Tests` でテスト可） |
+| `CistaNAS.Mobile` | Android 用 Avalonia モバイルアプリ（`net10.0-android`。ボリューム一覧・ファイル閲覧・画像/テキストビューア。動画等は Intent で外部アプリ委譲） |
+| `CistaNAS.Shared` | 暗号化プリミティブ（Web / Client / Wasm / Mobile で共有） |
 | `CistaNAS.Tests` | xUnit 単体・統合テスト |
 | `CistaNAS.PlaywrightTests` | Playwright によるブラウザ E2E テスト（CSP 検出・UI 回帰・実 JS 暗号化検証） |
 
@@ -87,6 +90,19 @@ Crypto / Volume / Journal
 - ターゲット: `net10.0-windows`, `WinExe`
 - DokanNet: CistaNasFileSystem (IDokanOperations 実装) でボリュームをマウント
 - Crypto: 共有プロジェクトの `E2eeCrypto` を使用
+
+## CistaNAS.Mobile の役割
+
+`CistaNAS.Mobile` は Avalonia 12 + `net10.0-android` の **Android 用モバイルクライアント**。
+ボリューム一覧・フォルダ閲覧・画像 / テキストのアプリ内表示に対応。PDF・動画等は
+FileProvider + ACTION_VIEW Intent で外部アプリに委譲。E2EE モード / サーバー側暗号化モード両対応。
+
+- 起動モデルは Avalonia 12 方式: `MainActivity : AvaloniaMainActivity`（非ジェネリック）+ `CistanasApplication : AvaloniaAndroidApplication<App>`（`CustomizeAppBuilder` で構成）。`UseAndroid()` は廃止済み API
+- ロジックはすべて `CistaNAS.Mobile.Core`（UI 非依存）に置き、Android head は View + プラットフォーム実装のみ
+- サーバーモードはクライアント側 `FileTreeBuilder` でフォルダツリー構築。E2EE モードは名前復号したフラット一覧
+- 秘密鍵保存は AndroidKeyStore の非エクスポート AES-256-GCM 鍵でラップ（`AndroidSecureKeyStore`、Desktop の DPAPI 版と同じ役割）
+- AXAML は compiled bindings 既定のため、全 View に `x:DataType` が必須
+- DI コンテナは使わず `AppServices`（手動コンポジションルート）で構築
 
 ## 重要なセキュリティ・整合性の修正履歴
 

@@ -1,0 +1,22 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:CistaNAS.Mobile.Core.ViewModels"
+             x:Class="CistaNAS.Mobile.Views.ShellView"
+             x:DataType="vm:ShellViewModel">
+  <Grid RowDefinitions="Auto,*">
+    <!-- ヘッダ: 戻る + タイトル -->
+    <Grid Grid.Row="0" ColumnDefinitions="Auto,*,Auto" Background="#1F6FEB">
+      <Button Grid.Column="0" Content="&lt;"
+              IsVisible="{Binding Navigation.CanGoBack}"
+              Command="{Binding GoBackCommand}"
+              Margin="8,8" Background="Transparent" Foreground="White" FontSize="18" />
+      <TextBlock Grid.Column="1" Text="{Binding Navigation.Current.Title}" VerticalAlignment="Center"
+                 Foreground="White" FontSize="18" FontWeight="SemiBold" Margin="4,14" />
+      <TextBlock Grid.Column="2" Text="CistaNAS" Margin="12,14" VerticalAlignment="Center"
+                 Foreground="#CCFFFFFF" FontSize="12" />
+    </Grid>
+
+    <!-- 画面本体 (ViewLocator が ViewModel から View を解決する) -->
+    <ContentControl Grid.Row="1" Content="{Binding Navigation.Current}" />
+  </Grid>
+</UserControl>

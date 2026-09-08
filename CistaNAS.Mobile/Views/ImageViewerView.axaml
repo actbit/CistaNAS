@@ -1,0 +1,23 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:CistaNAS.Mobile.Core.ViewModels"
+             xmlns:local="using:CistaNAS.Mobile.Views"
+             x:Class="CistaNAS.Mobile.Views.ImageViewerView"
+             x:DataType="vm:ImageViewerViewModel">
+  <Panel>
+    <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+      <Image x:Name="ViewerImage"
+             Source="{Binding ImageData, Converter={x:Static local:ByteArrayToImageConverter.Instance}}"
+             Stretch="Uniform" />
+    </ScrollViewer>
+
+    <StackPanel Orientation="Vertical" Spacing="4" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="12">
+      <Button Content="＋" Click="OnZoomIn" Width="44" Height="44" />
+      <Button Content="－" Click="OnZoomOut" Width="44" Height="44" />
+    </StackPanel>
+
+    <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" VerticalAlignment="Bottom" />
+    <TextBlock Text="{Binding Error}" IsVisible="{Binding Error, Converter={x:Static ObjectConverters.IsNotNull}}"
+               Foreground="Crimson" HorizontalAlignment="Center" VerticalAlignment="Center" TextWrapping="Wrap" />
+  </Panel>
+</UserControl>
