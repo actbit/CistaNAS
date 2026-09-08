@@ -24,6 +24,7 @@
     <ProjectReference Include="..\CistaNAS.Api.Client\CistaNAS.Api.Client.csproj" />
     <ProjectReference Include="..\CistaNAS.AppHost\CistaNAS.AppHost.csproj" />
     <ProjectReference Include="..\CistaNAS.Client\CistaNAS.Client.csproj" />
+    <ProjectReference Include="..\CistaNAS.Mobile.Core\CistaNAS.Mobile.Core.csproj" />
     <ProjectReference Include="..\CistaNAS.Shared\CistaNAS.Shared.csproj" />
     <ProjectReference Include="..\CistaNAS.Web\CistaNAS.Web.csproj" />
     <ProjectReference Include="..\CistaNAS.Wasm\CistaNAS.Wasm.csproj" />

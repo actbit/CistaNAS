@@ -22,6 +22,12 @@ public sealed class CistaNasApiClient
         _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
     }
 
+    /// <summary>Authorization ヘッダーを除去する。</summary>
+    public void ClearToken()
+    {
+        _http.DefaultRequestHeaders.Authorization = null;
+    }
+
     // ---- 認証 ----
 
     public async Task<string> LoginAsync(string username, string password)
