@@ -568,15 +568,12 @@ public class ChaCha20Poly1305Tests
     }
 
     /// <summary>
-    /// RFC 7539 §2.4.2 (Sunscreen 入力) を使った Poly1305 MAC 検証。
-    /// ChaCha20Poly1305.Encrypt は AAD を受け取らないため、ciphertext に対する
-    /// Poly1305 MAC (one-time key 込み) を検証する。
-    /// 期待タグは poly1305-donna リファレンス実装と完全一致する値 (AAD なしの MAC)。
-    /// RFC 7539 §2.8.2 の AEAD タグ (1ae10b594f09e26a7e902ecbd0600691) とは
-    /// AAD を含む/含まないで別物なので注意。
+    /// RFC 8439 §2.8.2 (旧 RFC 7539 §2.8.2) の Sunscreen AEAD テストベクトル。
+    /// AAD = 50515253c0c1c2c3c4c5c6c7、タグは RFC 正規値 (1ae10b...) と一致しなければならない。
+    /// BCL 実装・マネージ実装の両方で同じ値になることを確認する。
     /// </summary>
     [Fact]
-    public void ChaCha20Poly1305_Rfc7539_Sunscreen_TestVector()
+    public void ChaCha20Poly1305_Rfc8439_Section282_Sunscreen_TestVector()
     {
         byte[] key = Bytes(
             0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
@@ -588,23 +585,114 @@ public class ChaCha20Poly1305Tests
             0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43,
             0x44, 0x45, 0x46, 0x47);
 
+        byte[] aad = Bytes(0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7);
+
         // "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
         byte[] plaintext = System.Text.Encoding.UTF8.GetBytes(
             "Ladies and Gentlemen of the class of '99: " +
             "If I could offer you only one tip for the future, sunscreen would be it.");
 
-        // Poly1305(polyKey, ciphertext) の期待値 (poly1305-donna リファレンスと一致)
+        // RFC 8439 §2.8.2 正規の AEAD タグ
         byte[] expectedTag = Bytes(
-            0x6e, 0xf3, 0x68, 0x02, 0xf5, 0x1c, 0x90, 0x41,
-            0x60, 0x44, 0x75, 0x03, 0x60, 0xee, 0x32, 0xd3);
+            0x1a, 0xe1, 0x0b, 0x59, 0x4f, 0x09, 0xe2, 0x6a,
+            0x7e, 0x90, 0x2e, 0xcb, 0xd0, 0x60, 0x06, 0x91);
 
-        var (encNonce, ciphertext, tag) = ClientChaCha20.Encrypt(plaintext, key, nonce);
-
+        // 既定パス (BCL 環境では BCL、それ以外はマネージ)
+        var (encNonce, ciphertext, tag) = ClientChaCha20.Encrypt(plaintext, key, nonce, aad);
         Assert.Equal(expectedTag, tag);
-
-        // 復号もタグ検証込みで通ることを確認
-        byte[] decrypted = ClientChaCha20.Decrypt(ciphertext, tag, nonce, key);
+        byte[] decrypted = ClientChaCha20.Decrypt(ciphertext, tag, nonce, key, aad);
         Assert.Equal(plaintext, decrypted);
+
+        // マネージ実装も同じタグ・暗号文を生成すること (BCL と相互運用可能)
+        var (mNonce, mCiphertext, mTag) = ClientChaCha20.EncryptManaged(plaintext, key, nonce, aad);
+        Assert.Equal(ciphertext, mCiphertext);
+        Assert.Equal(expectedTag, mTag);
+        byte[] mDecrypted = ClientChaCha20.Decrypt(mCiphertext, mTag, nonce, key, aad);
+        Assert.Equal(plaintext, mDecrypted);
+    }
+
+    /// <summary>
+    /// BCL とマネージ実装の AEAD 出力 (暗号文・タグ) が完全一致する相互運用検証。
+    /// ランダム長・AAD なし/ありの両方で確認する。
+    /// </summary>
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(1, false)]
+    [InlineData(15, true)]
+    [InlineData(16, true)]
+    [InlineData(17, false)]
+    [InlineData(1000, true)]
+    public void ChaCha20Poly1305_Bcl_And_Managed_Interop(int size, bool withAad)
+    {
+        byte[] key = RandomNumberGenerator.GetBytes(32);
+        byte[] nonce = RandomNumberGenerator.GetBytes(12);
+        byte[] plaintext = RandomNumberGenerator.GetBytes(size);
+        byte[] aad = withAad ? RandomNumberGenerator.GetBytes(5) : [];
+
+        var (_, bclCt, bclTag) = ClientChaCha20.Encrypt(plaintext, key, nonce, aad);
+        var (_, manCt, manTag) = ClientChaCha20.EncryptManaged(plaintext, key, nonce, aad);
+
+        Assert.Equal(bclCt, manCt);
+        Assert.Equal(bclTag, manTag);
+
+        // 相互復号
+        Assert.Equal(plaintext, ClientChaCha20.Decrypt(manCt, manTag, nonce, key, aad));
+        Assert.Equal(plaintext, ClientChaCha20.DecryptManaged(bclCt, bclTag, nonce, key, aad));
+    }
+
+    /// <summary>
+    /// 旧実装の簡略タグ (Poly1305 over ciphertext のみ、RFC 8439 mac_data でない) で
+    /// 保存された既存データを、フォールバック検証で復号できること。
+    /// </summary>
+    [Fact]
+    public void ChaCha20Poly1305_LegacySimplifiedTag_FallbackDecrypt()
+    {
+        byte[] key = RandomNumberGenerator.GetBytes(32);
+        byte[] nonce = RandomNumberGenerator.GetBytes(12);
+        byte[] plaintext = RandomNumberGenerator.GetBytes(123);
+
+        // 旧実装と同じ手順で簡略タグ形式のデータを手動構築:
+        //   ciphertext = ChaCha20(key, nonce, counter=1, plaintext)
+        //   tag        = Poly1305(oneTimeKey, ciphertext)   ← mac_data でなく ct のみ
+        byte[] ciphertext = new byte[plaintext.Length];
+        ClientChaCha20.ChaCha20Encrypt(key, nonce, 1, ciphertext, plaintext);
+        byte[] legacyTag = ClientChaCha20.ComputeLegacySimplifiedTag(key, nonce, ciphertext);
+
+        // 新 Decrypt はフォールバック検証で旧データを読める (AAD なしのみ)
+        byte[] decrypted = ClientChaCha20.Decrypt(ciphertext, legacyTag, nonce, key);
+        Assert.Equal(plaintext, decrypted);
+
+        // マネージパスのフォールバックも同様
+        byte[] decrypted2 = ClientChaCha20.DecryptManaged(ciphertext, legacyTag, nonce, key);
+        Assert.Equal(plaintext, decrypted2);
+    }
+
+    /// <summary>
+    /// BCL 対応環境でも ForceManagedForTesting でマネージパスを強制でき、
+    /// マネージ Decrypt が BCL 生成データ (RFC 8439 形式タグ) を復号できること。
+    /// </summary>
+    [Fact]
+    public void ChaCha20Poly1305_ManagedPath_HandlesBclData()
+    {
+        byte[] key = RandomNumberGenerator.GetBytes(32);
+        byte[] nonce = RandomNumberGenerator.GetBytes(12);
+        byte[] plaintext = RandomNumberGenerator.GetBytes(200);
+
+        // 既定パス (BCL) で暗号化
+        var (_, ct, tag) = ClientChaCha20.Encrypt(plaintext, key, nonce);
+        byte[] aad = RandomNumberGenerator.GetBytes(4);
+        var (_, ctAad, tagAad) = ClientChaCha20.Encrypt(plaintext, key, nonce, aad);
+
+        ClientChaCha20.ForceManagedForTesting = true;
+        try
+        {
+            Assert.Equal(plaintext, ClientChaCha20.Decrypt(ct, tag, nonce, key));
+            Assert.Equal(plaintext, ClientChaCha20.Decrypt(ctAad, tagAad, nonce, key, aad));
+        }
+        finally
+        {
+            ClientChaCha20.ForceManagedForTesting = false;
+        }
     }
 
     /// <summary>

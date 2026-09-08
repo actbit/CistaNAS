@@ -26,31 +26,99 @@ function removeKey(handle) {
     _keys.delete(handle);
 }
 
+// ---- KDF ----
+
+// KDF パラメータを正規化する。
+// - 数値が渡された場合はレガシー PBKDF2 単段（既存データ互換）
+// - オブジェクト { algorithm, iterations, memoryKiB, timeCost, parallelism } を受け取る。
+//   algorithm === "argon2id" は合成 KDF:
+//     KEK = PBKDF2-SHA256( Argon2id(password, salt, t, m, p), salt, iterations, 32 )
+//   algorithm === "argon2id-raw" は Argon2id 単独（PBKDF2 後段なし）:
+//     KEK = Argon2id(password, salt, t, m, p)
+//   （.NET 側 KeyDerivation.DeriveKek / hash-wasm と同一規約。RFC 9106 ベクトルで相互運性検証済み）
+function normalizeKdf(kdf) {
+    if (typeof kdf === "number") {
+        return { algorithm: "pbkdf2-sha256", iterations: kdf, memoryKiB: 0, timeCost: 0, parallelism: 0 };
+    }
+    const spec = kdf || {};
+    return {
+        algorithm: spec.algorithm || "pbkdf2-sha256",
+        iterations: spec.iterations || 0,
+        memoryKiB: spec.memoryKiB || 0,
+        timeCost: spec.timeCost || 0,
+        parallelism: spec.parallelism || 0,
+    };
+}
+
+async function pbkdf2Bits(passwordBytes, salt, iterations) {
+    if (!iterations || iterations < 1) throw new Error("PBKDF2 反復数が不正です。");
+    const keyMaterial = await crypto.subtle.importKey(
+        "raw", passwordBytes, "PBKDF2", false, ["deriveBits"]);
+    return new Uint8Array(await crypto.subtle.deriveBits(
+        { name: "PBKDF2", salt, iterations, hash: "SHA-256" }, keyMaterial, 256));
+}
+
+// Argon2id (RFC 9106)。hash-wasm (wwwroot/js/argon2.umd.min.js, index.html で読み込み) を使用。
+// メモリ困難性により GPU/ASIC での総当たり攻撃を困難にする。
+async function argon2idBits(passwordBytes, salt, timeCost, memoryKiB, parallelism) {
+    const hw = globalThis.hashwasm;
+    if (!hw || typeof hw.argon2id !== "function") {
+        throw new Error("hash-wasm (argon2) がロードされていません。");
+    }
+    return new Uint8Array(await hw.argon2id({
+        password: passwordBytes,
+        salt: salt,
+        iterations: timeCost,
+        parallelism: parallelism,
+        memorySize: memoryKiB,
+        hashLength: 32,
+        outputType: "binary"
+    }));
+}
+
+// KEK の raw ビット列（32 バイト）を導出する。combinedSalt は結合済みを想定。
+async function deriveKekBits(password, combinedSalt, spec) {
+    const enc = new TextEncoder();
+    const passwordBytes = enc.encode(password);
+    if (spec.algorithm === "argon2id") {
+        const argonOut = await argon2idBits(passwordBytes, combinedSalt, spec.timeCost, spec.memoryKiB, spec.parallelism);
+        try {
+            // 後段 PBKDF2: Argon2id 実装が将来破られた場合の CPU 困難性バックストップ
+            return await pbkdf2Bits(argonOut, combinedSalt, spec.iterations);
+        } finally {
+            argonOut.fill(0);
+        }
+    }
+    if (spec.algorithm === "argon2id-raw") {
+        // Argon2id 単独: RFC 9106 の出力をそのまま鍵として使う（後段変換なし）
+        return argon2idBits(passwordBytes, combinedSalt, spec.timeCost, spec.memoryKiB, spec.parallelism);
+    }
+    return pbkdf2Bits(passwordBytes, combinedSalt, spec.iterations);
+}
+
+// Cross-platform compatibility: SHA256(username) || salt
+// (matching KeyDerivation.CombineUserSalt / e2ee deriveKek)
+async function combineUserSalt(username, salt) {
+    if (!username) return salt;
+    const userHash = new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(username)));
+    return concatBufs(userHash, salt);
+}
+
 // ---- 鍵管理 ----
 
-export async function deriveKek(password, saltBase64, iterations, username) {
+// kdf: { algorithm, iterations, memoryKiB, timeCost, parallelism }（数値はレガシー PBKDF2）
+export async function deriveKek(password, saltBase64, kdf, username) {
+    const spec = normalizeKdf(kdf);
     const salt = uint8FromBase64(saltBase64);
-    const enc = new TextEncoder();
+    const combinedSalt = await combineUserSalt(username, salt);
 
-    // Cross-platform compatibility: SHA256(username) || salt
-    // (matching VolumeHeader.DeriveKek / E2eeCrypto.DeriveKek)
-    let combinedSalt;
-    if (username) {
-        const userHash = new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(username)));
-        combinedSalt = concatBufs(userHash, salt);
-    } else {
-        combinedSalt = salt;
-    }
-
-    const keyMaterial = await crypto.subtle.importKey(
-        "raw", enc.encode(password), "PBKDF2", false, ["deriveBits", "deriveKey"]);
-
-    const kek = await crypto.subtle.deriveKey(
-        { name: "PBKDF2", salt: combinedSalt, iterations, hash: "SHA-256" },
-        keyMaterial,
-        { name: "AES-GCM", length: 256 },
+    const kekBits = await deriveKekBits(password, combinedSalt, spec);
+    const kek = await crypto.subtle.importKey(
+        "raw", kekBits, { name: "AES-GCM", length: 256 },
         false,
         ["wrapKey", "unwrapKey", "encrypt", "decrypt"]);
+    kekBits.fill(0);
 
     return storeKey(kek);
 }
@@ -249,14 +317,15 @@ export async function exportPublicKey(handle) {
     return uint8ToBase64(new Uint8Array(raw));
 }
 
-export async function encryptPrivateKey(privKeyHandle, password, saltBase64, iterations) {
+// kdf: { algorithm, iterations, memoryKiB, timeCost, parallelism }（数値はレガシー PBKDF2）。
+// ソルトは username を含まない raw salt（C# 側 encryptPrivateKey 経路と同一規約）。
+export async function encryptPrivateKey(privKeyHandle, password, saltBase64, kdf) {
+    const spec = normalizeKdf(kdf);
     const salt = uint8FromBase64(saltBase64);
-    const enc = new TextEncoder();
-    const keyMaterial = await crypto.subtle.importKey(
-        "raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
-    const kek = await crypto.subtle.deriveKey(
-        { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
-        keyMaterial, { name: "AES-GCM", length: 256 }, false, ["wrapKey"]);
+    const kekBits = await deriveKekBits(password, salt, spec);
+    const kek = await crypto.subtle.importKey(
+        "raw", kekBits, { name: "AES-GCM", length: 256 }, false, ["wrapKey"]);
+    kekBits.fill(0);
     const privateKey = getKey(privKeyHandle);
     const nonce = crypto.getRandomValues(new Uint8Array(GCM_NONCE_SIZE));
     const wrapped = await crypto.subtle.wrapKey("jwk", privateKey, kek,
@@ -267,14 +336,13 @@ export async function encryptPrivateKey(privKeyHandle, password, saltBase64, ite
     };
 }
 
-export async function decryptPrivateKey(wrappedBase64, nonceBase64, password, saltBase64, iterations) {
+export async function decryptPrivateKey(wrappedBase64, nonceBase64, password, saltBase64, kdf) {
+    const spec = normalizeKdf(kdf);
     const salt = uint8FromBase64(saltBase64);
-    const enc = new TextEncoder();
-    const keyMaterial = await crypto.subtle.importKey(
-        "raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
-    const kek = await crypto.subtle.deriveKey(
-        { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
-        keyMaterial, { name: "AES-GCM", length: 256 }, false, ["unwrapKey"]);
+    const kekBits = await deriveKekBits(password, salt, spec);
+    const kek = await crypto.subtle.importKey(
+        "raw", kekBits, { name: "AES-GCM", length: 256 }, false, ["unwrapKey"]);
+    kekBits.fill(0);
     const nonce = uint8FromBase64(nonceBase64);
     const wrapped = uint8FromBase64(wrappedBase64);
     const privateKey = await crypto.subtle.unwrapKey("jwk", wrapped, kek,

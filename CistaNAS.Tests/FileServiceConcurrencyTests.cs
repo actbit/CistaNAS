@@ -276,10 +276,13 @@ public class FileServiceConcurrencyTests : IAsyncDisposable
             {
                 SectorSize = 512,
                 KdfIterations = 10_000,
+                KdfMemoryKiB = 8192, // テスト用に軽量な Argon2id パラメータ
+                KdfTimeCost = 1,
+                KdfParallelism = 1,
                 ChunkStorage = "auto",
                 ServerChunkSize = 65536,
             },
-            Auth = new AuthOptions { Pbkdf2Iterations = 10_000 },
+            Auth = new AuthOptions { Pbkdf2Iterations = 10_000, Argon2MemoryKiB = 8192, Argon2TimeCost = 1, Argon2Parallelism = 1 },
         };
         var io = Options.Create(opt);
         var services = new ServiceCollection();
@@ -300,7 +303,7 @@ public class FileServiceConcurrencyTests : IAsyncDisposable
         })
         .AddEntityFrameworkStores<AppDbContext>()
         .AddDefaultTokenProviders();
-        services.AddScoped<IPasswordHasher<ApplicationUser>, LegacyPasswordHasher>();
+        services.AddScoped<IPasswordHasher<ApplicationUser>, Argon2PasswordHasher>();
         services.AddSingleton<IStorageProvider>(sp =>
         {
             var o = sp.GetRequiredService<IOptions<CistaNasOptions>>().Value;

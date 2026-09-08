@@ -55,7 +55,7 @@ public sealed partial class VolumeService
 
             try
             {
-                header.AddUserWrap(targetUsername, targetPassword, masterKey, VolOpts.KdfIterations);
+                header.AddUserWrap(targetUsername, targetPassword, masterKey, VolOpts.ToKdfSpec());
                 await _metaStore.SaveAsync(volumeName, header);
                 RefreshMountedHeader(volumeName, header);
             }
@@ -96,7 +96,7 @@ public sealed partial class VolumeService
                 var header = await LoadHeaderIfExistsAsync(name);
                 if (header is null || !header.HasUserAccess(username)) continue;
 
-                header.RewrapUser(username, oldPassword, newPassword, VolOpts.KdfIterations);
+                header.RewrapUser(username, oldPassword, newPassword, VolOpts.ToKdfSpec());
                 await _metaStore.SaveAsync(name, header);
                 RefreshMountedHeader(name, header);
             }

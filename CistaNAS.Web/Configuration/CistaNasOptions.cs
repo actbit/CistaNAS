@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using CistaNAS.Shared.Crypto;
 
 namespace CistaNAS.Web.Configuration;
 
@@ -95,16 +96,38 @@ public sealed class AuthOptions
     /// <summary>初期管理者パスワード。未設定時はランダム生成しログへ出力。</summary>
     public string? DefaultAdminPassword { get; set; }
 
-    /// <summary>ログインパスワードハッシュの PBKDF2 反復回数。</summary>
+    /// <summary>ログインパスワードハッシュの Argon2id メモリ量（KiB）。既定 64 MiB（RFC 9106 低メモリ推奨ベース）。</summary>
+    [Range(8192, 1_048_576)]
+    public int Argon2MemoryKiB { get; set; } = 65536;
+
+    /// <summary>ログインパスワードハッシュの Argon2id 時間コスト（パス数）。</summary>
+    [Range(1, 32)]
+    public int Argon2TimeCost { get; set; } = 4;
+
+    /// <summary>ログインパスワードハッシュの Argon2id 並列度（レーン数）。</summary>
+    [Range(1, 16)]
+    public int Argon2Parallelism { get; set; } = 4;
+
+    /// <summary>
+    /// （レガシー）旧 PBKDF2 ログインハッシュの反復回数。新規ハッシュは Argon2id を使用するため不使用。
+    /// 既存の appsettings.json / cista-settings.json との互換のため残置。
+    /// </summary>
     [Range(600_000, 10_000_000)]
     public int Pbkdf2Iterations { get; set; } = 600_000;
 
     /// <summary>
-    /// WebDAV Basic 認証のダミーハッシュ用 PBKDF2 反復回数。
-    /// メイン認証 (Pbkdf2Iterations) より低めに設定し、DoS リスクを軽減 (H-9)。
+    /// （レガシー）WebDAV Basic 認証ダミーハッシュ用 PBKDF2 反復回数。Argon2id 移行後は不使用。
+    /// 既存設定ファイルとの互換のため残置。
     /// </summary>
     [Range(10_000, 600_000)]
     public int WebDavPbkdf2Iterations { get; set; } = 100_000;
+
+    /// <summary>
+    /// WebDAV Basic 認証の成功資格情報キャッシュ秒数。Argon2id 検証は 1 回あたり 64 MiB 相当の
+    /// メモリを消費するため、同一資格情報でのリクエスト毎の再検証をこの TTL 内では省略する。0 で無効化。
+    /// </summary>
+    [Range(0, 86400)]
+    public int WebDavAuthCacheSeconds { get; set; } = 600;
 }
 
 public sealed class VolumeOptions
@@ -113,9 +136,37 @@ public sealed class VolumeOptions
     [Range(512, 4096)]
     public int SectorSize { get; set; } = 4096;
 
-    /// <summary>ボリュームパスワードからマスター鍵を導出する際の PBKDF2 反復回数。</summary>
+    /// <summary>
+    /// 新規ボリュームの KDF 種別。"argon2id"（Argon2id+PBKDF2 合成、既定）or "argon2id-raw"（Argon2id 単独）。
+    /// ヘッダに永続化されるため、変更しても既存ボリュームの検証には影響しない。
+    /// </summary>
+    public string KdfAlgorithm { get; set; } = KdfSpec.Argon2id;
+
+    /// <summary>
+    /// ボリュームパスワードからの鍵導出のうち後段 PBKDF2 の反復数。
+    /// KdfAlgorithm == "argon2id"（合成）のときのみ使用（"argon2id-raw" では不使用）。
+    /// ヘッダに永続化されるため、変更しても既存ボリュームの検証には影響しない。
+    /// </summary>
     [Range(600_000, 10_000_000)]
     public int KdfIterations { get; set; } = 600_000;
+
+    /// <summary>新規ボリュームの Argon2id 前段メモリ量（KiB）。既定 64 MiB。</summary>
+    [Range(8192, 1_048_576)]
+    public int KdfMemoryKiB { get; set; } = 65536;
+
+    /// <summary>新規ボリュームの Argon2id 前段パス数（t）。</summary>
+    [Range(1, 32)]
+    public int KdfTimeCost { get; set; } = 4;
+
+    /// <summary>新規ボリュームの Argon2id 前段並列度。</summary>
+    [Range(1, 16)]
+    public int KdfParallelism { get; set; } = 4;
+
+    /// <summary>新規ボリューム作成時にヘッダへ永続化する KDF スペック。</summary>
+    public KdfSpec ToKdfSpec() =>
+        string.Equals(KdfAlgorithm, KdfSpec.Argon2idRaw, StringComparison.Ordinal)
+            ? new KdfSpec(KdfSpec.Argon2idRaw, 0, KdfMemoryKiB, KdfParallelism, KdfTimeCost)
+            : new KdfSpec(KdfSpec.Argon2id, KdfIterations, KdfMemoryKiB, KdfParallelism, KdfTimeCost);
 
     /// <summary>新規ボリューム作成時のデフォルト暗号化モード。"server" | "e2ee" | "none"。</summary>
     public string DefaultEncryptionMode { get; set; } = "server";

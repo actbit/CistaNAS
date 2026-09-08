@@ -2,12 +2,18 @@ using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
+using BclAead = System.Security.Cryptography.ChaCha20Poly1305;
 
 namespace CistaNAS.Shared.Crypto;
 
 /// <summary>
 /// ChaCha20-Poly1305 AEAD 暗号化アルゴリズム実装。
-/// RFC 7539 に準拠。
+/// RFC 8439 (旧 RFC 7539) に準拠。
+/// <para>
+/// BCL の <see cref="System.Security.Cryptography.ChaCha20Poly1305"/> (CNG / OpenSSL 実装) を
+/// サポート環境では優先使用し、未サポート環境 (macOS・古い OS 等) では同梱のマネージ実装に
+/// フォールバックする。タグ形式は RFC 8439 §2.8 (AAD || ct || le64 || le64) で BCL と完全互換。
+/// </para>
 /// </summary>
 public static class ChaCha20Poly1305
 {
@@ -16,44 +22,153 @@ public static class ChaCha20Poly1305
     private const int TagSize = 16;        // 128-bit (Poly1305 MAC)
     private const int BlockSize = 64;      // ChaCha20 ブロックサイズ
 
-    /// <summary>暗号化。</summary>
+    /// <summary>テスト用: true で BCL を使わずマネージ実装を強制する。</summary>
+    internal static bool ForceManagedForTesting;
+
+    /// <summary>BCL 実装が現在の環境で利用可能か。</summary>
+    public static bool IsBclSupported => BclAead.IsSupported;
+
+    private static bool UseBcl => BclAead.IsSupported && !ForceManagedForTesting;
+
+    /// <summary>暗号化 (AAD なし)。</summary>
     public static (byte[] Nonce, byte[] Ciphertext, byte[] Tag) Encrypt(
         byte[] plaintext, byte[] key, byte[] nonce)
+        => Encrypt(plaintext, key, nonce, default);
+
+    /// <summary>暗号化 (AAD 付き、RFC 8439)。</summary>
+    public static (byte[] Nonce, byte[] Ciphertext, byte[] Tag) Encrypt(
+        byte[] plaintext, byte[] key, byte[] nonce, ReadOnlySpan<byte> aad)
     {
-        if (key.Length != KeySize)
-            throw new ArgumentException($"ChaCha20 鍵長は {KeySize} バイトである必要があります。", nameof(key));
-        if (nonce.Length != NonceSize)
-            throw new ArgumentException($"ChaCha20 ノンスは {NonceSize} バイトである必要があります。", nameof(nonce));
-        if (plaintext is null) throw new ArgumentNullException(nameof(plaintext));
+        ValidateArgs(key, nonce, plaintext, tag: null);
+
+        if (UseBcl)
+        {
+            using var aead = new BclAead(key);
+            byte[] ciphertext = new byte[plaintext.Length];
+            byte[] tag = new byte[TagSize];
+            aead.Encrypt(nonce, plaintext, ciphertext, tag, aad);
+            return (nonce, ciphertext, tag);
+        }
+
+        return EncryptManaged(plaintext, key, nonce, aad);
+    }
+
+    /// <summary>
+    /// 復号 (AAD なし)。
+    /// </summary>
+    public static byte[] Decrypt(byte[] ciphertext, byte[] tag, byte[] nonce, byte[] key)
+        => Decrypt(ciphertext, tag, nonce, key, default);
+
+    /// <summary>
+    /// 復号 (AAD 付き、RFC 8439)。
+    /// <para>
+    /// タグが RFC 8439 形式で検証に失敗した場合、旧実装の簡略タグ
+    /// (Poly1305 over ciphertext のみ。歴史的経緯による) での検証を試す
+    /// 旧データ読み取り互換フォールバックを持つ。
+    /// </para>
+    /// </summary>
+    public static byte[] Decrypt(byte[] ciphertext, byte[] tag, byte[] nonce, byte[] key, ReadOnlySpan<byte> aad)
+    {
+        ValidateArgs(key, nonce, ciphertext, tag);
+
+        if (UseBcl)
+        {
+            using var aead = new BclAead(key);
+            try
+            {
+                byte[] plaintext = new byte[ciphertext.Length];
+                aead.Decrypt(nonce, ciphertext, tag, plaintext, aad);
+                return plaintext;
+            }
+            catch (AuthenticationTagMismatchException ex)
+            {
+                // 旧簡略タグ形式の可能性 → フォールバック検証
+                if (!Poly1305VerifyTag(key, nonce, ciphertext, tag))
+                    throw new CryptographicException("ChaCha20-Poly1305 タグ検証失敗。", ex);
+            }
+        }
+        else
+        {
+            // マネージ: まず RFC 8439 形式 (AAD 含む)、だめなら旧簡略形式
+            if (!Poly1305VerifyTag(key, nonce, BuildMacData(aad, ciphertext), tag)
+                && !Poly1305VerifyTag(key, nonce, ciphertext, tag))
+                throw new CryptographicException("ChaCha20-Poly1305 タグ検証失敗。");
+        }
+
+        // タグ検証済み (フォールバック経由)。ChaCha20 keystream (counter=1) は BCL と同一なので
+        // マネージ XOR で復号してよい。
+        byte[] result = new byte[ciphertext.Length];
+        ChaCha20Decrypt(key, nonce, 1, ciphertext, result);
+        return result;
+    }
+
+    /// <summary>マネージ実装による AEAD 暗号化 (RFC 8439 タグ形式)。</summary>
+    internal static (byte[] Nonce, byte[] Ciphertext, byte[] Tag) EncryptManaged(
+        byte[] plaintext, byte[] key, byte[] nonce, ReadOnlySpan<byte> aad = default)
+    {
+        ValidateArgs(key, nonce, plaintext, tag: null);
 
         byte[] ciphertext = new byte[plaintext.Length];
-
-        // ChaCha20 暗号化（カウンタ=1から開始）
         ChaCha20Encrypt(key, nonce, 1, ciphertext, plaintext);
-
-        // Poly1305 タグ生成（RFC 7539 §2.8）
-        byte[] tag = Poly1305ComputeTag(key, nonce, ciphertext);
-
+        byte[] tag = Poly1305ComputeTag(key, nonce, BuildMacData(aad, ciphertext));
         return (nonce, ciphertext, tag);
     }
 
-    /// <summary>復号。</summary>
-    public static byte[] Decrypt(byte[] ciphertext, byte[] tag, byte[] nonce, byte[] key)
+    /// <summary>マネージ実装による AEAD 復号 (RFC 8439 形式 + 旧簡略タグフォールバック)。</summary>
+    internal static byte[] DecryptManaged(
+        byte[] ciphertext, byte[] tag, byte[] nonce, byte[] key, ReadOnlySpan<byte> aad = default)
     {
+        ValidateArgs(key, nonce, ciphertext, tag);
+        if (!Poly1305VerifyTag(key, nonce, BuildMacData(aad, ciphertext), tag)
+            && !Poly1305VerifyTag(key, nonce, ciphertext, tag))
+            throw new CryptographicException("ChaCha20-Poly1305 タグ検証失敗。");
+
+        byte[] result = new byte[ciphertext.Length];
+        ChaCha20Decrypt(key, nonce, 1, ciphertext, result);
+        return result;
+    }
+
+    /// <summary>
+    /// テスト・旧データ生成用: 旧簡略タグ (Poly1305 over ciphertext のみ) を計算する。
+    /// 旧実装の保存形式を再現するためだけのもの。新規データには使用しないこと。
+    /// </summary>
+    internal static byte[] ComputeLegacySimplifiedTag(byte[] key, byte[] nonce, byte[] ciphertext)
+    {
+        ValidateArgs(key, nonce, ciphertext, tag: null);
+        return Poly1305ComputeTag(key, nonce, ciphertext);
+    }
+
+    private static void ValidateArgs(byte[] key, byte[] nonce, byte[] data, byte[]? tag)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        ArgumentNullException.ThrowIfNull(nonce);
+        ArgumentNullException.ThrowIfNull(data);
+        if (tag is not null && tag.Length != TagSize)
+            throw new ArgumentException($"ChaCha20-Poly1305 タグ長は {TagSize} バイトである必要があります。", nameof(tag));
         if (key.Length != KeySize)
             throw new ArgumentException($"ChaCha20 鍵長は {KeySize} バイトである必要があります。", nameof(key));
         if (nonce.Length != NonceSize)
             throw new ArgumentException($"ChaCha20 ノンスは {NonceSize} バイトである必要があります。", nameof(nonce));
-        if (ciphertext is null) throw new ArgumentNullException(nameof(ciphertext));
-        if (tag is null) throw new ArgumentNullException(nameof(tag));
+    }
 
-        // Poly1305 タグ検証
-        if (!Poly1305VerifyTag(key, nonce, ciphertext, tag))
-            throw new CryptographicException("ChaCha20-Poly1305 タグ検証失敗。");
+    /// <summary>
+    /// RFC 8439 §2.8 形式の Poly1305 入力 (mac_data) を構築。
+    /// aad || pad16(aad) || ciphertext || pad16(ciphertext) || le64(len(aad)) || le64(len(ct))
+    /// </summary>
+    private static byte[] BuildMacData(ReadOnlySpan<byte> aad, byte[] ciphertext)
+    {
+        int aadPad = (16 - (aad.Length % 16)) % 16;
+        int ctPad = (16 - (ciphertext.Length % 16)) % 16;
 
-        byte[] plaintext = new byte[ciphertext.Length];
-        ChaCha20Decrypt(key, nonce, 1, ciphertext, plaintext);
-        return plaintext;
+        byte[] data = new byte[aad.Length + aadPad + ciphertext.Length + ctPad + 16];
+        int pos = 0;
+        aad.CopyTo(data.AsSpan(pos));
+        pos += aad.Length + aadPad;  // パディング分はゼロ初期化済み
+        ciphertext.CopyTo(data, pos);
+        pos += ciphertext.Length + ctPad;
+        BinaryPrimitives.WriteInt64LittleEndian(data.AsSpan(pos, 8), aad.Length);
+        BinaryPrimitives.WriteInt64LittleEndian(data.AsSpan(pos + 8, 8), ciphertext.Length);
+        return data;
     }
 
     /// <summary>ChaCha20 暗号化（RFC 7539）。</summary>
@@ -268,30 +383,6 @@ public static class ChaCha20Poly1305
             result |= computed[i] ^ tag[i];
         }
         return result == 0;
-    }
-
-    /// <summary>
-    /// 任意バイト列に対する Poly1305 タグ計算（公開）。
-    /// E2eeCrypto.EncryptChunkChaCha20 等で AAD を含む mac_data のタグ計算に使用する。
-    /// </summary>
-    internal static byte[] ComputePoly1305Tag(byte[] key, byte[] nonce, byte[] data)
-    {
-        ArgumentNullException.ThrowIfNull(key);
-        ArgumentNullException.ThrowIfNull(nonce);
-        ArgumentNullException.ThrowIfNull(data);
-        return Poly1305ComputeTag(key, nonce, data);
-    }
-
-    /// <summary>
-    /// 任意バイト列に対する Poly1305 タグ検証（公開、定数時間比較）。
-    /// </summary>
-    internal static bool VerifyPoly1305Tag(byte[] key, byte[] nonce, byte[] data, byte[] tag)
-    {
-        ArgumentNullException.ThrowIfNull(key);
-        ArgumentNullException.ThrowIfNull(nonce);
-        ArgumentNullException.ThrowIfNull(data);
-        ArgumentNullException.ThrowIfNull(tag);
-        return Poly1305VerifyTag(key, nonce, data, tag);
     }
 
     /// <summary>

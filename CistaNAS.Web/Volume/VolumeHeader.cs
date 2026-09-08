@@ -70,9 +70,31 @@ public sealed class VolumeHeader
 
     public sealed class KdfParams
     {
-        public string Algorithm { get; set; } = "pbkdf2-sha256";
+        /// <summary>"argon2id"（Argon2id+PBKDF2 合成、現行）or "argon2id-raw"（Argon2id 単独）or "pbkdf2-sha256"（レガシー単段）。</summary>
+        public string Algorithm { get; set; } = KdfSpec.Pbkdf2Sha256;
+        /// <summary>argon2id: 後段 PBKDF2 の反復数。argon2id-raw: 不使用（0）。pbkdf2-sha256: PBKDF2 反復数。</summary>
         public int Iterations { get; set; }
+        /// <summary>argon2id 前段のメモリ量（KiB）。レガシー pbkdf2 では 0。</summary>
+        public int MemoryKiB { get; set; }
+        /// <summary>argon2id 前段のパス数（t）。レガシー pbkdf2 では 0。</summary>
+        public int TimeCost { get; set; }
+        /// <summary>argon2id 前段の並列度。レガシー pbkdf2 では 0。</summary>
+        public int Parallelism { get; set; }
         public byte[] Salt { get; set; } = [];
+
+        /// <summary>KdfSpec に変換（導出に渡す用）。</summary>
+        public KdfSpec ToKdfSpec() => new(Algorithm, Iterations, MemoryKiB, Parallelism, TimeCost);
+
+        /// <summary>現行既定（Argon2id 合成）の KdfParams を生成する。</summary>
+        public static KdfParams FromSpec(KdfSpec spec, byte[] salt) => new()
+        {
+            Algorithm = spec.Algorithm,
+            Iterations = spec.Iterations,
+            MemoryKiB = spec.MemoryKiB,
+            TimeCost = spec.TimeCost,
+            Parallelism = spec.Parallelism,
+            Salt = salt,
+        };
     }
 
     public sealed class WrappedKey
@@ -124,16 +146,15 @@ public sealed class VolumeHeader
     public int EffectiveServerChunkSize => ServerChunkSize > 0 ? ServerChunkSize : 4194304;
 
     /// <summary>
-    /// KEK 導出: PBKDF2-SHA256(password, SHA256(username) || salt, iterations, 32)
-    /// ユーザー名がソルトの一部 → 同じパスワードでもユーザー違いで別 KEK。
+    /// KEK 導出: KDF スペックに応じて Argon2id+PBKDF2 合成 / Argon2id 単独 / レガシー PBKDF2 単段を使い分ける。
+    /// ソルトは SHA256(username) || salt（ユーザー名がソルトの一部 → 同じパスワードでもユーザー違いで別 KEK）。
+    /// ヘッダ保存の Argon2id パラメータは上限チェックする（改ざんによるメモリ/CPU DoS 対策）。
     /// </summary>
-    private static byte[] DeriveKek(string username, string password, byte[] salt, int iterations)
+    private static byte[] DeriveKek(string username, string password, byte[] salt, KdfSpec spec)
     {
-        byte[] userHash = SHA256.HashData(Encoding.UTF8.GetBytes(username));
-        byte[] combinedSalt = new byte[userHash.Length + salt.Length];
-        Buffer.BlockCopy(userHash, 0, combinedSalt, 0, userHash.Length);
-        Buffer.BlockCopy(salt, 0, combinedSalt, userHash.Length, salt.Length);
-        return Rfc2898DeriveBytes.Pbkdf2(password, combinedSalt, iterations, HashAlgorithmName.SHA256, KekSize);
+        if (spec.IsArgon2Family && !spec.IsValidArgon2Family())
+            throw new InvalidDataException("ボリュームヘッダの Argon2id KDF パラメータが上限を超えています。");
+        return KeyDerivation.DeriveKek(username, password, salt, spec, KekSize);
     }
 
     private static (byte[] Nonce, byte[] Ciphertext, byte[] Tag) WrapKey(byte[] masterKey, byte[] kek)
@@ -158,7 +179,7 @@ public sealed class VolumeHeader
 
     /// <summary>新しいボリュームの header＋マスター鍵を生成する。</summary>
     public static (VolumeHeader Header, byte[]? MasterKey) Create(
-        string name, string? username, string? password, int sectorSize, int kdfIterations, bool encrypted = true, string cipherAlgorithm = "aes-256-xts")
+        string name, string? username, string? password, int sectorSize, KdfSpec kdf, bool encrypted = true, string cipherAlgorithm = "aes-256-xts")
     {
         if (!encrypted)
         {
@@ -188,7 +209,7 @@ public sealed class VolumeHeader
             CipherAlgorithm = cipherAlgorithm,
             KeySize = GetKeySize(cipherAlgorithm),
         };
-        header.AddUserWrap(username, password, master, kdfIterations);
+        header.AddUserWrap(username, password, master, kdf);
         return (header, master);
     }
 
@@ -203,19 +224,19 @@ public sealed class VolumeHeader
     };
 
     /// <summary>追加ユーザーのためにマスター鍵をラップして登録。</summary>
-    public void AddUserWrap(string username, string password, byte[] masterKey, int kdfIterations)
+    public void AddUserWrap(string username, string password, byte[] masterKey, KdfSpec kdf)
     {
         ArgumentException.ThrowIfNullOrEmpty(username);
         ArgumentException.ThrowIfNullOrEmpty(password);
 
         byte[] salt = KeyDerivation.NewSalt();
-        byte[] kek = DeriveKek(username, password, salt, kdfIterations);
+        byte[] kek = DeriveKek(username, password, salt, kdf);
         try
         {
             var (nonce, ct, tag) = WrapKey(masterKey, kek);
             UserKeys[username] = new UserWrappedKey
             {
-                Kdf = new KdfParams { Iterations = kdfIterations, Salt = salt },
+                Kdf = KdfParams.FromSpec(kdf, salt),
                 WrappedMasterKey = new WrappedKey { Nonce = nonce, Ciphertext = ct, Tag = tag },
             };
         }
@@ -226,26 +247,26 @@ public sealed class VolumeHeader
     }
 
     /// <summary>指定ユーザーのエントリを新しいパスワードで再ラップ。</summary>
-    public void RewrapUser(string username, string oldPassword, string newPassword, int kdfIterations)
+    public void RewrapUser(string username, string oldPassword, string newPassword, KdfSpec kdf)
     {
         if (!UserKeys.TryGetValue(username, out var entry))
             throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
 
-        byte[] oldKek = DeriveKek(username, oldPassword, entry.Kdf.Salt, entry.Kdf.Iterations);
+        byte[] oldKek = DeriveKek(username, oldPassword, entry.Kdf.Salt, entry.Kdf.ToKdfSpec());
         try
         {
             byte[] masterKey = UnwrapKey(entry.WrappedMasterKey, oldKek);
             try
             {
-                // 新しいソルトで再ラップ
+                // 新しいソルトで再ラップ（KDF も現行スペックへ昇格）
                 byte[] newSalt = KeyDerivation.NewSalt();
-                byte[] newKek = DeriveKek(username, newPassword, newSalt, kdfIterations);
+                byte[] newKek = DeriveKek(username, newPassword, newSalt, kdf);
                 try
                 {
                     var (nonce, ct, tag) = WrapKey(masterKey, newKek);
                     UserKeys[username] = new UserWrappedKey
                     {
-                        Kdf = new KdfParams { Iterations = kdfIterations, Salt = newSalt },
+                        Kdf = KdfParams.FromSpec(kdf, newSalt),
                         WrappedMasterKey = new WrappedKey { Nonce = nonce, Ciphertext = ct, Tag = tag },
                     };
                 }
@@ -282,7 +303,21 @@ public sealed class VolumeHeader
         if (!Encrypted) return null;
         if (!UserKeys.TryGetValue(username, out var entry)) return null;
 
-        byte[] kek = DeriveKek(username, password, entry.Kdf.Salt, entry.Kdf.Iterations);
+        byte[] kek;
+        try
+        {
+            kek = DeriveKek(username, password, entry.Kdf.Salt, entry.Kdf.ToKdfSpec());
+        }
+        catch (ArgumentException)
+        {
+            // ヘッダの KDF パラメータ不正（仕様範囲外）→ パスワード誤りと同様に扱う
+            return null;
+        }
+        catch (InvalidDataException)
+        {
+            // ヘッダの Argon2id パラメータが検証上限超（改ざん疑い）
+            return null;
+        }
         try
         {
             return UnwrapKey(entry.WrappedMasterKey, kek);

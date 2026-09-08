@@ -11,7 +11,7 @@
 - **ボリューム暗号化** — AES-XTS (IEEE 1619) によるセクタ単位の透過暗号化。暗号化なしのボリュームも作成可能
 - **チャンクベースストレージ** — volume.dat を S3/R2 等にチャンク分割保存。VPS のローカルディスクを不要に。サーバー暗号化・E2EE 両対応
 - **E2EE（エンドツーエンド暗号化）** — クライアント側 AES-256-GCM チャンク暗号化。サーバーは暗号化済みデータのみを保持し、平文にアクセス不可
-- **マルチユーザー鍵管理** — ユーザーごとに独立した PBKDF2 → KEK でマスターキーをラップ。パスワード変更時は対象ユーザーのエントリのみ再ラップ
+- **マルチユーザー鍵管理** — ユーザーごとに独立した Argon2id+PBKDF2 → KEK でマスターキーをラップ。パスワード変更時は対象ユーザーのエントリのみ再ラップ
 - **共有ボリューム** — オーナーが他ユーザーにアクセス権を付与・取り消し可能。グループ単位のアクセス制御にも対応
 - **メディアストリーミング** — ブラウザでの動画再生・写真プレビュー。通常ボリュームは HTTP Range 要求でシーク対応、E2EE ボリュームはチャンク単位の Blob URL プレビュー
 - **3 クライアント対応** — ブラウザ (Blazor + Web Crypto API)、Windows (Dokan.NET 仮想ファイルシステム)、WebDAV (rclone / RCX)
@@ -73,8 +73,8 @@ Crypto / Volume / Journal
       AesXtsTransform        AES-XTS バッファ単位変換（チャンク暗号化用）
       ChunkEncryptor         チャンク単位 AES-XTS 暗号化/復号ヘルパー
       E2eeCrypto             AES-256-GCM チャンク暗号化 (Client)
-      PasswordHasher         PBKDF2-SHA256 パスワードハッシュ
-      KeyDerivation          KEK 導出 (PBKDF2)
+      PasswordHasher         ASP.NET Identity パスワードハッシュ（旧 PBKDF2 互換）
+      KeyDerivation          Argon2id + PBKDF2 合成 KEK 導出 (RFC 9106)
 Storage
   └ ストレージ抽象
       IStorageProvider       メタデータ保存先（local / S3 / Azure Blob / GCS）
@@ -161,6 +161,7 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
     },
     "Volume": {
       "SectorSize": 4096,
+      "KdfAlgorithm": "argon2id",
       "KdfIterations": 600000,
       "DefaultEncryptionMode": "server",
       "E2eeChunkSize": 1048576,
@@ -188,9 +189,16 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
 | `Storage:VolumeDataPath` | volume.dat のローカルパス（K8s では PV マウントパス）。未設定時は `DataRoot` |
 | `Jwt:SigningKey` | 未設定時は起動ごとにランダム生成（再起動でトークン失効） |
 | `Jwt:AccessTokenMinutes` | アクセストークンの有効期限（分） |
-| `Auth:Pbkdf2Iterations` | パスワードハッシュの反復回数（デフォルト 600,000） |
+| `Auth:Argon2MemoryKiB` | ログインハッシュの Argon2id メモリ量 KiB（デフォルト 65,536 = 64 MiB） |
+| `Auth:Argon2TimeCost` | ログインハッシュの Argon2id パス数（デフォルト 4） |
+| `Auth:Argon2Parallelism` | ログインハッシュの Argon2id 並列度（デフォルト 4） |
+| `Auth:Pbkdf2Iterations` | （レガシー）旧パスワードハッシュの PBKDF2 反復回数。新規ハッシュは Argon2id |
 | `Volume:SectorSize` | AES-XTS のセクタサイズ（16 の倍数） |
-| `Volume:KdfIterations` | KEK 導出の PBKDF2 反復回数（デフォルト 600,000） |
+| `Volume:KdfAlgorithm` | KEK 導出アルゴリズム: `argon2id`（Argon2id+PBKDF2 合成、デフォルト）or `argon2id-raw`（Argon2id 単独、RFC 9106 標準構成） |
+| `Volume:KdfMemoryKiB` | KEK 導出の Argon2id メモリ量 KiB（デフォルト 65,536 = 64 MiB） |
+| `Volume:KdfTimeCost` | KEK 導出の Argon2id パス数（デフォルト 4） |
+| `Volume:KdfParallelism` | KEK 導出の Argon2id 並列度（デフォルト 4） |
+| `Volume:KdfIterations` | KEK 導出の後段 PBKDF2 反復回数（デフォルト 600,000。`Volume:KdfAlgorithm` = `argon2id-raw` 時は不使用） |
 | `Volume:DefaultEncryptionMode` | デフォルト暗号化モード（`server` / `e2ee` / `none`） |
 | `Volume:E2eeChunkSize` | E2EE チャンクサイズ（バイト、デフォルト 1 MiB） |
 | `Volume:ChunkStorage` | チャンクストレージモード（`local` = 常に volume.dat / `auto` = S3 使用時に自動チャンク） |
@@ -202,10 +210,15 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
 
 ```
 ログインパスワード
-  └ PBKDF2(password, SHA256(username) || salt, iterations) → KEK
-      └ AES-256-GCM でマスターキーをアンラップ
+  └ Argon2id(password, SHA256(username) || salt, t=4, m=64MiB, p=4)   [RFC 9106]
+      └ PBKDF2-SHA256(argon2out, SHA256(username) || salt, 600,000) → KEK
+          └ AES-256-GCM でマスターキーをアンラップ
           └ マスターキー (64B) で AES-XTS ボリュームデータを暗号/復号
 ```
+
+`Volume:KdfAlgorithm = "argon2id-raw"` にすると新規ボリューム作成時の KDF が Argon2id 単独
+（`KEK = Argon2id(...)` をそのまま使用、PBKDF2 後段なし）になります。KDF 種別はボリューム
+ヘッダごとに永続化されるため、既存ボリュームはどちらの設定でも元の導出方式のまま動作します。
 
 #### ローカルモード（volume.dat）
 
@@ -230,8 +243,9 @@ Download → S3 GET → ChunkedReadStream（Seekable + Range 対応）
 
 ```
 ユーザーパスワード
-  └ PBKDF2-SHA256(password, SHA256(username) || salt, 310000) → KEK (32B)
-      └ AES-256-GCM でマスターキーを wrap/unwrap
+  └ Argon2id(password, SHA256(username) || salt, t=4, m=64MiB, p=4)   [RFC 9106]
+      └ PBKDF2-SHA256(argon2out, SHA256(username) || salt, 600,000) → KEK (32B)
+          └ AES-256-GCM でマスターキーを wrap/unwrap
           └ マスターキー (32B) はクライアント側でのみ生成・保持
 
 ファイルごと:
@@ -332,10 +346,10 @@ E2EE ボリュームの WebDAV は暗号化済みファイル名と暗号化済�
 
 ## セキュリティ対策
 
-- **認証タイミング攻撃対策** — ユーザー存在の有無に関わらず応答時間を均一化（ダミー PBKDF2 計算）
+- **認証タイミング攻撃対策** — ユーザー存在の有無に関わらず応答時間を均一化（ダミー Argon2id 計算）
 - **パスサニタイザ** — ディレクトリトラバーサル防止（API・WebDAV 両対応）
 - **レート制限** — 認証エンドポイント 10 req/min/IP、API 全体 100 req/min/IP
-- **認証ロックアウト** — 5 回失敗で 15 分間ロック（PBKDF2 反復回数 600,000）
+- **認証ロックアウト** — 5 回失敗で 15 分間ロック（1 試行ごとに Argon2id ハッシュ 64 MiB / 4 パスのコスト）
 - **セキュリティヘッダ** — CSP, HSTS, X-Content-Type-Options, X-Frame-Options 等
 - **JWT 署名鍵** — 本番環境で 32 バイト以上必須（開発環境ではランダム生成）
 - **ストリーミングトークン** — 60 秒有効・短命・URL ベースアクセス用・最大 10,000 個

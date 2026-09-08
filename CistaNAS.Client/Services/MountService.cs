@@ -50,8 +50,9 @@ public sealed class MountService
         }
         else
         {
-            // password ラップキー: KEK を導出してアンラップ
-            byte[] kek = E2eeCrypto.DeriveKek(username, password, wkInfo.KdfSalt, wkInfo.KdfIterations);
+            // password ラップキー: ヘッダの KDF スペック（Argon2id 合成 / レガシー PBKDF2）で KEK を導出してアンラップ
+            byte[] kek = E2eeCrypto.DeriveKek(username, password, wkInfo.KdfSalt, new KdfSpec(
+                wkInfo.KdfAlgorithm, wkInfo.KdfIterations, wkInfo.KdfMemoryKiB, wkInfo.KdfParallelism, wkInfo.KdfTimeCost));
             try
             {
                 using var kekBuf = new SecureBuffer(kek);

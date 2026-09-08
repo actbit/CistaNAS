@@ -140,9 +140,17 @@ public sealed record CreateUserRequest(
     [Required] string Password,
     string? Role = "user");
 
-/// <summary>暗号化設定更新リクエスト (WASM 用)。</summary>
+/// <summary>
+/// 暗号化設定更新リクエスト (WASM 用)。Kdf* は新規ボリュームの鍵導出スペック:
+/// KdfAlgorithm=="argon2id"（既定）は Argon2id(MemoryKiB/TimeCost/Parallelism) + PBKDF2(Iterations) の合成 KDF、
+/// "argon2id-raw" は Argon2id 単独（Iterations 不使用）。
+/// </summary>
 public sealed record UpdateEncryptionSettingsRequest(
     string DefaultEncryptionMode = "server",
     int E2eeChunkSize = 1048576,
-    int KdfIterations = 310_000,
+    string KdfAlgorithm = "argon2id",
+    int KdfIterations = 600_000,
+    int KdfMemoryKiB = 65536,
+    int KdfTimeCost = 4,
+    int KdfParallelism = 4,
     int SectorSize = 4096);

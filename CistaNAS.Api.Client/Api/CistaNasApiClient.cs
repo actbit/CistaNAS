@@ -40,9 +40,16 @@ public sealed class CistaNasApiClient
 
     // ---- E2EE ボリューム ----
 
-    public async Task CreateVolumeAsync(string volumeName, string username,
+    public Task CreateVolumeAsync(string volumeName, string username,
         byte[] wrappedNonce, byte[] wrappedCt, byte[] wrappedTag,
         byte[] kdfSalt, int kdfIterations, int chunkSize = 1048576)
+        => CreateVolumeAsync(volumeName, username, wrappedNonce, wrappedCt, wrappedTag,
+            kdfSalt, KdfInfo.LegacyPbkdf2(kdfIterations), chunkSize);
+
+    /// <summary>E2EE ボリュームを作成する（KDF スペック指定。新規は <see cref="KdfInfo.DefaultArgon2id"/> を使用）。</summary>
+    public async Task CreateVolumeAsync(string volumeName, string username,
+        byte[] wrappedNonce, byte[] wrappedCt, byte[] wrappedTag,
+        byte[] kdfSalt, KdfInfo kdf, int chunkSize = 1048576)
     {
         var req = new
         {
@@ -50,7 +57,15 @@ public sealed class CistaNasApiClient
             username,
             wrappedMasterKey = new
             {
-                kdf = new { algorithm = "pbkdf2-sha256", iterations = kdfIterations, salt = kdfSalt },
+                kdf = new
+                {
+                    algorithm = kdf.Algorithm,
+                    iterations = kdf.Iterations,
+                    memoryKiB = kdf.MemoryKiB,
+                    timeCost = kdf.TimeCost,
+                    parallelism = kdf.Parallelism,
+                    salt = kdfSalt
+                },
                 wrappedMasterKey = new
                 {
                     algorithm = "aes-256-gcm",
@@ -84,6 +99,9 @@ public sealed class CistaNasApiClient
         {
             KdfAlgorithm = kdf.GetProperty("algorithm").GetString()!,
             KdfIterations = kdf.GetProperty("iterations").GetInt32(),
+            KdfMemoryKiB = kdf.TryGetProperty("memoryKiB", out var mk) && mk.ValueKind == JsonValueKind.Number ? mk.GetInt32() : 0,
+            KdfTimeCost = kdf.TryGetProperty("timeCost", out var tc) && tc.ValueKind == JsonValueKind.Number ? tc.GetInt32() : 0,
+            KdfParallelism = kdf.TryGetProperty("parallelism", out var pl) && pl.ValueKind == JsonValueKind.Number ? pl.GetInt32() : 0,
             KdfSalt = Convert.FromBase64String(kdf.GetProperty("salt").GetString()!),
             WrapType = json.TryGetProperty("wrapType", out var wt) && wt.ValueKind == JsonValueKind.String
                 ? wt.GetString() : "password",
@@ -262,6 +280,27 @@ public class E2eeFileEntry
     public DateTimeOffset ModifiedAt { get; set; }
 }
 
+/// <summary>
+/// パスワードベース KDF のパラメータ（サーバー VolumeHeader.KdfParams と同型）。
+/// Algorithm == "argon2id" は合成 KDF: KEK = PBKDF2-SHA256(Argon2id(pw, salt, t, m, p), salt, Iterations, 32)。
+/// Algorithm == "argon2id-raw" は Argon2id 単独（PBKDF2 後段なし。Iterations 不使用）。
+/// </summary>
+public sealed record KdfInfo(string Algorithm, int Iterations, int MemoryKiB, int TimeCost, int Parallelism)
+{
+    public const string Argon2id = "argon2id";
+    public const string Argon2idRaw = "argon2id-raw";
+    public const string Pbkdf2Sha256 = "pbkdf2-sha256";
+
+    /// <summary>新規作成時の既定: Argon2id(m=64MiB, t=4, p=4) + PBKDF2(600k) 合成。</summary>
+    public static KdfInfo DefaultArgon2id { get; } = new(Argon2id, 600_000, 65536, 4, 4);
+
+    /// <summary>Argon2id 単独の既定スペック（m=64MiB, t=4, p=4。PBKDF2 後段なし）。</summary>
+    public static KdfInfo DefaultArgon2idRaw { get; } = new(Argon2idRaw, 0, 65536, 4, 4);
+
+    /// <summary>レガシー PBKDF2 単段スペック（既存データの検証用）。</summary>
+    public static KdfInfo LegacyPbkdf2(int iterations) => new(Pbkdf2Sha256, iterations, 0, 0, 0);
+}
+
 public class VolumeListItem
 {
     public required string Name { get; set; }
@@ -286,6 +325,12 @@ public class WrappedKeyInfo
 {
     public required string KdfAlgorithm { get; set; }
     public required int KdfIterations { get; set; }
+    /// <summary>argon2id 前段のメモリ量 (KiB)。レガシー pbkdf2-sha256 では 0。</summary>
+    public int KdfMemoryKiB { get; set; }
+    /// <summary>argon2id 前段のパス数 (t)。レガシー pbkdf2-sha256 では 0。</summary>
+    public int KdfTimeCost { get; set; }
+    /// <summary>argon2id 前段の並列度。レガシー pbkdf2-sha256 では 0。</summary>
+    public int KdfParallelism { get; set; }
     public required byte[] KdfSalt { get; set; }
     /// <summary>"password" or "ecdh"。未指定時は password。</summary>
     public string? WrapType { get; set; }

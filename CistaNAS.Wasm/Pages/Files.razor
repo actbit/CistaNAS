@@ -319,7 +319,7 @@ else
                         privRoot.GetProperty("nonce").GetString()!,
                         _e2eePassword,
                         privRoot.GetProperty("salt").GetString()!,
-                        privRoot.GetProperty("iterations").GetInt32());
+                        E2eeInterop.ReadPrivKeyKdf(privRoot));
                 }
                 catch
                 {
@@ -338,7 +338,10 @@ else
             }
             else
             {
-                kekHandle = await E2ee.DeriveKek(_e2eePassword, wrappedKeyResp.Kdf.Salt, wrappedKeyResp.Kdf.Iterations, Auth.CurrentUsername);
+                kekHandle = await E2ee.DeriveKek(_e2eePassword, wrappedKeyResp.Kdf.Salt,
+                    new E2eeKdfOptions(wrappedKeyResp.Kdf.Algorithm, wrappedKeyResp.Kdf.Iterations,
+                        wrappedKeyResp.Kdf.MemoryKiB, wrappedKeyResp.Kdf.TimeCost, wrappedKeyResp.Kdf.Parallelism),
+                    Auth.CurrentUsername);
 
                 _masterKeyHandle = await E2ee.UnwrapMasterKey(
                     wrappedKeyResp.WrappedMasterKey.Nonce,

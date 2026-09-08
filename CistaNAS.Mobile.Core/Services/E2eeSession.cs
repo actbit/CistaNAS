@@ -32,7 +32,9 @@ public sealed class E2eeSession : IDisposable
             {
                 if (string.IsNullOrEmpty(password))
                     throw new InvalidOperationException("ボリュームパスワードが必要です。");
-                byte[] kek = E2eeCrypto.DeriveKek(username, password, wk.KdfSalt, wk.KdfIterations);
+                // ヘッダの KDF スペック（Argon2id 合成 / レガシー PBKDF2）で KEK を導出
+                byte[] kek = E2eeCrypto.DeriveKek(username, password, wk.KdfSalt, new KdfSpec(
+                    wk.KdfAlgorithm, wk.KdfIterations, wk.KdfMemoryKiB, wk.KdfParallelism, wk.KdfTimeCost));
                 try
                 {
                     return E2eeCrypto.UnwrapMasterKey(wk.WrappedNonce, wk.WrappedCiphertext, wk.WrappedTag, kek, wk.KdfAlgorithm == "chacha20-poly1305" ? "chacha20-poly1305" : "aes-256-gcm");

@@ -11,7 +11,7 @@ Volume-level encryption (server-side AES-XTS / E2EE AES-256-GCM), multi-user key
 - **Volume encryption** — Transparent sector-level encryption with AES-XTS (IEEE 1619). Unencrypted volumes can also be created
 - **Chunk-based storage** — `volume.dat` is split into chunks and stored on S3/R2 etc., removing the need for local disk on the VPS. Supports both server-side encryption and E2EE
 - **E2EE (End-to-End Encryption)** — Client-side AES-256-GCM chunk encryption. The server only ever holds encrypted data and cannot access plaintext
-- **Multi-user key management** — Each user wraps the master key with an independent PBKDF2 → KEK. Password changes re-wrap only the target user's entry
+- **Multi-user key management** — Each user wraps the master key with an independent Argon2id+PBKDF2 → KEK. Password changes re-wrap only the target user's entry
 - **Shared volumes** — Owners can grant/revoke access to other users, with group-level access control
 - **Media streaming** — Video playback and photo preview in the browser. Regular volumes support HTTP Range seeking; E2EE volumes use chunk-wise Blob URL previews
 - **3 client types** — Browser (Blazor + Web Crypto API), Windows (Dokan.NET virtual filesystem), WebDAV (rclone / RCX)
@@ -73,8 +73,8 @@ Crypto / Volume / Journal
       AesXtsTransform        AES-XTS buffer-level transform (for chunk encryption)
       ChunkEncryptor         Per-chunk AES-XTS encrypt/decrypt helper
       E2eeCrypto             AES-256-GCM chunk encryption (Client)
-      PasswordHasher         PBKDF2-SHA256 password hashing
-      KeyDerivation          KEK derivation (PBKDF2)
+      PasswordHasher         ASP.NET Identity password hashing (legacy PBKDF2 compat)
+      KeyDerivation          Argon2id + PBKDF2 composite KEK derivation (RFC 9106)
 Storage
   └ Storage abstraction
       IStorageProvider       Metadata backend (local / S3 / Azure Blob / GCS)
@@ -188,9 +188,16 @@ Configure under the `CistaNas` section of `appsettings.json`.
 | `Storage:VolumeDataPath` | Local path for volume.dat (PV mount path on K8s). Defaults to `DataRoot` |
 | `Jwt:SigningKey` | Randomly generated per launch if unset (tokens invalidated on restart) |
 | `Jwt:AccessTokenMinutes` | Access token lifetime in minutes |
-| `Auth:Pbkdf2Iterations` | Password hash iterations (default 600,000) |
+| `Auth:Argon2MemoryKiB` | Login hash Argon2id memory in KiB (default 65,536 = 64 MiB) |
+| `Auth:Argon2TimeCost` | Login hash Argon2id passes (default 4) |
+| `Auth:Argon2Parallelism` | Login hash Argon2id parallelism (default 4) |
+| `Auth:Pbkdf2Iterations` | (Legacy) PBKDF2 iterations for old password hashes; new hashes use Argon2id |
 | `Volume:SectorSize` | AES-XTS sector size (multiple of 16) |
-| `Volume:KdfIterations` | PBKDF2 iterations for KEK derivation (default 600,000) |
+| `Volume:KdfAlgorithm` | KEK derivation algorithm: `argon2id` (Argon2id+PBKDF2 composite, default) or `argon2id-raw` (Argon2id only, RFC 9106 standard composition) |
+| `Volume:KdfMemoryKiB` | KEK derivation Argon2id memory in KiB (default 65,536 = 64 MiB) |
+| `Volume:KdfTimeCost` | KEK derivation Argon2id passes (default 4) |
+| `Volume:KdfParallelism` | KEK derivation Argon2id parallelism (default 4) |
+| `Volume:KdfIterations` | PBKDF2 iterations for the second KDF stage (default 600,000; unused when `Volume:KdfAlgorithm` = `argon2id-raw`) |
 | `Volume:DefaultEncryptionMode` | Default encryption mode (`server` / `e2ee` / `none`) |
 | `Volume:E2eeChunkSize` | E2EE chunk size in bytes (default 1 MiB) |
 | `Volume:ChunkStorage` | Chunk storage mode (`local` = always volume.dat / `auto` = auto-chunk on S3) |
@@ -202,10 +209,15 @@ Configure under the `CistaNas` section of `appsettings.json`.
 
 ```
 Login password
-  └ PBKDF2(password, SHA256(username) || salt, iterations) → KEK
-      └ AES-256-GCM unwraps the master key
+  └ Argon2id(password, SHA256(username) || salt, t=4, m=64MiB, p=4)   [RFC 9106]
+      └ PBKDF2-SHA256(argon2out, SHA256(username) || salt, 600,000) → KEK
+          └ AES-256-GCM unwraps the master key
           └ Master key (64B) encrypts/decrypts AES-XTS volume data
 ```
+
+`Volume:KdfAlgorithm = "argon2id-raw"` switches new volume creation to the Argon2id-only
+composition (`KEK = Argon2id(...)` directly, no PBKDF2 second stage). The KDF algorithm is
+persisted per volume header, so existing volumes keep their original derivation either way.
 
 #### Local mode (volume.dat)
 
@@ -230,8 +242,9 @@ Download → S3 GET → ChunkedReadStream (Seekable + Range support)
 
 ```
 User password
-  └ PBKDF2-SHA256(password, SHA256(username) || salt, 310000) → KEK (32B)
-      └ AES-256-GCM wrap/unwrap of the master key
+  └ Argon2id(password, SHA256(username) || salt, t=4, m=64MiB, p=4)   [RFC 9106]
+      └ PBKDF2-SHA256(argon2out, SHA256(username) || salt, 600,000) → KEK (32B)
+          └ AES-256-GCM wrap/unwrap of the master key
           └ Master key (32B) is generated and held only on the client
 
 Per file:
@@ -332,10 +345,10 @@ WebDAV for E2EE volumes transfers encrypted filenames and encrypted blobs as-is.
 
 ## Security Measures
 
-- **Auth timing-attack mitigation** — Response time is uniform regardless of user existence (dummy PBKDF2 computation)
+- **Auth timing-attack mitigation** — Response time is uniform regardless of user existence (dummy Argon2id computation)
 - **Path sanitizer** — Prevents directory traversal (both API and WebDAV)
 - **Rate limiting** — Auth endpoints 10 req/min/IP, overall API 100 req/min/IP
-- **Auth lockout** — Locks for 15 minutes after 5 failures (PBKDF2 600,000 iterations)
+- **Auth lockout** — Locks for 15 minutes after 5 failures (each attempt costs an Argon2id hash: 64 MiB / 4 passes)
 - **Security headers** — CSP, HSTS, X-Content-Type-Options, X-Frame-Options, etc.
 - **JWT signing key** — Must be ≥ 32 bytes in production (randomly generated in dev)
 - **Streaming tokens** — 60s short-lived, URL-based access, max 10,000 tokens
