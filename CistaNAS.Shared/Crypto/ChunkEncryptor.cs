@@ -14,6 +14,7 @@ public static class ChunkEncryptor
 {
     private static ReadOnlySpan<byte> ChaCha20V2Magic => "CSTCH20\x02"u8;
     private static ReadOnlySpan<byte> ChaCha20V2KeyInfo => "cista-chacha20-chunk-key/v2"u8;
+    private static ReadOnlySpan<byte> FileKeyInfo => "cista-chunk-file-key/v1"u8;
     private const int ChaCha20NonceSize = 12;
     private const int ChaCha20TagSize = 16;
 
@@ -26,6 +27,12 @@ public static class ChunkEncryptor
     /// <param name="sectorSize">セクタサイズ（ボリュームの SectorSize）。</param>
     /// <param name="chunkSize">チャンクサイズ（バイト）。</param>
     /// <param name="plaintext">平文データ。</param>
+    /// <param name="fileSalt">
+    /// ファイル毎のソルト（16 バイト推奨）。chunkIndex はファイル相対であるため、
+    /// ボリュームマスターキーをそのまま使うと別ファイルの同一位置チャンクで
+    /// tweak が衝突する（C⊕C = P⊕P leak）。ソルトを渡すと鍵を HKDF で
+    /// ファイルスコープに導出して衝突を防ぐ。null/空は旧形式（レガシー）扱い。
+    /// </param>
     /// <returns>暗号化済みデータ（16 の倍数にパディング済み）。</returns>
     public static byte[] EncryptChunk(
         ReadOnlySpan<byte> masterKey,
@@ -33,7 +40,8 @@ public static class ChunkEncryptor
         int chunkIndex,
         int sectorSize,
         int chunkSize,
-        ReadOnlySpan<byte> plaintext)
+        ReadOnlySpan<byte> plaintext,
+        ReadOnlySpan<byte> fileSalt = default)
     {
         // セクタサイズが未設定（E2EE 等）の場合はブロックサイズ（16）を使用
         if (sectorSize <= 0) sectorSize = 16;
@@ -45,23 +53,33 @@ public static class ChunkEncryptor
 
         long firstSector = (long)chunkIndex * (chunkSize / sectorSize);
 
-        switch (algorithm)
+        byte[]? derivedKey = DeriveFileScopedKeyIfAny(masterKey, fileSalt, algorithm);
+        try
         {
-            case CipherAlgorithm.Aes256Xts:
-                using (var transform = new AesXtsTransform(masterKey, sectorSize))
-                {
-                    transform.Encrypt(firstSector, padded, padded);
-                }
-                break;
+            ReadOnlySpan<byte> key = derivedKey ?? masterKey;
+            switch (algorithm)
+            {
+                case CipherAlgorithm.Aes256Xts:
+                    using (var transform = new AesXtsTransform(key, sectorSize))
+                    {
+                        transform.Encrypt(firstSector, padded, padded);
+                    }
+                    break;
 
-            case CipherAlgorithm.ChaCha20:
-                return EncryptChaCha20V2(masterKey, padded);
+                case CipherAlgorithm.ChaCha20:
+                    return EncryptChaCha20V2(key, padded);
 
-            default:
-                throw new ArgumentException($"サポートされていない暗号化アルゴリズム: {algorithm}");
+                default:
+                    throw new ArgumentException($"サポートされていない暗号化アルゴリズム: {algorithm}");
+            }
+
+            return padded;
         }
-
-        return padded;
+        finally
+        {
+            if (derivedKey is not null)
+                CryptographicOperations.ZeroMemory(derivedKey);
+        }
     }
 
     /// <summary>
@@ -74,6 +92,7 @@ public static class ChunkEncryptor
     /// <param name="chunkSize">チャンクサイズ（バイト）。</param>
     /// <param name="ciphertext">暗号化データ。</param>
     /// <param name="originalLength">復号後の元データ長。</param>
+    /// <param name="fileSalt"><see cref="EncryptChunk"/> の <c>fileSalt</c> と同じ値を渡すこと。</param>
     /// <returns>復号済みデータ（元の長さにトリム済み）。</returns>
     public static byte[] DecryptChunk(
         ReadOnlySpan<byte> masterKey,
@@ -82,7 +101,8 @@ public static class ChunkEncryptor
         int sectorSize,
         int chunkSize,
         ReadOnlySpan<byte> ciphertext,
-        int originalLength)
+        int originalLength,
+        ReadOnlySpan<byte> fileSalt = default)
     {
         // セクタサイズが未設定（E2EE 等）の場合はブロックサイズ（16）を使用
         if (sectorSize <= 0) sectorSize = 16;
@@ -91,24 +111,34 @@ public static class ChunkEncryptor
 
         long firstSector = (long)chunkIndex * (chunkSize / sectorSize);
 
-        switch (algorithm)
+        byte[]? derivedKey = DeriveFileScopedKeyIfAny(masterKey, fileSalt, algorithm);
+        try
         {
-            case CipherAlgorithm.Aes256Xts:
-                using (var transform = new AesXtsTransform(masterKey, sectorSize))
-                {
-                    transform.Decrypt(firstSector, padded, padded);
-                }
-                break;
+            ReadOnlySpan<byte> key = derivedKey ?? masterKey;
+            switch (algorithm)
+            {
+                case CipherAlgorithm.Aes256Xts:
+                    using (var transform = new AesXtsTransform(key, sectorSize))
+                    {
+                        transform.Decrypt(firstSector, padded, padded);
+                    }
+                    break;
 
-            case CipherAlgorithm.ChaCha20:
-                if (IsChaCha20V2(ciphertext))
-                    padded = DecryptChaCha20V2(masterKey, ciphertext);
-                else
-                    ChaCha20Decrypt(masterKey, firstSector, padded, sectorSize);
-                break;
+                case CipherAlgorithm.ChaCha20:
+                    if (IsChaCha20V2(ciphertext))
+                        padded = DecryptChaCha20V2(key, ciphertext);
+                    else
+                        ChaCha20Decrypt(key, firstSector, padded, sectorSize);
+                    break;
 
-            default:
-                throw new ArgumentException($"サポートされていない暗号化アルゴリズム: {algorithm}");
+                default:
+                    throw new ArgumentException($"サポートされていない暗号化アルゴリズム: {algorithm}");
+            }
+        }
+        finally
+        {
+            if (derivedKey is not null)
+                CryptographicOperations.ZeroMemory(derivedKey);
         }
 
         // 元の長さにトリム
@@ -179,6 +209,19 @@ public static class ChunkEncryptor
     {
         byte[] key = new byte[32];
         HKDF.DeriveKey(HashAlgorithmName.SHA256, masterKey, key, ReadOnlySpan<byte>.Empty, ChaCha20V2KeyInfo);
+        return key;
+    }
+
+    /// <summary>
+    /// fileSalt が指定されていればマスターキーからファイルスコープ鍵を導出する。
+    /// XTS は 64 バイト（2×32）、ChaCha20 は 32 バイト。ソルトが空なら null（レガシー: マスターキー直用）。
+    /// </summary>
+    private static byte[]? DeriveFileScopedKeyIfAny(ReadOnlySpan<byte> masterKey, ReadOnlySpan<byte> fileSalt, CipherAlgorithm algorithm)
+    {
+        if (fileSalt.IsEmpty) return null;
+        int length = algorithm == CipherAlgorithm.Aes256Xts ? 64 : 32;
+        byte[] key = new byte[length];
+        HKDF.DeriveKey(HashAlgorithmName.SHA256, masterKey, key, fileSalt, FileKeyInfo);
         return key;
     }
 

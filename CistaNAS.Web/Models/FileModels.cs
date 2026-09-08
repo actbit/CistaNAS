@@ -24,6 +24,14 @@ public sealed class FileMetadata
 
     /// <summary>チャンクの保存オブジェクト ID。旧カタログではファイル名を使用する。</summary>
     public string? ChunkObjectId { get; set; }
+
+    /// <summary>
+    /// サーバー側暗号化チャンクのファイルスコープ鍵導出用ソルト（base64 16 バイト）。
+    /// chunkIndex はファイル相対のため、マスターキー直用だと別ファイル同一位置で
+    /// XTS tweak が衝突する。これを防ぐため新規書き込み時に生成する。
+    /// null は旧形式（レガシー: マスターキー直接使用）として復号する。
+    /// </summary>
+    public string? KeySalt { get; set; }
 }
 
 public sealed record ListFilesResponse(IReadOnlyList<FileMetadata> Files);

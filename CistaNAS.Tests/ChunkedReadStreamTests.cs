@@ -14,7 +14,7 @@ public class ChunkedReadStreamTests
 
     /// <summary>暗号化チャンクを InMemoryChunkStore に書き込み、ChunkedReadStream を返す。</summary>
     private static async Task<(ChunkedReadStream stream, byte[] originalData, InMemoryChunkStore store)>
-        PrepareStreamAsync(byte[] plainData, int chunksCount, byte[]? key = null)
+        PrepareStreamAsync(byte[] plainData, int chunksCount, byte[]? key = null, byte[]? fileSalt = null)
     {
         key ??= MasterKey();
         var store = new InMemoryChunkStore();
@@ -25,14 +25,14 @@ public class ChunkedReadStreamTests
         {
             int size = (i < chunksCount - 1) ? ChunkSize : plainData.Length - offset;
             byte[] chunkPlain = plainData[offset..(offset + size)];
-            byte[] encrypted = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, i, SectorSize, ChunkSize, chunkPlain);
+            byte[] encrypted = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, i, SectorSize, ChunkSize, chunkPlain, fileSalt);
             using var ms = new MemoryStream(encrypted);
             await store.WriteChunkAsync("vol", "file", i, ms);
             chunkSizes.Add(size);
             offset += size;
         }
 
-        var stream = new ChunkedReadStream(store, "vol", "file", key, CipherAlgorithm.Aes256Xts, SectorSize, ChunkSize, chunkSizes);
+        var stream = new ChunkedReadStream(store, "vol", "file", key, CipherAlgorithm.Aes256Xts, SectorSize, ChunkSize, chunkSizes, fileSalt);
         return (stream, plainData, store);
     }
 
@@ -65,6 +65,21 @@ public class ChunkedReadStreamTests
             byte[] result = new byte[plain.Length];
             stream.ReadExactly(result);
             Assert.Equal(plain, result);
+        }
+    }
+
+    [Fact]
+    public async Task WithFileSalt_Roundtrip()
+    {
+        // FileMetadata.KeySalt を使ったファイルスコープ鍵でストリーム経由の復号が通ること
+        byte[] plain = RandomNumberGenerator.GetBytes(ChunkSize + 500);
+        byte[] fileSalt = RandomNumberGenerator.GetBytes(16);
+        var (stream, original, _) = await PrepareStreamAsync(plain, 2, fileSalt: fileSalt);
+        using (stream)
+        {
+            byte[] result = new byte[original.Length];
+            stream.ReadExactly(result);
+            Assert.Equal(original, result);
         }
     }
 

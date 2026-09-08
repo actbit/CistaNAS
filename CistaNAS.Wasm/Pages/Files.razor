@@ -10,6 +10,7 @@
 @inject E2eeApiClient E2eeApi
 @inject ClientVolumeMountService VolumeMountService
 @inject E2eeInterop E2ee
+@inject E2eeFileTransferService Transfer
 @inject WasmAuthStateProvider Auth
 @inject HttpClient Http
 @inject NavigationManager Nav
@@ -430,59 +431,9 @@ else
     {
         foreach (var file in e.GetMultipleFiles())
         {
-            string encName = await E2ee.EncryptFilename(file.Name, _masterKeyHandle!);
-            string fileSaltB64 = await E2ee.GenerateFileSalt();
-
             await using var stream = file.OpenReadStream(maxAllowedSize: 10L * 1024 * 1024 * 1024);
-            long totalSize = file.Size;
-            int totalChunks = (int)((totalSize + _e2eeChunkSize - 1) / _e2eeChunkSize);
-            if (totalChunks == 0) totalChunks = 1;
-
-            // 暗号化後サイズの推定 (salt 16 bytes + chunk ごとに tag 16 bytes)
-            long estimatedLength = ComputeEncryptedLength(totalSize, _e2eeChunkSize);
-
-            var entry = await E2eeApi.CreateFileAsync(VolumeName, encName, estimatedLength, totalChunks);
-            string writeLease = entry.WriteLeaseToken
-                ?? throw new InvalidDataException("書き込みリースtokenがありません。");
-            try
-            {
-                long bytesRemaining = totalSize;
-                for (int i = 0; i < totalChunks; i++)
-                {
-                    int readLen = (int)Math.Min(_e2eeChunkSize, bytesRemaining);
-                    byte[] buffer = new byte[readLen];
-                    int read = 0;
-                    while (read < readLen)
-                    {
-                        int n = await stream.ReadAsync(buffer, read, readLen - read);
-                        if (n == 0) break;
-                        read += n;
-                    }
-                    if (read < buffer.Length) buffer = buffer[..read];
-
-                    string encB64 = await E2ee.EncryptChunk(buffer, _masterKeyHandle!, i, fileSaltB64, isFirstChunk: i == 0);
-                    byte[] encBytes = Convert.FromBase64String(encB64);
-
-                    await E2eeApi.UploadChunkAsync(VolumeName, entry.FileId, i, encBytes, writeLease);
-                    bytesRemaining -= read;
-                }
-
-                // actual encrypted length
-                long actualLength = 16 + (totalChunks > 1 ? ((long)(totalChunks - 1) * (_e2eeChunkSize + 16)) : 0)
-                    + (totalSize - (totalChunks > 1 ? (long)(totalChunks - 1) * _e2eeChunkSize : 0)) + 16;
-                await E2eeApi.FinalizeFileAsync(VolumeName, entry.FileId, actualLength, writeLease);
-            }
-            catch
-            {
-                try { await E2eeApi.DeleteFileAsync(VolumeName, entry.FileId, writeLease); }
-                catch { }
-                throw;
-            }
-            finally
-            {
-                try { await E2eeApi.ReleaseWriteLeaseAsync(VolumeName, entry.FileId, writeLease); }
-                catch { }
-            }
+            // 暗号化・リース取得・ファイナライズ・ロールバックはサービス層に委譲
+            await Transfer.UploadAsync(VolumeName, file.Name, stream, file.Size, _e2eeChunkSize, _masterKeyHandle!);
         }
 
         await RefreshE2eeList();
@@ -497,38 +448,8 @@ else
 
         try
         {
-            var entry = item.Entry;
-            var decryptedChunks = new List<byte[]>(entry.ChunkCount);
-            string? fileSaltB64 = null;
-
-            for (int i = 0; i < entry.ChunkCount; i++)
-            {
-                (byte[] encData, int revision) = await E2eeApi.DownloadChunkAsync(VolumeName, entry.FileId, i);
-
-                if (i == 0 && fileSaltB64 is null)
-                {
-                    byte[] salt = new byte[16];
-                    Buffer.BlockCopy(encData, 0, salt, 0, 16);
-                    fileSaltB64 = Convert.ToBase64String(salt);
-                }
-
-                string encB64 = Convert.ToBase64String(encData);
-                // revision >= 1 のチャンク（Dokan 差分保存で再暗号化済み）は nonce 導出に revision が必須
-                byte[] plainBytes = await E2ee.DecryptChunk(encB64, _masterKeyHandle!, i, fileSaltB64 ?? "", revision);
-                decryptedChunks.Add(plainBytes);
-            }
-
-            // チャンク結合
-            int totalLength = 0;
-            foreach (var chunk in decryptedChunks) totalLength += chunk.Length;
-
-            byte[] combined = new byte[totalLength];
-            int offset = 0;
-            foreach (var chunk in decryptedChunks)
-            {
-                Buffer.BlockCopy(chunk, 0, combined, offset, chunk.Length);
-                offset += chunk.Length;
-            }
+            // チャンク取得・復号・結合はサービス層に委譲
+            byte[] combined = await Transfer.DownloadAsync(VolumeName, item.Entry.FileId, item.Entry.ChunkCount, _masterKeyHandle!);
 
             var base64 = Convert.ToBase64String(combined);
             await JS.InvokeVoidAsync("cistaDownload", item.PlainName, base64, "application/octet-stream");
@@ -542,22 +463,13 @@ else
     private async Task HandleE2eeDelete(string fileId)
     {
         _operationError = null;
-        string? writeLease = null;
         try
         {
-            writeLease = await E2eeApi.AcquireWriteLeaseAsync(VolumeName, fileId);
-            await E2eeApi.DeleteFileAsync(VolumeName, fileId, writeLease);
+            // リース取得・削除・解放はサービス層に委譲
+            await Transfer.DeleteAsync(VolumeName, fileId);
             await RefreshE2eeList();
         }
         catch (Exception ex) { _operationError = $"削除エラー: {ex.Message}"; }
-        finally
-        {
-            if (writeLease is not null)
-            {
-                try { await E2eeApi.ReleaseWriteLeaseAsync(VolumeName, fileId, writeLease); }
-                catch { }
-            }
-        }
     }
 
     // ---- 通常ボリューム: ダウンロード ----
@@ -670,14 +582,6 @@ else
         if (bytes < 1024 * 1024) return $"{bytes / 1024:F1} KB";
         if (bytes < 1024 * 1024 * 1024) return $"{bytes / (1024.0 * 1024.0):F1} MB";
         return $"{bytes / (1024.0 * 1024.0 * 1024.0):F1} GB";
-    }
-
-    private static long ComputeEncryptedLength(long plainSize, int chunkSize)
-    {
-        int totalChunks = Math.Max(1, (int)((plainSize + chunkSize - 1) / chunkSize));
-        long saltOverhead = 16;
-        long tagOverhead = (long)totalChunks * 16;
-        return plainSize + saltOverhead + tagOverhead;
     }
 
     private class E2eeFileViewItem

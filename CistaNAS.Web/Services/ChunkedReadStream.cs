@@ -15,6 +15,7 @@ public sealed class ChunkedReadStream : Stream
     private readonly string _volumeName;
     private readonly string _objectId;
     private readonly byte[] _masterKey;
+    private readonly byte[]? _fileSalt; // FileMetadata.KeySalt（レガシーな salt なしファイルは null）
     private readonly CipherAlgorithm _cipherAlgorithm;
     private readonly int _sectorSize;
     private readonly int _chunkSize;
@@ -35,12 +36,14 @@ public sealed class ChunkedReadStream : Stream
         CipherAlgorithm cipherAlgorithm,
         int sectorSize,
         int chunkSize,
-        IReadOnlyList<int> chunkSizes)
+        IReadOnlyList<int> chunkSizes,
+        ReadOnlySpan<byte> fileSalt = default)
     {
         _chunkStore = chunkStore;
         _volumeName = volumeName;
         _objectId = objectId;
         _masterKey = masterKey.ToArray();
+        _fileSalt = fileSalt.IsEmpty ? null : fileSalt.ToArray();
         _cipherAlgorithm = cipherAlgorithm;
         _sectorSize = sectorSize;
         _chunkSize = chunkSize;
@@ -173,7 +176,8 @@ public sealed class ChunkedReadStream : Stream
 
         int originalLength = chunkIndex < _chunkSizes.Count ? _chunkSizes[chunkIndex] : encrypted.Length;
         byte[] plain = ChunkEncryptor.DecryptChunk(
-            _masterKey, _cipherAlgorithm, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength);
+            _masterKey, _cipherAlgorithm, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength,
+            _fileSalt);
 
         _cachedDecrypted = plain;
         _cachedChunkIndex = chunkIndex;
@@ -193,7 +197,8 @@ public sealed class ChunkedReadStream : Stream
 
         int originalLength = chunkIndex < _chunkSizes.Count ? _chunkSizes[chunkIndex] : encrypted.Length;
         byte[] plain = ChunkEncryptor.DecryptChunk(
-            _masterKey, _cipherAlgorithm, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength);
+            _masterKey, _cipherAlgorithm, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength,
+            _fileSalt);
 
         _cachedDecrypted = plain;
         _cachedChunkIndex = chunkIndex;

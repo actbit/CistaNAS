@@ -130,6 +130,71 @@ public class ChunkEncryptorTests
         Assert.NotEqual(c0, c2);
     }
 
+    // ---- ファイルスコープ鍵（fileSalt）の回帰防止 ----
+    // chunkIndex はファイル相対のため、マスターキー直用だと別ファイルの同一位置
+    // チャンクで XTS tweak が衝突し C⊕C = P⊕P が漏れる。
+
+    [Fact]
+    public void Xts_DifferentFileSalt_SameChunkIndex_DifferentCiphertext()
+    {
+        byte[] key = MasterKey();
+        byte[] plain = new byte[4096]; // 全ゼロ
+        const int sectorSize = 4096;
+        const int chunkSize = 4194304;
+        byte[] saltA = RandomNumberGenerator.GetBytes(16);
+        byte[] saltB = RandomNumberGenerator.GetBytes(16);
+
+        // 修正前: 同一 (key, chunkIndex) で別ファイルのチャンク 0 が同一暗号文になる
+        byte[] cA = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, plain, saltA);
+        byte[] cB = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, plain, saltB);
+
+        Assert.NotEqual(cA, cB);
+    }
+
+    [Fact]
+    public void Xts_WithFileSalt_Roundtrip()
+    {
+        byte[] key = MasterKey();
+        byte[] plain = RandomNumberGenerator.GetBytes(1000);
+        const int sectorSize = 4096;
+        const int chunkSize = 4194304;
+        byte[] fileSalt = RandomNumberGenerator.GetBytes(16);
+
+        byte[] cipher = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 3, sectorSize, chunkSize, plain, fileSalt);
+        byte[] dec = ChunkEncryptor.DecryptChunk(key, CipherAlgorithm.Aes256Xts, 3, sectorSize, chunkSize, cipher, plain.Length, fileSalt);
+
+        Assert.Equal(plain, dec);
+    }
+
+    [Fact]
+    public void Xts_WrongFileSalt_DoesNotDecrypt()
+    {
+        byte[] key = MasterKey();
+        byte[] plain = RandomNumberGenerator.GetBytes(1000);
+        const int sectorSize = 4096;
+        const int chunkSize = 4194304;
+
+        byte[] cipher = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, plain, RandomNumberGenerator.GetBytes(16));
+        byte[] dec = ChunkEncryptor.DecryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, cipher, plain.Length, RandomNumberGenerator.GetBytes(16));
+
+        Assert.NotEqual(plain, dec);
+    }
+
+    [Fact]
+    public void Xts_NullSalt_LegacyPath_Roundtrip()
+    {
+        // 旧カタログ（KeySalt なし）はレガシーパス（マスターキー直接）で透過的に復号できること
+        byte[] key = MasterKey();
+        byte[] plain = RandomNumberGenerator.GetBytes(1000);
+        const int sectorSize = 4096;
+        const int chunkSize = 4194304;
+
+        byte[] cipher = ChunkEncryptor.EncryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, plain);
+        byte[] dec = ChunkEncryptor.DecryptChunk(key, CipherAlgorithm.Aes256Xts, 0, sectorSize, chunkSize, cipher, plain.Length);
+
+        Assert.Equal(plain, dec);
+    }
+
     // ---- ChaCha20 ノンス/カウンタ修正の回帰防止 (C-1) ----
 
     [Fact]

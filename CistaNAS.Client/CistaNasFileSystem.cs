@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Http;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using CistaNAS.Client.Api;
@@ -230,6 +232,18 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 CryptographicOperations.ZeroMemory(data);
             _ranges.Clear();
         }
+
+        /// <summary>
+        /// サーバーへの永続化が完了した範囲を解放する（ゼロクリア）。
+        /// 保持し続けると WriteFile のたびに全蓄積レンジが再送され転送量が O(N²) に
+        /// 膨らむため、PATCH 成功後に呼ぶ。以降の書き込みは新しいレンジだけを送る。
+        /// </summary>
+        public void ClearPersistedRanges()
+        {
+            foreach (var (_, data) in _ranges)
+                CryptographicOperations.ZeroMemory(data);
+            _ranges.Clear();
+        }
     }
 
     // E2EE: 汚れたチャンクを RMW（既存チャンク DL→復号→部分更新）で追跡し、Cleanup で汚れたチャンクだけ差分上書きする。
@@ -371,6 +385,19 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             _dirtyChunks.Clear();
         }
 
+        /// <summary>
+        /// サーバーへの永続化が完了したダーティチャンクを解放する（ゼロクリア）。
+        /// 保持し続けると WriteFile のたびに全蓄積チャンクが再送（+ revision 取分の
+        /// 追加 HTTP）され転送量が O(N²) に膨らむため、差分アップロード成功後に呼ぶ。
+        /// 以降の RMW は GetOrLoadChunk がサーバーから最新を再取得するため正しさは維持される。
+        /// </summary>
+        public void ClearPersistedChunks()
+        {
+            foreach (var (_, chunk) in _dirtyChunks)
+                CryptographicOperations.ZeroMemory(chunk);
+            _dirtyChunks.Clear();
+        }
+
         private byte[] GetOrLoadChunk(int ci)
         {
             if (_dirtyChunks.TryGetValue(ci, out var cached)) return cached;
@@ -489,8 +516,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 // 書き込みアクセスがある場合は上書きモード（チャンク差分保存）
                 if ((access & (DokanNet.FileAccess.WriteData | DokanNet.FileAccess.GenericWrite)) != 0)
                 {
-                    info.Context = new E2eeChunkWriteState(this, plainName, fileId);
-                    return DokanResult.Success;
+                    return OpenE2eeWriteHandle(plainName, fileId, info);
                 }
                 info.Context = fileId;
                 return DokanResult.Success;
@@ -498,8 +524,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
             if (mode == FileMode.OpenOrCreate)
             {
-                info.Context = new E2eeChunkWriteState(this, plainName, null);
-                return DokanResult.Success;
+                return OpenE2eeWriteHandle(plainName, null, info);
             }
 
             return DokanResult.FileNotFound;
@@ -519,8 +544,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             if (existing is not null)
                 return DokanResult.FileExists;
 
-            info.Context = new E2eeChunkWriteState(this, plainName, null);
-            return DokanResult.Success;
+            return OpenE2eeWriteHandle(plainName, null, info);
         }
 
         if (mode == FileMode.Create)
@@ -537,11 +561,29 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
             // E2EE モード: 旧IDを保持（差分上書き時は維持、新規作成時は Cleanup で削除）
             var existing = FindFileId(plainName);
-            info.Context = new E2eeChunkWriteState(this, plainName, existing);
-            return DokanResult.Success;
+            return OpenE2eeWriteHandle(plainName, existing, info);
         }
 
         return DokanResult.Success;
+    }
+
+    /// <summary>
+    /// E2EE 書き込みハンドル用の WriteState を作成して info.Context に設定する。
+    /// 書き込みリースの競合 (423 Locked) は SharingViolation として返す。
+    /// 未処理の例外を Dokan にそのまま伝えると、利用者には原因不明のエラーとして見える
+    /// （Word 等で既に開かれているファイルへの上書きコピーがこれに当たる）。
+    /// </summary>
+    private NtStatus OpenE2eeWriteHandle(string plainName, string? existingFileId, IDokanFileInfo info)
+    {
+        try
+        {
+            info.Context = new E2eeChunkWriteState(this, plainName, existingFileId);
+            return DokanResult.Success;
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Locked)
+        {
+            return DokanResult.SharingViolation;
+        }
     }
 
     /// <summary>非E2EE: 既存ファイルの平文長を取得（差分保存で末尾保持のため）。</summary>
@@ -1052,6 +1094,11 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             deleteLease = _api.AcquireWriteLeaseAsync(_volumeName, fileId).GetAwaiter().GetResult();
             _api.DeleteFileAsync(_volumeName, fileId, deleteLease).GetAwaiter().GetResult();
         }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Locked)
+        {
+            // 他ハンドルが書き込みリース保持中 → Windows の共有違反として報告
+            return DokanResult.SharingViolation;
+        }
         catch (Exception) { return DokanResult.InternalError; }
         finally
         {
@@ -1190,6 +1237,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                     Buffer.BlockCopy(data, 0, full, (int)off, data.Length);
             }
             CistaNasApiClientFiles.UploadFileAsync(_api, _volumeName, ws.PlainName, full).GetAwaiter().GetResult();
+            ws.ClearPersistedRanges();
             return;
         }
 
@@ -1199,11 +1247,13 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             return;
         }
 
-        // 各範囲を PATCH（サーバー AesXtsStream がセクタ RMW で安全に部分上書き）
+        // 各範囲を PATCH（サーバー AesXtsStream がセクタ RMW で安全に部分上書き）。
+        // 成功した範囲は解放する（保持すると次の書き込みで全蓄積分が再送される）。
         foreach (var (off, data) in ws.Ranges)
         {
             CistaNasApiClientFiles.PatchFileRangeAsync(_api, _volumeName, ws.PlainName, off, data).GetAwaiter().GetResult();
         }
+        ws.ClearPersistedRanges();
     }
 
     // E2EE 新規ファイル: 新 fileSalt で全チャンク作成（従来方式、Critical-4 ロールバック維持）。
@@ -1318,6 +1368,10 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             cache.ChunkCount = finalizeChunkCount;
             cache.PlainLength = newPlainLength;
         }
+
+        // 全チャンク + FinalizeFile が成功した時点でサーバーに永続化済み。
+        // 蓄積チャンクを保持すると次の書き込みで全量が再送されるため解放する。
+        ws.ClearPersistedChunks();
     }
 
     private static byte[] ResizeChunk(byte[] chunk, int newLen)
