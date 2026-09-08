@@ -12,7 +12,7 @@ public static class CistaNasApiClientE2eeExtensions
     public static async Task AddWrappedKeyAsync(this CistaNasApiClient client, string volumeName, string username,
         byte[] wrappedNonce, byte[] wrappedCt, byte[] wrappedTag, byte[] ephemeralPublicKey)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new
         {
             username,
@@ -42,7 +42,7 @@ public static class CistaNasApiClientE2eeExtensions
     /// <summary>グループメンバーの公開鍵一覧を取得する（ECDH 共有用）。</summary>
     public static async Task<List<GroupMemberInfo>> GetGroupMembersAsync(this CistaNasApiClient client, string volumeName)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.GetAsync($"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/group-members");
         res.EnsureSuccessStatusCode();
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();
@@ -62,7 +62,7 @@ public static class CistaNasApiClientE2eeExtensions
     public static async Task AddWrappedKeysBatchAsync(this CistaNasApiClient client, string volumeName,
         Dictionary<string, (byte[] nonce, byte[] ct, byte[] tag, byte[] ephemeralPublicKey)> wrappedKeys)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var keys = new Dictionary<string, object>();
         foreach (var (username, (nonce, ct, tag, ephemeralPublicKey)) in wrappedKeys)
         {
@@ -93,7 +93,7 @@ public static class CistaNasApiClientE2eeExtensions
     /// <summary>ユーザーのクオータを設定する。</summary>
     public static async Task SetUserQuotaAsync(this CistaNasApiClient client, string volumeName, string username, long maxBytes)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new { maxBytes };
         var res = await http.PutAsJsonAsync($"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/quota/{Uri.EscapeDataString(username)}", req, JsonOpts);
         res.EnsureSuccessStatusCode();
@@ -102,7 +102,7 @@ public static class CistaNasApiClientE2eeExtensions
     /// <summary>ユーザーの公開鍵を取得する。</summary>
     public static async Task<string?> GetPublicKeyAsync(this CistaNasApiClient client, string username)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.GetAsync($"/api/v1/e2ee/public-key/{Uri.EscapeDataString(username)}");
         if (!res.IsSuccessStatusCode) return null;
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();
@@ -112,7 +112,7 @@ public static class CistaNasApiClientE2eeExtensions
     /// <summary>自分の公開鍵を設定する。</summary>
     public static async Task SetMyPublicKeyAsync(this CistaNasApiClient client, byte[] publicKey)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new { publicKey = Convert.ToBase64String(publicKey) };
         var res = await http.PutAsJsonAsync("/api/v1/e2ee/my-public-key", req, JsonOpts);
         res.EnsureSuccessStatusCode();
@@ -122,7 +122,7 @@ public static class CistaNasApiClientE2eeExtensions
     public static async Task<VolumeInfo> CreateGroupVolumeAsync(this CistaNasApiClient client, string groupName,
         byte[] wrappedNonce, byte[] wrappedCt, byte[] wrappedTag, byte[] kdfSalt, int kdfIterations, int chunkSize = 1048576)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new
         {
             groupName,
@@ -156,13 +156,6 @@ public static class CistaNasApiClientE2eeExtensions
             IsMounted = json.TryGetProperty("isMounted", out var mnt) && mnt.GetBoolean(),
             OwnerUser = json.TryGetProperty("ownerUser", out var owner) ? owner.GetString() ?? "" : "",
         };
-    }
-
-    private static HttpClient GetHttp(CistaNasApiClient client)
-    {
-        var field = typeof(CistaNasApiClient).GetField("_http", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-            ?? throw new InvalidOperationException("_http フィールドが見つかりません。");
-        return (HttpClient?)field.GetValue(client) ?? throw new InvalidOperationException("_http が null です。");
     }
 }
 

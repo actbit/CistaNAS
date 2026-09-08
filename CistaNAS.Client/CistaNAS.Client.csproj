@@ -21,6 +21,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\CistaNAS.Api.Client\CistaNAS.Api.Client.csproj" />
     <ProjectReference Include="..\CistaNAS.Shared\CistaNAS.Shared.csproj" />
   </ItemGroup>
 

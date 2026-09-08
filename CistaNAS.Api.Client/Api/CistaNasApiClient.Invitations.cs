@@ -11,7 +11,7 @@ public static class CistaNasApiClientInvitations
     /// <summary>招待を作成する。</summary>
     public static async Task<string> CreateInvitationAsync(this CistaNasApiClient client, string targetUsername)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new { targetUsername };
         var res = await http.PostAsJsonAsync("/api/v1/e2ee/invitations", req, JsonOpts);
         res.EnsureSuccessStatusCode();
@@ -22,7 +22,7 @@ public static class CistaNasApiClientInvitations
     /// <summary>招待情報を取得する。</summary>
     public static async Task<InvitationInfo?> GetInvitationAsync(this CistaNasApiClient client, string invitationId)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.GetAsync($"/api/v1/e2ee/invitations/{Uri.EscapeDataString(invitationId)}");
         if (!res.IsSuccessStatusCode) return null;
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();
@@ -37,7 +37,7 @@ public static class CistaNasApiClientInvitations
     /// <summary>招待を受け入れる。</summary>
     public static async Task AcceptInvitationAsync(this CistaNasApiClient client, string invitationId, byte[] encryptedPublicKey, byte[] nonce)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new
         {
             encryptedPublicKey = Convert.ToBase64String(encryptedPublicKey),
@@ -45,13 +45,6 @@ public static class CistaNasApiClientInvitations
         };
         var res = await http.PostAsJsonAsync($"/api/v1/e2ee/invitations/{Uri.EscapeDataString(invitationId)}/accept", req, JsonOpts);
         res.EnsureSuccessStatusCode();
-    }
-
-    private static HttpClient GetHttp(CistaNasApiClient client)
-    {
-        var field = typeof(CistaNasApiClient).GetField("_http", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-            ?? throw new InvalidOperationException("_http フィールドが見つかりません。");
-        return (HttpClient?)field.GetValue(client) ?? throw new InvalidOperationException("_http が null です。");
     }
 }
 

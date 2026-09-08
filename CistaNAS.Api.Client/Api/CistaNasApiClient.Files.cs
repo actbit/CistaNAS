@@ -11,7 +11,7 @@ public static class CistaNasApiClientFiles
     /// <summary>ボリューム内のファイル一覧を取得する。</summary>
     public static async Task<List<FileMetadata>> ListFilesAsync(this CistaNasApiClient client, string volumeName)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.GetAsync($"/api/v1/files/{Uri.EscapeDataString(volumeName)}/");
         res.EnsureSuccessStatusCode();
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();
@@ -33,7 +33,7 @@ public static class CistaNasApiClientFiles
     /// <summary>ファイルをアップロードする。</summary>
     public static async Task<FileMetadata> UploadFileAsync(this CistaNasApiClient client, string volumeName, string filePath, byte[] data)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var content = new ByteArrayContent(data);
         content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
         var res = await http.PostAsync($"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(filePath)}", content);
@@ -51,7 +51,7 @@ public static class CistaNasApiClientFiles
     /// <summary>ファイルをアップロードする（Stream 版）。</summary>
     public static async Task<FileMetadata> UploadFileAsync(this CistaNasApiClient client, string volumeName, string filePath, Stream dataStream)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var content = new StreamContent(dataStream);
         content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
         var res = await http.PostAsync($"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(filePath)}", content);
@@ -69,7 +69,7 @@ public static class CistaNasApiClientFiles
     /// <summary>ファイルをダウンロードする。</summary>
     public static async Task<byte[]> DownloadFileAsync(this CistaNasApiClient client, string volumeName, string filePath)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.GetAsync($"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(filePath)}");
         res.EnsureSuccessStatusCode();
         return await res.Content.ReadAsByteArrayAsync();
@@ -78,7 +78,7 @@ public static class CistaNasApiClientFiles
     /// <summary>ファイルをダウンロードする（Stream 版）。</summary>
     public static async Task<Stream> DownloadFileStreamAsync(this CistaNasApiClient client, string volumeName, string filePath)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.GetAsync($"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(filePath)}", System.Net.Http.HttpCompletionOption.ResponseHeadersRead);
         res.EnsureSuccessStatusCode();
         return await res.Content.ReadAsStreamAsync();
@@ -87,7 +87,7 @@ public static class CistaNasApiClientFiles
     /// <summary>ファイルを削除する。</summary>
     public static async Task DeleteFileAsync(this CistaNasApiClient client, string volumeName, string filePath)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.DeleteAsync($"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(filePath)}");
         res.EnsureSuccessStatusCode();
     }
@@ -95,7 +95,7 @@ public static class CistaNasApiClientFiles
     /// <summary>ファイルの一部をダウンロードする（Range リクエスト対応）。</summary>
     public static async Task<byte[]> DownloadFileRangeAsync(this CistaNasApiClient client, string volumeName, string filePath, long offset, int count)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         using var request = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Get,
             $"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(filePath)}");
         request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(offset, offset + count - 1);
@@ -109,7 +109,7 @@ public static class CistaNasApiClientFiles
     /// <summary>ファイルの一部を書き込む（差分保存）。PATCH /files/{volume}/{path}?offset=N。</summary>
     public static async Task<FileMetadata> PatchFileRangeAsync(this CistaNasApiClient client, string volumeName, string filePath, long offset, byte[] data)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var content = new ByteArrayContent(data);
         content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
         var res = await http.PatchAsync(
@@ -123,13 +123,6 @@ public static class CistaNasApiClientFiles
             CreatedAt = json.GetProperty("createdAt").GetDateTimeOffset(),
             ModifiedAt = json.GetProperty("modifiedAt").GetDateTimeOffset(),
         };
-    }
-
-    private static HttpClient GetHttp(CistaNasApiClient client)
-    {
-        var field = typeof(CistaNasApiClient).GetField("_http", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-            ?? throw new InvalidOperationException("_http フィールドが見つかりません。");
-        return (HttpClient?)field.GetValue(client) ?? throw new InvalidOperationException("_http が null です。");
     }
 }
 

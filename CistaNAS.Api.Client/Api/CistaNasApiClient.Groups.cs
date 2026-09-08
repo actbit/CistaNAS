@@ -11,7 +11,7 @@ public static class CistaNasApiClientGroups
     /// <summary>ユーザーのグループ一覧を取得する。</summary>
     public static async Task<List<GroupInfo>> ListGroupsAsync(this CistaNasApiClient client)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.GetAsync("/api/v1/groups/");
         res.EnsureSuccessStatusCode();
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();
@@ -41,7 +41,7 @@ public static class CistaNasApiClientGroups
     /// <summary>グループを作成する。</summary>
     public static async Task CreateGroupAsync(this CistaNasApiClient client, string groupName)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new { groupName };
         var res = await http.PostAsJsonAsync("/api/v1/groups/", req, JsonOpts);
         res.EnsureSuccessStatusCode();
@@ -50,7 +50,7 @@ public static class CistaNasApiClientGroups
     /// <summary>グループを削除する。</summary>
     public static async Task DeleteGroupAsync(this CistaNasApiClient client, string groupName)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.DeleteAsync($"/api/v1/groups/{Uri.EscapeDataString(groupName)}");
         res.EnsureSuccessStatusCode();
     }
@@ -58,7 +58,7 @@ public static class CistaNasApiClientGroups
     /// <summary>グループにメンバーを追加する。</summary>
     public static async Task AddGroupMemberAsync(this CistaNasApiClient client, string groupName, string username)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new { username };
         var res = await http.PostAsJsonAsync($"/api/v1/groups/{Uri.EscapeDataString(groupName)}/members", req, JsonOpts);
         res.EnsureSuccessStatusCode();
@@ -67,16 +67,9 @@ public static class CistaNasApiClientGroups
     /// <summary>グループからメンバーを削除する。</summary>
     public static async Task RemoveGroupMemberAsync(this CistaNasApiClient client, string groupName, string username)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.DeleteAsync($"/api/v1/groups/{Uri.EscapeDataString(groupName)}/members/{Uri.EscapeDataString(username)}");
         res.EnsureSuccessStatusCode();
-    }
-
-    private static HttpClient GetHttp(CistaNasApiClient client)
-    {
-        var field = typeof(CistaNasApiClient).GetField("_http", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-            ?? throw new InvalidOperationException("_http フィールドが見つかりません。");
-        return (HttpClient?)field.GetValue(client) ?? throw new InvalidOperationException("_http が null です。");
     }
 }
 

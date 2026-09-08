@@ -9,7 +9,7 @@ namespace CistaNAS.Client.Api;
 /// </summary>
 public sealed class CistaNasApiClient
 {
-    private readonly HttpClient _http;
+    internal readonly HttpClient _http;
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
     public CistaNasApiClient(HttpClient http)

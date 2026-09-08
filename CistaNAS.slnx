@@ -1,4 +1,5 @@
 <Solution>
+  <Project Path="CistaNAS.Api.Client/CistaNAS.Api.Client.csproj" />
   <Project Path="CistaNAS.AppHost/CistaNAS.AppHost.csproj" />
   <Project Path="CistaNAS.Client/CistaNAS.Client.csproj" />
   <Project Path="CistaNAS.ServiceDefaults/CistaNAS.ServiceDefaults.csproj" />
