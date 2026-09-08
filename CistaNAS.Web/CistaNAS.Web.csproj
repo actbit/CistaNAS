@@ -16,6 +16,11 @@
   <ItemGroup>
     <ProjectReference Include="..\CistaNAS.ServiceDefaults\CistaNAS.ServiceDefaults.csproj" />
     <ProjectReference Include="..\CistaNAS.Shared\CistaNAS.Shared.csproj" />
+    <!-- DB モデル本体 (AppDbContext 等は namespace CistaNAS.Web.Identity のまま) -->
+    <ProjectReference Include="..\CistaNAS.Web.Data\CistaNAS.Web.Data.csproj" />
+    <!-- プロバイダ別マイグレーションセット (出力先に同梱するため参照。Migrations 側は Web を参照しない) -->
+    <ProjectReference Include="..\CistaNAS.Web.Migrations.Sqlite\CistaNAS.Web.Migrations.Sqlite.csproj" />
+    <ProjectReference Include="..\CistaNAS.Web.Migrations.PostgreSql\CistaNAS.Web.Migrations.PostgreSql.csproj" />
   </ItemGroup>
 
   <!-- WASMをpublishしてWebのwwwrootにコピー -->

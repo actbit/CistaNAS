@@ -58,6 +58,11 @@ public static class ServiceCollectionExtensions
         return services;
     }
 
+    // プロバイダ別マイグレーションセット (1 つの DbContext に対して複数プロバイダの
+    // マイグレーションは同一アセンブリに置けないため、プロバイダごとに別アセンブリ)
+    private const string SqliteMigrationsAssembly = "CistaNAS.Web.Migrations.Sqlite";
+    private const string PostgreSqlMigrationsAssembly = "CistaNAS.Web.Migrations.PostgreSql";
+
     private static void RegisterDatabaseAndIdentity(
         IServiceCollection services, CistaNasOptions cista, IStorageProvider storage)
     {
@@ -68,7 +73,8 @@ public static class ServiceCollectionExtensions
         {
             case "postgresql":
                 services.AddDbContext<AppDbContext>(o =>
-                    o.UseNpgsql(db.ConnectionString));
+                    o.UseNpgsql(db.ConnectionString,
+                        b => b.MigrationsAssembly(PostgreSqlMigrationsAssembly)));
                 break;
 
             case "s3":
@@ -80,7 +86,8 @@ public static class ServiceCollectionExtensions
                 services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<CloudSqliteSync>());
                 services.AddDbContext<AppDbContext>(o =>
                 {
-                    o.UseSqlite($"Data Source={sync.LocalDbPath};Mode=ReadWriteCreate;Cache=Shared");
+                    o.UseSqlite($"Data Source={sync.LocalDbPath};Mode=ReadWriteCreate;Cache=Shared",
+                        b => b.MigrationsAssembly(SqliteMigrationsAssembly));
                     o.AddInterceptors(new CloudSqliteSaveChangesInterceptor(sync));
                 });
                 break;
@@ -91,7 +98,8 @@ public static class ServiceCollectionExtensions
                 var localPath = db.ConnectionString
                     ?? Path.Combine(cista.DataRoot, "cista.db");
                 services.AddDbContext<AppDbContext>(o =>
-                o.UseSqlite($"Data Source={localPath};Mode=ReadWriteCreate;Cache=Shared"));
+                o.UseSqlite($"Data Source={localPath};Mode=ReadWriteCreate;Cache=Shared",
+                    b => b.MigrationsAssembly(SqliteMigrationsAssembly)));
                 break;
             }
         }

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- AppDbContext を Web / Migrations.Sqlite / Migrations.PostgreSql の 3 Project から
+         参照できるようにここへ抽出 (循環参照回避。namespace は CistaNAS.Web.Identity のまま) -->
+    <PackageReference Include="Microsoft.AspNetCore.Identity.EntityFrameworkCore" Version="10.0.8" />
+  </ItemGroup>
+
+</Project>

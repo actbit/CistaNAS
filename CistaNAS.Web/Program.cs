@@ -5,6 +5,7 @@ using CistaNAS.Web.Api;
 using CistaNAS.Web.Authorization;
 using CistaNAS.Web.Components;
 using CistaNAS.Web.Configuration;
+using CistaNAS.Web.Data;
 using CistaNAS.Web.Identity;
 using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
@@ -195,7 +196,7 @@ using (var initScope = app.Services.CreateAsyncScope())
     var dbOpts = initScope.ServiceProvider.GetRequiredService<IOptions<CistaNasOptions>>().Value;
     var db = initScope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-    // オブジェクトストレージ上の SQLite: 起動時にダウンロード（EnsureCreated の前）
+    // オブジェクトストレージ上の SQLite: 起動時にダウンロード（マイグレーションの前）
     var cloudSync = initScope.ServiceProvider.GetService<CloudSqliteSync>();
     if (cloudSync is not null)
     {
@@ -203,11 +204,17 @@ using (var initScope = app.Services.CreateAsyncScope())
     }
 
     // SQLite の場合、DB ファイルの親ディレクトリが存在することを確認
-    var dbPath = dbOpts.Database.ConnectionString
-        ?? Path.Combine(dbOpts.DataRoot, "cista.db");
-    Directory.CreateDirectory(Path.GetDirectoryName(dbPath) ?? dbOpts.DataRoot);
+    if (db.Database.ProviderName == "Microsoft.EntityFrameworkCore.Sqlite")
+    {
+        var dbPath = dbOpts.Database.ConnectionString
+            ?? Path.Combine(dbOpts.DataRoot, "cista.db");
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(dbPath)) ?? dbOpts.DataRoot);
+    }
 
-    await db.Database.EnsureCreatedAsync();
+    // 構成プロバイダ (sqlite / postgresql) に応じた EF マイグレーションを適用。
+    // EnsureCreated 由来のレガシー DB は InitialCreate をベースライン登録してから差分を適用
+    var dbLogger = initScope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("DatabaseInitializer");
+    await DatabaseInitializer.InitializeAsync(db, dbLogger);
 
     // users.json / groups.json → DB 移行
     var storage = initScope.ServiceProvider.GetRequiredService<IStorageProvider>();

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- PostgreSQL 用マイグレーションセット。
+         1 つの DbContext に対して複数プロバイダのマイグレーションセットは
+         同一アセンブリに置けない (スナップショット衝突) ため、プロバイダごとに別アセンブリ。
+         AppDbContext を含む CistaNAS.Web.Data のみを参照し、Web とは逆方向の参照にしない。 -->
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.2" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.8">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <ProjectReference Include="..\CistaNAS.Web.Data\CistaNAS.Web.Data.csproj" />
+  </ItemGroup>
+
+</Project>
