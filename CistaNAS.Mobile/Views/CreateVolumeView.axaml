@@ -1,0 +1,26 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:CistaNAS.Mobile.Core.ViewModels"
+             x:Class="CistaNAS.Mobile.Views.CreateVolumeView"
+             x:DataType="vm:CreateVolumeViewModel">
+  <ScrollViewer Padding="24,32">
+    <StackPanel Spacing="16" MaxWidth="480">
+      <TextBlock Text="ボリューム作成" FontSize="22" FontWeight="SemiBold" />
+      <TextBox Text="{Binding VolumeName}" Watermark="ボリューム名" />
+
+      <StackPanel Spacing="8">
+        <CheckBox Content="E2EE (クライアント側暗号化)" IsChecked="{Binding IsE2ee}" />
+        <TextBlock Text="オフの場合はサーバー側暗号化 (AES-XTS) になります。E2EE の鍵は端末外に出ません。"
+                   TextWrapping="Wrap" Foreground="Gray" FontSize="12" />
+      </StackPanel>
+
+      <TextBox Text="{Binding Password}" Watermark="パスワード (8 文字以上)" PasswordChar="●" />
+      <TextBox Text="{Binding PasswordConfirm}" Watermark="パスワード (確認)" PasswordChar="●" />
+
+      <Button Content="作成" Command="{Binding CreateCommand}" HorizontalAlignment="Left" Padding="24,10" />
+      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />
+      <TextBlock Text="{Binding Error}" IsVisible="{Binding Error, Converter={x:Static ObjectConverters.IsNotNull}}"
+                 Foreground="Crimson" TextWrapping="Wrap" />
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>

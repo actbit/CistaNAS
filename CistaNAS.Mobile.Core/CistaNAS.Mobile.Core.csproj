@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- CistaNAS モバイルアプリのロジック層 (ViewModel / Service)。UI を持たず net10.0 のみでテスト可能。 -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CistaNAS.Api.Client\CistaNAS.Api.Client.csproj" />
+    <ProjectReference Include="..\CistaNAS.Shared\CistaNAS.Shared.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CistaNAS.Tests" />
+  </ItemGroup>
+
+</Project>

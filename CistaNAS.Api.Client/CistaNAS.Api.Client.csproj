@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- CistaNAS サーバーの /api/v1 REST クライアント。プラットフォーム非依存 (Desktop Client / Mobile 共用)。 -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>CistaNAS.Client.Api</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CistaNAS.Tests" />
+  </ItemGroup>
+
+</Project>

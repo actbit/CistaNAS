@@ -11,7 +11,7 @@ public static class CistaNasApiClientSettings
     /// <summary>暗号化設定を取得する。</summary>
     public static async Task<EncryptionSettingsInfo> GetEncryptionSettingsAsync(this CistaNasApiClient client)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.GetAsync("/api/v1/settings/encryption");
         res.EnsureSuccessStatusCode();
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();
@@ -27,7 +27,7 @@ public static class CistaNasApiClientSettings
     /// <summary>暗号化設定を保存する。</summary>
     public static async Task SaveEncryptionSettingsAsync(this CistaNasApiClient client, EncryptionSettingsInfo settings)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new
         {
             defaultEncryptionMode = settings.DefaultEncryptionMode,
@@ -37,13 +37,6 @@ public static class CistaNasApiClientSettings
         };
         var res = await http.PutAsJsonAsync("/api/v1/settings/encryption", req, JsonOpts);
         res.EnsureSuccessStatusCode();
-    }
-
-    private static HttpClient GetHttp(CistaNasApiClient client)
-    {
-        var field = typeof(CistaNasApiClient).GetField("_http", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-            ?? throw new InvalidOperationException("_http フィールドが見つかりません。");
-        return (HttpClient?)field.GetValue(client) ?? throw new InvalidOperationException("_http が null です。");
     }
 }
 

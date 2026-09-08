@@ -9,7 +9,7 @@ namespace CistaNAS.Client.Api;
 /// </summary>
 public sealed class CistaNasApiClient
 {
-    private readonly HttpClient _http;
+    internal readonly HttpClient _http;
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
     public CistaNasApiClient(HttpClient http)
@@ -20,6 +20,12 @@ public sealed class CistaNasApiClient
     public void SetToken(string token)
     {
         _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+    }
+
+    /// <summary>Authorization ヘッダーを除去する。</summary>
+    public void ClearToken()
+    {
+        _http.DefaultRequestHeaders.Authorization = null;
     }
 
     // ---- 認証 ----

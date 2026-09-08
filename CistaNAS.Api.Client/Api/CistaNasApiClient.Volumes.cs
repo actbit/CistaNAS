@@ -11,7 +11,7 @@ public static class CistaNasApiClientVolumes
     /// <summary>通常ボリュームを作成する。</summary>
     public static async Task<VolumeInfo> CreateVolumeAsync(this CistaNasApiClient client, string name, string username, string? password = null, bool encrypted = true)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new { name, username, password, encrypted };
         var res = await http.PostAsJsonAsync("/api/v1/volumes", req, JsonOpts);
         res.EnsureSuccessStatusCode();
@@ -22,7 +22,7 @@ public static class CistaNasApiClientVolumes
     /// <summary>ボリュームをマウントする。</summary>
     public static async Task<VolumeInfo> MountVolumeAsync(this CistaNasApiClient client, string name, string password)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new { password };
         var res = await http.PostAsJsonAsync($"/api/v1/volumes/{Uri.EscapeDataString(name)}/mount", req, JsonOpts);
         res.EnsureSuccessStatusCode();
@@ -33,7 +33,7 @@ public static class CistaNasApiClientVolumes
     /// <summary>ボリュームをロック（アンマウント）する。</summary>
     public static async Task LockVolumeAsync(this CistaNasApiClient client, string name)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.PostAsync($"/api/v1/volumes/{Uri.EscapeDataString(name)}/lock", null);
         res.EnsureSuccessStatusCode();
     }
@@ -41,7 +41,7 @@ public static class CistaNasApiClientVolumes
     /// <summary>ボリューム一覧（詳細情報付き）を取得する。</summary>
     public static async Task<List<VolumeDetail>> ListVolumesDetailAsync(this CistaNasApiClient client)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.GetAsync("/api/v1/volumes");
         res.EnsureSuccessStatusCode();
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();
@@ -86,7 +86,7 @@ public static class CistaNasApiClientVolumes
     /// <summary>ボリュームを削除する。</summary>
     public static async Task DeleteVolumeAsync(this CistaNasApiClient client, string name)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.DeleteAsync($"/api/v1/volumes/{Uri.EscapeDataString(name)}");
         res.EnsureSuccessStatusCode();
     }
@@ -94,7 +94,7 @@ public static class CistaNasApiClientVolumes
     /// <summary>ボリュームにユーザーアクセス権を付与する。</summary>
     public static async Task GrantAccessAsync(this CistaNasApiClient client, string name, string granterPassword, string targetUsername, string targetPassword)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new
         {
             granterPassword,
@@ -108,7 +108,7 @@ public static class CistaNasApiClientVolumes
     /// <summary>ボリュームからユーザーアクセス権を剥奪する。</summary>
     public static async Task RevokeAccessAsync(this CistaNasApiClient client, string name, string targetUsername)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new { targetUsername };
         var res = await http.PostAsJsonAsync($"/api/v1/volumes/{Uri.EscapeDataString(name)}/revoke", req, JsonOpts);
         res.EnsureSuccessStatusCode();
@@ -117,7 +117,7 @@ public static class CistaNasApiClientVolumes
     /// <summary>ボリュームにグループアクセス権を付与する。</summary>
     public static async Task GrantGroupAccessAsync(this CistaNasApiClient client, string name, string groupName)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new { groupName };
         var res = await http.PostAsJsonAsync($"/api/v1/volumes/{Uri.EscapeDataString(name)}/grant-group", req, JsonOpts);
         res.EnsureSuccessStatusCode();
@@ -126,7 +126,7 @@ public static class CistaNasApiClientVolumes
     /// <summary>ボリュームからグループアクセス権を剥奪する。</summary>
     public static async Task RevokeGroupAccessAsync(this CistaNasApiClient client, string name, string groupName)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new { groupName };
         var res = await http.PostAsJsonAsync($"/api/v1/volumes/{Uri.EscapeDataString(name)}/revoke-group", req, JsonOpts);
         res.EnsureSuccessStatusCode();
@@ -144,13 +144,6 @@ public static class CistaNasApiClientVolumes
             IsMounted = json.TryGetProperty("isMounted", out var mnt) && mnt.GetBoolean(),
             OwnerUser = json.TryGetProperty("ownerUser", out var owner) ? owner.GetString() ?? "" : "",
         };
-    }
-
-    private static HttpClient GetHttp(CistaNasApiClient client)
-    {
-        var field = typeof(CistaNasApiClient).GetField("_http", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-            ?? throw new InvalidOperationException("_http フィールドが見つかりません。");
-        return (HttpClient?)field.GetValue(client) ?? throw new InvalidOperationException("_http が null です。");
     }
 }
 

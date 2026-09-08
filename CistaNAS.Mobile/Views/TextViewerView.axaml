@@ -1,0 +1,12 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:CistaNAS.Mobile.Core.ViewModels"
+             x:Class="CistaNAS.Mobile.Views.TextViewerView"
+             x:DataType="vm:TextViewerViewModel">
+  <Panel>
+    <TextBox Text="{Binding Content}" IsReadOnly="True" AcceptsReturn="True"
+             TextWrapping="NoWrap" FontFamily="Consolas,monospace" Margin="8"
+             HorizontalContentAlignment="Left" />
+    <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" VerticalAlignment="Bottom" />
+  </Panel>
+</UserControl>

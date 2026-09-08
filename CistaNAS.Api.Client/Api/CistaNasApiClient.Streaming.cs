@@ -11,7 +11,7 @@ public static class CistaNasApiClientStreaming
     /// <summary>ストリーミングトークンを発行する。</summary>
     public static async Task<string> IssueStreamTokenAsync(this CistaNasApiClient client, string volumeName, string fileName)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var req = new { volumeName, fileName };
         var res = await http.PostAsJsonAsync("/api/v1/stream/token", req, JsonOpts);
         res.EnsureSuccessStatusCode();
@@ -22,7 +22,7 @@ public static class CistaNasApiClientStreaming
     /// <summary>ストリーミングエンドポイントからファイルをダウンロードする。</summary>
     public static async Task<byte[]> StreamFileAsync(this CistaNasApiClient client, string volumeName, string filePath, string token)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.GetAsync($"/api/v1/stream/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(filePath)}?token={Uri.EscapeDataString(token)}");
         res.EnsureSuccessStatusCode();
         return await res.Content.ReadAsByteArrayAsync();
@@ -31,16 +31,9 @@ public static class CistaNasApiClientStreaming
     /// <summary>ストリーミングエンドポイントからファイルをダウンロードする（Stream 版）。</summary>
     public static async Task<Stream> StreamFileStreamAsync(this CistaNasApiClient client, string volumeName, string filePath, string token)
     {
-        var http = GetHttp(client);
+        var http = client._http;
         var res = await http.GetAsync($"/api/v1/stream/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(filePath)}?token={Uri.EscapeDataString(token)}", System.Net.Http.HttpCompletionOption.ResponseHeadersRead);
         res.EnsureSuccessStatusCode();
         return await res.Content.ReadAsStreamAsync();
-    }
-
-    private static HttpClient GetHttp(CistaNasApiClient client)
-    {
-        var field = typeof(CistaNasApiClient).GetField("_http", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-            ?? throw new InvalidOperationException("_http フィールドが見つかりません。");
-        return (HttpClient?)field.GetValue(client) ?? throw new InvalidOperationException("_http が null です。");
     }
 }

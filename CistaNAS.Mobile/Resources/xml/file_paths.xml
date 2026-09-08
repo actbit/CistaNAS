@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+  <!-- 外部アプリへ渡す一時復号ファイル (ExternalViewerViewModel のキャッシュ) -->
+  <cache-path name="external_viewer" path="externalviewer/" />
+</paths>
