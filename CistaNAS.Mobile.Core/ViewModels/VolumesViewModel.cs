@@ -83,6 +83,7 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
     /// <summary>
     /// E2EE ボリュームのマウント: wrapped-key を取得してローカルでアンラップし、
     /// masterKey をセッションに登録する (サーバーに鍵は送らない)。
+    /// サーバー側は作成時に自動マウント済みのことがあるため、未マウント時のみ解除を依頼する。
     /// </summary>
     private async Task MountE2eeAsync(VolumeListItem volume, string password, CancellationToken ct)
     {
@@ -107,7 +108,8 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
             masterKey = app.E2ee.UnwrapMasterKey(username, password, wk, null);
         }
 
-        await app.Session.Api.MountAsync(volume.Name);
+        if (!volume.IsMounted)
+            await app.Session.Api.MountAsync(volume.Name);
         app.E2ee.StoreKey(volume.Name, masterKey, wk.ChunkSize);
     }
 

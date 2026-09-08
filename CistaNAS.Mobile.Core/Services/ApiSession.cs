@@ -12,9 +12,10 @@ public sealed class ApiSession : IDisposable
     private readonly HttpClient _http;
     private string? _token;
 
-    public ApiSession()
+    public ApiSession(HttpMessageHandler? httpHandler = null)
     {
         _authHandler = new AuthHeaderHandler(() => _token);
+        if (httpHandler is not null) _authHandler.InnerHandler = httpHandler;
         _http = new HttpClient(_authHandler) { Timeout = TimeSpan.FromMinutes(5) };
         Api = new CistaNasApiClient(_http);
     }

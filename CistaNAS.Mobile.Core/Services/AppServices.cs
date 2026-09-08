@@ -9,13 +9,15 @@ namespace CistaNAS.Mobile.Core.Services;
 public sealed class AppServices : IDisposable
 {
     public AppServices(ISecureKeyStore keyStore, IAppSettings settings,
-        IFileCacheProvider fileCache, IExternalViewerLauncher externalViewer)
+        IFileCacheProvider fileCache, IExternalViewerLauncher externalViewer,
+        HttpMessageHandler? httpHandler = null)
     {
         KeyStore = keyStore;
         Settings = settings;
         FileCache = fileCache;
         ExternalViewer = externalViewer;
         EcdhKeys = new EcdhKeyManager(keyStore);
+        Session = new ApiSession(httpHandler);
         Transfer = new E2eeFileTransferService(Session.Api, E2ee);
         Session.Unauthorized += () => SessionExpired?.Invoke();
     }
@@ -24,7 +26,7 @@ public sealed class AppServices : IDisposable
     public IAppSettings Settings { get; }
     public IFileCacheProvider FileCache { get; }
     public IExternalViewerLauncher ExternalViewer { get; }
-    public ApiSession Session { get; } = new();
+    public ApiSession Session { get; }
     public E2eeSession E2ee { get; } = new();
     public EcdhKeyManager EcdhKeys { get; }
     public E2eeFileTransferService Transfer { get; }
