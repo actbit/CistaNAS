@@ -503,7 +503,7 @@ else
 
             for (int i = 0; i < entry.ChunkCount; i++)
             {
-                var encData = await E2eeApi.DownloadChunkAsync(VolumeName, entry.FileId, i);
+                (byte[] encData, int revision) = await E2eeApi.DownloadChunkAsync(VolumeName, entry.FileId, i);
 
                 if (i == 0 && fileSaltB64 is null)
                 {
@@ -513,7 +513,8 @@ else
                 }
 
                 string encB64 = Convert.ToBase64String(encData);
-                byte[] plainBytes = await E2ee.DecryptChunk(encB64, _masterKeyHandle!, i, fileSaltB64 ?? "");
+                // revision >= 1 のチャンク（Dokan 差分保存で再暗号化済み）は nonce 導出に revision が必須
+                byte[] plainBytes = await E2ee.DecryptChunk(encB64, _masterKeyHandle!, i, fileSaltB64 ?? "", revision);
                 decryptedChunks.Add(plainBytes);
             }
 
@@ -632,7 +633,7 @@ else
 
         try
         {
-            var chunk0Data = await E2eeApi.DownloadChunkAsync(VolumeName, e2eeItem.Entry.FileId, 0);
+            var (chunk0Data, _) = await E2eeApi.DownloadChunkAsync(VolumeName, e2eeItem.Entry.FileId, 0);
             if (chunk0Data.Length < 16) { await SetupStreamingPlayer(fileName); return; }
 
             var salt = new byte[16];

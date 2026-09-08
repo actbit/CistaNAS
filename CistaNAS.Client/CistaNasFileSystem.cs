@@ -333,7 +333,13 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 long chunkStart = (long)ci * chunkSize;
                 byte[] chunk = GetOrLoadChunk(ci);
                 long relStart = Math.Max(0, fileOffset - chunkStart);
-                long relEnd = Math.Min(chunk.Length, endOffset - chunkStart);
+                // 書き込みが及ぶチャンク内の終端。既存末尾チャンク（短い）をまたぐ追記では
+                // チャンクバッファを書き込み終端まで拡張する（隙間はゼロ = sparse セマンティクス）。
+                // 拡張しないと relEnd が旧チャンク長に抑えられ copyLen=0 になり、
+                // 追記データが PrepareForPersist のゼロ埋めで消失する。
+                long relEnd = Math.Min(chunkSize, endOffset - chunkStart);
+                if (relEnd > chunk.Length)
+                    chunk = ResizeChunk(chunk, (int)relEnd);
                 int copyLen = (int)(relEnd - relStart);
                 long srcStart = Math.Max(0, chunkStart - fileOffset);
                 Buffer.BlockCopy(data, dataOffset + (int)srcStart, chunk, (int)relStart, copyLen);

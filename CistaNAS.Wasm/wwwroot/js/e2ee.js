@@ -117,24 +117,32 @@ async function deriveFileKey(masterKey, fileSalt) {
         { name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
 }
 
-async function deriveChunkNonce(fileKeyRaw, chunkIndex, fileSalt) {
+async function deriveChunkNonce(fileKeyRaw, chunkIndex, fileSalt, revision) {
     const chunkIndexBuf = new ArrayBuffer(4);
     new DataView(chunkIndexBuf).setUint32(0, chunkIndex, true);
-    // Cross-platform compatibility: HMAC-SHA256(fileKey, fileSalt || chunkIndex)
+    // Cross-platform compatibility: HMAC-SHA256(fileKey, fileSalt || chunkIndex [|| revision])
     // (matching E2eeCrypto.DeriveChunkNonce)
-    const data = concatBufs(fileSalt, new Uint8Array(chunkIndexBuf));
+    // revision == 0 では入力に revision を含めない（既存ファイルと後方互換）。
+    // revision > 0 では le32 revision を追加し、同じ chunkIndex の安全な再暗号化を可能にする。
+    const bufs = [fileSalt, new Uint8Array(chunkIndexBuf)];
+    if (revision > 0) {
+        const revBuf = new ArrayBuffer(4);
+        new DataView(revBuf).setUint32(0, revision, true);
+        bufs.push(new Uint8Array(revBuf));
+    }
+    const data = concatBufs(...bufs);
     const key = await crypto.subtle.importKey("raw", fileKeyRaw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
     const mac = await crypto.subtle.sign("HMAC", key, data);
     return new Uint8Array(mac).slice(0, GCM_NONCE_SIZE);
 }
 
-export async function encryptChunk(plainBase64, masterKeyHandle, chunkIndex, fileSaltBase64, isFirstChunk) {
+export async function encryptChunk(plainBase64, masterKeyHandle, chunkIndex, fileSaltBase64, isFirstChunk, revision = 0) {
     const masterKey = getKey(masterKeyHandle);
     const plainBytes = uint8FromBase64(plainBase64);
     const fileSalt = uint8FromBase64(fileSaltBase64);
     const fileKey = await deriveFileKey(masterKey, fileSalt);
     const fileKeyRaw = new Uint8Array(await crypto.subtle.exportKey("raw", fileKey));
-    const nonce = await deriveChunkNonce(fileKeyRaw, chunkIndex, fileSalt);
+    const nonce = await deriveChunkNonce(fileKeyRaw, chunkIndex, fileSalt, revision);
 
     const aad = new ArrayBuffer(4);
     new DataView(aad).setUint32(0, chunkIndex, true);
@@ -148,13 +156,13 @@ export async function encryptChunk(plainBase64, masterKeyHandle, chunkIndex, fil
     return uint8ToBase64(result);
 }
 
-export async function decryptChunk(encBase64, masterKeyHandle, chunkIndex, fileSaltBase64) {
+export async function decryptChunk(encBase64, masterKeyHandle, chunkIndex, fileSaltBase64, revision = 0) {
     const masterKey = getKey(masterKeyHandle);
     let encBytes = uint8FromBase64(encBase64);
     const fileSalt = uint8FromBase64(fileSaltBase64);
     const fileKey = await deriveFileKey(masterKey, fileSalt);
     const fileKeyRaw = new Uint8Array(await crypto.subtle.exportKey("raw", fileKey));
-    const nonce = await deriveChunkNonce(fileKeyRaw, chunkIndex, fileSalt);
+    const nonce = await deriveChunkNonce(fileKeyRaw, chunkIndex, fileSalt, revision);
 
     const aad = new ArrayBuffer(4);
     new DataView(aad).setUint32(0, chunkIndex, true);

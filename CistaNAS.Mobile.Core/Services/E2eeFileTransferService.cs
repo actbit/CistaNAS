@@ -23,21 +23,22 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
         int chunkSize = e2eeSession.GetChunkSize(volumeName);
 
         // チャンク 0 から fileSalt を取得して fileKey を導出
-        (byte[] data0, _) = await api.DownloadChunkAsync(volumeName, entry.FileId, 0);
+        (byte[] data0, int revision0) = await api.DownloadChunkAsync(volumeName, entry.FileId, 0);
         if (data0.Length < E2eeCrypto.SaltSize + E2eeCrypto.GcmTagSize)
             throw new InvalidOperationException("チャンク 0 が不正です。");
         byte[] fileSalt = new byte[E2eeCrypto.SaltSize];
         Buffer.BlockCopy(data0, 0, fileSalt, 0, E2eeCrypto.SaltSize);
         byte[] fileKey = E2eeCrypto.DeriveFileKey(masterKey, fileSalt);
 
-        byte[] plain0 = E2eeCrypto.DecryptChunk(data0, fileKey, 0, fileSalt);
+        // nonce 導出にはチャンクごとの revision が必須（Dokan 差分保存で revision >= 1 に上がる）。
+        byte[] plain0 = E2eeCrypto.DecryptChunk(data0, fileKey, 0, fileSalt, revision0);
         await output.WriteAsync(plain0, ct);
 
         for (int i = 1; i < entry.ChunkCount; i++)
         {
             ct.ThrowIfCancellationRequested();
-            (byte[] enc, _) = await api.DownloadChunkAsync(volumeName, entry.FileId, i);
-            byte[] plain = E2eeCrypto.DecryptChunk(enc, fileKey, i, fileSalt);
+            (byte[] enc, int revision) = await api.DownloadChunkAsync(volumeName, entry.FileId, i);
+            byte[] plain = E2eeCrypto.DecryptChunk(enc, fileKey, i, fileSalt, revision);
             await output.WriteAsync(plain, ct);
             progress?.Report((double)(i + 1) / entry.ChunkCount * 100);
         }
