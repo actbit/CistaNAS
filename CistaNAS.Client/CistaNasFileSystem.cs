@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Http;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using CistaNAS.Client.Api;
@@ -489,8 +491,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 // 書き込みアクセスがある場合は上書きモード（チャンク差分保存）
                 if ((access & (DokanNet.FileAccess.WriteData | DokanNet.FileAccess.GenericWrite)) != 0)
                 {
-                    info.Context = new E2eeChunkWriteState(this, plainName, fileId);
-                    return DokanResult.Success;
+                    return OpenE2eeWriteHandle(plainName, fileId, info);
                 }
                 info.Context = fileId;
                 return DokanResult.Success;
@@ -498,8 +499,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
             if (mode == FileMode.OpenOrCreate)
             {
-                info.Context = new E2eeChunkWriteState(this, plainName, null);
-                return DokanResult.Success;
+                return OpenE2eeWriteHandle(plainName, null, info);
             }
 
             return DokanResult.FileNotFound;
@@ -519,8 +519,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             if (existing is not null)
                 return DokanResult.FileExists;
 
-            info.Context = new E2eeChunkWriteState(this, plainName, null);
-            return DokanResult.Success;
+            return OpenE2eeWriteHandle(plainName, null, info);
         }
 
         if (mode == FileMode.Create)
@@ -537,11 +536,29 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
             // E2EE モード: 旧IDを保持（差分上書き時は維持、新規作成時は Cleanup で削除）
             var existing = FindFileId(plainName);
-            info.Context = new E2eeChunkWriteState(this, plainName, existing);
-            return DokanResult.Success;
+            return OpenE2eeWriteHandle(plainName, existing, info);
         }
 
         return DokanResult.Success;
+    }
+
+    /// <summary>
+    /// E2EE 書き込みハンドル用の WriteState を作成して info.Context に設定する。
+    /// 書き込みリースの競合 (423 Locked) は SharingViolation として返す。
+    /// 未処理の例外を Dokan にそのまま伝えると、利用者には原因不明のエラーとして見える
+    /// （Word 等で既に開かれているファイルへの上書きコピーがこれに当たる）。
+    /// </summary>
+    private NtStatus OpenE2eeWriteHandle(string plainName, string? existingFileId, IDokanFileInfo info)
+    {
+        try
+        {
+            info.Context = new E2eeChunkWriteState(this, plainName, existingFileId);
+            return DokanResult.Success;
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Locked)
+        {
+            return DokanResult.SharingViolation;
+        }
     }
 
     /// <summary>非E2EE: 既存ファイルの平文長を取得（差分保存で末尾保持のため）。</summary>
@@ -1051,6 +1068,11 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         {
             deleteLease = _api.AcquireWriteLeaseAsync(_volumeName, fileId).GetAwaiter().GetResult();
             _api.DeleteFileAsync(_volumeName, fileId, deleteLease).GetAwaiter().GetResult();
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Locked)
+        {
+            // 他ハンドルが書き込みリース保持中 → Windows の共有違反として報告
+            return DokanResult.SharingViolation;
         }
         catch (Exception) { return DokanResult.InternalError; }
         finally
