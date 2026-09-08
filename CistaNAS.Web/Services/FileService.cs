@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text.Json;
 using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Journal;
@@ -367,6 +368,10 @@ public sealed class FileService
                 newObjectId = $"{fileName}.patch-{Guid.NewGuid():N}";
 
                 var chunkSizes = existing is null ? new List<int>() : new List<int>(existing.ChunkSizes);
+                // 既存ファイルのソルトをそのまま使う（範囲外チャンクは暗号文のまま
+                // コピーされるため、鍵スコープを跨いで混在させてはいけない）。
+                // null は旧形式（レガシー: マスターキー直接使用）として透過的に扱う。
+                byte[]? patchFileSalt = DecodeKeySalt(existing?.KeySalt);
                 long existingLength = existing?.Length ?? 0;
                 long writeEnd = checked(offset + contentLength);
                 long newLength = Math.Max(existingLength, writeEnd);
@@ -413,7 +418,7 @@ public sealed class FileService
                     {
                         int origLen = Math.Min(chunkSizes[ci], curPlainSize);
                         byte[] previous = encrypted
-                            ? ChunkEncryptor.DecryptChunk(masterKey!, algorithm, ci, sectorSize, chunkSize, oldStored, origLen)
+                            ? ChunkEncryptor.DecryptChunk(masterKey!, algorithm, ci, sectorSize, chunkSize, oldStored, origLen, patchFileSalt)
                             : oldStored;
                         Array.Copy(previous, plain, Math.Min(previous.Length, plain.Length));
                     }
@@ -430,7 +435,7 @@ public sealed class FileService
                     }
 
                     byte[] stored = encrypted
-                        ? ChunkEncryptor.EncryptChunk(masterKey!, algorithm, ci, sectorSize, chunkSize, plain)
+                        ? ChunkEncryptor.EncryptChunk(masterKey!, algorithm, ci, sectorSize, chunkSize, plain, patchFileSalt)
                         : plain;
                     using var ms = new MemoryStream(stored);
                     await _chunkStore.WriteChunkAsync(volumeName, newObjectId, ci, ms, ct);
@@ -447,6 +452,7 @@ public sealed class FileService
                     ChunkCount = lastNeeded + 1,
                     ChunkSizes = chunkSizes,
                     ChunkObjectId = newObjectId,
+                    KeySalt = existing?.KeySalt,
                     CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
                     ModifiedAt = DateTimeOffset.UtcNow,
                 };
@@ -523,6 +529,13 @@ public sealed class FileService
             long remaining = contentLength;
             int sectorSize = header.EffectiveSectorSize;
 
+            // 新規アップロードでは全チャンクを書き直すため新しいソルトを生成し、
+            // ファイルスコープ鍵で別ファイル同一位置チャンクとの tweak 衝突を防ぐ。
+            // （チャンクインデックスはファイル相対のためマスターキー直用は衝突する）
+            byte[]? uploadFileSalt = header.Encrypted && masterKey is not null
+                ? RandomNumberGenerator.GetBytes(16)
+                : null;
+
             while (remaining > 0)
             {
                 int toRead = (int)Math.Min(buffer.Length, remaining);
@@ -536,7 +549,7 @@ public sealed class FileService
                 {
                     chunkData = ChunkEncryptor.EncryptChunk(
                         masterKey, header.EffectiveCipherAlgorithm,
-                        chunkIndex, sectorSize, chunkSize, chunkData);
+                        chunkIndex, sectorSize, chunkSize, chunkData, uploadFileSalt);
                 }
 
                 // S3 にチャンクを保存
@@ -556,6 +569,7 @@ public sealed class FileService
                 ChunkCount = chunkSizes.Count,
                 ChunkSizes = chunkSizes,
                 ChunkObjectId = objectId,
+                KeySalt = uploadFileSalt is null ? null : Convert.ToBase64String(uploadFileSalt),
                 CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
                 ModifiedAt = DateTimeOffset.UtcNow,
             };
@@ -644,7 +658,7 @@ public sealed class FileService
                 chunkedStream = new ChunkedReadStream(
                     _chunkStore, volumeName, meta.ChunkObjectId ?? fileName, masterKey,
                 header.EffectiveCipherAlgorithm,
-                sectorSize, chunkSize, meta.ChunkSizes);
+                sectorSize, chunkSize, meta.ChunkSizes, DecodeKeySalt(meta.KeySalt));
         }
         else
         {
@@ -808,4 +822,19 @@ public sealed class FileService
 
     private Task<IDisposable> AcquireCatalogLockAsync(string volumeName, CancellationToken ct)
         => _storage.AcquireLockAsync($"catalog/{Uri.EscapeDataString(volumeName)}", ct);
+
+    /// <summary>FileMetadata.KeySalt (base64) をデコードする。null/不正値はレガシー（ソルトなし）扱い。</summary>
+    private static byte[]? DecodeKeySalt(string? keySalt)
+    {
+        if (string.IsNullOrEmpty(keySalt)) return null;
+        try
+        {
+            byte[] salt = Convert.FromBase64String(keySalt);
+            return salt.Length > 0 ? salt : null;
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
+    }
 }
