@@ -256,7 +256,10 @@ public static class ChunkEncryptor
                 BinaryPrimitives.WriteInt64LittleEndian(sectorIndexBytes, sectorIndex);
                 HKDF.DeriveKey(HashAlgorithmName.SHA256, keyArr.AsSpan(), nonce, sectorIndexBytes, infoBytes);
 
-                ChaCha20EncryptCore(keyArr, nonce, counter: 0, data.AsSpan(sectorOffset, sectorSize));
+                // 生 ChaCha20 ストリーム (counter=0) は BCL AEAD に相当 API がないため
+                // Shared のマネージ実装に委譲（旧保存形式の復号互換用）
+                ChaCha20Poly1305.ChaCha20Encrypt(keyArr, nonce, 0,
+                    data.AsSpan(sectorOffset, sectorSize), data.AsSpan(sectorOffset, sectorSize));
             }
         }
         finally
@@ -271,106 +274,4 @@ public static class ChunkEncryptor
         // ChaCha20 は XOR 暗号なので暗号化と復号化は同じ
         ChaCha20Encrypt(masterKey, firstSector, data, sectorSize);
     }
-
-    /// <summary>ChaCha20 暗号化コア（RFC 7539）。</summary>
-    private static void ChaCha20EncryptCore(byte[] key, byte[] nonce, uint counter, Span<byte> data)
-    {
-        uint[] state = InitializeChaChaState(key, nonce, counter);
-
-        int byteCount = data.Length;
-        int blockIndex = 0;
-
-        while (byteCount > 0)
-        {
-            // カウンタ更新
-            state[12] = (uint)blockIndex + counter;
-
-            // ブロックキーストリーム生成
-            uint[] keyStream = ChaCha20Block(state);
-
-            // XOR 処理
-            int blockSize = Math.Min(64, byteCount);
-            for (int i = 0; i < blockSize; i++)
-            {
-                int wordIndex = i / 4;
-                int byteInWord = i % 4;
-                uint keyByte = (keyStream[wordIndex] >> (byteInWord * 8)) & 0xFF;
-                data[blockIndex * 64 + i] = (byte)(data[blockIndex * 64 + i] ^ keyByte);
-            }
-
-            byteCount -= blockSize;
-            blockIndex++;
-        }
-    }
-
-    /// <summary>ChaCha20 初期状態生成。</summary>
-    private static uint[] InitializeChaChaState(byte[] key, byte[] nonce, uint counter)
-    {
-        uint[] state = new uint[16];
-
-        // 定数 "expand 32-byte k"
-        state[0] = 0x61707865;  // "expa"
-        state[1] = 0x3320646e;  // "nd 3"
-        state[2] = 0x79622d32;  // "2-by"
-        state[3] = 0x6b206574;  // "te k"
-
-        // キー（32 bytes = 8 words）
-        for (int i = 0; i < 8; i++)
-        {
-            state[4 + i] = BinaryPrimitives.ReadUInt32LittleEndian(key.AsSpan(i * 4));
-        }
-
-        // カウンタ（1 word）
-        state[12] = counter;
-
-        // ノンス（12 bytes = 3 words）
-        state[13] = BinaryPrimitives.ReadUInt32LittleEndian(nonce.AsSpan(0));
-        state[14] = BinaryPrimitives.ReadUInt32LittleEndian(nonce.AsSpan(4));
-        state[15] = BinaryPrimitives.ReadUInt32LittleEndian(nonce.AsSpan(8));
-
-        return state;
-    }
-
-    /// <summary>ChaCha20 ブロック処理。</summary>
-    private static uint[] ChaCha20Block(uint[] state)
-    {
-        uint[] workingState = (uint[])state.Clone();
-
-        // 10 double-rounds = 20 rounds
-        for (int i = 0; i < 20; i += 2)
-        {
-            // Column rounds
-            QuarterRound(workingState, 0, 4, 8, 12);
-            QuarterRound(workingState, 1, 5, 9, 13);
-            QuarterRound(workingState, 2, 6, 10, 14);
-            QuarterRound(workingState, 3, 7, 11, 15);
-
-            // Diagonal rounds
-            QuarterRound(workingState, 0, 5, 10, 15);
-            QuarterRound(workingState, 1, 6, 11, 12);
-            QuarterRound(workingState, 2, 7, 8, 13);
-            QuarterRound(workingState, 3, 4, 9, 14);
-        }
-
-        // 状態を加算
-        for (int i = 0; i < 16; i++)
-        {
-            workingState[i] += state[i];
-        }
-
-        return workingState;
-    }
-
-    /// <summary>QuarterRound 関数（RFC 7539 §2.1.1 準拠）。</summary>
-    private static void QuarterRound(uint[] x, int a, int b, int c, int d)
-    {
-        x[a] += x[b]; x[d] = RotateLeft(x[d] ^ x[a], 16);
-        x[c] += x[d]; x[b] = RotateLeft(x[b] ^ x[c], 12);
-        x[a] += x[b]; x[d] = RotateLeft(x[d] ^ x[a], 8);
-        x[c] += x[d]; x[b] = RotateLeft(x[b] ^ x[c], 7);
-    }
-
-    /// <summary>左ローテート。</summary>
-    private static uint RotateLeft(uint value, int count)
-        => (value << count) | (value >> (32 - count));
 }
