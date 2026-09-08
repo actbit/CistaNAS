@@ -61,6 +61,36 @@ public class WrappedKeyUnwrapTests
     }
 
     [Fact]
+    public void argon2id_rawラップのアンラップ()
+    {
+        // Argon2id 単独（PBKDF2 後段なし）でラップされた鍵もラウンドトリップできること
+        byte[] masterKey = E2eeCrypto.GenerateMasterKey();
+        byte[] salt = RandomNumberGenerator.GetBytes(E2eeCrypto.SaltSize);
+        var spec = new KdfSpec(KdfSpec.Argon2idRaw, 0, 1024, 1, 1);
+        byte[] kek = E2eeCrypto.DeriveKek("alice", "password123", salt, spec);
+        (byte[] nonce, byte[] ct, byte[] tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
+        Array.Clear(kek);
+
+        var wk = new WrappedKeyInfo
+        {
+            KdfAlgorithm = "argon2id-raw",
+            KdfIterations = 0,
+            KdfMemoryKiB = 1024,
+            KdfTimeCost = 1,
+            KdfParallelism = 1,
+            KdfSalt = salt,
+            WrapType = "password",
+            WrappedNonce = nonce,
+            WrappedCiphertext = ct,
+            WrappedTag = tag,
+        };
+
+        var session = new E2eeSession();
+        byte[] unwrapped = session.UnwrapMasterKey("alice", "password123", wk, null);
+        Assert.Equal(masterKey, unwrapped);
+    }
+
+    [Fact]
     public void ecdhラップのアンラップ()
     {
         byte[] masterKey = E2eeCrypto.GenerateMasterKey();

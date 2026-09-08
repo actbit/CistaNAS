@@ -245,6 +245,14 @@ else
                     <div class="form-text">E2EE ボリュームのチャンク分割サイズ。小さいほどストリーミングに有利、大きいほどオーバーヘッドが少ない。</div>
                 </div>
                 <div class="col-12">
+                    <label class="form-label">KDF 種別（ボリューム鍵導出）</label>
+                    <select class="form-select" @bind="_encSettings.KdfAlgorithm">
+                        <option value="argon2id">Argon2id + PBKDF2 合成（推奨）</option>
+                        <option value="argon2id-raw">Argon2id 単独（RFC 9106 標準構成）</option>
+                    </select>
+                    <div class="form-text">合成は Argon2id の後に PBKDF2 を重ねる二段構成（Argon2id 実装が将来破られた場合のバックストップ付き）。単独は PBKDF2 後段なしの RFC 9106 標準構成。既存ボリュームには影響しない。</div>
+                </div>
+                <div class="col-12">
                     <label class="form-label">KDF メモリ量（Argon2id、ボリューム鍵導出）</label>
                     <select class="form-select" @bind="_encSettings.KdfMemoryKiB">
                         <option value="16384">16 MB（高速・テスト用）</option>
@@ -270,8 +278,15 @@ else
                 </div>
                 <div class="col-12">
                     <label class="form-label">後段 PBKDF2 反復数（Argon2id 合成 KDF のバックストップ）</label>
-                    <input type="number" class="form-control" @bind="_encSettings.KdfIterations" min="600000" step="10000" />
-                    <div class="form-text">現在の設定: @_encSettings.KdfIterations.ToString("N0")。Argon2id 後に追加でかかる CPU コスト。既存ボリュームには影響しない。</div>
+                    <input type="number" class="form-control" @bind="_encSettings.KdfIterations" min="600000" step="10000"
+                           disabled="@(_encSettings.KdfAlgorithm == "argon2id-raw")" />
+                    <div class="form-text">
+                        現在の設定: @_encSettings.KdfIterations.ToString("N0")。Argon2id 後に追加でかかる CPU コスト。既存ボリュームには影響しない。
+                        @if (_encSettings.KdfAlgorithm == "argon2id-raw")
+                        {
+                            <span class="text-muted">（Argon2id 単独モードでは不使用）</span>
+                        }
+                    </div>
                 </div>
                 <div class="col-12">
                     <label class="form-label">セクタサイズ（AES-XTS）</label>

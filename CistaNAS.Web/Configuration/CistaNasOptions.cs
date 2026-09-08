@@ -137,8 +137,14 @@ public sealed class VolumeOptions
     public int SectorSize { get; set; } = 4096;
 
     /// <summary>
+    /// 新規ボリュームの KDF 種別。"argon2id"（Argon2id+PBKDF2 合成、既定）or "argon2id-raw"（Argon2id 単独）。
+    /// ヘッダに永続化されるため、変更しても既存ボリュームの検証には影響しない。
+    /// </summary>
+    public string KdfAlgorithm { get; set; } = KdfSpec.Argon2id;
+
+    /// <summary>
     /// ボリュームパスワードからの鍵導出のうち後段 PBKDF2 の反復数。
-    /// 現行 KDF は Argon2id 前段 + PBKDF2 後段の合成（<see cref="KdfSpec"/> 参照）。
+    /// KdfAlgorithm == "argon2id"（合成）のときのみ使用（"argon2id-raw" では不使用）。
     /// ヘッダに永続化されるため、変更しても既存ボリュームの検証には影響しない。
     /// </summary>
     [Range(600_000, 10_000_000)]
@@ -157,7 +163,10 @@ public sealed class VolumeOptions
     public int KdfParallelism { get; set; } = 4;
 
     /// <summary>新規ボリューム作成時にヘッダへ永続化する KDF スペック。</summary>
-    public KdfSpec ToKdfSpec() => new(KdfSpec.Argon2id, KdfIterations, KdfMemoryKiB, KdfParallelism, KdfTimeCost);
+    public KdfSpec ToKdfSpec() =>
+        string.Equals(KdfAlgorithm, KdfSpec.Argon2idRaw, StringComparison.Ordinal)
+            ? new KdfSpec(KdfSpec.Argon2idRaw, 0, KdfMemoryKiB, KdfParallelism, KdfTimeCost)
+            : new KdfSpec(KdfSpec.Argon2id, KdfIterations, KdfMemoryKiB, KdfParallelism, KdfTimeCost);
 
     /// <summary>新規ボリューム作成時のデフォルト暗号化モード。"server" | "e2ee" | "none"。</summary>
     public string DefaultEncryptionMode { get; set; } = "server";

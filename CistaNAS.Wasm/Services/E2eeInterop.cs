@@ -7,16 +7,22 @@ namespace CistaNAS.Wasm.Services;
 /// パスワードベース KDF のパラメータ（JS の normalizeKdf にそのまま渡す）。
 /// Algorithm == "argon2id" は合成 KDF を意味する:
 /// KEK = PBKDF2-SHA256( Argon2id(password, salt, TimeCost, MemoryKiB, Parallelism), salt, Iterations, 32 )
+/// Algorithm == "argon2id-raw" は Argon2id 単独（PBKDF2 後段なし。Iterations 不使用）。
 /// （Shared の KdfSpec・サーバー VolumeHeader.KdfParams と同じ wire format）
 /// </summary>
 public sealed record E2eeKdfOptions(string Algorithm, int Iterations, int MemoryKiB, int TimeCost, int Parallelism)
 {
     public const string Argon2id = "argon2id";
+    public const string Argon2idRaw = "argon2id-raw";
     public const string Pbkdf2Sha256 = "pbkdf2-sha256";
 
     /// <summary>サーバー設定に基づく新規作成用スペック（Argon2id + PBKDF2 合成）。</summary>
     public static E2eeKdfOptions NewArgon2id(int iterations, int memoryKiB, int timeCost, int parallelism) =>
         new(Argon2id, iterations, memoryKiB, timeCost, parallelism);
+
+    /// <summary>サーバー設定に基づく新規作成用スペック（Argon2id 単独。PBKDF2 後段なし）。</summary>
+    public static E2eeKdfOptions NewArgon2idRaw(int memoryKiB, int timeCost, int parallelism) =>
+        new(Argon2idRaw, 0, memoryKiB, timeCost, parallelism);
 
     /// <summary>レガシー PBKDF2 単段（既存データの検証用）。</summary>
     public static E2eeKdfOptions LegacyPbkdf2(int iterations) => new(Pbkdf2Sha256, iterations, 0, 0, 0);
@@ -58,15 +64,19 @@ public sealed class E2eeInterop(IJSRuntime js) : IAsyncDisposable
     {
         int iterations = root.TryGetProperty("iterations", out var it) && it.ValueKind == System.Text.Json.JsonValueKind.Number && it.TryGetInt32(out var i)
             ? i : 0;
-        if (root.TryGetProperty("algorithm", out var alg) && alg.ValueKind == System.Text.Json.JsonValueKind.String
-            && string.Equals(alg.GetString(), E2eeKdfOptions.Argon2id, StringComparison.Ordinal))
+        if (root.TryGetProperty("algorithm", out var alg) && alg.ValueKind == System.Text.Json.JsonValueKind.String)
         {
-            return new E2eeKdfOptions(
-                E2eeKdfOptions.Argon2id,
-                iterations,
-                root.TryGetProperty("memoryKiB", out var m) && m.TryGetInt32(out var mv) ? mv : 0,
-                root.TryGetProperty("timeCost", out var t) && t.TryGetInt32(out var tv) ? tv : 0,
-                root.TryGetProperty("parallelism", out var p) && p.TryGetInt32(out var pv) ? pv : 0);
+            string algorithm = alg.GetString()!;
+            if (string.Equals(algorithm, E2eeKdfOptions.Argon2id, StringComparison.Ordinal)
+                || string.Equals(algorithm, E2eeKdfOptions.Argon2idRaw, StringComparison.Ordinal))
+            {
+                return new E2eeKdfOptions(
+                    algorithm,
+                    iterations,
+                    root.TryGetProperty("memoryKiB", out var m) && m.TryGetInt32(out var mv) ? mv : 0,
+                    root.TryGetProperty("timeCost", out var t) && t.TryGetInt32(out var tv) ? tv : 0,
+                    root.TryGetProperty("parallelism", out var p) && p.TryGetInt32(out var pv) ? pv : 0);
+            }
         }
         return E2eeKdfOptions.LegacyPbkdf2(iterations);
     }

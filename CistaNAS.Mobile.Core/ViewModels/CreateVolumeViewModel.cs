@@ -51,16 +51,17 @@ public sealed partial class CreateVolumeViewModel(AppServices app) : BusyViewMod
     /// </summary>
     private async Task CreateE2eeVolumeAsync(string username, string password)
     {
-        // Argon2id+PBKDF2 合成 KDF（サーバー既定スペックと同一）
+        // サーバー設定の KDF 種別に従う（既定: Argon2id+PBKDF2 合成）
+        KdfSpec spec = await GetCreationKdfAsync();
         byte[] salt = RandomNumberGenerator.GetBytes(E2eeCrypto.SaltSize);
-        byte[] kek = E2eeCrypto.DeriveKek(username, password, salt, KdfSpec.DefaultArgon2id);
+        byte[] kek = E2eeCrypto.DeriveKek(username, password, salt, spec);
         try
         {
             byte[] masterKey = E2eeCrypto.GenerateMasterKey();
             try
             {
                 (byte[] nonce, byte[] ciphertext, byte[] tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
-                await app.Session.Api.CreateVolumeAsync(VolumeName, username, nonce, ciphertext, tag, salt, KdfInfo.DefaultArgon2id);
+                await app.Session.Api.CreateVolumeAsync(VolumeName, username, nonce, ciphertext, tag, salt, ToKdfInfo(spec));
             }
             finally
             {
@@ -72,4 +73,26 @@ public sealed partial class CreateVolumeViewModel(AppServices app) : BusyViewMod
             CryptographicOperations.ZeroMemory(kek);
         }
     }
+
+    /// <summary>
+    /// 新規 E2EE ボリュームの KEK 導出に使う KDF スペックをサーバー設定から取得する
+    /// （Argon2id+PBKDF2 合成 or Argon2id 単独）。取得失敗時は現行標準にフォールバック。
+    /// </summary>
+    private async Task<KdfSpec> GetCreationKdfAsync()
+    {
+        try
+        {
+            var settings = await CistaNasApiClientSettings.GetEncryptionSettingsAsync(app.Session.Api);
+            return string.Equals(settings.KdfAlgorithm, KdfSpec.Argon2idRaw, StringComparison.Ordinal)
+                ? new KdfSpec(KdfSpec.Argon2idRaw, 0, settings.KdfMemoryKiB, settings.KdfParallelism, settings.KdfTimeCost)
+                : new KdfSpec(KdfSpec.Argon2id, settings.KdfIterations, settings.KdfMemoryKiB, settings.KdfParallelism, settings.KdfTimeCost);
+        }
+        catch
+        {
+            return KdfSpec.DefaultArgon2id;
+        }
+    }
+
+    private static KdfInfo ToKdfInfo(KdfSpec spec) =>
+        new(spec.Algorithm, spec.Iterations, spec.MemoryKiB, spec.TimeCost, spec.Parallelism);
 }

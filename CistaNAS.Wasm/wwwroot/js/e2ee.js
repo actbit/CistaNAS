@@ -33,6 +33,8 @@ function removeKey(handle) {
 // - オブジェクト { algorithm, iterations, memoryKiB, timeCost, parallelism } を受け取る。
 //   algorithm === "argon2id" は合成 KDF:
 //     KEK = PBKDF2-SHA256( Argon2id(password, salt, t, m, p), salt, iterations, 32 )
+//   algorithm === "argon2id-raw" は Argon2id 単独（PBKDF2 後段なし）:
+//     KEK = Argon2id(password, salt, t, m, p)
 //   （.NET 側 KeyDerivation.DeriveKek / hash-wasm と同一規約。RFC 9106 ベクトルで相互運性検証済み）
 function normalizeKdf(kdf) {
     if (typeof kdf === "number") {
@@ -86,6 +88,10 @@ async function deriveKekBits(password, combinedSalt, spec) {
         } finally {
             argonOut.fill(0);
         }
+    }
+    if (spec.algorithm === "argon2id-raw") {
+        // Argon2id 単独: RFC 9106 の出力をそのまま鍵として使う（後段変換なし）
+        return argon2idBits(passwordBytes, combinedSalt, spec.timeCost, spec.memoryKiB, spec.parallelism);
     }
     return pbkdf2Bits(passwordBytes, combinedSalt, spec.iterations);
 }

@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using Microsoft.Extensions.Options;
@@ -50,6 +51,7 @@ public sealed class EncryptionSettingsService
             if (persisted?.Volume is not null)
             {
                 _options.Volume.SectorSize = persisted.Volume.SectorSize;
+                _options.Volume.KdfAlgorithm = persisted.Volume.KdfAlgorithm;
                 _options.Volume.KdfIterations = persisted.Volume.KdfIterations;
                 _options.Volume.KdfMemoryKiB = persisted.Volume.KdfMemoryKiB;
                 _options.Volume.KdfTimeCost = persisted.Volume.KdfTimeCost;
@@ -82,6 +84,7 @@ public sealed class EncryptionSettingsService
             persisted.Volume = new PersistedVolume
             {
                 SectorSize = volume.SectorSize,
+                KdfAlgorithm = volume.KdfAlgorithm,
                 KdfIterations = volume.KdfIterations,
                 KdfMemoryKiB = volume.KdfMemoryKiB,
                 KdfTimeCost = volume.KdfTimeCost,
@@ -110,6 +113,7 @@ public sealed class EncryptionSettingsService
         var updated = new VolumeOptions
         {
             SectorSize = body.SectorSize,
+            KdfAlgorithm = body.KdfAlgorithm,
             KdfIterations = body.KdfIterations,
             KdfMemoryKiB = body.KdfMemoryKiB,
             KdfTimeCost = body.KdfTimeCost,
@@ -126,8 +130,13 @@ public sealed class EncryptionSettingsService
     {
         if (body.SectorSize is < 512 or > 4096 || body.SectorSize % 16 != 0)
             throw new ArgumentOutOfRangeException(nameof(body.SectorSize));
-        // KdfIterations は合成 KDF の後段 PBKDF2 反復数
-        if (body.KdfIterations is < 600_000 or > 10_000_000)
+        // KdfAlgorithm: "argon2id"（合成）or "argon2id-raw"（単独）。
+        // 未知の値は将来のアルゴリズム追加に備えて拒否する（サイレントに既定へ落とさない）
+        bool isRaw = string.Equals(body.KdfAlgorithm, KdfSpec.Argon2idRaw, StringComparison.Ordinal);
+        if (!isRaw && !string.Equals(body.KdfAlgorithm, KdfSpec.Argon2id, StringComparison.Ordinal))
+            throw new ArgumentException("KDF アルゴリズムが不正です。", nameof(body.KdfAlgorithm));
+        // KdfIterations は合成 KDF の後段 PBKDF2 反復数（argon2id-raw では不使用のため検証しない）
+        if (!isRaw && body.KdfIterations is < 600_000 or > 10_000_000)
             throw new ArgumentOutOfRangeException(nameof(body.KdfIterations));
         if (body.KdfMemoryKiB is < 8192 or > 1_048_576)
             throw new ArgumentOutOfRangeException(nameof(body.KdfMemoryKiB));
@@ -208,6 +217,7 @@ public sealed class EncryptionSettingsService
     private sealed class PersistedVolume
     {
         public int SectorSize { get; set; }
+        public string KdfAlgorithm { get; set; } = KdfSpec.Argon2id;
         public int KdfIterations { get; set; }
         public int KdfMemoryKiB { get; set; }
         public int KdfTimeCost { get; set; }

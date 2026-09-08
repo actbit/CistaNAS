@@ -504,14 +504,18 @@ else
     }
 
     /// <summary>
-    /// ブラウザ側 JS Interop でパスワードから KEK 導出（Argon2id+PBKDF2 合成）→
-    /// マスターキー生成 → AES-256-GCM ラップを行い、サーバー送信用の UserWrappedKey を構築する。
+    /// ブラウザ側 JS Interop でパスワードから KEK 導出（サーバー設定の KDF 種別に従う:
+    /// Argon2id+PBKDF2 合成 or Argon2id 単独）→ マスターキー生成 → AES-256-GCM ラップを行い、
+    /// サーバー送信用の UserWrappedKey を構築する。
     /// </summary>
     private async Task<UserWrappedKey> CreatePasswordWrappedKeyAsync(
         string password, string wrapType = "password")
     {
         var settings = await GetEncSettingsAsync();
-        var kdf = E2eeKdfOptions.NewArgon2id(settings.KdfIterations, settings.KdfMemoryKiB, settings.KdfTimeCost, settings.KdfParallelism);
+        bool raw = string.Equals(settings.KdfAlgorithm, E2eeKdfOptions.Argon2idRaw, StringComparison.Ordinal);
+        var kdf = raw
+            ? E2eeKdfOptions.NewArgon2idRaw(settings.KdfMemoryKiB, settings.KdfTimeCost, settings.KdfParallelism)
+            : E2eeKdfOptions.NewArgon2id(settings.KdfIterations, settings.KdfMemoryKiB, settings.KdfTimeCost, settings.KdfParallelism);
         byte[] salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
         string saltB64 = Convert.ToBase64String(salt);
         string kekHandle = await E2ee.DeriveKek(password, saltB64, kdf, Auth.CurrentUsername);
@@ -525,7 +529,7 @@ else
             WrapType = wrapType,
             Kdf = new()
             {
-                Algorithm = E2eeKdfOptions.Argon2id,
+                Algorithm = kdf.Algorithm,
                 Iterations = kdf.Iterations,
                 MemoryKiB = kdf.MemoryKiB,
                 TimeCost = kdf.TimeCost,

@@ -131,4 +131,59 @@ public class Argon2idKdfTests
         byte[] actual = KeyDerivation.DeriveKek("alice", "pw", salt, KdfSpec.LegacyPbkdf2(100_000));
         Assert.Equal(expected, actual);
     }
+
+    [Fact]
+    public void KdfSpec_DefaultArgon2idRaw_IsValid()
+    {
+        Assert.True(KdfSpec.DefaultArgon2idRaw.IsArgon2idRaw);
+        Assert.True(KdfSpec.DefaultArgon2idRaw.IsArgon2Family);
+        Assert.True(KdfSpec.DefaultArgon2idRaw.IsValidArgon2Family());
+        Assert.False(KdfSpec.DefaultArgon2idRaw.IsArgon2id);
+        Assert.False(KdfSpec.DefaultArgon2idRaw.IsPbkdf2);
+        Assert.Equal(0, KdfSpec.DefaultArgon2idRaw.Iterations);
+    }
+
+    [Fact]
+    public void DeriveKek_Argon2idRaw_MatchesDirectArgon2id()
+    {
+        // 単独 KDF: KEK = Argon2id(pw, combinedSalt, t, m, p)（後段変換なし）
+        byte[] salt = Enumerable.Repeat((byte)0x24, 16).ToArray();
+        byte[] combined = KeyDerivation.CombineUserSalt("alice", salt);
+        byte[] expected = Argon2idKdf.Derive("pw", combined, timeCost: 1, memoryKiB: 1024, parallelism: 1, length: 32);
+        byte[] actual = KeyDerivation.DeriveKek("alice", "pw", salt, new KdfSpec(KdfSpec.Argon2idRaw, 0, 1024, 1, 1));
+        Assert.Equal(expected, actual);
+
+        // 出力長の伝播: 64 バイト出力でも直接 Argon2id と一致する
+        byte[] expected64 = Argon2idKdf.Derive("pw", combined, 1, 1024, 1, 64);
+        byte[] actual64 = KeyDerivation.DeriveKek("alice", "pw", salt, new KdfSpec(KdfSpec.Argon2idRaw, 0, 1024, 1, 1), outputLength: 64);
+        Assert.Equal(expected64, actual64);
+    }
+
+    [Fact]
+    public void DeriveKek_Argon2idRaw_DiffersFromComposite()
+    {
+        // 同一 t/m/p でも合成（PBKDF2 後段あり）とは別の鍵になること
+        byte[] salt = Enumerable.Repeat((byte)0x25, 16).ToArray();
+        byte[] raw = KeyDerivation.DeriveKek("alice", "pw", salt, new KdfSpec(KdfSpec.Argon2idRaw, 0, 1024, 1, 1));
+        byte[] composite = KeyDerivation.DeriveKek("alice", "pw", salt, new KdfSpec(KdfSpec.Argon2id, 10, 1024, 1, 1));
+        Assert.NotEqual(raw, composite);
+    }
+
+    [Fact]
+    public void DeriveKek_Argon2idRaw_DifferentUser_ProducesDifferentKek()
+    {
+        byte[] salt = Enumerable.Repeat((byte)0x26, 16).ToArray();
+        byte[] alice = KeyDerivation.DeriveKek("alice", "pw", salt, new KdfSpec(KdfSpec.Argon2idRaw, 0, 1024, 1, 1));
+        byte[] bob = KeyDerivation.DeriveKek("bob", "pw", salt, new KdfSpec(KdfSpec.Argon2idRaw, 0, 1024, 1, 1));
+        Assert.NotEqual(alice, bob);
+    }
+
+    [Fact]
+    public void DeriveKek_Argon2idRaw_InvalidParams_Throws()
+    {
+        // t=0 は ValidateParams で拒否される
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            KeyDerivation.DeriveKek("alice", "pw", Enumerable.Repeat((byte)0x27, 16).ToArray(),
+                new KdfSpec(KdfSpec.Argon2idRaw, 0, 1024, 1, timeCost: 0)));
+    }
 }

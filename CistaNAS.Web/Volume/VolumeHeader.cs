@@ -70,9 +70,9 @@ public sealed class VolumeHeader
 
     public sealed class KdfParams
     {
-        /// <summary>"argon2id"（Argon2id+PBKDF2 合成、現行）or "pbkdf2-sha256"（レガシー単段）。</summary>
+        /// <summary>"argon2id"（Argon2id+PBKDF2 合成、現行）or "argon2id-raw"（Argon2id 単独）or "pbkdf2-sha256"（レガシー単段）。</summary>
         public string Algorithm { get; set; } = KdfSpec.Pbkdf2Sha256;
-        /// <summary>argon2id: 後段 PBKDF2 の反復数。pbkdf2-sha256: PBKDF2 反復数。</summary>
+        /// <summary>argon2id: 後段 PBKDF2 の反復数。argon2id-raw: 不使用（0）。pbkdf2-sha256: PBKDF2 反復数。</summary>
         public int Iterations { get; set; }
         /// <summary>argon2id 前段のメモリ量（KiB）。レガシー pbkdf2 では 0。</summary>
         public int MemoryKiB { get; set; }
@@ -146,13 +146,13 @@ public sealed class VolumeHeader
     public int EffectiveServerChunkSize => ServerChunkSize > 0 ? ServerChunkSize : 4194304;
 
     /// <summary>
-    /// KEK 導出: KDF スペックに応じて Argon2id+PBKDF2 合成 / レガシー PBKDF2 単段を使い分ける。
+    /// KEK 導出: KDF スペックに応じて Argon2id+PBKDF2 合成 / Argon2id 単独 / レガシー PBKDF2 単段を使い分ける。
     /// ソルトは SHA256(username) || salt（ユーザー名がソルトの一部 → 同じパスワードでもユーザー違いで別 KEK）。
     /// ヘッダ保存の Argon2id パラメータは上限チェックする（改ざんによるメモリ/CPU DoS 対策）。
     /// </summary>
     private static byte[] DeriveKek(string username, string password, byte[] salt, KdfSpec spec)
     {
-        if (spec.IsArgon2id && !spec.IsValidArgon2id())
+        if (spec.IsArgon2Family && !spec.IsValidArgon2Family())
             throw new InvalidDataException("ボリュームヘッダの Argon2id KDF パラメータが上限を超えています。");
         return KeyDerivation.DeriveKek(username, password, salt, spec, KekSize);
     }

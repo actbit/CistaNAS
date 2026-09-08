@@ -193,10 +193,11 @@ Configure under the `CistaNas` section of `appsettings.json`.
 | `Auth:Argon2Parallelism` | Login hash Argon2id parallelism (default 4) |
 | `Auth:Pbkdf2Iterations` | (Legacy) PBKDF2 iterations for old password hashes; new hashes use Argon2id |
 | `Volume:SectorSize` | AES-XTS sector size (multiple of 16) |
+| `Volume:KdfAlgorithm` | KEK derivation algorithm: `argon2id` (Argon2id+PBKDF2 composite, default) or `argon2id-raw` (Argon2id only, RFC 9106 standard composition) |
 | `Volume:KdfMemoryKiB` | KEK derivation Argon2id memory in KiB (default 65,536 = 64 MiB) |
 | `Volume:KdfTimeCost` | KEK derivation Argon2id passes (default 4) |
 | `Volume:KdfParallelism` | KEK derivation Argon2id parallelism (default 4) |
-| `Volume:KdfIterations` | PBKDF2 iterations for the second KDF stage (default 600,000) |
+| `Volume:KdfIterations` | PBKDF2 iterations for the second KDF stage (default 600,000; unused when `Volume:KdfAlgorithm` = `argon2id-raw`) |
 | `Volume:DefaultEncryptionMode` | Default encryption mode (`server` / `e2ee` / `none`) |
 | `Volume:E2eeChunkSize` | E2EE chunk size in bytes (default 1 MiB) |
 | `Volume:ChunkStorage` | Chunk storage mode (`local` = always volume.dat / `auto` = auto-chunk on S3) |
@@ -213,6 +214,10 @@ Login password
           └ AES-256-GCM unwraps the master key
           └ Master key (64B) encrypts/decrypts AES-XTS volume data
 ```
+
+`Volume:KdfAlgorithm = "argon2id-raw"` switches new volume creation to the Argon2id-only
+composition (`KEK = Argon2id(...)` directly, no PBKDF2 second stage). The KDF algorithm is
+persisted per volume header, so existing volumes keep their original derivation either way.
 
 #### Local mode (volume.dat)
 

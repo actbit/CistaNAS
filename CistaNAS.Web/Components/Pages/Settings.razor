@@ -248,6 +248,16 @@ else
                     </div>
                 </div>
                 <div class="col-12">
+                    <label class="form-label">KDF 種別（ボリューム鍵導出）</label>
+                    <select class="form-select" @bind="_encSettings.KdfAlgorithm">
+                        <option value="argon2id">Argon2id + PBKDF2 合成（推奨）</option>
+                        <option value="argon2id-raw">Argon2id 単独（RFC 9106 標準構成）</option>
+                    </select>
+                    <div class="form-text">
+                        合成は Argon2id の後に PBKDF2 を重ねる二段構成（Argon2id 実装が将来破られた場合のバックストップ付き）。単独は PBKDF2 後段なしの RFC 9106 標準構成。既存ボリュームには影響しない。
+                    </div>
+                </div>
+                <div class="col-12">
                     <label class="form-label">KDF メモリ量（Argon2id、ボリューム鍵導出）</label>
                     <select class="form-select" @bind="_encSettings.KdfMemoryKiB">
                         <option value="16384">16 MB（高速・テスト用）</option>
@@ -275,9 +285,14 @@ else
                 </div>
                 <div class="col-12">
                     <label class="form-label">後段 PBKDF2 反復数（Argon2id 合成 KDF のバックストップ）</label>
-                    <input type="number" class="form-control" @bind="_encSettings.KdfIterations" min="600000" step="10000" />
+                    <input type="number" class="form-control" @bind="_encSettings.KdfIterations" min="600000" step="10000"
+                           disabled="@(_encSettings.KdfAlgorithm == "argon2id-raw")" />
                     <div class="form-text">
                         現在の設定: @_encSettings.KdfIterations.ToString("N0")。Argon2id 後に追加でかかる CPU コスト。既存ボリュームには影響しない。
+                        @if (_encSettings.KdfAlgorithm == "argon2id-raw")
+                        {
+                            <span class="text-muted">（Argon2id 単独モードでは不使用）</span>
+                        }
                     </div>
                 </div>
                 <div class="col-12">
@@ -387,6 +402,7 @@ else
     {
         public string DefaultEncryptionMode { get; set; } = "server";
         public int E2eeChunkSize { get; set; } = 1048576;
+        public string KdfAlgorithm { get; set; } = "argon2id";
         public int KdfIterations { get; set; } = 600_000;
         public int KdfMemoryKiB { get; set; } = 65536;
         public int KdfTimeCost { get; set; } = 4;
@@ -532,6 +548,8 @@ else
             var vol = EncSettings.CurrentVolumeOptions();
             _encSettings.DefaultEncryptionMode = vol.DefaultEncryptionMode ?? "server";
             _encSettings.E2eeChunkSize = vol.E2eeChunkSize > 0 ? vol.E2eeChunkSize : 1048576;
+            _encSettings.KdfAlgorithm = string.Equals(vol.KdfAlgorithm, "argon2id-raw", StringComparison.Ordinal)
+                ? "argon2id-raw" : "argon2id";
             _encSettings.KdfIterations = vol.KdfIterations > 0 ? vol.KdfIterations : 600_000;
             _encSettings.KdfMemoryKiB = vol.KdfMemoryKiB > 0 ? vol.KdfMemoryKiB : 65536;
             _encSettings.KdfTimeCost = vol.KdfTimeCost > 0 ? vol.KdfTimeCost : 4;
@@ -550,6 +568,7 @@ else
             var updated = new VolumeOptions
             {
                 SectorSize = _encSettings.SectorSize,
+                KdfAlgorithm = _encSettings.KdfAlgorithm,
                 KdfIterations = _encSettings.KdfIterations,
                 KdfMemoryKiB = _encSettings.KdfMemoryKiB,
                 KdfTimeCost = _encSettings.KdfTimeCost,

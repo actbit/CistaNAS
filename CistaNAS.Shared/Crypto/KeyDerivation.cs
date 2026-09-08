@@ -51,6 +51,7 @@ public static class KeyDerivation
     /// パスワードとソルトから KDF スペックに応じて鍵を導出する（現行エントリポイント）。
     /// argon2id: 合成 KDF = PBKDF2-SHA256( Argon2id(password, salt, t, m, p), salt, Iterations )。
     /// Argon2id がメモリ困難性を、PBKDF2 後段が CPU 困難性のバックストップを担う。
+    /// argon2id-raw: Argon2id 単独（PBKDF2 後段なし）。RFC 9106 標準構成のまま出力を鍵として使う。
     /// pbkdf2-sha256: レガシー単段（既存ボリュームの検証専用。テスト用の低反復数もここで許容）。
     /// </summary>
     public static byte[] DeriveKek(string username, string password, byte[] salt, KdfSpec spec, int outputLength = 32)
@@ -74,6 +75,13 @@ public static class KeyDerivation
             {
                 CryptographicOperations.ZeroMemory(argon2Output);
             }
+        }
+
+        if (spec.IsArgon2idRaw)
+        {
+            // Argon2id 単独: RFC 9106 の出力をそのまま鍵として使う（後段変換なし）
+            Argon2idKdf.ValidateParams(spec.TimeCost, spec.MemoryKiB, spec.Parallelism);
+            return Argon2idKdf.Derive(password, combinedSalt, spec.TimeCost, spec.MemoryKiB, spec.Parallelism, outputLength);
         }
 
         // レガシー PBKDF2-SHA256 単段（既存ボリューム / テスト低反復数の検証用）

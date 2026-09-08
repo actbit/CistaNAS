@@ -243,6 +243,13 @@
                                         </ComboBox>
                                     </StackPanel>
                                     <StackPanel Orientation="Horizontal" Spacing="8">
+                                        <TextBlock Text="KDF 種別" VerticalAlignment="Center" Width="160"/>
+                                        <ComboBox SelectedIndex="{Binding EncKdfAlgorithmIndex}" Width="200">
+                                            <ComboBoxItem Content="Argon2id + PBKDF2 合成" />
+                                            <ComboBoxItem Content="Argon2id 単独 (RFC 9106)" />
+                                        </ComboBox>
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Spacing="8">
                                         <TextBlock Text="KDF メモリ量 KiB (Argon2id)" VerticalAlignment="Center" Width="160"/>
                                         <NumericUpDown Value="{Binding EncKdfMemoryKiB}" Minimum="8192" Maximum="1048576"
                                                        Increment="16384" Width="200" />
@@ -255,7 +262,8 @@
                                     <StackPanel Orientation="Horizontal" Spacing="8">
                                         <TextBlock Text="後段 PBKDF2 反復数" VerticalAlignment="Center" Width="160"/>
                                         <NumericUpDown Value="{Binding EncKdfIterations}" Minimum="600000" Maximum="10000000"
-                                                       Increment="100000" Width="200" />
+                                                       Increment="100000" Width="200"
+                                                       IsEnabled="{Binding IsKdfComposite}" />
                                     </StackPanel>
                                     <StackPanel Orientation="Horizontal" Spacing="8">
                                         <TextBlock Text="セクタサイズ (AES-XTS)" VerticalAlignment="Center" Width="160"/>

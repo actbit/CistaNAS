@@ -283,14 +283,19 @@ public class E2eeFileEntry
 /// <summary>
 /// パスワードベース KDF のパラメータ（サーバー VolumeHeader.KdfParams と同型）。
 /// Algorithm == "argon2id" は合成 KDF: KEK = PBKDF2-SHA256(Argon2id(pw, salt, t, m, p), salt, Iterations, 32)。
+/// Algorithm == "argon2id-raw" は Argon2id 単独（PBKDF2 後段なし。Iterations 不使用）。
 /// </summary>
 public sealed record KdfInfo(string Algorithm, int Iterations, int MemoryKiB, int TimeCost, int Parallelism)
 {
     public const string Argon2id = "argon2id";
+    public const string Argon2idRaw = "argon2id-raw";
     public const string Pbkdf2Sha256 = "pbkdf2-sha256";
 
     /// <summary>新規作成時の既定: Argon2id(m=64MiB, t=4, p=4) + PBKDF2(600k) 合成。</summary>
     public static KdfInfo DefaultArgon2id { get; } = new(Argon2id, 600_000, 65536, 4, 4);
+
+    /// <summary>Argon2id 単独の既定スペック（m=64MiB, t=4, p=4。PBKDF2 後段なし）。</summary>
+    public static KdfInfo DefaultArgon2idRaw { get; } = new(Argon2idRaw, 0, 65536, 4, 4);
 
     /// <summary>レガシー PBKDF2 単段スペック（既存データの検証用）。</summary>
     public static KdfInfo LegacyPbkdf2(int iterations) => new(Pbkdf2Sha256, iterations, 0, 0, 0);

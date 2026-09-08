@@ -161,6 +161,7 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
     },
     "Volume": {
       "SectorSize": 4096,
+      "KdfAlgorithm": "argon2id",
       "KdfIterations": 600000,
       "DefaultEncryptionMode": "server",
       "E2eeChunkSize": 1048576,
@@ -193,10 +194,11 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
 | `Auth:Argon2Parallelism` | ログインハッシュの Argon2id 並列度（デフォルト 4） |
 | `Auth:Pbkdf2Iterations` | （レガシー）旧パスワードハッシュの PBKDF2 反復回数。新規ハッシュは Argon2id |
 | `Volume:SectorSize` | AES-XTS のセクタサイズ（16 の倍数） |
+| `Volume:KdfAlgorithm` | KEK 導出アルゴリズム: `argon2id`（Argon2id+PBKDF2 合成、デフォルト）or `argon2id-raw`（Argon2id 単独、RFC 9106 標準構成） |
 | `Volume:KdfMemoryKiB` | KEK 導出の Argon2id メモリ量 KiB（デフォルト 65,536 = 64 MiB） |
 | `Volume:KdfTimeCost` | KEK 導出の Argon2id パス数（デフォルト 4） |
 | `Volume:KdfParallelism` | KEK 導出の Argon2id 並列度（デフォルト 4） |
-| `Volume:KdfIterations` | KEK 導出の後段 PBKDF2 反復回数（デフォルト 600,000） |
+| `Volume:KdfIterations` | KEK 導出の後段 PBKDF2 反復回数（デフォルト 600,000。`Volume:KdfAlgorithm` = `argon2id-raw` 時は不使用） |
 | `Volume:DefaultEncryptionMode` | デフォルト暗号化モード（`server` / `e2ee` / `none`） |
 | `Volume:E2eeChunkSize` | E2EE チャンクサイズ（バイト、デフォルト 1 MiB） |
 | `Volume:ChunkStorage` | チャンクストレージモード（`local` = 常に volume.dat / `auto` = S3 使用時に自動チャンク） |
@@ -213,6 +215,10 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
           └ AES-256-GCM でマスターキーをアンラップ
           └ マスターキー (64B) で AES-XTS ボリュームデータを暗号/復号
 ```
+
+`Volume:KdfAlgorithm = "argon2id-raw"` にすると新規ボリューム作成時の KDF が Argon2id 単独
+（`KEK = Argon2id(...)` をそのまま使用、PBKDF2 後段なし）になります。KDF 種別はボリューム
+ヘッダごとに永続化されるため、既存ボリュームはどちらの設定でも元の導出方式のまま動作します。
 
 #### ローカルモード（volume.dat）
 

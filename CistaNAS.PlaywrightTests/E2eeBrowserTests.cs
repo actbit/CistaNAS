@@ -249,4 +249,64 @@ public class E2eeBrowserTests(PlaywrightWebAppFixture fixture)
             CryptographicOperations.ZeroMemory(kek);
         }
     }
+
+    /// <summary>
+    /// ブラウザ e2ee.js の Argon2id 単独 KDF（PBKDF2 後段なし、argon2id-raw）が
+    /// C# E2eeCrypto と相互運用できることを検証する（回帰防止）。
+    /// </summary>
+    [Fact]
+    public async Task E2ee_Argon2idRawKek_BrowserMatchesCsharp()
+    {
+        await using var context = await fixture.CreateAuthenticatedContextAsync();
+        var page = await context.NewPageAsync();
+        await page.GotoAsync(fixture.BaseUrl + "/",
+            options: new PageGotoOptions { WaitUntil = WaitUntilState.Load });
+
+        byte[] masterKey = E2eeCrypto.GenerateMasterKey();
+        byte[] kekSalt = RandomNumberGenerator.GetBytes(16);
+        // 軽量テストスペック (8 MiB / t=1 / p=1、PBKDF2 後段なし)
+        var spec = new KdfSpec(KdfSpec.Argon2idRaw, Iterations: 0, MemoryKiB: 8192, Parallelism: 1, TimeCost: 1);
+
+        byte[] kek = E2eeCrypto.DeriveKek(PlaywrightWebAppFixture.Username, PlaywrightWebAppFixture.Password, kekSalt, spec);
+        try
+        {
+            var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(masterKey, kek);
+
+            // JS 側: argon2id-raw の KDF オブジェクトで KEK を導出 → masterKey アンラップ →
+            // ファイル名を暗号化して返す
+            string encNameB64 = await page.EvaluateAsync<string>(@"async (args) => {
+                const mod = await import(args.moduleUrl);
+                const kdf = {
+                    algorithm: 'argon2id-raw',
+                    iterations: 0,
+                    memoryKiB: args.memoryKiB,
+                    timeCost: args.timeCost,
+                    parallelism: args.parallelism,
+                };
+                const kekHandle = await mod.deriveKek(args.password, args.kekSaltB64, kdf, args.username);
+                const mkHandle = await mod.unwrapMasterKey(args.nonceB64, args.ctB64, args.tagB64, kekHandle);
+                return await mod.encryptFilename('argon2-raw-e2e-check.txt', mkHandle);
+            }", new
+            {
+                moduleUrl = $"{fixture.BaseUrl}/js/e2ee.js",
+                password = PlaywrightWebAppFixture.Password,
+                username = PlaywrightWebAppFixture.Username,
+                kekSaltB64 = Convert.ToBase64String(kekSalt),
+                memoryKiB = spec.MemoryKiB,
+                timeCost = spec.TimeCost,
+                parallelism = spec.Parallelism,
+                nonceB64 = Convert.ToBase64String(nonce),
+                ctB64 = Convert.ToBase64String(ct),
+                tagB64 = Convert.ToBase64String(tag),
+            });
+
+            // JS が正しい masterKey を復号できたことの間接検証（= JS の Argon2id 単独 KEK が C# と一致）
+            string decryptedName = E2eeCrypto.DecryptFilename(encNameB64, masterKey);
+            Assert.Equal("argon2-raw-e2e-check.txt", decryptedName);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(kek);
+        }
+    }
 }

@@ -75,11 +75,36 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty] private EncryptionSettingsInfo? _encSettings;
     [ObservableProperty] private string _encDefaultMode = "server";
     [ObservableProperty] private int _encChunkSize = 1048576;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsKdfComposite))]
+    private string _encKdfAlgorithm = KdfSpec.Argon2id;
     [ObservableProperty] private int _encKdfIterations = 600_000;
     [ObservableProperty] private int _encKdfMemoryKiB = 65536;
     [ObservableProperty] private int _encKdfTimeCost = 4;
     [ObservableProperty] private int _encKdfParallelism = 4;
     [ObservableProperty] private int _encSectorSize = 4096;
+
+    /// <summary>KDF 種別 ComboBox（SelectedIndex バインディング用）の選択肢。</summary>
+    public static readonly string[] KdfAlgorithmValues = [KdfSpec.Argon2id, KdfSpec.Argon2idRaw];
+
+    [ObservableProperty]
+    private int _encKdfAlgorithmIndex = 0;
+
+    /// <summary>Argon2id 単独（argon2id-raw）ではない（= 合成 KDF）とき true。PBKDF2 反復数入力の有効化に使用。</summary>
+    public bool IsKdfComposite => !string.Equals(EncKdfAlgorithm, KdfSpec.Argon2idRaw, StringComparison.Ordinal);
+
+    partial void OnEncKdfAlgorithmChanged(string value)
+    {
+        // ComboBox 側の SelectedIndex を同期（未登録の値は合成に寄せる）
+        _encKdfAlgorithmIndex = Math.Max(0, Array.IndexOf(KdfAlgorithmValues, value ?? KdfAlgorithmValues[0]));
+    }
+
+    partial void OnEncKdfAlgorithmIndexChanged(int value)
+    {
+        string alg = KdfAlgorithmValues[Math.Clamp(value, 0, KdfAlgorithmValues.Length - 1)];
+        if (!string.Equals(EncKdfAlgorithm, alg, StringComparison.Ordinal))
+            EncKdfAlgorithm = alg; // OnEncKdfAlgorithmChanged で index が再同期される（収束）
+    }
 
     // ---- 設定: E2EE鍵ペア ----
     [ObservableProperty] private bool _hasPublicKey;
@@ -295,30 +320,57 @@ public partial class MainViewModel : ObservableObject
         finally { IsBusy = false; }
     }
 
+    /// <summary>
+    /// 新規 E2EE ボリュームの KEK 導出に使う KDF スペックをサーバー設定から取得する
+    /// （Argon2id+PBKDF2 合成 or Argon2id 単独）。取得失敗時は現行標準にフォールバック。
+    /// </summary>
+    private async Task<KdfSpec> GetCreationKdfAsync()
+    {
+        try
+        {
+            var settings = await CistaNasApiClientSettings.GetEncryptionSettingsAsync(_api!);
+            return ToKdfSpec(settings);
+        }
+        catch
+        {
+            return KdfSpec.DefaultArgon2id;
+        }
+    }
+
+    private static KdfSpec ToKdfSpec(EncryptionSettingsInfo s) =>
+        string.Equals(s.KdfAlgorithm, KdfSpec.Argon2idRaw, StringComparison.Ordinal)
+            ? new KdfSpec(KdfSpec.Argon2idRaw, 0, s.KdfMemoryKiB, s.KdfParallelism, s.KdfTimeCost)
+            : new KdfSpec(KdfSpec.Argon2id, s.KdfIterations, s.KdfMemoryKiB, s.KdfParallelism, s.KdfTimeCost);
+
+    private static KdfInfo ToKdfInfo(KdfSpec spec) =>
+        new(spec.Algorithm, spec.Iterations, spec.MemoryKiB, spec.TimeCost, spec.Parallelism);
+
     private async Task CreateE2eeVolumeAsync()
     {
-        // Argon2id+PBKDF2 合成 KDF（サーバー既定スペックと同一）
+        // サーバー設定の KDF 種別に従う（既定: Argon2id+PBKDF2 合成）
+        KdfSpec spec = await GetCreationKdfAsync();
         byte[] salt = RandomNumberGenerator.GetBytes(16);
-        using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, CreateVolPassword, salt, KdfSpec.DefaultArgon2id));
+        using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, CreateVolPassword, salt, spec));
         byte[] masterKey = new byte[32];
         RandomNumberGenerator.Fill(masterKey);
         using var mkBuf = new SecureBuffer(masterKey);
         var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(mkBuf.Buffer, kekBuf.Buffer);
 
-        await _api!.CreateVolumeAsync(CreateVolName, Username!, nonce, ct, tag, salt, KdfInfo.DefaultArgon2id);
+        await _api!.CreateVolumeAsync(CreateVolName, Username!, nonce, ct, tag, salt, ToKdfInfo(spec));
     }
 
     private async Task CreateGroupE2eeVolumeAsync()
     {
-        // Argon2id+PBKDF2 合成 KDF（サーバー既定スペックと同一）
+        // サーバー設定の KDF 種別に従う（既定: Argon2id+PBKDF2 合成）
+        KdfSpec spec = await GetCreationKdfAsync();
         byte[] salt = RandomNumberGenerator.GetBytes(16);
-        using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, CreateVolPassword, salt, KdfSpec.DefaultArgon2id));
+        using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, CreateVolPassword, salt, spec));
         byte[] masterKey = new byte[32];
         RandomNumberGenerator.Fill(masterKey);
         using var mkBuf = new SecureBuffer(masterKey);
         var (nonce, ct, tag) = E2eeCrypto.WrapMasterKey(mkBuf.Buffer, kekBuf.Buffer);
 
-        await CistaNasApiClientE2eeExtensions.CreateGroupVolumeAsync(_api!, CreateVolName, nonce, ct, tag, salt, KdfInfo.DefaultArgon2id);
+        await CistaNasApiClientE2eeExtensions.CreateGroupVolumeAsync(_api!, CreateVolName, nonce, ct, tag, salt, ToKdfInfo(spec));
     }
 
     [RelayCommand]
@@ -684,6 +736,7 @@ public partial class MainViewModel : ObservableObject
             var settings = await CistaNasApiClientSettings.GetEncryptionSettingsAsync(_api);
             EncDefaultMode = settings.DefaultEncryptionMode;
             EncChunkSize = settings.E2eeChunkSize;
+            EncKdfAlgorithm = settings.KdfAlgorithm;
             EncKdfIterations = settings.KdfIterations;
             EncKdfMemoryKiB = settings.KdfMemoryKiB;
             EncKdfTimeCost = settings.KdfTimeCost;
@@ -703,6 +756,7 @@ public partial class MainViewModel : ObservableObject
             {
                 DefaultEncryptionMode = EncDefaultMode,
                 E2eeChunkSize = EncChunkSize,
+                KdfAlgorithm = EncKdfAlgorithm,
                 KdfIterations = EncKdfIterations,
                 KdfMemoryKiB = EncKdfMemoryKiB,
                 KdfTimeCost = EncKdfTimeCost,
