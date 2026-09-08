@@ -13,7 +13,14 @@ public sealed partial class VolumeService
     {
         var header = await LoadHeaderIfExistsAsync(volumeName);
         if (header is null) return false;
-        var userGroups = await GetGroupsForUserAsync(username);
+
+        // グループ共有が設定されていないボリュームでは、グループ判定は常に false になるため
+        // membership の DB クエリを省略する (E2EE ボリュームは GrantGroupAccessAsync で
+        // グループ共有が禁止されているため、常に AuthorizedGroups が空 → 毎リクエストの
+        // アクセス確認で無駄なクエリが発生していた)
+        var userGroups = header.AuthorizedGroups.Count > 0
+            ? await GetGroupsForUserAsync(username)
+            : [];
         return HasAccessInternal(header, username, userGroups);
     }
 
