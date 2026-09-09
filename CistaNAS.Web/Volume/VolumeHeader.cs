@@ -51,6 +51,37 @@ public sealed class VolumeHeader
     /// <summary>ボリュームの作成者（削除不可）。</summary>
     public string OwnerUser { get; set; } = "";
 
+    /// <summary>
+    /// ボリュームの stable identifier（GUID "N" 形式）。crypto format v2 の AAD に bind する。
+    /// ボリューム名リネーム後も不変。新規 E2EE ボリューム作成時に生成し、
+    /// 既存ボリュームは共有昇格（epoch 1 生成）時に生成する。
+    /// </summary>
+    public string? VolumeId { get; set; }
+
+    /// <summary>
+    /// 共有 E2EE の GroupKey epoch。0 = v1（共有なしの単独 E2EE、masterKey 直使用）、
+    /// ≥ 1 = 共有 v2 モード（GroupKey + per-file DEK）。
+    /// </summary>
+    public int KeyEpoch { get; set; }
+
+    /// <summary>
+    /// epoch ごとの GroupKey（remaining members の公開鍵で ECDH ラップ済み）。
+    /// 旧 epoch は既存ファイル（その epoch の GroupKey でラップされた WrappedFileKey）を
+    /// remaining members が引き続き読めるよう、revoke されていない限り保持する。
+    /// </summary>
+    public List<GroupEpochEntry> GroupKeyEpochs { get; set; } = [];
+
+    /// <summary>epoch 単位の GroupKey wraps。</summary>
+    public sealed class GroupEpochEntry
+    {
+        public int Epoch { get; set; }
+
+        /// <summary>キー = ユーザー名。値 = そのユーザーの公開鍵でラップされた GroupKey。</summary>
+        public Dictionary<string, UserWrappedKey> Wraps { get; set; } = new(StringComparer.Ordinal);
+
+        public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    }
+
     /// <summary>ユーザーごとのラップ済み鍵。キー = ユーザー名。</summary>
     public Dictionary<string, UserWrappedKey> UserKeys { get; set; } = new(StringComparer.Ordinal);
 
@@ -66,6 +97,12 @@ public sealed class VolumeHeader
         public KdfParams Kdf { get; set; } = new();
         public WrappedKey WrappedMasterKey { get; set; } = new();
         public byte[]? EphemeralPublicKey { get; set; } // ECDH only: raw 65B uncompressed point
+
+        /// <summary>
+        /// 将来拡張用のメタデータ（KeyId / DeviceId / Signature 等）。
+        /// Identity key 署名モデル導入時に使用。現行プロトコルでは未使用。
+        /// </summary>
+        public Dictionary<string, string>? Extensions { get; set; }
     }
 
     public sealed class KdfParams
@@ -121,6 +158,7 @@ public sealed class VolumeHeader
             ChunkSize = chunkSize,
             SectorSize = 0,
             OwnerUser = username,
+            VolumeId = Guid.NewGuid().ToString("N"),
             UserKeys = { [username] = wrappedKey },
         };
     }
@@ -129,6 +167,66 @@ public sealed class VolumeHeader
     public void AddWrappedKey(string username, UserWrappedKey wrappedKey)
     {
         UserKeys[username] = wrappedKey;
+    }
+
+    // ---- 共有 v2（GroupKey epoch） ----
+
+    /// <summary>VolumeId を取得。未生成なら新規生成してヘッダに設定する。</summary>
+    public string EnsureVolumeId()
+    {
+        if (string.IsNullOrEmpty(VolumeId))
+            VolumeId = Guid.NewGuid().ToString("N");
+        return VolumeId;
+    }
+
+    /// <summary>共有 v2 モード（GroupKey epoch 運用中）か。</summary>
+    public bool IsGroupE2ee => KeyEpoch >= 1;
+
+    /// <summary>指定 epoch の GroupKey wraps エントリを取得。無ければ null。</summary>
+    public GroupEpochEntry? GetGroupEpoch(int epoch)
+        => GroupKeyEpochs.FirstOrDefault(e => e.Epoch == epoch);
+
+    /// <summary>指定ユーザー宛ての、指定 epoch の GroupKey wrap を取得。無ければ null。</summary>
+    public UserWrappedKey? GetGroupKeyWrap(int epoch, string username)
+        => GetGroupEpoch(epoch)?.Wraps.GetValueOrDefault(username);
+
+    /// <summary>
+    /// 新しい GroupKey epoch を登録する。wraps は remaining members 分のみ
+    /// （削除されたメンバー宛ての wrap を含めてはならない — クライアント側で生成）。
+    /// </summary>
+    public GroupEpochEntry AddGroupEpoch(int epoch, Dictionary<string, UserWrappedKey> wraps)
+    {
+        if (GetGroupEpoch(epoch) is not null)
+            throw new VolumeException($"GroupKey epoch {epoch} は既に存在します。");
+        var entry = new GroupEpochEntry { Epoch = epoch, Wraps = wraps };
+        GroupKeyEpochs.Add(entry);
+        KeyEpoch = epoch;
+        return entry;
+    }
+
+    /// <summary>指定ユーザーの全鍵エントリ（UserKeys + 全 epoch の GroupKey wraps）を削除（revoke）。</summary>
+    public bool RemoveUserEverywhere(string username)
+    {
+        bool removed = UserKeys.Remove(username);
+        foreach (var entry in GroupKeyEpochs)
+            removed |= entry.Wraps.Remove(username);
+        return removed;
+    }
+
+    /// <summary>
+    /// crypto format v2: 現行 epoch の GroupKey wraps にメンバー追加分の wrap を登録する。
+    /// rotation は伴わない（追加メンバーは現行 epoch 以降のデータのみ読める — 追加は新データ権限のみ）。
+    /// 旧 epoch の wraps は不変。既に wrap を持つユーザーは拒否（誤って別の GroupKey で上書きしないため）。
+    /// </summary>
+    public void AddGroupKeyWrap(int epoch, string username, UserWrappedKey wrappedKey)
+    {
+        if (epoch != KeyEpoch)
+            throw new VolumeException($"epoch {epoch} は現行 epoch（{KeyEpoch}）ではありません。");
+        var entry = GetGroupEpoch(epoch)
+            ?? throw new VolumeException($"GroupKey epoch {epoch} が存在しません（共有 v2 に移行されていません）。");
+        if (entry.Wraps.ContainsKey(username))
+            throw new VolumeException($"ユーザー '{username}' は既に epoch {epoch} の GroupKey を持っています。");
+        entry.Wraps[username] = wrappedKey;
     }
 
     public bool IsE2ee => EncryptionMode == "e2ee";

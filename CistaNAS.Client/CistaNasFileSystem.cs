@@ -17,7 +17,8 @@ namespace CistaNAS.Client;
 public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 {
     private readonly CistaNasApiClient _api;
-    private readonly SecureBuffer? _masterKey;  // E2EE モードでのみ使用（VirtualLock + ゼロクリア保護）
+    private readonly SecureBuffer? _masterKey;  // v1 互換 + v2 オーナーの残置 v1 ファイル読み取り用（VirtualLock + ゼロクリア保護）
+    private readonly E2eeV2VolumeState? _v2;    // 共有 v2: VolumeId + epoch ごとの GroupKey（Dispose でゼロクリア）
     private readonly string _volumeName;
     private readonly int _chunkSize;
     private readonly bool _isE2ee;  // E2EE モードフラグ
@@ -41,11 +42,16 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
     private (long UserUsedBytes, long UserQuotaBytes)? _cachedStats;
     private readonly object _statsLock = new();
 
-    /// <summary>E2EE モードでファイルシステムを作成。</summary>
-    public CistaNasFileSystem(CistaNasApiClient api, byte[] masterKey, string volumeName, int chunkSize = 1048576)
+    /// <summary>
+    /// E2EE モードでファイルシステムを作成。
+    /// 共有 v2 ボリュームでは <paramref name="masterKey"/> は null 可（v2 メンバーは GroupKey のみ）。
+    /// </summary>
+    public CistaNasFileSystem(CistaNasApiClient api, byte[]? masterKey, string volumeName,
+        int chunkSize = 1048576, E2eeV2VolumeState? v2State = null)
     {
         _api = api;
-        _masterKey = new SecureBuffer(masterKey);
+        _masterKey = masterKey is null ? null : new SecureBuffer(masterKey);
+        _v2 = v2State;
         _volumeName = volumeName;
         _chunkSize = chunkSize;
         _isE2ee = true;
@@ -56,6 +62,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
     {
         _api = api;
         _masterKey = null;
+        _v2 = null;
         _volumeName = volumeName;
         _chunkSize = 0;
         _isE2ee = false;
@@ -70,6 +77,11 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public string FileId = "";
         public int ChunkCount;
         public long PlainLength;
+
+        /// <summary>crypto format v2: このファイルの鍵 epoch。0 = v1 形式（masterKey 派生 fileKey）。</summary>
+        public int KeyEpoch;
+        /// <summary>crypto format v2: per-file DEK の wrap（GroupKey[KeyEpoch] でラップ）。v1 では null。</summary>
+        public WrappedAeadKey? WrappedFileKey;
 
         private SecureBuffer? _fileKey;
         private byte[]? _fileSalt;
@@ -255,6 +267,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         private byte[]? _existingFileKey;
         private int _existingChunkCount;
         private long _existingPlainLength;
+        // crypto format v2: 既存チャンク復号に使う鍵 epoch（0 = v1）と volumeId（AAD bind 用）
+        private int _existingFileKeyEpoch;
+        private string? _existingVolumeId;
         private readonly Timer? _leaseRenewal;
 
         public E2eeChunkWriteState(CistaNasFileSystem fs, string plainName, string? existingFileId)
@@ -271,6 +286,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
                     _existingChunkCount = cache.ChunkCount;
                     _existingPlainLength = cache.PlainLength;
+                    _existingFileKeyEpoch = cache.KeyEpoch;
+                    _existingVolumeId = fs.VolumeIdString;
                     if (cache.TryGetFileKey(out var key, out var salt))
                     {
                         _existingFileKey = key;
@@ -279,11 +296,34 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                         // 保存直後の再読み込みで復号鍵が壊れる。
                         _existingFileSalt = salt is null ? null : (byte[])salt.Clone();
                     }
+                    else if (cache.KeyEpoch >= 1)
+                    {
+                        // v2: WrappedFileKey を GroupKey でアンラップした per-file DEK で RMW する。
+                        // 部分更新のRMWには既存鍵が必須。取得失敗を新規チャンク扱いすると
+                        // 未変更部分をゼロで上書きするため、書き込み開始自体を失敗させる。
+                        _existingFileKey = fs.UnwrapFileKeyV2(cache);
+                        if (_existingChunkCount > 0)
+                        {
+                            var (enc0, _, _) = fs._api.DownloadChunkAsync(fs._volumeName, existingFileId, 0).GetAwaiter().GetResult();
+                            if (enc0.Length <= E2eeCrypto.SaltSize)
+                                throw new InvalidDataException("既存E2EEファイルの先頭チャンクが不正です。");
+                            var salt0 = new byte[E2eeCrypto.SaltSize];
+                            Buffer.BlockCopy(enc0, 0, salt0, 0, E2eeCrypto.SaltSize);
+                            _existingFileSalt = salt0;
+                        }
+                        else
+                        {
+                            // 旧クライアントが空ファイルを ChunkCount=0 で確定したカタログとの互換性。
+                            // 次回保存時に新しいsaltを持つ空chunk 0を作り、現行形式へ移行する。
+                            _existingFileSalt = E2eeCrypto.GenerateFileSalt();
+                        }
+                        cache.SetFileKey(_existingFileKey, _existingFileSalt);
+                    }
                     else if (_existingChunkCount > 0)
                     {
                         // 部分更新のRMWには既存鍵が必須。取得失敗を新規チャンク扱いすると
                         // 未変更部分をゼロで上書きするため、書き込み開始自体を失敗させる。
-                        var (enc0, _) = fs._api.DownloadChunkAsync(fs._volumeName, existingFileId, 0).GetAwaiter().GetResult();
+                        var (enc0, _, _) = fs._api.DownloadChunkAsync(fs._volumeName, existingFileId, 0).GetAwaiter().GetResult();
                         if (enc0.Length <= E2eeCrypto.SaltSize)
                             throw new InvalidDataException("既存E2EEファイルの先頭チャンクが不正です。");
 
@@ -323,6 +363,10 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public byte[]? ExistingFileKey => _existingFileKey;
         public int ExistingChunkCount => _existingChunkCount;
         public long ExistingPlainLength => _existingPlainLength;
+        /// <summary>crypto format v2: 既存チャンク復号に使う鍵 epoch（0 = v1）。RMW 用。</summary>
+        public int ExistingFileKeyEpoch => _existingFileKeyEpoch;
+        /// <summary>crypto format v2: volumeId（チャンク AAD bind 用）。v1 では null。</summary>
+        public string? ExistingVolumeId => _existingVolumeId;
         public string? WriteLeaseToken { get; }
 
         public override long CurrentSize
@@ -407,7 +451,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             if (ExistingFileId is not null && ci < _existingChunkCount
                 && _existingFileKey is not null && _existingFileSalt is not null)
             {
-                return Fs.LoadPlainChunkForWrite(ExistingFileId, ci, _existingFileKey, _existingFileSalt);
+                return Fs.LoadPlainChunkForWrite(ExistingFileId, ci, _existingFileKey, _existingFileSalt,
+                    _existingFileKeyEpoch, _existingVolumeId);
             }
             // 新規チャンク: chunkSize のゼロ
             return new byte[chunkSize];
@@ -655,7 +700,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                         else if (e2ee.ExistingFileId is not null && ci < e2ee.ExistingChunkCount
                                  && e2ee.ExistingFileKey is not null && e2ee.ExistingFileSalt is not null)
                         {
-                            chunk = LoadPlainChunkForWrite(e2ee.ExistingFileId, ci, e2ee.ExistingFileKey, e2ee.ExistingFileSalt);
+                            chunk = LoadPlainChunkForWrite(e2ee.ExistingFileId, ci, e2ee.ExistingFileKey,
+                                e2ee.ExistingFileSalt, e2ee.ExistingFileKeyEpoch, e2ee.ExistingVolumeId);
                         }
                         else
                         {
@@ -735,23 +781,33 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
                 // チャンク 0 から salt を抽出して fileKey を確定。
                 // salt は全チャンクの nonce 導出（DeriveChunkNonce）で共通して使うため保持する。
+                // v2 ファイル（KeyEpoch ≥ 1）は WrappedFileKey を GroupKey でアンラップした DEK を使う。
                 if (!cache.TryGetFileKey(out var fileKey, out var fileSalt))
                 {
-                    var (encData, rev0) = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
+                    var (encData, rev0, chunkEpoch0) = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
                     if (encData.Length <= 16)
                         return (DokanResult.InternalError, 0);
 
                     fileSalt = new byte[16];
                     Buffer.BlockCopy(encData, 0, fileSalt, 0, 16);
-                    var derivedKey = E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, fileSalt);
+                    byte[] derivedKey = cache.KeyEpoch >= 1
+                        ? UnwrapFileKeyV2(cache)
+                        : E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, fileSalt);
+                    int keyEpoch = cache.KeyEpoch;
 
                     // チャンク 0 を復号してキャッシュ
-                    var chunk = E2eeCrypto.DecryptChunk(encData, derivedKey, 0, fileSalt, rev0);
+                    var chunk = keyEpoch >= 1
+                        ? E2eeV2.DecryptChunk(encData, derivedKey,
+                            new E2eeChunkContext(_v2!.VolumeIdString, fileId, 0, rev0,
+                                chunkEpoch0 > 0 ? chunkEpoch0 : keyEpoch), fileSalt)
+                        : E2eeCrypto.DecryptChunk(encData, derivedKey, 0, fileSalt, rev0);
                     PutChunkToPool(fileId, 0, chunk, ComputeHashHex(encData));
 
                     cache.SetFileKey(derivedKey, fileSalt);
                     fileKey = derivedKey;
                 }
+                int readFileKeyEpoch = cache.KeyEpoch;
+                string? readFileVolumeId = readFileKeyEpoch >= 1 ? _v2!.VolumeIdString : null;
 
                 // 他クライアント上書き検出のため、チャンク0のハッシュ検証を最初に行う
                 // salt が変わった場合は fileKey を再導出する必要がある
@@ -770,24 +826,39 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                     if (serverHash is null || serverHash != chunk0Cached.Value.EncryptedHash)
                     {
                         // チャンク0が変わっている可能性があるため、再ダウンロードして salt を確認
-                        var (chunk0Data, chunk0Rev) = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
+                        var (chunk0Data, chunk0Rev, chunk0Epoch) = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
                         if (chunk0Data.Length > E2eeCrypto.SaltSize)
                         {
                             byte[] newSalt = new byte[E2eeCrypto.SaltSize];
                             Buffer.BlockCopy(chunk0Data, 0, newSalt, 0, E2eeCrypto.SaltSize);
-                            var newKey = E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, newSalt);
-
-                            // fileKey が変わった場合はキャッシュをクリアして再構築
-                            if (!CryptographicOperations.FixedTimeEquals(newKey, fileKey))
+                            if (readFileKeyEpoch >= 1)
                             {
-                                cache.SetFileKey(newKey, newSalt);
-                                fileKeyToUse = newKey;
+                                // v2: DEK は WrappedFileKey 由来で不変。salt 変化のみ反映して再復号する
                                 fileSalt = newSalt;
+                                cache.SetFileKey(fileKeyToUse!, newSalt);
                                 RemoveFileChunksFromPool(fileId);
 
-                                // チャンク0を復号してキャッシュ
-                                var chunk0 = E2eeCrypto.DecryptChunk(chunk0Data, newKey, 0, newSalt, chunk0Rev);
+                                var chunk0 = E2eeV2.DecryptChunk(chunk0Data, fileKeyToUse!,
+                                    new E2eeChunkContext(readFileVolumeId!, fileId, 0, chunk0Rev,
+                                        chunk0Epoch > 0 ? chunk0Epoch : readFileKeyEpoch), newSalt);
                                 PutChunkToPool(fileId, 0, chunk0, ComputeHashHex(chunk0Data));
+                            }
+                            else
+                            {
+                                var newKey = E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, newSalt);
+
+                                // fileKey が変わった場合はキャッシュをクリアして再構築
+                                if (!CryptographicOperations.FixedTimeEquals(newKey, fileKey))
+                                {
+                                    cache.SetFileKey(newKey, newSalt);
+                                    fileKeyToUse = newKey;
+                                    fileSalt = newSalt;
+                                    RemoveFileChunksFromPool(fileId);
+
+                                    // チャンク0を復号してキャッシュ
+                                    var chunk0 = E2eeCrypto.DecryptChunk(chunk0Data, newKey, 0, newSalt, chunk0Rev);
+                                    PutChunkToPool(fileId, 0, chunk0, ComputeHashHex(chunk0Data));
+                                }
                             }
                         }
                     }
@@ -829,16 +900,24 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                         else
                         {
                             // ハッシュ不一致 or ハッシュなし or 通信失敗 → 再ダウンロード
-                            var (encData, rev) = await _api.DownloadChunkAsync(_volumeName, fileId, i);
-                            chunk = E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, fileSalt!, rev);
+                            var (encData, rev, chunkEpoch) = await _api.DownloadChunkAsync(_volumeName, fileId, i);
+                            chunk = readFileKeyEpoch >= 1
+                                ? E2eeV2.DecryptChunk(encData, fileKeyToUse!,
+                                    new E2eeChunkContext(readFileVolumeId!, fileId, i, rev,
+                                        chunkEpoch > 0 ? chunkEpoch : readFileKeyEpoch), fileSalt!)
+                                : E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, fileSalt!, rev);
                             PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));
                         }
                     }
                     else
                     {
                         // キャッシュミス: ダウンロード + 復号 + キャッシュ保存
-                        var (encData, rev) = await _api.DownloadChunkAsync(_volumeName, fileId, i);
-                        chunk = E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, fileSalt!, rev);
+                        var (encData, rev, chunkEpoch) = await _api.DownloadChunkAsync(_volumeName, fileId, i);
+                        chunk = readFileKeyEpoch >= 1
+                            ? E2eeV2.DecryptChunk(encData, fileKeyToUse!,
+                                new E2eeChunkContext(readFileVolumeId!, fileId, i, rev,
+                                    chunkEpoch > 0 ? chunkEpoch : readFileKeyEpoch), fileSalt!)
+                            : E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, fileSalt!, rev);
                         PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));
                     }
 
@@ -1015,9 +1094,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
             foreach (var entry in e2eeEntries)
             {
-                string plainName;
-                try { plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!.Buffer); }
-                catch { plainName = $"<{entry.FileId[..8]}...>"; }
+                // v2 は entry.KeyEpoch の GroupKey（他 epoch にフォールバック）、v1 は masterKey で復号
+                string plainName = TryDecryptNameForEntry(entry) ?? $"<{entry.FileId[..8]}...>";
 
                 long plainLength = Math.Max(0, entry.EncryptedLength - E2eeCrypto.SaltSize - (long)entry.ChunkCount * E2eeCrypto.GcmTagSize);
 
@@ -1043,6 +1121,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                         FileId = entry.FileId,
                         ChunkCount = entry.ChunkCount,
                         PlainLength = plainLength,
+                        KeyEpoch = entry.KeyEpoch,
+                        WrappedFileKey = entry.WrappedFileKey,
                     });
                 }
             }
@@ -1257,73 +1337,118 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
     }
 
     // E2EE 新規ファイル: 新 fileSalt で全チャンク作成（従来方式、Critical-4 ロールバック維持）。
+    // 共有 v2 状態がある場合は per-file DEK + GroupKey wrap（epoch は現行）で作成する。
     private void UploadE2eeNewFile(E2eeChunkWriteState ws)
     {
-        string encName = E2eeCrypto.EncryptFilename(ws.PlainName, _masterKey!.Buffer);
-        byte[] fileSalt = E2eeCrypto.GenerateFileSalt();
-        byte[] fileKey = E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, fileSalt);
+        bool isV2 = _v2 is not null;
+        int keyEpoch = isV2 ? _v2!.CurrentEpoch : 0;
+        if (isV2 && keyEpoch < 1)
+            throw new InvalidOperationException("共有 v2 の GroupKey がありません（この共有から削除された可能性があります）。");
+        byte[]? groupKey = isV2 ? _v2!.GetGroupKey(keyEpoch) : null;
+        byte[]? dek = null;
 
-        long plainLength = ws.CurrentSize;
-        int chunkCount = plainLength == 0 ? 1 : (int)((plainLength + _chunkSize - 1) / _chunkSize);
-        long encLength = 16L + plainLength + (long)chunkCount * 16;
-        var (fileId, initialWriteLease) = _api.CreateFileAsync(
-            _volumeName, encName, encLength, chunkCount).GetAwaiter().GetResult();
-
-        string? writeLease = initialWriteLease;
-        bool finalized = false;
         try
         {
-            long written = 0;
-            for (int i = 0; i < chunkCount; i++)
+            string encName = isV2
+                ? E2eeCrypto.EncryptFilename(ws.PlainName, groupKey!)
+                : E2eeCrypto.EncryptFilename(ws.PlainName, _masterKey!.Buffer);
+            byte[] fileSalt = E2eeCrypto.GenerateFileSalt();
+            if (isV2)
+                dek = E2eeV2.GenerateFileKey();
+            else
+                dek = E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, fileSalt);
+            byte[] fileKey = dek;
+
+            long plainLength = ws.CurrentSize;
+            int chunkCount = plainLength == 0 ? 1 : (int)((plainLength + _chunkSize - 1) / _chunkSize);
+            long encLength = 16L + plainLength + (long)chunkCount * 16;
+
+            string fileId;
+            string? initialWriteLease;
+            WrappedAeadKey? localWrappedFileKey = null;
+            if (isV2)
             {
-                int chunkLen = (int)Math.Min(_chunkSize, plainLength - written);
-                byte[] chunk;
-                if (ws.DirtyChunks.TryGetValue(i, out var dirty))
-                {
-                    chunk = new byte[chunkLen];
-                    Array.Copy(dirty, chunk, Math.Min(dirty.Length, chunkLen));
-                }
-                else
-                {
-                    chunk = new byte[chunkLen]; // ゼロ
-                }
-                byte[] encChunk = E2eeCrypto.EncryptChunk(chunk, fileKey, i, fileSalt, isFirstChunk: i == 0);
-                _api.UploadChunkAsync(_volumeName, fileId, i, encChunk, writeLease).GetAwaiter().GetResult();
-                written += chunkLen;
+                // v2: fileId を先に決定する（WrappedFileKey の AAD に fileId が bind されるため）
+                string preallocatedFileId = Guid.NewGuid().ToString("N");
+                var (wnonce, wct, wtag) = E2eeV2.WrapFileKey(fileKey, groupKey!, _v2!.VolumeIdString, preallocatedFileId, keyEpoch);
+                localWrappedFileKey = new WrappedAeadKey { Algorithm = "aes-256-gcm", Nonce = wnonce, Ciphertext = wct, Tag = wtag };
+                (fileId, initialWriteLease) = _api.CreateFileAsync(
+                    _volumeName, encName, encLength, chunkCount, keyEpoch,
+                    new WrappedAeadKey { Algorithm = "aes-256-gcm", Nonce = wnonce, Ciphertext = wct, Tag = wtag },
+                    preallocatedFileId).GetAwaiter().GetResult();
             }
-            _api.FinalizeFileAsync(_volumeName, fileId, encLength, writeLease).GetAwaiter().GetResult();
-            finalized = true;
-        }
-        catch
-        {
-            // ロールバック: 作成中の fileId を削除し、サーバーに孤児ファイルを残さない（Critical-4）。
+            else
+            {
+                (fileId, initialWriteLease) = _api.CreateFileAsync(
+                    _volumeName, encName, encLength, chunkCount).GetAwaiter().GetResult();
+            }
+
+            string? writeLease = initialWriteLease;
+            bool finalized = false;
             try
             {
-                if (writeLease is not null)
-                    _api.DeleteFileAsync(_volumeName, fileId, writeLease).GetAwaiter().GetResult();
+                long written = 0;
+                for (int i = 0; i < chunkCount; i++)
+                {
+                    int chunkLen = (int)Math.Min(_chunkSize, plainLength - written);
+                    byte[] chunk;
+                    if (ws.DirtyChunks.TryGetValue(i, out var dirty))
+                    {
+                        chunk = new byte[chunkLen];
+                        Array.Copy(dirty, chunk, Math.Min(dirty.Length, chunkLen));
+                    }
+                    else
+                    {
+                        chunk = new byte[chunkLen]; // ゼロ
+                    }
+                    byte[] encChunk = isV2
+                        ? E2eeV2.EncryptChunk(chunk, fileKey,
+                            new E2eeChunkContext(_v2!.VolumeIdString, fileId, i, Revision: 0, keyEpoch),
+                            isFirstChunk: i == 0, fileSalt)
+                        : E2eeCrypto.EncryptChunk(chunk, fileKey, i, fileSalt, isFirstChunk: i == 0);
+                    _api.UploadChunkAsync(_volumeName, fileId, i, encChunk, writeLease).GetAwaiter().GetResult();
+                    written += chunkLen;
+                }
+                _api.FinalizeFileAsync(_volumeName, fileId, encLength, writeLease).GetAwaiter().GetResult();
+                finalized = true;
             }
-            catch { /* ベストエフォート */ }
-            throw;
+            catch
+            {
+                // ロールバック: 作成中の fileId を削除し、サーバーに孤児ファイルを残さない（Critical-4）。
+                try
+                {
+                    if (writeLease is not null)
+                        _api.DeleteFileAsync(_volumeName, fileId, writeLease).GetAwaiter().GetResult();
+                }
+                catch { /* ベストエフォート */ }
+                throw;
+            }
+            finally
+            {
+                if (writeLease is not null)
+                {
+                    try { _api.ReleaseWriteLeaseAsync(_volumeName, fileId, writeLease).GetAwaiter().GetResult(); }
+                    catch { }
+                }
+            }
+
+            if (finalized)
+            {
+                _fileIdCache[ws.PlainName] = fileId;
+                _cache[fileId] = new FileCache
+                {
+                    PlainName = ws.PlainName,
+                    FileId = fileId,
+                    ChunkCount = chunkCount,
+                    PlainLength = plainLength,
+                    KeyEpoch = keyEpoch,
+                    WrappedFileKey = localWrappedFileKey, // v2: 自分で wrap した DEK ラップ（差分保存時に再利用）
+                };
+            }
         }
         finally
         {
-            if (writeLease is not null)
-            {
-                try { _api.ReleaseWriteLeaseAsync(_volumeName, fileId, writeLease).GetAwaiter().GetResult(); }
-                catch { }
-            }
-        }
-
-        if (finalized)
-        {
-            _fileIdCache[ws.PlainName] = fileId;
-            _cache[fileId] = new FileCache
-            {
-                PlainName = ws.PlainName,
-                FileId = fileId,
-                ChunkCount = chunkCount,
-                PlainLength = plainLength,
-            };
+            if (dek is not null) CryptographicOperations.ZeroMemory(dek);
         }
     }
 
@@ -1333,6 +1458,19 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         string fileId = ws.ExistingFileId!;
         byte[] fileSalt = ws.ExistingFileSalt!;
         byte[] fileKey = ws.ExistingFileKey!;
+        int keyEpoch = ws.ExistingFileKeyEpoch;
+        string? volumeId = ws.ExistingVolumeId;
+
+        // v2: handle-open と persist の間で rotation + rewrap が起きた可能性がある。
+        // rewrap は DEK を不変のまま WrappedFileKey を張り替えるだけなので fileKey は有効だが、
+        // チャンク AAD/nonce に刻む keyEpoch はアップロード時点のカタログ値（サーバー刻印と一致）に合わせる。
+        if (volumeId is not null)
+        {
+            var entry = _api.ListFilesAsync(_volumeName).GetAwaiter().GetResult()
+                .FirstOrDefault(f => string.Equals(f.FileId, fileId, StringComparison.Ordinal));
+            if (entry is not null && entry.KeyEpoch >= 1)
+                keyEpoch = entry.KeyEpoch;
+        }
 
         ws.PrepareForPersist();
         long newPlainLength = ws.CurrentSize;
@@ -1349,8 +1487,12 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             var (_, currentRev) = _api.GetChunkHashAsync(_volumeName, fileId, ci).GetAwaiter().GetResult();
             int nextRevision = ci < ws.ExistingChunkCount ? currentRev + 1 : 0;
 
-            byte[] encChunk = E2eeCrypto.EncryptChunk(toEncrypt, fileKey, ci, fileSalt,
-                isFirstChunk: ci == 0, revision: nextRevision);
+            byte[] encChunk = keyEpoch >= 1
+                ? E2eeV2.EncryptChunk(toEncrypt, fileKey,
+                    new E2eeChunkContext(volumeId!, fileId, ci, nextRevision, keyEpoch),
+                    isFirstChunk: ci == 0, fileSalt)
+                : E2eeCrypto.EncryptChunk(toEncrypt, fileKey, ci, fileSalt,
+                    isFirstChunk: ci == 0, revision: nextRevision);
             _api.UploadChunkAsync(_volumeName, fileId, ci, encChunk, ws.WriteLeaseToken!, replace: true).GetAwaiter().GetResult();
 
             // チャンクプールのキャッシュを更新（新しい暗号文ハッシュで）
@@ -1381,11 +1523,18 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         return result;
     }
 
-    /// <summary>E2EE: 既存チャンクを DL + 復号して平文を返す（差分保存の RMW 用）。チャンクプールも更新。</summary>
-    internal byte[] LoadPlainChunkForWrite(string fileId, int chunkIndex, byte[] fileKey, byte[] fileSalt)
+    /// <summary>
+    /// E2EE: 既存チャンクを DL + 復号して平文を返す（差分保存の RMW 用）。チャンクプールも更新。
+    /// v2 ファイル（keyEpoch ≥ 1）はチャンク固有 epoch（ヘッダ欠如時は keyEpoch）で AAD / nonce を組む。
+    /// </summary>
+    internal byte[] LoadPlainChunkForWrite(string fileId, int chunkIndex, byte[] fileKey, byte[] fileSalt,
+        int keyEpoch = 0, string? volumeId = null)
     {
-        var (data, revision) = _api.DownloadChunkAsync(_volumeName, fileId, chunkIndex).GetAwaiter().GetResult();
-        byte[] chunk = E2eeCrypto.DecryptChunk(data, fileKey, chunkIndex, fileSalt, revision);
+        var (data, revision, chunkEpoch) = _api.DownloadChunkAsync(_volumeName, fileId, chunkIndex).GetAwaiter().GetResult();
+        byte[] chunk = keyEpoch >= 1
+            ? E2eeV2.DecryptChunk(data, fileKey,
+                new E2eeChunkContext(volumeId!, fileId, chunkIndex, revision, chunkEpoch > 0 ? chunkEpoch : keyEpoch), fileSalt)
+            : E2eeCrypto.DecryptChunk(data, fileKey, chunkIndex, fileSalt, revision);
         PutChunkToPool(fileId, chunkIndex, chunk, ComputeHashHex(data));
         return chunk;
     }
@@ -1459,6 +1608,49 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
     private static string ComputeHashHex(byte[] data)
         => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(data));
 
+    /// <summary>共有 v2 の volumeId（チャンク AAD bind 用）。v2 状態がなければ null。</summary>
+    internal string? VolumeIdString => _v2?.VolumeIdString;
+
+    /// <summary>
+    /// crypto format v2: カタログの WrappedFileKey を GroupKey[KeyEpoch] でアンラップして per-file DEK を返す。
+    /// </summary>
+    internal byte[] UnwrapFileKeyV2(FileCache cache)
+    {
+        if (_v2 is null)
+            throw new InvalidOperationException("共有 v2 の鍵状態がありません。");
+        var wfk = cache.WrappedFileKey
+            ?? throw new IOException($"v2 ファイル '{cache.FileId}' の WrappedFileKey がカタログにありません。");
+        return E2eeV2.UnwrapFileKey(wfk.Nonce, wfk.Ciphertext, wfk.Tag,
+            _v2.GetGroupKey(cache.KeyEpoch), _v2.VolumeIdString, cache.FileId, cache.KeyEpoch);
+    }
+
+    /// <summary>
+    /// エントリの暗号化ファイル名を復号する。v2 は entry.KeyEpoch を優先し、
+    /// rotation + rewrap では名前が再暗号化されないため保持する他の epoch にもフォールバックする。
+    /// 復号できない場合は null（masterKey を持たない v2 メンバーが v1 ファイルに当たる等）。
+    /// </summary>
+    internal string? TryDecryptNameForEntry(E2eeFileEntry entry)
+    {
+        if (entry.KeyEpoch >= 1 && _v2 is not null)
+        {
+            if (_v2.HasEpoch(entry.KeyEpoch))
+            {
+                try { return E2eeCrypto.DecryptFilename(entry.EncryptedName, _v2.GetGroupKey(entry.KeyEpoch)); }
+                catch (CryptographicException) { /* rotation 前の epoch で暗号化された可能性 → フォールバック */ }
+            }
+            for (int epoch = _v2.CurrentEpoch; epoch >= 1; epoch--)
+            {
+                if (epoch == entry.KeyEpoch || !_v2.HasEpoch(epoch)) continue;
+                try { return E2eeCrypto.DecryptFilename(entry.EncryptedName, _v2.GetGroupKey(epoch)); }
+                catch (CryptographicException) { /* 次の epoch を試す */ }
+            }
+            return null;
+        }
+        if (_masterKey is null) return null;
+        try { return E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey.Buffer); }
+        catch (CryptographicException) { return null; }
+    }
+
     private string? FindFileId(string plainName)
     {
         if (_fileIdCache.TryGetValue(plainName, out var fileId))
@@ -1470,8 +1662,10 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             var entries = _api.ListFilesAsync(_volumeName).GetAwaiter().GetResult();
             foreach (var entry in entries)
             {
-                string decrypted = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!.Buffer);
-                _fileIdCache.TryAdd(decrypted, entry.FileId);
+                // 復号できないエントリ（他ユーザーの鍵の v1 ファイル等）は名前索引から外れる
+                string? decrypted = TryDecryptNameForEntry(entry);
+                if (decrypted is not null)
+                    _fileIdCache.TryAdd(decrypted, entry.FileId);
             }
             return _fileIdCache.TryGetValue(plainName, out var found) ? found : null;
         }
@@ -1480,10 +1674,11 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         return null;
     }
 
-    /// <summary>アンマウント時: マスターキー（VirtualUnlock 含む）・ファイルキー・平文チャンクをゼロクリア。</summary>
+    /// <summary>アンマウント時: マスターキー（VirtualUnlock 含む）・GroupKey・ファイルキー・平文チャンクをゼロクリア。</summary>
     public void Dispose()
     {
         _masterKey?.Dispose();
+        _v2?.Dispose();
         foreach (var cache in _cache.Values)
             cache.Dispose();
         _cache.Clear();
@@ -1510,7 +1705,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             var entry = entries.FirstOrDefault(e => e.FileId == fileId);
             if (entry is null) return null;
 
-            string plainName = E2eeCrypto.DecryptFilename(entry.EncryptedName, _masterKey!.Buffer);
+            // 名前が復号できない（他ユーザーの鍵の v1 ファイル等）場合はプレースホルダ表示
+            string plainName = TryDecryptNameForEntry(entry) ?? $"<{fileId[..Math.Min(8, fileId.Length)]}...>";
             long plainLength = Math.Max(0, entry.EncryptedLength - E2eeCrypto.SaltSize - (long)entry.ChunkCount * E2eeCrypto.GcmTagSize);
             var cache = new FileCache
             {
@@ -1518,6 +1714,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 FileId = fileId,
                 ChunkCount = entry.ChunkCount,
                 PlainLength = plainLength,
+                KeyEpoch = entry.KeyEpoch,
+                WrappedFileKey = entry.WrappedFileKey,
             };
             _fileIdCache[plainName] = fileId;
             _cache.TryAdd(fileId, cache);

@@ -10,12 +10,19 @@ public sealed class E2eeApiClient
 
     public E2eeApiClient(HttpClient http) => _http = http;
 
-    /// <summary>E2EE ファイル作成。</summary>
-    public async Task<E2eeFileEntry> CreateFileAsync(string volumeName, string encryptedName, long encryptedLength, int chunkCount)
+    /// <summary>E2EE ファイル作成（v1 形式: KeyEpoch == 0）。</summary>
+    public Task<E2eeFileEntry> CreateFileAsync(string volumeName, string encryptedName, long encryptedLength, int chunkCount)
+        => CreateFileAsync(volumeName, encryptedName, encryptedLength, chunkCount, keyEpoch: 0, wrappedFileKey: null, fileId: null);
+
+    /// <summary>E2EE ファイル作成（crypto format v2: KeyEpoch ≥ 1 の場合はラップ済み DEK が必須）。
+    /// fileId にはクライアント生成 GUID "N" 形式を指定可能（WrappedFileKey の AAD bind 用）。</summary>
+    public async Task<E2eeFileEntry> CreateFileAsync(
+        string volumeName, string encryptedName, long encryptedLength, int chunkCount,
+        int keyEpoch, WrappedAeadKeyParams? wrappedFileKey, string? fileId)
     {
         var response = await _http.PostAsJsonAsync(
             $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/create-file",
-            new E2eeCreateFileRequest(encryptedName, encryptedLength, chunkCount));
+            new E2eeCreateFileRequest(encryptedName, encryptedLength, chunkCount, keyEpoch, wrappedFileKey, fileId));
         response.EnsureSuccessStatusCode();
         return (await response.Content.ReadFromJsonAsync<E2eeFileEntry>())!;
     }
@@ -50,8 +57,9 @@ public sealed class E2eeApiClient
         response.EnsureSuccessStatusCode();
     }
 
-    /// <summary>チャンクダウンロード。nonce 導出に必要な X-Chunk-Revision も返す。</summary>
-    public async Task<(byte[] Data, int Revision)> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex)
+    /// <summary>チャンクダウンロード。nonce 導出に必要な X-Chunk-Revision と、v2 復号に必要な
+    /// X-Chunk-KeyEpoch（チャンク暗号化時の keyEpoch、旧サーバーでは欠如 → 0）も返す。</summary>
+    public async Task<(byte[] Data, int Revision, int KeyEpoch)> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex)
     {
         var response = await _http.GetAsync(
             $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/download-chunk/{Uri.EscapeDataString(fileId)}/{chunkIndex}");
@@ -63,7 +71,13 @@ public sealed class E2eeApiClient
             var v = vals.FirstOrDefault();
             if (v is not null && int.TryParse(v, out int rev)) revision = rev;
         }
-        return (data, revision);
+        int keyEpoch = 0;
+        if (response.Headers.TryGetValues("X-Chunk-KeyEpoch", out var epochVals))
+        {
+            var v = epochVals.FirstOrDefault();
+            if (v is not null && int.TryParse(v, out int epoch)) keyEpoch = epoch;
+        }
+        return (data, revision, keyEpoch);
     }
 
     /// <summary>チャンクハッシュ取得。</summary>

@@ -39,6 +39,7 @@ builder.Services.AddScoped<GroupApiClient>();
 builder.Services.AddScoped<EncryptionSettingsClient>();
 builder.Services.AddScoped<ClientVolumeMountService>();
 builder.Services.AddScoped<E2eeInterop>();
+builder.Services.AddScoped<E2eeKeyResolverService>();
 
 var host = builder.Build();
 

@@ -116,8 +116,25 @@ public sealed class CistaNasApiClient
 
     public async Task<(string FileId, string WriteLeaseToken)> CreateFileAsync(
         string volumeName, string encryptedName, long encryptedLength, int chunkCount)
+        => await CreateFileAsync(volumeName, encryptedName, encryptedLength, chunkCount,
+            keyEpoch: 0, wrappedFileKey: null);
+
+    /// <summary>E2EE ファイルを作成する（crypto format v2: KeyEpoch ≥ 1 の場合はラップ済み DEK が必須）。</summary>
+    public async Task<(string FileId, string WriteLeaseToken)> CreateFileAsync(
+        string volumeName, string encryptedName, long encryptedLength, int chunkCount,
+        int keyEpoch, WrappedAeadKey? wrappedFileKey, string? fileId = null)
     {
-        var req = new { encryptedName, encryptedLength, chunkCount };
+        var req = new
+        {
+            encryptedName,
+            encryptedLength,
+            chunkCount,
+            keyEpoch,
+            wrappedFileKey = wrappedFileKey is null
+                ? null
+                : new { algorithm = wrappedFileKey.Algorithm, nonce = wrappedFileKey.Nonce, ciphertext = wrappedFileKey.Ciphertext, tag = wrappedFileKey.Tag },
+            fileId
+        };
         var res = await _http.PostAsJsonAsync($"/api/v1/e2ee/{volumeName}/create-file", req, JsonOpts);
         res.EnsureSuccessStatusCode();
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();
@@ -162,7 +179,12 @@ public sealed class CistaNasApiClient
         res.EnsureSuccessStatusCode();
     }
 
-    public async Task<(byte[] Data, int Revision)> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex)
+    /// <summary>
+    /// チャンクをダウンロードする。Revision は差分上書き番号、KeyEpoch は crypto format v2 の
+    /// このチャンクの暗号化時 keyEpoch（v1 では 0、旧サーバーではヘッダ欠如で 0）。
+    /// v2 チャンクの nonce / AAD は (chunkIndex, revision, keyEpoch) を bind するため復号に必須。
+    /// </summary>
+    public async Task<(byte[] Data, int Revision, int KeyEpoch)> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex)
     {
         var res = await _http.GetAsync($"/api/v1/e2ee/{volumeName}/download-chunk/{fileId}/{chunkIndex}");
         res.EnsureSuccessStatusCode();
@@ -173,7 +195,13 @@ public sealed class CistaNasApiClient
             var v = vals.FirstOrDefault();
             if (v is not null && int.TryParse(v, out int rev)) revision = rev;
         }
-        return (data, revision);
+        int keyEpoch = 0;
+        if (res.Headers.TryGetValues("X-Chunk-KeyEpoch", out var epochVals))
+        {
+            var v = epochVals.FirstOrDefault();
+            if (v is not null && int.TryParse(v, out int epoch)) keyEpoch = epoch;
+        }
+        return (data, revision, keyEpoch);
     }
 
     /// <summary>チャンクの事前計算ハッシュと revision を取得する（軽量エンドポイント）。ハッシュなしの場合は (null, 0)。</summary>
@@ -222,6 +250,8 @@ public sealed class CistaNasApiClient
                 EncryptedName = f.GetProperty("encryptedName").GetString()!,
                 EncryptedLength = f.GetProperty("encryptedLength").GetInt64(),
                 ChunkCount = f.GetProperty("chunkCount").GetInt32(),
+                KeyEpoch = f.TryGetProperty("keyEpoch", out var ke) && ke.ValueKind == JsonValueKind.Number ? ke.GetInt32() : 0,
+                WrappedFileKey = E2eeJsonParsers.ParseWrappedAeadKey(f, "wrappedFileKey"),
                 CreatedAt = f.GetProperty("createdAt").GetDateTimeOffset(),
                 ModifiedAt = f.GetProperty("modifiedAt").GetDateTimeOffset(),
             });
@@ -276,8 +306,67 @@ public class E2eeFileEntry
     public required string EncryptedName { get; set; }
     public long EncryptedLength { get; set; }
     public int ChunkCount { get; set; }
+    /// <summary>crypto format v2: このファイルの鍵 epoch。0 = v1 形式（masterKey 派生 fileKey）。</summary>
+    public int KeyEpoch { get; set; }
+    /// <summary>crypto format v2: per-file DEK を GroupKey[KeyEpoch] でラップしたもの。KeyEpoch == 0 では null。</summary>
+    public WrappedAeadKey? WrappedFileKey { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset ModifiedAt { get; set; }
+}
+
+/// <summary>crypto format v2: AEAD ラップされた鍵（algorithm / nonce / ciphertext / tag、base64）。</summary>
+public class WrappedAeadKey
+{
+    public required string Algorithm { get; set; }
+    public required byte[] Nonce { get; set; }
+    public required byte[] Ciphertext { get; set; }
+    public required byte[] Tag { get; set; }
+}
+
+/// <summary>crypto format v2: 自分宛てにラップされた GroupKey（epoch 単位）。</summary>
+public class GroupKeyWrapInfo
+{
+    public int Epoch { get; set; }
+    public string WrapType { get; set; } = "ecdh";
+    public required byte[] Nonce { get; set; }
+    public required byte[] Ciphertext { get; set; }
+    public required byte[] Tag { get; set; }
+    public byte[]? EphemeralPublicKey { get; set; }
+}
+
+/// <summary>crypto format v2: ボリュームの GroupKey 状態（group-key-info 応答）。</summary>
+public class E2eeGroupKeyInfo
+{
+    public required string VolumeId { get; set; }
+    public int KeyEpoch { get; set; }
+    public List<GroupKeyWrapInfo> MyGroupKeys { get; set; } = [];
+    public bool HasLegacyFiles { get; set; }
+}
+
+/// <summary>crypto format v2: remaining members の公開鍵（member-public-keys 応答）。</summary>
+public class MemberPublicKeyInfo
+{
+    public required string Username { get; set; }
+    public string? PublicKeyBase64 { get; set; }
+}
+
+internal static partial class E2eeJsonParsers
+{
+    /// <summary>camelCase プロパティ下の {algorithm, nonce, ciphertext, tag} を WrappedAeadKey としてパース。無ければ null。</summary>
+    public static WrappedAeadKey? ParseWrappedAeadKey(JsonElement parent, string propertyName)
+    {
+        if (!parent.TryGetProperty(propertyName, out var w) || w.ValueKind != JsonValueKind.Object)
+            return null;
+        if (!w.TryGetProperty("nonce", out var n) || n.ValueKind != JsonValueKind.String)
+            return null;
+        return new WrappedAeadKey
+        {
+            Algorithm = w.TryGetProperty("algorithm", out var a) ? a.GetString() ?? "aes-256-gcm" : "aes-256-gcm",
+            Nonce = Convert.FromBase64String(n.GetString()!),
+            Ciphertext = Convert.FromBase64String(w.GetProperty("ciphertext").GetString()!),
+            Tag = Convert.FromBase64String(w.GetProperty("tag").GetString()!),
+        };
+    }
 }
 
 /// <summary>

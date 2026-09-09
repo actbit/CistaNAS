@@ -146,5 +146,57 @@ public sealed class VolumeApiClient
         return json?.Select(m => (m.Username, m.PublicKey)).ToList() ?? [];
     }
 
+    // ---- 共有 E2EE v2: GroupKey epoch / per-file DEK ----
+
+    /// <summary>v2: 自分宛ての全 epoch GroupKey wraps とボリューム鍵状態を取得。</summary>
+    public async Task<E2eeGroupKeyInfoResponse?> GetGroupKeyInfoAsync(string volumeName)
+    {
+        var response = await _http.GetAsync(
+            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/group-key-info");
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<E2eeGroupKeyInfoResponse>();
+    }
+
+    /// <summary>v2: GroupKey をローテーションする（revoke 時、owner 限定）。</summary>
+    public async Task RotateGroupKeyAsync(string volumeName, int newEpoch,
+        Dictionary<string, UserWrappedKey> wrappedGroupKeys, string? removedUsername = null)
+    {
+        var response = await _http.PostAsJsonAsync(
+            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/rotate-group-key",
+            new E2eeRotateGroupKeyRequest(newEpoch, wrappedGroupKeys, removedUsername));
+        response.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>v2: remaining members の公開鍵一覧を取得（rotation 用、owner 限定）。</summary>
+    public async Task<IReadOnlyList<E2eeMemberPublicKeyResponse>> GetMemberPublicKeysAsync(string volumeName)
+    {
+        var response = await _http.GetAsync(
+            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/member-public-keys");
+        response.EnsureSuccessStatusCode();
+        var list = await response.Content.ReadFromJsonAsync<List<E2eeMemberPublicKeyResponse>>();
+        return list ?? [];
+    }
+
+    /// <summary>v2: ファイル鍵を現行 epoch の GroupKey に再ラップ（チャンク本体は不変）。</summary>
+    public async Task RewrapFileKeysAsync(string volumeName, IReadOnlyList<E2eeRewrapFileKeyEntry> rewraps)
+    {
+        var response = await _http.PostAsJsonAsync(
+            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/rewrap-file-keys",
+            new E2eeRewrapFileKeysRequest(rewraps));
+        response.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>v2: 指定ユーザーの公開鍵を取得（pinning 検証用）。未登録なら null。</summary>
+    public async Task<string?> GetUserPublicKeyAsync(string username)
+    {
+        var response = await _http.GetAsync($"/api/v1/e2ee/public-key/{Uri.EscapeDataString(username)}");
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        response.EnsureSuccessStatusCode();
+        var json = await response.Content.ReadFromJsonAsync<UserPublicKeyResponse>();
+        return json?.PublicKey;
+    }
+
     private sealed record MemberPublicKey(string Username, string? PublicKey);
+    private sealed record UserPublicKeyResponse(string PublicKey);
 }

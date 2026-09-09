@@ -53,6 +53,7 @@ public partial class MainViewModel : ObservableObject
 
     // ECDH
     [ObservableProperty] private string _ecdhUsername = "";
+    [ObservableProperty] private string _pinUsername = ""; // pin 更新（明示的な再信頼）対象ユーザー
 
     // ---- グループ ----
     [ObservableProperty] private ObservableCollection<GroupItem> _groups = [];
@@ -498,13 +499,119 @@ public partial class MainViewModel : ObservableObject
         if (_api is null || SelectedVolume is null) return;
         try
         {
-            await CistaNasApiClientVolumes.RevokeAccessAsync(_api, SelectedVolume.Name, targetUser);
-            StatusMessage = $"{targetUser} のアクセス権を剥奪しました。";
+            // 共有 v2 の E2EE オーナーによる剥奪は GroupKey ローテーションで行う:
+            // 新 epoch の GroupKey は remaining members（削除対象を除く）宛てのみ生成され、
+            // 削除対象の鍵はサーバーからも除去される（rotate-group-key が ACL 剥奪込みで処理）。
+            // revoke 前のデータを削除対象が回収済みの可能性は防げない点に注意。
+            bool revokedByRotation = false;
+            if (SelectedVolume.IsE2ee
+                && string.Equals(SelectedVolume.OwnerUser, Username, StringComparison.Ordinal))
+            {
+                var gki = await _api.GetGroupKeyInfoAsync(SelectedVolume.Name);
+                if (gki is not null && gki.KeyEpoch >= 1)
+                {
+                    await RotateGroupKeyV2Async(SelectedVolume.Name, gki, targetUser);
+                    revokedByRotation = true;
+                    StatusMessage = $"{targetUser} のアクセス権を剥奪し、GroupKey をローテーションしました（epoch {gki.KeyEpoch + 1}）。";
+                }
+            }
+
+            if (!revokedByRotation)
+            {
+                await CistaNasApiClientVolumes.RevokeAccessAsync(_api, SelectedVolume.Name, targetUser);
+                StatusMessage = $"{targetUser} のアクセス権を剥奪しました。";
+            }
             await RefreshVolumesAsync();
             if (SelectedVolume is not null)
                 AuthorizedUsers = new ObservableCollection<string>(SelectedVolume.AuthorizedUsers);
         }
         catch (Exception ex) { StatusMessage = $"アクセス権剥奪失敗: {ex.Message}"; }
+    }
+
+    /// <summary>
+    /// 共有 v2: 新 GroupKey を生成して remaining members（targetUser を除く全メンバー）の公開鍵で
+    /// ECIES ラップし、rotate-group-key で epoch を進める（targetUser の鍵エントリと ACL はサーバー側で
+    /// 全削除される）。ローテーション後、旧 epoch の per-file DEK を新 epoch GroupKey に再ラップする
+    /// （チャンク本体は不変）。pin 不一致時は例外で中断（鍵の削除も行わない）。
+    /// </summary>
+    private async Task RotateGroupKeyV2Async(string volumeName, E2eeGroupKeyInfo gki, string targetUser)
+    {
+        int currentEpoch = gki.KeyEpoch;
+        int newEpoch = currentEpoch + 1;
+        string volumeId = gki.VolumeId;
+
+        // 現行 epoch の GroupKey を自分の ECDH 秘密鍵でアンラップ（旧 per-file DEK の再ラップ用）
+        var myWrap = gki.MyGroupKeys.FirstOrDefault(k => k.Epoch == currentEpoch)
+            ?? throw new InvalidOperationException("自分宛ての現行 epoch GroupKey がありません。");
+        byte[]? privateKey = EcdhKeyStore.LoadPrivateKey(Username!);
+        if (privateKey is null)
+            throw new InvalidOperationException("ローカルに ECDH 秘密鍵が見つかりません。先に設定で鍵ペアを生成してください。");
+        try
+        {
+            using var oldGroupKeyBuf = new SecureBuffer(E2eeV2.EcdhUnwrapGroupKey(
+                myWrap.Nonce, myWrap.Ciphertext, myWrap.Tag, myWrap.EphemeralPublicKey!,
+                privateKey, volumeId, currentEpoch, Username!));
+
+            // remaining members（削除対象を除く）の公開鍵を取得して pin 検証 → wrap 生成
+            var members = (await _api!.GetMemberPublicKeysAsync(volumeName))
+                .Where(m => !string.Equals(m.Username, targetUser, StringComparison.Ordinal))
+                .ToList();
+            if (members.Count == 0)
+                throw new InvalidOperationException("remaining members がいません（自分宛ての wrap が少なくとも 1 つ必要です）。");
+
+            byte[] newGroupKey = E2eeV2.GenerateGroupKey();
+            try
+            {
+                var wraps = new Dictionary<string, (byte[] nonce, byte[] ct, byte[] tag, byte[] ephemeralPublicKey)>();
+                foreach (var m in members)
+                {
+                    if (m.PublicKeyBase64 is null)
+                        throw new InvalidOperationException($"ユーザー '{m.Username}' の公開鍵が未登録のため GroupKey をローテーションできません。");
+                    byte[] pubRaw = Convert.FromBase64String(m.PublicKeyBase64);
+                    if (!VerifyOrCreatePin(m.Username, pubRaw))
+                        throw new InvalidOperationException(
+                            $"{m.Username} の暗号化公開鍵が以前確認したものから変更されています。サーバー侵害または鍵更新の可能性があります。操作を中断しました。");
+                    wraps[m.Username] = E2eeV2.EcdhWrapGroupKey(newGroupKey, pubRaw, volumeId, newEpoch, m.Username);
+                }
+                if (wraps.ContainsKey(targetUser))
+                    throw new InvalidOperationException("削除対象ユーザー宛ての wrap が含まれています。");
+                if (!wraps.ContainsKey(Username!))
+                    throw new InvalidOperationException("自分宛ての wrap が含まれていません（オーナーは remaining members に含まれる必要があります）。");
+
+                await _api!.RotateGroupKeyAsync(volumeName, newEpoch, wraps, removedUsername: targetUser);
+
+                // 旧 epoch の per-file DEK を新 epoch GroupKey に再ラップしてサーバーに登録（チャンク本体は不変）。
+                // v1 形式ファイル（KeyEpoch == 0）は対象外（オーナーの masterKey でのみ読めるまま）。
+                var files = await _api!.ListFilesAsync(volumeName);
+                var rewraps = new List<(string fileId, int keyEpoch, WrappedAeadKey wrappedFileKey)>();
+                foreach (var f in files)
+                {
+                    if (f.KeyEpoch != currentEpoch || f.WrappedFileKey is null) continue;
+                    byte[] dek = E2eeV2.UnwrapFileKey(f.WrappedFileKey.Nonce, f.WrappedFileKey.Ciphertext, f.WrappedFileKey.Tag,
+                        oldGroupKeyBuf.Buffer, volumeId, f.FileId, f.KeyEpoch);
+                    try
+                    {
+                        var (wNonce, wCt, wTag) = E2eeV2.WrapFileKey(dek, newGroupKey, volumeId, f.FileId, newEpoch);
+                        rewraps.Add((f.FileId, newEpoch, new WrappedAeadKey
+                        { Algorithm = "aes-256-gcm", Nonce = wNonce, Ciphertext = wCt, Tag = wTag }));
+                    }
+                    finally
+                    {
+                        CryptographicOperations.ZeroMemory(dek);
+                    }
+                }
+                if (rewraps.Count > 0)
+                    await _api.RewrapFileKeysAsync(volumeName, rewraps);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(newGroupKey);
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(privateKey);
+        }
     }
 
     [RelayCommand]
@@ -545,32 +652,118 @@ public partial class MainViewModel : ObservableObject
         IsBusy = true;
         try
         {
+            string targetUser = EcdhUsername.Trim();
+
             // 相手の公開鍵を取得
-            string? recipientPubKeyB64 = await CistaNasApiClientE2eeExtensions.GetPublicKeyAsync(_api, EcdhUsername.Trim());
+            string? recipientPubKeyB64 = await CistaNasApiClientE2eeExtensions.GetPublicKeyAsync(_api, targetUser);
             if (recipientPubKeyB64 is null)
             {
                 StatusMessage = "相手の公開鍵が登録されていません。";
                 return;
             }
+            byte[] recipientPubKeyRaw = Convert.FromBase64String(recipientPubKeyB64);
 
-            // 自分の wrapped key を取得してアンラップ
+            // TOFU pin 検証: pin 未登録なら記録、不一致なら中断（自動的には新しい鍵を信頼しない）。
+            if (!VerifyOrCreatePin(targetUser, recipientPubKeyRaw))
+                return;
+
+            // 共有 v2（GroupKey epoch 運用）: masterKey の代わりに現行 epoch GroupKey を
+            // 新メンバーの公開鍵でラップする（rotation はしない — 追加メンバーは現行 epoch
+            // 以降のデータのみ読める）。GroupKey の復号は ECDH 秘密鍵（DPAPI 保護）で行うため
+            // パスワード不要。
+            var gki = await _api.GetGroupKeyInfoAsync(SelectedVolume.Name);
+            if (gki is not null && gki.KeyEpoch >= 1)
+            {
+                var myWrap = gki.MyGroupKeys.FirstOrDefault(k => k.Epoch == gki.KeyEpoch)
+                    ?? throw new InvalidOperationException("自分宛ての現行 epoch GroupKey がありません。");
+                byte[]? privateKey = EcdhKeyStore.LoadPrivateKey(Username!);
+                if (privateKey is null)
+                    throw new InvalidOperationException("ローカルに ECDH 秘密鍵が見つかりません。先に設定で鍵ペアを生成してください。");
+                try
+                {
+                    using var groupKeyBuf = new SecureBuffer(E2eeV2.EcdhUnwrapGroupKey(
+                        myWrap.Nonce, myWrap.Ciphertext, myWrap.Tag, myWrap.EphemeralPublicKey!,
+                        privateKey, gki.VolumeId, gki.KeyEpoch, Username!));
+                    var (ephPubKey, nonce, ct, tag) = E2eeV2.EcdhWrapGroupKey(
+                        groupKeyBuf.Buffer, recipientPubKeyRaw, gki.VolumeId, gki.KeyEpoch, targetUser);
+                    await CistaNasApiClientE2eeExtensions.AddWrappedKeyAsync(_api, SelectedVolume.Name, targetUser, nonce, ct, tag, ephPubKey);
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(privateKey);
+                }
+
+                StatusMessage = $"{targetUser} に ECDH 共有しました（共有 v2）。";
+                EcdhUsername = "";
+                await RefreshVolumesAsync();
+                return;
+            }
+
+            // v1: 自分の wrapped key を取得してアンラップ（従来フロー）
             var wkInfo = await _api.GetWrappedKeyAsync(SelectedVolume.Name, Username!);
             using var kekBuf = new SecureBuffer(E2eeCrypto.DeriveKek(Username!, GrantGranterPassword, wkInfo.KdfSalt, new KdfSpec(
                 wkInfo.KdfAlgorithm, wkInfo.KdfIterations, wkInfo.KdfMemoryKiB, wkInfo.KdfParallelism, wkInfo.KdfTimeCost)));
             using var mkBuf = new SecureBuffer(E2eeCrypto.UnwrapMasterKey(wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag, kekBuf.Buffer));
 
             // ECIES ラップ (E2eeCrypto を使用) - 相手公開鍵は raw 非圧縮点 65B
-            byte[] recipientPubKeyRaw = Convert.FromBase64String(recipientPubKeyB64);
-            var (ephPubKey, nonce, ct, tag) = E2eeCrypto.EcdhWrap(mkBuf.Buffer, recipientPubKeyRaw);
+            var (ephPubKeyV1, nonceV1, ctV1, tagV1) = E2eeCrypto.EcdhWrap(mkBuf.Buffer, recipientPubKeyRaw);
 
-            await CistaNasApiClientE2eeExtensions.AddWrappedKeyAsync(_api, SelectedVolume.Name, EcdhUsername.Trim(), nonce, ct, tag, ephPubKey);
-            StatusMessage = $"{EcdhUsername} に ECDH 共有しました。";
+            await CistaNasApiClientE2eeExtensions.AddWrappedKeyAsync(_api, SelectedVolume.Name, targetUser, nonceV1, ctV1, tagV1, ephPubKeyV1);
+            StatusMessage = $"{targetUser} に ECDH 共有しました。";
             EcdhUsername = "";
             GrantGranterPassword = "";
             await RefreshVolumesAsync();
         }
         catch (Exception ex) { StatusMessage = $"ECDH 共有失敗: {ex.Message}"; }
         finally { IsBusy = false; }
+    }
+
+    /// <summary>
+    /// TOFU pin 検証。pin 未登録なら fingerprint を記録して保存（初回使用）。
+    /// 登録済みで fingerprint が一致しない場合は操作を中断して false を返す
+    /// （自動的には新しい鍵を信頼しない。pin 更新は TrustNewKey コマンド = ユーザーの明示操作のみ）。
+    /// pin はローカル（%APPDATA%）にのみ保存され、サーバーには送信されない。
+    /// </summary>
+    private bool VerifyOrCreatePin(string targetUser, byte[] recipientPubKeyRaw)
+    {
+        string fingerprint = E2eeV2.ComputeFingerprint(recipientPubKeyRaw);
+        string? pinned = PublicKeyPinStore.GetPin(Username!, targetUser);
+        if (pinned is null)
+        {
+            PublicKeyPinStore.SetPin(Username!, targetUser, fingerprint);
+            return true;
+        }
+        if (!string.Equals(pinned, fingerprint, StringComparison.Ordinal))
+        {
+            StatusMessage = $"{targetUser} の暗号化公開鍵が以前確認したものから変更されています。" +
+                "サーバー侵害または鍵更新の可能性があります。操作を中断しました。" +
+                "本人確認のうえ「pin 更新」で明示的に再信頼してください。";
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>pin 不一致検知後の明示的な pin 更新（新しい鍵を信頼する）。
+    /// サーバーが現在公開している鍵を pin し直すのみで、中断した共有操作は自動再実行しない。</summary>
+    [RelayCommand]
+    private async Task TrustNewKey()
+    {
+        if (_api is null || string.IsNullOrWhiteSpace(PinUsername)) return;
+        try
+        {
+            string targetUser = PinUsername.Trim();
+            string? pubKeyB64 = await CistaNasApiClientE2eeExtensions.GetPublicKeyAsync(_api, targetUser);
+            if (pubKeyB64 is null)
+            {
+                StatusMessage = $"{targetUser} の公開鍵が登録されていません。";
+                return;
+            }
+            byte[] pubRaw = Convert.FromBase64String(pubKeyB64);
+            PublicKeyPinStore.SetPin(Username!, targetUser, E2eeV2.ComputeFingerprint(pubRaw));
+            StatusMessage = $"{targetUser} の公開鍵を再信頼しました（pin 更新）。";
+            PinUsername = "";
+        }
+        catch (Exception ex) { StatusMessage = $"pin 更新失敗: {ex.Message}"; }
     }
 
     // ================================================================

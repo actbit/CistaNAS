@@ -33,6 +33,10 @@ public static class E2eeEndpoints
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
         e2ee.MapGet("/{volumeName}/download-chunk/{fileId}/{chunkIndex}", DownloadChunk)
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapGet("/{volumeName}/group-key-info", GetGroupKeyInfo)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapPost("/{volumeName}/rewrap-file-keys", RewrapFileKeys)
+            .RequireAuthorization(CistaAuthorities.VolumeAccess);
         e2ee.MapGet("/{volumeName}/chunk-hash/{fileId}/{chunkIndex}", GetChunkHash)
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
         e2ee.MapPatch("/{volumeName}/finalize-file/{fileId}", FinalizeFile)
@@ -52,6 +56,12 @@ public static class E2eeEndpoints
         e2ee.MapPost("/{volumeName}/add-wrapped-keys-batch", AddWrappedKeysBatch)
             .RequireAuthorization(CistaAuthorities.VolumeOwner);
         e2ee.MapPut("/{volumeName}/quota/{username}", SetQuota)
+            .RequireAuthorization(CistaAuthorities.VolumeOwner);
+
+        // ---- 共有 v2: GroupKey epoch（オーナー限定の rotation） ----
+        e2ee.MapPost("/{volumeName}/rotate-group-key", RotateGroupKey)
+            .RequireAuthorization(CistaAuthorities.VolumeOwner);
+        e2ee.MapGet("/{volumeName}/member-public-keys", GetMemberPublicKeys)
             .RequireAuthorization(CistaAuthorities.VolumeOwner);
 
         // ---- ECDH public key management ----
@@ -133,11 +143,91 @@ public static class E2eeEndpoints
         }
     }
 
+    // ---- 共有 v2: GroupKey epoch ----
+
+    private static async Task<IResult> GetGroupKeyInfo(string volumeName, VolumeService vs, HttpContext ctx)
+    {
+        string username = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(username))
+            return Results.Unauthorized();
+        if (!await vs.HasAccessAsync(volumeName, username))
+            return Results.Forbid();
+
+        try
+        {
+            var info = await vs.GetGroupKeyInfoAsync(volumeName, username, ctx.RequestAborted);
+            return info is not null ? Results.Ok(info) : Results.NotFound();
+        }
+        catch (VolumeException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
+
+    private static async Task<IResult> RotateGroupKey(string volumeName, E2eeRotateGroupKeyRequest req,
+        VolumeService vs, HttpContext ctx)
+    {
+        string username = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(username))
+            return Results.Unauthorized();
+
+        try
+        {
+            await vs.RotateGroupKeyAsync(volumeName, username, req);
+            return Results.Ok(new { keyEpoch = req.NewEpoch });
+        }
+        catch (VolumeException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
+
+    private static async Task<IResult> GetMemberPublicKeys(string volumeName, VolumeService vs, HttpContext ctx)
+    {
+        string username = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(username))
+            return Results.Unauthorized();
+
+        try
+        {
+            var members = await vs.GetMemberPublicKeysAsync(volumeName, username, ctx.RequestAborted);
+            return Results.Ok(members);
+        }
+        catch (VolumeException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
+
+    private static async Task<IResult> RewrapFileKeys(string volumeName, E2eeRewrapFileKeysRequest req,
+        VolumeService vs, E2eeFileService e2eeFs, HttpContext ctx)
+    {
+        string username = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(username))
+            return Results.Unauthorized();
+        if (!await vs.HasAccessAsync(volumeName, username))
+            return Results.Forbid();
+        if (!vs.IsMounted(volumeName))
+            return Results.NotFound(new { error = "ボリュームがマウントされていません。" });
+
+        try
+        {
+            await e2eeFs.RewrapFileKeysAsync(volumeName, req, username, ctx.RequestAborted);
+            return Results.Ok(new { rewrapped = req.Rewraps.Count });
+        }
+        catch (FileServiceException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
+
     private static async Task<IResult> CreateFile(string volumeName, E2eeCreateFileRequest req, HttpContext ctx,
         VolumeService vs, E2eeFileService e2eeFs, E2eeWriteLeaseService leases)
     {
         string username = ctx.User.Identity?.Name ?? "";
-        string fileId = Guid.NewGuid().ToString("N");
+        // v2 では WrappedFileKey の AAD に fileId が bind されるため、クライアント生成 fileId を優先
+        // （CreateFileAsync 側で GUID 形式・重複を検証済み。汚染はリース確保前の BadRequest で排除）。
+        string fileId = string.IsNullOrWhiteSpace(req.FileId) ? Guid.NewGuid().ToString("N") : req.FileId;
         WriteLease? lease = null;
         try
         {
@@ -195,8 +285,11 @@ public static class E2eeEndpoints
     {
         try
         {
-            var (stream, length, revision) = await e2eeFs.DownloadChunkAsync(volumeName, fileId, chunkIndex, ctx.RequestAborted);
+            var (stream, length, revision, keyEpoch) = await e2eeFs.DownloadChunkAsync(volumeName, fileId, chunkIndex, ctx.RequestAborted);
             ctx.Response.Headers["X-Chunk-Revision"] = revision.ToString();
+            // crypto format v2: このチャンクが暗号化されたときの keyEpoch（v1 では 0）。
+            // v2 チャンクの nonce / AAD は keyEpoch を bind するため復号に必須。
+            ctx.Response.Headers["X-Chunk-KeyEpoch"] = keyEpoch.ToString();
             return Results.Stream(stream, "application/octet-stream", null, null, enableRangeProcessing: false);
         }
         catch (FileServiceException ex)

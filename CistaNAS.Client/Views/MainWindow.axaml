@@ -403,10 +403,15 @@
                         <!-- ECDH共有（E2EE） -->
                         <StackPanel>
                             <TextBlock Text="ECDH メンバー追加" FontWeight="SemiBold" />
-                            <TextBlock Text="相手ユーザーが公開鍵を登録している場合、ECDH でマスターキーを共有します。" FontSize="11" Foreground="Gray" TextWrapping="Wrap" />
+                            <TextBlock Text="相手ユーザーが公開鍵を登録している場合、鍵を ECDH で共有します。初回使用時に相手の公開鍵 fingerprint をローカルに pin し、以降の不一致時は操作を中断します。" FontSize="11" Foreground="Gray" TextWrapping="Wrap" />
                             <TextBox Text="{Binding EcdhUsername}" PlaceholderText="ユーザー名" Margin="0,4" />
                             <TextBox Text="{Binding GrantGranterPassword}" PasswordChar="*" PlaceholderText="自分のパスワード" Margin="0,4" />
                             <Button Content="ECDH 共有" Command="{Binding EcdhGrantCommand}" Margin="0,4" />
+                            <TextBlock Text="pin 更新（鍵変更を本人確認した場合のみ）" FontSize="11" Foreground="Gray" Margin="0,6,0,0" />
+                            <StackPanel Orientation="Horizontal" Margin="0,4">
+                                <TextBox Text="{Binding PinUsername}" PlaceholderText="ユーザー名" Width="160" />
+                                <Button Content="pin 更新" Command="{Binding TrustNewKeyCommand}" Margin="8,0,0,0" />
+                            </StackPanel>
                         </StackPanel>
 
                         <Button Content="閉じる" Click="CloseShareDialog" HorizontalAlignment="Right" />

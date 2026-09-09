@@ -69,16 +69,51 @@ public sealed partial class FileBrowserViewModel(AppServices app, VolumeListItem
     /// <summary>E2EE: 一覧を取得して名前を復号する。復号できないエントリは (他ユーザーの鍵のため) スキップ表示。</summary>
     private async Task LoadE2eeAsync()
     {
-        byte[] masterKey = app.E2ee.GetMasterKey(volume.Name);
         List<E2eeFileEntry> entries = await app.Session.Api.ListFilesAsync(volume.Name);
         _e2eeFiles = [];
+        bool hasV2 = app.E2ee.TryGetV2State(volume.Name, out E2eeV2VolumeState? v2);
+        byte[]? masterKey = app.E2ee.HasKey(volume.Name) ? app.E2ee.GetMasterKey(volume.Name) : null;
+
         foreach (E2eeFileEntry e in entries)
         {
-            string? name = E2eeFileTransferService.TryDecryptName(e.EncryptedName, masterKey);
+            string? name;
+            if (e.KeyEpoch >= 1 && hasV2)
+            {
+                name = TryDecryptNameV2(v2!, e);
+            }
+            else if (masterKey is not null)
+            {
+                name = E2eeFileTransferService.TryDecryptName(e.EncryptedName, masterKey);
+            }
+            else
+            {
+                // v1 ファイルを masterKey なし (v2 メンバー) では読めない
+                name = null;
+            }
             if (name is null) continue;
             _e2eeFiles.Add((name, e));
         }
         _e2eeFiles.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// v2 のファイル名復号。名前はアップロード時点の epoch の GroupKey で暗号化され、
+    /// rotation + rewrap でも再暗号化されないため、entry.KeyEpoch を優先して保持する全 epoch を試す。
+    /// </summary>
+    private static string? TryDecryptNameV2(E2eeV2VolumeState v2, E2eeFileEntry e)
+    {
+        if (v2.HasEpoch(e.KeyEpoch))
+        {
+            string? name = E2eeFileTransferService.TryDecryptName(e.EncryptedName, v2.GetGroupKey(e.KeyEpoch));
+            if (name is not null) return name;
+        }
+        for (int epoch = v2.CurrentEpoch; epoch >= 1; epoch--)
+        {
+            if (epoch == e.KeyEpoch || !v2.HasEpoch(epoch)) continue;
+            string? name = E2eeFileTransferService.TryDecryptName(e.EncryptedName, v2.GetGroupKey(epoch));
+            if (name is not null) return name;
+        }
+        return null;
     }
 
     private void RefreshChildren()

@@ -85,7 +85,9 @@ public sealed class WrappedKeyParams
 }
 
 public sealed record E2eeCreateVolumeRequest(string VolumeName, string? Username, UserWrappedKey WrappedMasterKey, int ChunkSize = 1048576);
-public sealed record E2eeCreateFileRequest(string EncryptedName, long EncryptedLength, int ChunkCount);
+public sealed record E2eeCreateFileRequest(
+    string EncryptedName, long EncryptedLength, int ChunkCount,
+    int KeyEpoch = 0, WrappedAeadKeyParams? WrappedFileKey = null, string? FileId = null);
 public sealed record E2eeFinalizeFileRequest(long ActualEncryptedLength);
 public sealed record E2eeListFilesResponse(IReadOnlyList<E2eeFileEntry> Files);
 public sealed record E2eeMountResponse(int ChunkSize, string EncryptionMode);
@@ -103,12 +105,57 @@ public sealed class E2eeFileEntry
     public DateTimeOffset ModifiedAt { get; set; }
     public string OwnerUsername { get; set; } = "";
     public string? WriteLeaseToken { get; set; }
+    /// <summary>crypto format v2: このファイルの鍵 epoch。0 = v1 形式（masterKey 派生 fileKey）。</summary>
+    public int KeyEpoch { get; set; }
+    /// <summary>crypto format v2: per-file DEK を GroupKey[KeyEpoch] でラップしたもの。KeyEpoch == 0 では null。</summary>
+    public WrappedAeadKeyParams? WrappedFileKey { get; set; }
 }
 
 public sealed record E2eeVolumeStats(long TotalUsedBytes, long UserUsedBytes, long UserQuotaBytes, int TotalFiles, int UserFiles);
 public sealed record E2eeSetQuotaRequest(long MaxBytes);
 public sealed record E2eeAddWrappedKeyRequest(string Username, UserWrappedKey WrappedMasterKey);
 public sealed record AddE2eeWrappedKeysBatchRequest(Dictionary<string, UserWrappedKey> WrappedKeys);
+
+// ---- 共有 E2EE v2（GroupKey epoch / per-file DEK / pinning）----
+
+/// <summary>AEAD ラップされた鍵（algorithm / nonce / ciphertext / tag。JSON は base64）。</summary>
+public sealed class WrappedAeadKeyParams
+{
+    public string Algorithm { get; set; } = "aes-256-gcm";
+    public byte[] Nonce { get; set; } = [];
+    public byte[] Ciphertext { get; set; } = [];
+    public byte[] Tag { get; set; } = [];
+}
+
+/// <summary>group-key-info 応答: 自分宛てにラップされた GroupKey（epoch 単位）。</summary>
+public sealed record GroupKeyWrapInfoJson(
+    int Epoch,
+    string WrapType,
+    string WrappedKeyAlgorithm,
+    byte[] Nonce,
+    byte[] Ciphertext,
+    byte[] Tag,
+    string? EphemeralPublicKey);
+
+/// <summary>group-key-info 応答。共有 v2 未移行ボリュームでは KeyEpoch == 0 / MyGroupKeys 空。</summary>
+public sealed record E2eeGroupKeyInfoResponse(
+    string VolumeId,
+    int KeyEpoch,
+    IReadOnlyList<GroupKeyWrapInfoJson> MyGroupKeys,
+    bool HasLegacyFiles);
+
+/// <summary>rotate-group-key 要求（revoke 時）。WrappedGroupKeys は remaining members のユーザー名 → wrap。</summary>
+public sealed record E2eeRotateGroupKeyRequest(
+    int NewEpoch,
+    Dictionary<string, UserWrappedKey> WrappedGroupKeys,
+    string? RemovedUsername = null);
+
+/// <summary>member-public-keys 応答: remaining members の公開鍵（base64）。</summary>
+public sealed record E2eeMemberPublicKeyResponse(string Username, string? PublicKeyBase64);
+
+/// <summary>rewrap-file-keys 要求エントリ: ファイル鍵を現行 epoch の GroupKey に再ラップ。</summary>
+public sealed record E2eeRewrapFileKeyEntry(string FileId, int KeyEpoch, WrappedAeadKeyParams WrappedFileKey);
+public sealed record E2eeRewrapFileKeysRequest(IReadOnlyList<E2eeRewrapFileKeyEntry> Rewraps);
 
 // ---- グループ ----
 

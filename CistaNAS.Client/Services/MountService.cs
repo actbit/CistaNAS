@@ -12,7 +12,11 @@ public sealed class MountService
     private readonly ConcurrentDictionary<string, MountedVolume> _mounted = new(StringComparer.Ordinal);
 
     /// <summary>
-    /// E2EE ボリュームをマウントする。サーバー側マウント + クライアント側でマスターキー復号。
+    /// E2EE ボリュームをマウントする。サーバー側マウント + クライアント側で鍵復号。
+    /// 共有 v2 ボリューム（KeyEpoch ≥ 1）では全 epoch の GroupKey を自分の ECDH 秘密鍵で
+    /// アンラップして v2 状態として登録する。オーナー（password wrap）のみ残置 v1 ファイルの
+    /// 読み取り用に masterKey も復元する（v2 メンバーの wrapped-key は GroupKey wrap と同型のため
+    /// masterKey としては扱わない）。
     /// </summary>
     public async Task MountE2eeAsync(string volumeName, string driveLetter, CistaNasApiClient api,
         string username, string password)
@@ -23,25 +27,61 @@ public sealed class MountService
         // E2EE ボリュームのサーバー側マウント（アクセス権チェック）
         await api.MountAsync(volumeName);
 
-        // サーバーから wrapped key 情報を取得
-        var wkInfo = await api.GetWrappedKeyAsync(volumeName, username);
+        // 共有 v2: GroupKey wraps を取得してアンラップ（KeyEpoch ≥ 1 が v2 ボリューム）
+        var gki = await api.GetGroupKeyInfoAsync(volumeName);
+        if (gki is not null && gki.KeyEpoch >= 1)
+        {
+            E2eeV2VolumeState? v2 = await UnwrapGroupKeysV2Async(gki, username);
+            try
+            {
+                // オーナー + password wrap の場合のみ masterKey も復元（残置 v1 ファイルの読み取り用）
+                var wkInfo = await api.GetWrappedKeyAsync(volumeName, username);
+                bool passwordWrap = wkInfo.WrapType is null
+                    || string.Equals(wkInfo.WrapType, "password", StringComparison.OrdinalIgnoreCase);
+                if (passwordWrap)
+                {
+                    byte[] masterKey = UnwrapPasswordWrappedKey(wkInfo, username, password);
+                    try
+                    {
+                        var fs = new CistaNasFileSystem(api, masterKey, volumeName, wkInfo.ChunkSize, v2);
+                        v2 = null; // 所有権をファイルシステムに移す
+                        await MountDokanAsync(volumeName, driveLetter, fs);
+                        return;
+                    }
+                    finally
+                    {
+                        CryptographicOperations.ZeroMemory(masterKey);
+                    }
+                }
 
-        byte[] masterKey;
-        if (string.Equals(wkInfo.WrapType, "ecdh", StringComparison.OrdinalIgnoreCase))
+                var fsMember = new CistaNasFileSystem(api, masterKey: null, volumeName, chunkSize: 1048576, v2);
+                v2 = null; // 所有権をファイルシステムに移す
+                await MountDokanAsync(volumeName, driveLetter, fsMember);
+            }
+            finally
+            {
+                v2?.Dispose();
+            }
+        }
+
+        // v1 パス（従来方式）
+        var wkV1 = await api.GetWrappedKeyAsync(volumeName, username);
+        byte[] masterKeyV1;
+        if (string.Equals(wkV1.WrapType, "ecdh", StringComparison.OrdinalIgnoreCase))
         {
             // ECDH ラップキー: 自分の秘密鍵（DPAPI 永続化）で ECIES アンラップ。password 不要。
             byte[]? privateKey = EcdhKeyStore.LoadPrivateKey(username);
             if (privateKey is null)
                 throw new InvalidOperationException(
                     "ローカルに ECDH 秘密鍵が見つかりません。先に設定で鍵ペアを生成してください。");
-            if (wkInfo.EphemeralPublicKey is null)
+            if (wkV1.EphemeralPublicKey is null)
                 throw new InvalidOperationException("ECDH ラップキーに一時公開鍵が含まれていません。");
             try
             {
                 using var privBuf = new SecureBuffer(privateKey);
-                masterKey = E2eeCrypto.EcdhUnwrap(
-                    wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag,
-                    wkInfo.EphemeralPublicKey, privBuf.Buffer);
+                masterKeyV1 = E2eeCrypto.EcdhUnwrap(
+                    wkV1.WrappedNonce, wkV1.WrappedCiphertext, wkV1.WrappedTag,
+                    wkV1.EphemeralPublicKey, privBuf.Buffer);
             }
             finally
             {
@@ -50,23 +90,62 @@ public sealed class MountService
         }
         else
         {
-            // password ラップキー: ヘッダの KDF スペック（Argon2id 合成 / レガシー PBKDF2）で KEK を導出してアンラップ
-            byte[] kek = E2eeCrypto.DeriveKek(username, password, wkInfo.KdfSalt, new KdfSpec(
-                wkInfo.KdfAlgorithm, wkInfo.KdfIterations, wkInfo.KdfMemoryKiB, wkInfo.KdfParallelism, wkInfo.KdfTimeCost));
-            try
-            {
-                using var kekBuf = new SecureBuffer(kek);
-                masterKey = E2eeCrypto.UnwrapMasterKey(
-                    wkInfo.WrappedNonce, wkInfo.WrappedCiphertext, wkInfo.WrappedTag, kekBuf.Buffer);
-            }
-            finally
-            {
-                CryptographicOperations.ZeroMemory(kek);
-            }
+            masterKeyV1 = UnwrapPasswordWrappedKey(wkV1, username, password);
         }
 
-        var fs = new CistaNasFileSystem(api, masterKey, volumeName, wkInfo.ChunkSize);
-        await MountDokanAsync(volumeName, driveLetter, fs);
+        var fsV1 = new CistaNasFileSystem(api, masterKeyV1, volumeName, wkV1.ChunkSize);
+        await MountDokanAsync(volumeName, driveLetter, fsV1);
+    }
+
+    /// <summary>共有 v2: 自分宛ての全 epoch GroupKey wraps を ECDH 秘密鍵でアンラップする。</summary>
+    private static async Task<E2eeV2VolumeState> UnwrapGroupKeysV2Async(E2eeGroupKeyInfo gki, string username)
+    {
+        byte[]? privateKey = EcdhKeyStore.LoadPrivateKey(username);
+        if (privateKey is null)
+            throw new InvalidOperationException(
+                "ローカルに ECDH 秘密鍵が見つかりません。先に設定で鍵ペアを生成してください。");
+        try
+        {
+            var groupKeys = new Dictionary<int, byte[]>();
+            foreach (var wrap in gki.MyGroupKeys)
+            {
+                if (wrap.EphemeralPublicKey is null) continue;
+                try
+                {
+                    groupKeys[wrap.Epoch] = E2eeV2.EcdhUnwrapGroupKey(wrap.Nonce, wrap.Ciphertext, wrap.Tag,
+                        wrap.EphemeralPublicKey, privateKey, gki.VolumeId, wrap.Epoch, username);
+                }
+                catch (System.Security.Cryptography.CryptographicException)
+                {
+                    // 個別 epoch のアンラップ失敗は無視（他の epoch で読めるファイルがある）
+                }
+            }
+            if (groupKeys.Count == 0)
+                throw new InvalidOperationException(
+                    "共有 v2 の GroupKey を復号できませんでした（この共有から削除された可能性があります）。");
+            return new E2eeV2VolumeState(gki.VolumeId, groupKeys);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(privateKey);
+        }
+    }
+
+    /// <summary>password ラップキーをヘッダの KDF スペック（Argon2id 合成 / レガシー PBKDF2）でアンラップする。</summary>
+    private static byte[] UnwrapPasswordWrappedKey(WrappedKeyInfo wk, string username, string password)
+    {
+        byte[] kek = E2eeCrypto.DeriveKek(username, password, wk.KdfSalt, new KdfSpec(
+            wk.KdfAlgorithm, wk.KdfIterations, wk.KdfMemoryKiB, wk.KdfParallelism, wk.KdfTimeCost));
+        try
+        {
+            using var kekBuf = new SecureBuffer(kek);
+            return E2eeCrypto.UnwrapMasterKey(
+                wk.WrappedNonce, wk.WrappedCiphertext, wk.WrappedTag, kekBuf.Buffer);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(kek);
+        }
     }
 
     /// <summary>

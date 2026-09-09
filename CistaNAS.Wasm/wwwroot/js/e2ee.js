@@ -273,6 +273,195 @@ export async function decryptFilename(encBase64, masterKeyHandle) {
     return new TextDecoder().decode(plain);
 }
 
+// ---- crypto format v2: GroupKey epoch / per-file DEK / 強化 AAD ----
+// C# 側 CistaNAS.Shared.Crypto.E2eeV2 とプロトコル互換。
+// - GroupKey: メンバー縮小（revoke）ごとに新鍵を生成し、remaining members の公開鍵で ECDH ラップ
+// - per-file DEK: ファイルごとにランダム 32B。GroupKey ローテーション時は再ラップのみで本体不変
+// - AAD: volumeId / fileId / chunkIndex / revision / keyEpoch を認証対象に含める
+
+const ECIES_V2_INFO = new TextEncoder().encode("CistaNAS-ECIES-V2");
+const AAD_PREFIX_CHUNK = utf8Bytes("CISTAV2\x01");
+const AAD_PREFIX_FILEKEY = utf8Bytes("CISTAV2\x02");
+const AAD_PREFIX_GROUPKEY = utf8Bytes("CISTAV2\x03");
+
+function utf8Bytes(str) {
+    return new TextEncoder().encode(str);
+}
+
+function le32(value) {
+    const buf = new ArrayBuffer(4);
+    new DataView(buf).setUint32(0, value, true);
+    return new Uint8Array(buf);
+}
+
+// AAD 構築: prefix || le32(len(p1)) || p1 || ... （文字列部分は length-prefix で曖昧性排除）
+function buildAadV2(prefix, stringParts, intParts) {
+    const bufs = [prefix];
+    for (const s of stringParts) {
+        const b = utf8Bytes(s);
+        bufs.push(le32(b.length), b);
+    }
+    for (const i of intParts) bufs.push(le32(i));
+    return concatBufs(...bufs);
+}
+
+// GroupKey wrap の AAD（C# BuildGroupKeyAad と完全一致）:
+// prefix || le32(len(volumeId)) || volumeId || le32(keyEpoch) || le32(len(username)) || username
+// （volumeId と username の間に keyEpoch を挟む — buildAadV2 の strings-then-ints とは異なる順序）
+function buildGroupKeyAadV2(volumeId, keyEpoch, username) {
+    const v = utf8Bytes(volumeId);
+    const u = utf8Bytes(username);
+    return concatBufs(AAD_PREFIX_GROUPKEY, le32(v.length), v, le32(keyEpoch), le32(u.length), u);
+}
+
+export async function generateGroupKeyV2() {
+    return uint8ToBase64(crypto.getRandomValues(new Uint8Array(32)));
+}
+
+export function generateFileKeyV2() {
+    return uint8ToBase64(crypto.getRandomValues(new Uint8Array(32)));
+}
+
+// SHA-256(publicKeyRaw) の fingerprint（大文字 hex）。TOFU pinning 用。
+export async function computeFingerprint(publicKeyBase64) {
+    const digest = await crypto.subtle.digest("SHA-256", uint8FromBase64(publicKeyBase64));
+    return uint8ToHex(new Uint8Array(digest));
+}
+
+function uint8ToHex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+}
+
+async function hkdfWrapKeyV2(sharedBits) {
+    const material = await crypto.subtle.importKey("raw", sharedBits, "HKDF", false, ["deriveKey"]);
+    return await crypto.subtle.deriveKey(
+        { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: ECIES_V2_INFO },
+        material, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+
+// GroupKey を受信者の公開鍵に対して ECDH+HKDF+AES-GCM（AAD: volumeId/epoch/username）でラップ
+export async function ecdhWrapGroupKey(groupKeyBase64, recipientPublicKeyBase64, volumeId, keyEpoch, username) {
+    const ephemeral = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    const recipientPub = await crypto.subtle.importKey(
+        "raw", uint8FromBase64(recipientPublicKeyBase64), { name: "ECDH", namedCurve: "P-256" }, false, []);
+    const sharedBits = await crypto.subtle.deriveBits({ name: "ECDH", public: recipientPub }, ephemeral.privateKey, 256);
+    const wrappingKey = await hkdfWrapKeyV2(sharedBits);
+
+    const aad = buildGroupKeyAadV2(volumeId, keyEpoch, username);
+    const nonce = crypto.getRandomValues(new Uint8Array(GCM_NONCE_SIZE));
+    const wrapped = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce, additionalData: aad, tagLength: 128 },
+        wrappingKey, uint8FromBase64(groupKeyBase64));
+    const w = new Uint8Array(wrapped); // ciphertext(32) || tag(16)
+
+    const ephPubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", ephemeral.publicKey));
+    return {
+        ephemeralPublicKey: uint8ToBase64(ephPubRaw),
+        nonce: uint8ToBase64(nonce),
+        ciphertext: uint8ToBase64(w.slice(0, 32)),
+        tag: uint8ToBase64(w.slice(32))
+    };
+}
+
+export async function ecdhUnwrapGroupKey(nonceBase64, ciphertextBase64, tagBase64,
+                                          ephemeralPublicKeyBase64, privateKeyHandle, volumeId, keyEpoch, username) {
+    const ephPub = await crypto.subtle.importKey(
+        "raw", uint8FromBase64(ephemeralPublicKeyBase64), { name: "ECDH", namedCurve: "P-256" }, false, []);
+    const privateKey = getKey(privateKeyHandle);
+    const sharedBits = await crypto.subtle.deriveBits({ name: "ECDH", public: ephPub }, privateKey, 256);
+    const wrappingKey = await hkdfWrapKeyV2(sharedBits);
+
+    const aad = buildGroupKeyAadV2(volumeId, keyEpoch, username);
+    const raw = concatBufs(uint8FromBase64(ciphertextBase64), uint8FromBase64(tagBase64));
+    const plain = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: uint8FromBase64(nonceBase64), additionalData: aad, tagLength: 128 },
+        wrappingKey, raw);
+    return uint8ToBase64(new Uint8Array(plain));
+}
+
+// per-file DEK を GroupKey でラップ（AAD: volumeId/fileId/epoch → カタログ差し替え攻撃を検知）
+export async function wrapFileKey(fileKeyBase64, groupKeyBase64, volumeId, fileId, keyEpoch) {
+    const groupKey = await crypto.subtle.importKey(
+        "raw", uint8FromBase64(groupKeyBase64), { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+    const aad = buildAadV2(AAD_PREFIX_FILEKEY, [volumeId, fileId], [keyEpoch]);
+    const nonce = crypto.getRandomValues(new Uint8Array(GCM_NONCE_SIZE));
+    const wrapped = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce, additionalData: aad, tagLength: 128 },
+        groupKey, uint8FromBase64(fileKeyBase64));
+    const w = new Uint8Array(wrapped);
+    return {
+        nonce: uint8ToBase64(nonce),
+        ciphertext: uint8ToBase64(w.slice(0, 32)),
+        tag: uint8ToBase64(w.slice(32))
+    };
+}
+
+export async function unwrapFileKey(nonceBase64, ciphertextBase64, tagBase64,
+                                      groupKeyBase64, volumeId, fileId, keyEpoch) {
+    const groupKey = await crypto.subtle.importKey(
+        "raw", uint8FromBase64(groupKeyBase64), { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+    const aad = buildAadV2(AAD_PREFIX_FILEKEY, [volumeId, fileId], [keyEpoch]);
+    const raw = concatBufs(uint8FromBase64(ciphertextBase64), uint8FromBase64(tagBase64));
+    const plain = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: uint8FromBase64(nonceBase64), additionalData: aad, tagLength: 128 },
+        groupKey, raw);
+    return uint8ToBase64(new Uint8Array(plain));
+}
+
+// v2 ノンス導出: HMAC-SHA256(dek, fileSalt || le32(chunkIndex) || le32(revision) || le32(keyEpoch))
+async function deriveChunkNonceV2(fileKeyRaw, chunkIndex, fileSalt, revision, keyEpoch) {
+    const data = concatBufs(fileSalt, le32(chunkIndex), le32(revision), le32(keyEpoch));
+    const key = await crypto.subtle.importKey("raw", fileKeyRaw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const mac = await crypto.subtle.sign("HMAC", key, data);
+    return new Uint8Array(mac).slice(0, GCM_NONCE_SIZE);
+}
+
+async function importAesKeyFromB64(base64) {
+    return await crypto.subtle.importKey(
+        "raw", uint8FromBase64(base64), { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+
+// v2: raw 鍵 (base64, 32B) を AES-GCM CryptoKey として登録してハンドルを返す。
+// 共有 v2 では GroupKey でファイル名も暗号化する（encryptFilename/decryptFilename に渡す）。
+export async function importKeyHandleFromB64(base64) {
+    return storeKey(await importAesKeyFromB64(base64));
+}
+
+export async function encryptChunkV2(plainBase64, fileKeyBase64, chunkIndex, revision, keyEpoch,
+                                       volumeId, fileId, fileSaltBase64, isFirstChunk) {
+    const fileKeyRaw = uint8FromBase64(fileKeyBase64);
+    const fileKey = await crypto.subtle.importKey(
+        "raw", fileKeyRaw, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    const fileSalt = uint8FromBase64(fileSaltBase64);
+    const nonce = await deriveChunkNonceV2(fileKeyRaw, chunkIndex, fileSalt, revision, keyEpoch);
+    const aad = buildAadV2(AAD_PREFIX_CHUNK, [volumeId, fileId], [chunkIndex, revision, keyEpoch]);
+    const ct = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce, additionalData: aad, tagLength: 128 },
+        fileKey, uint8FromBase64(plainBase64));
+    const ctBuf = new Uint8Array(ct);
+    return uint8ToBase64(isFirstChunk ? concatBufs(fileSalt, ctBuf) : ctBuf);
+}
+
+export async function decryptChunkV2(encBase64, fileKeyBase64, chunkIndex, revision, keyEpoch,
+                                       volumeId, fileId, fileSaltBase64) {
+    const fileKeyRaw = uint8FromBase64(fileKeyBase64);
+    const fileKey = await crypto.subtle.importKey(
+        "raw", fileKeyRaw, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    const fileSalt = uint8FromBase64(fileSaltBase64);
+    const nonce = await deriveChunkNonceV2(fileKeyRaw, chunkIndex, fileSalt, revision, keyEpoch);
+    const aad = buildAadV2(AAD_PREFIX_CHUNK, [volumeId, fileId], [chunkIndex, revision, keyEpoch]);
+
+    let encBytes = uint8FromBase64(encBase64);
+    let ciphertext = encBytes;
+    if (chunkIndex === 0 && encBytes.length > FILE_SALT_SIZE + GCM_TAG_SIZE) {
+        ciphertext = encBytes.slice(FILE_SALT_SIZE);
+    }
+    const plain = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: nonce, additionalData: aad, tagLength: 128 },
+        fileKey, ciphertext);
+    return uint8ToBase64(new Uint8Array(plain));
+}
+
 // ---- ヘルパー ----
 
 export function generateFileSalt() {

@@ -309,4 +309,146 @@ public class E2eeBrowserTests(PlaywrightWebAppFixture fixture)
             CryptographicOperations.ZeroMemory(kek);
         }
     }
+
+    /// <summary>
+    /// 共有 E2EE crypto format v2 のブラウザ (e2ee.js / Web Crypto) ↔ C# (E2eeV2) 相互運用を検証する:
+    /// TOFU fingerprint、GroupKey の ECDH wrap 双方向、per-file DEK wrap、
+    /// v2 チャンク暗号化双方向（AAD / nonce 導出の完全一致）（回帰防止）。
+    /// </summary>
+    [Fact]
+    public async Task E2ee_V2SharedCrypto_BrowserMatchesCsharp()
+    {
+        await using var context = await fixture.CreateAuthenticatedContextAsync();
+        var page = await context.NewPageAsync();
+        await page.GotoAsync(fixture.BaseUrl + "/",
+            options: new PageGotoOptions { WaitUntil = WaitUntilState.Load });
+
+        // 共通パラメータ
+        const string volumeId = "pw-v2-volume";
+        const string fileId = "abc123def4567890abcdef1234567890";
+        const string username = "pw-bob";
+        const int keyEpoch = 1;
+        byte[] groupKey = E2eeV2.GenerateGroupKey();
+        byte[] dek = E2eeV2.GenerateFileKey();
+        byte[] fileSalt = E2eeV2.GenerateFileSalt();
+        string groupKeyB64 = Convert.ToBase64String(groupKey);
+        string dekB64 = Convert.ToBase64String(dek);
+        string fileSaltB64 = Convert.ToBase64String(fileSalt);
+
+        // C# 側 recipient 鍵ペア（JS wrap → C# unwrap 方向の受信者）
+        var (recipientPub, recipientPriv) = E2eeCrypto.GenerateEcdhKeyPair();
+
+        // フェーズ 1: JS 側 recipient 鍵ペアを生成してページに保持し、公開鍵 (raw 65B) を受け取る。
+        // C# → JS 方向はこの公開鍵宛に wrap しないと秘密鍵が一致せず復号できない。
+        string jsPubB64 = await page.EvaluateAsync<string>(@"async (args) => {
+            const mod = await import(args.moduleUrl);
+            const kp = await mod.generateKeyPair();
+            window.__v2kp = kp;
+            return await mod.exportPublicKey(kp.publicKeyHandle);
+        }", new { moduleUrl = $"{fixture.BaseUrl}/js/e2ee.js" });
+
+        // C# → JS: JS 側 recipient 公開鍵宛に GroupKey を wrap（JS がアンラップする）
+        var (csEph, csNonce, csCt, csTag) = E2eeV2.EcdhWrapGroupKey(
+            groupKey, Convert.FromBase64String(jsPubB64), volumeId, keyEpoch, username);
+
+        // C# でチャンク (index=1, rev=0) を暗号化（JS が復号する）
+        byte[] plain = Encoding.UTF8.GetBytes("v2 chunk from C# to browser");
+        var ctx1 = new E2eeChunkContext(volumeId, fileId, 1, 0, keyEpoch);
+        byte[] chunkByCsharp = E2eeV2.EncryptChunk(plain, dek, ctx1, isFirstChunk: false, fileSalt);
+
+        string resultsJson = await page.EvaluateAsync<string>(@"async (args) => {
+            const mod = await import(args.moduleUrl);
+
+            // フェーズ 1 で生成した鍵ペア（C# はこの公開鍵宛に wrap 済み。
+            // モジュールインスタンスはページ内で共有されるため鍵ハンドルも有効）
+            const kp = window.__v2kp;
+
+            const results = {};
+
+            // TOFU fingerprint の一致
+            results.fingerprint = await mod.computeFingerprint(args.recipientPubB64);
+
+            // JS ECDH wrap → 呼び出し側 (C#) がアンラップする
+            results.jsWrapped = await mod.ecdhWrapGroupKey(
+                args.groupKeyB64, args.recipientPubB64, args.volumeId, args.keyEpoch, args.username);
+
+            // C# wrap → JS アンラップ
+            results.groupKeyFromCsharp = await mod.ecdhUnwrapGroupKey(
+                args.csWrapNonceB64, args.csWrapCtB64, args.csWrapTagB64, args.csWrapEphPubB64,
+                kp.privateKeyHandle, args.volumeId, args.keyEpoch, args.username);
+            results.jsRecipientPub = await mod.exportPublicKey(kp.publicKeyHandle); // フェーズ 1 鍵ハンドルの生存検証も兼ねる
+
+            // JS wrapFileKey → C# がアンラップする
+            results.jsFileKeyWrap = await mod.wrapFileKey(
+                args.dekB64, args.groupKeyB64, args.volumeId, args.fileId, args.keyEpoch);
+
+            // C# 暗号化チャンク (index=1) を JS 復号
+            results.chunkPlainFromCsharp = await mod.decryptChunkV2(
+                args.csChunkEncB64, args.dekB64, 1, 0, args.keyEpoch,
+                args.volumeId, args.fileId, args.fileSaltB64);
+
+            // JS 暗号化チャンク (index=2) → C# が復号する
+            results.jsChunkEnc = await mod.encryptChunkV2(
+                results.chunkPlainFromCsharp, args.dekB64, 2, 0, args.keyEpoch,
+                args.volumeId, args.fileId, args.fileSaltB64, false);
+
+            return JSON.stringify(results); // Playwright .NET は JS オブジェクトを string に変換しないため明示的に serialize
+        }", new
+        {
+            moduleUrl = $"{fixture.BaseUrl}/js/e2ee.js",
+            recipientPubB64 = Convert.ToBase64String(recipientPub),
+            groupKeyB64,
+            dekB64,
+            fileSaltB64,
+            volumeId,
+            fileId,
+            username,
+            keyEpoch,
+            csWrapEphPubB64 = Convert.ToBase64String(csEph),
+            csWrapNonceB64 = Convert.ToBase64String(csNonce),
+            csWrapCtB64 = Convert.ToBase64String(csCt),
+            csWrapTagB64 = Convert.ToBase64String(csTag),
+            csChunkEncB64 = Convert.ToBase64String(chunkByCsharp),
+        });
+
+        // JS 側は匿名オブジェクトを返すため System.Text.Json で展開
+        using var doc = System.Text.Json.JsonDocument.Parse(resultsJson);
+        var r = doc.RootElement;
+
+        // 1. fingerprint (TOFU): JS と C# が完全一致
+        Assert.Equal(E2eeV2.ComputeFingerprint(recipientPub), r.GetProperty("fingerprint").GetString());
+
+        // 2. JS wrap → C# unwrap: JS recipient 公開鍵は raw 65B
+        byte[] jsPubRaw = Convert.FromBase64String(r.GetProperty("jsRecipientPub").GetString()!);
+        Assert.Equal(65, jsPubRaw.Length);
+        var jsWrap = r.GetProperty("jsWrapped");
+        byte[] unwrapped = E2eeV2.EcdhUnwrapGroupKey(
+            Convert.FromBase64String(jsWrap.GetProperty("nonce").GetString()!),
+            Convert.FromBase64String(jsWrap.GetProperty("ciphertext").GetString()!),
+            Convert.FromBase64String(jsWrap.GetProperty("tag").GetString()!),
+            Convert.FromBase64String(jsWrap.GetProperty("ephemeralPublicKey").GetString()!),
+            recipientPriv, volumeId, keyEpoch, username);
+        Assert.Equal(groupKey, unwrapped);
+
+        // 3. C# wrap → JS unwrap: JS が復号した GroupKey が元と一致
+        Assert.Equal(groupKeyB64, r.GetProperty("groupKeyFromCsharp").GetString());
+
+        // 4. JS wrapFileKey → C# unwrap
+        var jfkw = r.GetProperty("jsFileKeyWrap");
+        byte[] dekFromJs = E2eeV2.UnwrapFileKey(
+            Convert.FromBase64String(jfkw.GetProperty("nonce").GetString()!),
+            Convert.FromBase64String(jfkw.GetProperty("ciphertext").GetString()!),
+            Convert.FromBase64String(jfkw.GetProperty("tag").GetString()!),
+            groupKey, volumeId, fileId, keyEpoch);
+        Assert.Equal(dek, dekFromJs);
+
+        // 5. C# 暗号化チャンクの JS 復号結果が平文と一致
+        Assert.Equal(plain, Convert.FromBase64String(r.GetProperty("chunkPlainFromCsharp").GetString()!));
+
+        // 6. JS 暗号化チャンク (index=2) を C# 復号
+        var ctx2 = new E2eeChunkContext(volumeId, fileId, 2, 0, keyEpoch);
+        byte[] decryptedByCsharp = E2eeV2.DecryptChunk(
+            Convert.FromBase64String(r.GetProperty("jsChunkEnc").GetString()!), dek, ctx2, fileSalt);
+        Assert.Equal(plain, decryptedByCsharp);
+    }
 }
