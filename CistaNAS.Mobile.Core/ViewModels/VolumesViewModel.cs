@@ -3,6 +3,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using CistaNAS.Client.Api;
 using CistaNAS.Mobile.Core.Services;
+using CistaNAS.Shared.Crypto;
 
 namespace CistaNAS.Mobile.Core.ViewModels;
 
@@ -83,20 +84,71 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
     /// <summary>
     /// E2EE ボリュームのマウント: wrapped-key を取得してローカルでアンラップし、
     /// masterKey をセッションに登録する (サーバーに鍵は送らない)。
+    /// 共有 v2 ボリューム (KeyEpoch ≥ 1) では全 epoch の GroupKey を自分の ECDH 秘密鍵で
+    /// アンラップして v2 状態として登録する。オーナー (password wrap) のみ残置 v1 ファイルの
+    /// 読み取り用に masterKey も復元する (v2 メンバーの wrapped-key は GroupKey wrap と同型のため
+    /// masterKey としては扱わない)。
     /// サーバー側は作成時に自動マウント済みのことがあるため、未マウント時のみ解除を依頼する。
     /// </summary>
     private async Task MountE2eeAsync(VolumeListItem volume, string password, CancellationToken ct)
     {
         string username = app.Settings.Username ?? throw new InvalidOperationException("未ログインです。");
-        WrappedKeyInfo wk = await app.Session.Api.GetWrappedKeyAsync(volume.Name, username);
 
-        byte[] masterKey;
-        if (string.Equals(wk.WrapType, "ecdh", StringComparison.Ordinal))
+        // 共有 v2: 全 epoch の GroupKey wraps を取得してアンラップ
+        var gki = await app.Session.Api.GetGroupKeyInfoAsync(volume.Name);
+        if (gki is not null && gki.KeyEpoch >= 1)
         {
             byte[] privateKey = await app.EcdhKeys.GetOrCreatePrivateKeyAsync(app.Session.Api, username);
             try
             {
-                masterKey = app.E2ee.UnwrapMasterKey(username, null, wk, privateKey);
+                var groupKeys = new Dictionary<int, byte[]>();
+                foreach (var wrap in gki.MyGroupKeys)
+                {
+                    if (wrap.EphemeralPublicKey is null) continue;
+                    try
+                    {
+                        groupKeys[wrap.Epoch] = E2eeV2.EcdhUnwrapGroupKey(wrap.Nonce, wrap.Ciphertext, wrap.Tag,
+                            wrap.EphemeralPublicKey, privateKey, gki.VolumeId, wrap.Epoch, username);
+                    }
+                    catch (System.Security.Cryptography.CryptographicException)
+                    {
+                        // 個別 epoch のアンラップ失敗は無視 (他の epoch で読めるファイルがある)
+                    }
+                }
+                if (groupKeys.Count == 0)
+                    throw new InvalidOperationException(
+                        "共有 v2 の GroupKey を復号できませんでした（この共有から削除された可能性があります）。");
+                app.E2ee.StoreV2State(volume.Name, gki.VolumeId, groupKeys);
+            }
+            finally
+            {
+                Array.Clear(privateKey);
+            }
+
+            // オーナー + password wrap の場合のみ masterKey も復元（残置 v1 ファイルの読み取り用）
+            WrappedKeyInfo wk = await app.Session.Api.GetWrappedKeyAsync(volume.Name, username);
+            bool passwordWrap = wk.WrapType is null || string.Equals(wk.WrapType, "password", StringComparison.Ordinal);
+            if (passwordWrap && string.Equals(volume.OwnerUser, username, StringComparison.OrdinalIgnoreCase))
+            {
+                byte[] masterKey = app.E2ee.UnwrapMasterKey(username, password, wk, null);
+                app.E2ee.StoreKey(volume.Name, masterKey, wk.ChunkSize);
+            }
+
+            if (!volume.IsMounted)
+                await app.Session.Api.MountAsync(volume.Name);
+            return;
+        }
+
+        // v1 パス (従来方式)
+        WrappedKeyInfo wkV1 = await app.Session.Api.GetWrappedKeyAsync(volume.Name, username);
+
+        byte[] masterKeyV1;
+        if (string.Equals(wkV1.WrapType, "ecdh", StringComparison.Ordinal))
+        {
+            byte[] privateKey = await app.EcdhKeys.GetOrCreatePrivateKeyAsync(app.Session.Api, username);
+            try
+            {
+                masterKeyV1 = app.E2ee.UnwrapMasterKey(username, null, wkV1, privateKey);
             }
             finally
             {
@@ -105,12 +157,12 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
         }
         else
         {
-            masterKey = app.E2ee.UnwrapMasterKey(username, password, wk, null);
+            masterKeyV1 = app.E2ee.UnwrapMasterKey(username, password, wkV1, null);
         }
 
         if (!volume.IsMounted)
             await app.Session.Api.MountAsync(volume.Name);
-        app.E2ee.StoreKey(volume.Name, masterKey, wk.ChunkSize);
+        app.E2ee.StoreKey(volume.Name, masterKeyV1, wkV1.ChunkSize);
     }
 
     [RelayCommand]

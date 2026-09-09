@@ -404,7 +404,7 @@ public static class E2eeCrypto
     }
 
     /// <summary>raw 非圧縮点公開鍵（0x04 || X[32] || Y[32], 65 バイト）を ECPoint から構築。</summary>
-    private static byte[] ExportRawPublicKey(ECPoint q)
+    internal static byte[] ExportRawPublicKey(ECPoint q)
     {
         byte[] raw = new byte[65];
         raw[0] = 0x04;
@@ -414,7 +414,7 @@ public static class E2eeCrypto
     }
 
     /// <summary>raw 非圧縮点公開鍵（65 バイト）から ECDiffieHellman を構築。</summary>
-    private static ECDiffieHellman ImportPublicKeyFromRaw(byte[] raw)
+    internal static ECDiffieHellman ImportPublicKeyFromRaw(byte[] raw)
     {
         if (raw is null || raw.Length != 65 || raw[0] != 0x04)
             throw new ArgumentException("公開鍵は raw 非圧縮点 65 バイト（0x04 || X || Y）である必要があります。", nameof(raw));
@@ -428,7 +428,7 @@ public static class E2eeCrypto
     }
 
     /// <summary>P-256 フィールド要素を 32 バイトに左ゼロパディング（leading zero の strip 対策）。</summary>
-    private static byte[] PadField(byte[]? value)
+    internal static byte[] PadField(byte[]? value)
     {
         if (value is null) return new byte[32];
         if (value.Length == 32) return value;
@@ -471,7 +471,7 @@ public static class E2eeCrypto
         return hmac.Hash![..GcmNonceSize];
     }
 
-    private static byte[] HkdfSha256(byte[] ikm, byte[] salt, byte[] info, int outputLength)
+    internal static byte[] HkdfSha256(byte[] ikm, byte[] salt, byte[] info, int outputLength)
     {
         const int HashLength = 32; // SHA-256
         if (outputLength > 255 * HashLength)

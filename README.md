@@ -126,6 +126,11 @@ dotnet run --project CistaNAS.Client -- <serverUrl> <username> <password> <mount
 dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword Z: my-e2ee-vol
 ```
 
+Supports shared E2EE v2: members mount with their ECDH private key (DPAPI-protected, no
+password needed for ECDH wraps), all GroupKey epochs are unlocked per mount, and file
+uploads/edits use per-file DEKs wrapped in the current epoch. The client's share dialog
+performs TOFU pin verification for ECDH grants and rotates the GroupKey as part of a revoke.
+
 ## Configuration
 
 Configure under the `CistaNas` section of `appsettings.json`.
@@ -273,6 +278,73 @@ Chunk N: [Ciphertext] [Tag (16B)]
 - **Safe even on server compromise** — only encrypted data and wrapped keys can leak
 - **Unrecoverable if password is lost** — keys exist only on the client
 
+### Shared E2EE (crypto format v2)
+
+Single-owner E2EE volumes (above) can be upgraded to **shared v2** when the owner grants
+access to another user. v2 introduces a GroupKey with epochs and per-file random DEKs
+(`CryptoFormatVersion`-style discrimination: a file with `KeyEpoch == 0` is v1/masterKey
+format, `KeyEpoch >= 1` is v2 format).
+
+```
+GroupKey (32B, one per epoch, generated on the client)
+  └ ECIES (ECDH + HKDF + AES-256-GCM) wrap per member — using the member's public key
+      └ Per file:
+          DEK (32B, CSPRNG, one per file)
+            └ AES-256-GCM wrap by the GroupKey of the file's epoch (WrappedFileKey)
+                └ Per chunk:
+                    Nonce = HMAC-SHA256(DEK, fileSalt || chunkIndex || revision || keyEpoch)[0:12]
+                    AES-256-GCM(plaintext, nonce,
+                        AAD = "CISTAV2\x01" || volumeId || fileId || chunkIndex || revision || keyEpoch)
+```
+
+- **Filenames** are encrypted with the GroupKey of the file's epoch (not the master key)
+- **AAD binding** — every v2 ciphertext binds `volumeId`, `fileId`, `chunkIndex`,
+  `revision`, and `keyEpoch`, so ciphertexts cannot be replayed across files, chunks,
+  revisions, or key generations. GroupKey wraps additionally bind `volumeId` and `username`
+- **Epoch migration** — re-uploading a file re-wraps its DEK into the current GroupKey
+  (chunk bodies are never re-encrypted for this)
+
+#### Trust model (public key pinning, TOFU)
+
+- Each user publishes an E2EE public key to the server; the server is an untrusted key directory
+- The **first time** a client uses a user's public key it stores a trust anchor —
+  `SHA-256(publicKeyRaw)` fingerprint — **locally only** (browser: IndexedDB,
+  Desktop: `%APPDATA%/CistaNAS/ecdh_pins_<user>.json`; fingerprints are not secret so they are
+  stored without encryption, but never sent to the server). The server never sees pins or
+  fingerprints. The mobile app currently has no share UI and therefore performs no pin checks
+- On every later use (share / rotate / wrap) the fingerprint is re-verified. On mismatch the
+  operation is **aborted** and the user is warned: *"The encryption public key has changed from
+  the one previously seen. This may indicate server compromise or a key rotation."*
+- The client **never trusts a new key automatically**. Updating a pin requires an explicit
+  user action ("trust new key"), and the interrupted operation is not silently retried
+
+#### Membership changes
+
+- **Grant (member added)** — the owner wraps the **current** epoch GroupKey for the new
+  member. No rotation happens; the new member can read data of the current epoch and later,
+  and cannot read files wrapped in older epochs
+- **Revoke (member removed)** — the owner generates a **new GroupKey (epoch n+1)**, wraps it
+  only for the remaining members, and the server atomically registers the new epoch and
+  deletes every key entry of the removed user. File DEKs are re-wrapped to the new epoch
+  (bodies unchanged); old epochs are retained so remaining members can still read older files
+
+#### Revoke semantics (important)
+
+- Revocation is **not retroactive**: a removed member may have already downloaded/decrypted
+  data while they had access. CistaNAS cannot undo that
+- After revocation the removed member cannot read **new or migrated** data (new epoch GroupKey
+  was never given to them and their key entries are gone)
+- Remaining members **keep read access to pre-revocation files** (old epochs stay readable);
+  this is intentional so a revoke never destroys the owner's history
+- The `revoke` API alone (without rotation) only removes server-side key entries — on v2
+  volumes the UI always performs a GroupKey rotation as part of a revoke
+
+#### Server role in shared E2EE
+
+The server stores only: public keys, wrapped GroupKeys / wrapped per-file DEKs, and encrypted
+(ciphertext) data. It never holds plaintext GroupKeys, DEKs, private keys, filenames, or
+content. E2EE volumes stay mounted with `masterKey: null` server-side.
+
 ## Media Streaming
 
 Supports preview of video, audio, and images in the browser.
@@ -326,6 +398,10 @@ PATCH  /api/v1/e2ee/{volume}/finalize-file/{fileId}           Finalize upload
 DELETE /api/v1/e2ee/{volume}/files/{fileId}                   Delete file
 GET    /api/v1/e2ee/{volume}/files                           List files
 POST   /api/v1/e2ee/{volume}/add-wrapped-key                 Add shared key
+GET    /api/v1/e2ee/{volume}/group-key-info                  GroupKey epochs + my wraps (v2)
+POST   /api/v1/e2ee/{volume}/rotate-group-key                Rotate GroupKey (epoch n+1, revoke)
+GET    /api/v1/e2ee/{volume}/member-public-keys              Remaining members' public keys (v2)
+POST   /api/v1/e2ee/{volume}/rewrap-file-keys                Re-wrap file DEKs to current epoch
 
 # Groups
 GET    /api/v1/groups/                                List groups

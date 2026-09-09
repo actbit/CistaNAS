@@ -174,3 +174,115 @@ public class GroupMemberInfo
     public required string Username { get; set; }
     public string? PublicKey { get; set; }
 }
+
+public static class CistaNasApiClientE2eeV2Extensions
+{
+    private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+    /// <summary>
+    /// crypto format v2: 自分宛ての全 epoch GroupKey wraps とボリューム鍵状態を取得する。
+    /// 共有 v2 未移行ボリュームでは KeyEpoch == 0 / MyGroupKeys 空。
+    /// </summary>
+    public static async Task<E2eeGroupKeyInfo?> GetGroupKeyInfoAsync(this CistaNasApiClient client, string volumeName)
+    {
+        var http = client._http;
+        var res = await http.GetAsync($"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/group-key-info");
+        if (res.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        res.EnsureSuccessStatusCode();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+
+        var myKeys = new List<GroupKeyWrapInfo>();
+        if (json.TryGetProperty("myGroupKeys", out var keys) && keys.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var k in keys.EnumerateArray())
+            {
+                myKeys.Add(new GroupKeyWrapInfo
+                {
+                    Epoch = k.GetProperty("epoch").GetInt32(),
+                    WrapType = k.TryGetProperty("wrapType", out var wt) ? wt.GetString() ?? "ecdh" : "ecdh",
+                    Nonce = Convert.FromBase64String(k.GetProperty("nonce").GetString()!),
+                    Ciphertext = Convert.FromBase64String(k.GetProperty("ciphertext").GetString()!),
+                    Tag = Convert.FromBase64String(k.GetProperty("tag").GetString()!),
+                    EphemeralPublicKey = k.TryGetProperty("ephemeralPublicKey", out var eph) && eph.ValueKind == JsonValueKind.String
+                        ? Convert.FromBase64String(eph.GetString()!) : null,
+                });
+            }
+        }
+
+        return new E2eeGroupKeyInfo
+        {
+            VolumeId = json.GetProperty("volumeId").GetString()!,
+            KeyEpoch = json.TryGetProperty("keyEpoch", out var ke) ? ke.GetInt32() : 0,
+            MyGroupKeys = myKeys,
+            HasLegacyFiles = json.TryGetProperty("hasLegacyFiles", out var hl) && hl.GetBoolean(),
+        };
+    }
+
+    /// <summary>
+    /// crypto format v2: GroupKey をローテーションする（revoke 時）。newGroupKeys は
+    /// remaining members のユーザー名 → (nonce, ct, tag, ephemeralPublicKey)。
+    /// </summary>
+    public static async Task RotateGroupKeyAsync(this CistaNasApiClient client, string volumeName,
+        int newEpoch, Dictionary<string, (byte[] nonce, byte[] ct, byte[] tag, byte[] ephemeralPublicKey)> newGroupKeys,
+        string? removedUsername = null)
+    {
+        var http = client._http;
+        var wrapped = new Dictionary<string, object>();
+        foreach (var (username, (nonce, ct, tag, ephemeralPublicKey)) in newGroupKeys)
+        {
+            wrapped[username] = new
+            {
+                wrapType = "ecdh",
+                kdf = new { algorithm = "pbkdf2-sha256", iterations = 0, salt = Array.Empty<byte>() },
+                ephemeralPublicKey,
+                wrappedMasterKey = new { algorithm = "aes-256-gcm", nonce, ciphertext = ct, tag }
+            };
+        }
+        var req = new { newEpoch, wrappedGroupKeys = wrapped, removedUsername };
+        var res = await http.PostAsJsonAsync($"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/rotate-group-key", req, JsonOpts);
+        res.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>crypto format v2: remaining members の公開鍵一覧を取得する（owner 限定）。</summary>
+    public static async Task<List<MemberPublicKeyInfo>> GetMemberPublicKeysAsync(this CistaNasApiClient client, string volumeName)
+    {
+        var http = client._http;
+        var res = await http.GetAsync($"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/member-public-keys");
+        res.EnsureSuccessStatusCode();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var result = new List<MemberPublicKeyInfo>();
+        foreach (var m in json.EnumerateArray())
+        {
+            result.Add(new MemberPublicKeyInfo
+            {
+                Username = m.GetProperty("username").GetString()!,
+                PublicKeyBase64 = m.TryGetProperty("publicKeyBase64", out var pk) ? pk.GetString() : null,
+            });
+        }
+        return result;
+    }
+
+    /// <summary>crypto format v2: ファイル鍵を現行 epoch の GroupKey に再ラップする（チャンク本体は不変）。</summary>
+    public static async Task RewrapFileKeysAsync(this CistaNasApiClient client, string volumeName,
+        IReadOnlyList<(string fileId, int keyEpoch, WrappedAeadKey wrappedFileKey)> rewraps)
+    {
+        var http = client._http;
+        var req = new
+        {
+            rewraps = rewraps.Select(r => new
+            {
+                fileId = r.fileId,
+                keyEpoch = r.keyEpoch,
+                wrappedFileKey = new
+                {
+                    algorithm = r.wrappedFileKey.Algorithm,
+                    nonce = r.wrappedFileKey.Nonce,
+                    ciphertext = r.wrappedFileKey.Ciphertext,
+                    tag = r.wrappedFileKey.Tag
+                }
+            }).ToList()
+        };
+        var res = await http.PostAsJsonAsync($"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/rewrap-file-keys", req, JsonOpts);
+        res.EnsureSuccessStatusCode();
+    }
+}

@@ -9,6 +9,7 @@
 @inject FileApiClient FileApi
 @inject E2eeApiClient E2eeApi
 @inject ClientVolumeMountService VolumeMountService
+@inject E2eeKeyResolverService KeyResolver
 @inject E2eeInterop E2ee
 @inject E2eeFileTransferService Transfer
 @inject WasmAuthStateProvider Auth
@@ -227,6 +228,10 @@ else
     private string? _masterKeyHandle;
     private int _e2eeChunkSize = 1048576;
     private List<E2eeFileViewItem> _e2eeFiles = [];
+    private string? _volumeOwner;
+    // 共有 v2: epoch → GroupKey (base64) とボリューム VolumeId。v2 未移行ボリュームでは空/null
+    private Dictionary<int, string> _groupKeysByEpoch = [];
+    private string? _volumeId;
 
     // メディアプレビュー
     private string? _selectedFile;
@@ -249,6 +254,7 @@ else
         {
             var volumes = await VolumeApi.ListAsync();
             var volInfo = volumes.FirstOrDefault(v => v.Name == VolumeName);
+            _volumeOwner = volInfo?.OwnerUser;
             _isE2ee = volInfo?.EncryptionMode == "e2ee" || volInfo?.EncryptionMode == "group-e2ee";
 
             if (_isE2ee)
@@ -263,8 +269,16 @@ else
                     {
                         _masterKeyHandle = handle;
                         _e2eeUnlocked = true;
-                        await RefreshE2eeList();
                     }
+                    // 共有 v2 の GroupKey 辞書もマウント状態から復元
+                    var v2Keys = VolumeMountService.GetE2eeV2Keys(VolumeName);
+                    if (v2Keys is not null)
+                    {
+                        _volumeId = v2Keys.Value.VolumeId;
+                        _groupKeysByEpoch = new Dictionary<int, string>(v2Keys.Value.GroupKeys);
+                    }
+                    if (_e2eeUnlocked || _groupKeysByEpoch.Count > 0)
+                        await RefreshE2eeList();
                 }
                 // 未マウント/未ロック解除 → パスワード入力画面を表示
             }
@@ -285,11 +299,14 @@ else
     {
         _e2eeUnlocking = true;
         _e2eeError = null;
-        string? kekHandle = null;
 
         try
         {
-            // wrapped key を取得してアンラップ
+            // 共有 v2: 自分宛ての全 epoch GroupKey をアンラップ（v2 未移行ボリュームでは空 / volumeId null）
+            var (groupKeys, volumeId) = await KeyResolver.LoadGroupKeysAsync(VolumeName, Auth.CurrentUsername, _e2eePassword);
+
+            // wrapped key を取得。v1 では masterKey、v2 owner（password wrap）では残置 v1 ファイル用の
+            // masterKey、v2 メンバーでは現行 epoch GroupKey の wrap が返る
             var wrappedKeyResp = await VolumeApi.GetWrappedKeyAsync(VolumeName, Auth.CurrentUsername);
             if (wrappedKeyResp is null)
             {
@@ -299,65 +316,31 @@ else
 
             _e2eeChunkSize = wrappedKeyResp.ChunkSize;
 
-            if (string.Equals(wrappedKeyResp.WrapType, "ecdh", StringComparison.OrdinalIgnoreCase))
+            string? mkHandle = null;
+            bool isV2 = volumeId is not null;
+            if (!isV2
+                || (_volumeOwner == Auth.CurrentUsername
+                    && string.Equals(wrappedKeyResp.WrapType, "password", StringComparison.OrdinalIgnoreCase)))
             {
-                // ECDH ラップキー: localStorage の ECDH 秘密鍵（password 復号）で ECIES アンラップ
-                if (string.IsNullOrEmpty(wrappedKeyResp.EphemeralPublicKey))
-                    throw new Exception("ECDH ラップキーに一時公開鍵が含まれていません。");
-
-                string privJson = await JS.InvokeAsync<string>("localStorage.getItem", $"e2ee_privkey_{Auth.CurrentUsername}");
-                if (string.IsNullOrEmpty(privJson))
-                    throw new Exception("ローカルに E2EE 秘密鍵が見つかりません。先に鍵ペアを生成してください。");
-
-                using var privDoc = System.Text.Json.JsonDocument.Parse(privJson);
-                var privRoot = privDoc.RootElement;
-                string privHandle;
-                try
-                {
-                    privHandle = await E2ee.DecryptPrivateKey(
-                        privRoot.GetProperty("wrapped").GetString()!,
-                        privRoot.GetProperty("nonce").GetString()!,
-                        _e2eePassword,
-                        privRoot.GetProperty("salt").GetString()!,
-                        E2eeInterop.ReadPrivKeyKdf(privRoot));
-                }
-                catch
-                {
-                    throw new Exception("E2EE 鍵ペアのパスワードが正しくありません。E2EE 鍵ペア生成時のパスワードを入力してください。");
-                }
-                try
-                {
-                    _masterKeyHandle = await E2ee.EcdhUnwrap(
-                        wrappedKeyResp.WrappedMasterKey.Nonce,
-                        wrappedKeyResp.WrappedMasterKey.Ciphertext,
-                        wrappedKeyResp.WrappedMasterKey.Tag,
-                        wrappedKeyResp.EphemeralPublicKey,
-                        privHandle);
-                }
-                finally { await E2ee.ClearKey(privHandle); }
+                // v1: UserKeys wrap は masterKey。v2 owner: 残置 v1 ファイル読取用に masterKey もアンラップ
+                mkHandle = await KeyResolver.UnwrapMyMasterKeyAsync(wrappedKeyResp, Auth.CurrentUsername, _e2eePassword);
             }
-            else
+            // v2 メンバーは GroupKey のみでマウント（UserKeys の wrap は GroupKey wrap と同一のため復号しない）
+
+            if (mkHandle is null && groupKeys.Count == 0)
             {
-                kekHandle = await E2ee.DeriveKek(_e2eePassword, wrappedKeyResp.Kdf.Salt,
-                    new E2eeKdfOptions(wrappedKeyResp.Kdf.Algorithm, wrappedKeyResp.Kdf.Iterations,
-                        wrappedKeyResp.Kdf.MemoryKiB, wrappedKeyResp.Kdf.TimeCost, wrappedKeyResp.Kdf.Parallelism),
-                    Auth.CurrentUsername);
-
-                _masterKeyHandle = await E2ee.UnwrapMasterKey(
-                    wrappedKeyResp.WrappedMasterKey.Nonce,
-                    wrappedKeyResp.WrappedMasterKey.Ciphertext,
-                    wrappedKeyResp.WrappedMasterKey.Tag,
-                    kekHandle);
-
-                await E2ee.ClearKey(kekHandle);
-                kekHandle = null;
+                _e2eeError = "ロック解除に失敗しました（パスワードが正しくない、またはメンバー登録されていない可能性があります）。";
+                return;
             }
 
+            _masterKeyHandle = mkHandle;
+            _volumeId = volumeId;
+            _groupKeysByEpoch = new Dictionary<int, string>(groupKeys);
             _e2eeUnlocked = true;
             _e2eePassword = "";
 
-            // ClientVolumeMountService にも登録
-            VolumeMountService.MountE2ee(VolumeName, _masterKeyHandle, _e2eeChunkSize, "e2ee");
+            // ClientVolumeMountService にも登録（v2 は GroupKey 辞書 + VolumeId を保持）
+            VolumeMountService.MountE2ee(VolumeName, mkHandle, _e2eeChunkSize, "e2ee", volumeId, groupKeys);
 
             await RefreshE2eeList();
         }
@@ -372,10 +355,6 @@ else
         }
         finally
         {
-            if (kekHandle is not null)
-            {
-                try { await E2ee.ClearKey(kekHandle); } catch { }
-            }
             _e2eeUnlocking = false;
         }
     }
@@ -391,7 +370,19 @@ else
             foreach (var entry in response.Files)
             {
                 string plainName;
-                try { plainName = await E2ee.DecryptFilename(entry.EncryptedName, _masterKeyHandle!); }
+                try
+                {
+                    if (entry.KeyEpoch >= 1 && _volumeId is not null)
+                    {
+                        // 共有 v2: ファイル名はその epoch の GroupKey で暗号化されている
+                        plainName = await Transfer.DecryptFilenameV2Async(entry, _volumeId, _groupKeysByEpoch);
+                    }
+                    else
+                    {
+                        // v1: masterKey で復号（v2 メンバーは masterKey を持たない → fileId 表示にフォールバック）
+                        plainName = await E2ee.DecryptFilename(entry.EncryptedName, _masterKeyHandle!);
+                    }
+                }
                 catch { plainName = $"<{entry.FileId[..Math.Min(8, entry.FileId.Length)]}...>"; }
                 _e2eeFiles.Add(new() { Entry = entry, PlainName = plainName });
             }
@@ -435,8 +426,18 @@ else
         foreach (var file in e.GetMultipleFiles())
         {
             await using var stream = file.OpenReadStream(maxAllowedSize: 10L * 1024 * 1024 * 1024);
-            // 暗号化・リース取得・ファイナライズ・ロールバックはサービス層に委譲
-            await Transfer.UploadAsync(VolumeName, file.Name, stream, file.Size, _e2eeChunkSize, _masterKeyHandle!);
+            if (_volumeId is not null && _groupKeysByEpoch.Count > 0)
+            {
+                // 共有 v2: GroupKey（保持する最新 epoch）で per-file DEK をラップしてアップロード
+                int currentEpoch = _groupKeysByEpoch.Keys.Max();
+                await Transfer.UploadV2Async(VolumeName, file.Name, stream, file.Size, _e2eeChunkSize,
+                    new E2eeV2KeyContext(_volumeId, currentEpoch, _groupKeysByEpoch[currentEpoch]));
+            }
+            else
+            {
+                // v1: masterKey で直接暗号化。暗号化・リース取得・ファイナライズ・ロールバックはサービス層に委譲
+                await Transfer.UploadAsync(VolumeName, file.Name, stream, file.Size, _e2eeChunkSize, _masterKeyHandle!);
+            }
         }
 
         await RefreshE2eeList();
@@ -451,8 +452,17 @@ else
 
         try
         {
-            // チャンク取得・復号・結合はサービス層に委譲
-            byte[] combined = await Transfer.DownloadAsync(VolumeName, item.Entry.FileId, item.Entry.ChunkCount, _masterKeyHandle!);
+            byte[] combined;
+            if (item.Entry.KeyEpoch >= 1 && _volumeId is not null)
+            {
+                // 共有 v2: WrappedFileKey（その epoch の GroupKey でラップ）から DEK を復元して復号
+                combined = await Transfer.DownloadAsync(VolumeName, item.Entry, _volumeId, _groupKeysByEpoch);
+            }
+            else
+            {
+                // v1: チャンク取得・復号・結合はサービス層に委譲
+                combined = await Transfer.DownloadAsync(VolumeName, item.Entry.FileId, item.Entry.ChunkCount, _masterKeyHandle!);
+            }
 
             var base64 = Convert.ToBase64String(combined);
             await JS.InvokeVoidAsync("cistaDownload", item.PlainName, base64, "application/octet-stream");
@@ -546,9 +556,18 @@ else
             return;
         }
 
+        // 共有 v2 のチャンクは per-file DEK + v2 AAD のため、masterKey ストリーミングでは再生できない
+        if (e2eeItem.Entry.KeyEpoch >= 1)
+        {
+            _operationError = "共有 v2 のファイルはブラウザ内プレビューに対応していません。ダウンロードしてご利用ください。";
+            _selectedFile = null;
+            StateHasChanged();
+            return;
+        }
+
         try
         {
-            var (chunk0Data, _) = await E2eeApi.DownloadChunkAsync(VolumeName, e2eeItem.Entry.FileId, 0);
+            var (chunk0Data, _, _) = await E2eeApi.DownloadChunkAsync(VolumeName, e2eeItem.Entry.FileId, 0);
             if (chunk0Data.Length < 16) { await SetupStreamingPlayer(fileName); return; }
 
             var salt = new byte[16];

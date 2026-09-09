@@ -21,6 +21,10 @@ public sealed class ClientVolumeMountService : IDisposable
         public byte[]? MasterKey { get; set; }
         /// <summary>E2EE マスターキーの JS interop ハンドル。</summary>
         public string? E2eeMasterKeyHandle { get; set; }
+        /// <summary>共有 v2: epoch → GroupKey (base64)。KeyEpoch ≥ 1 のファイル/ファイル名の復号に使う。旧 epoch も保持（旧ファイル読取用）。</summary>
+        public Dictionary<int, string> GroupKeysByEpoch { get; init; } = new();
+        /// <summary>共有 v2: ボリュームヘッダの VolumeId（AAD bind 用）。v2 未移行では null。</summary>
+        public string? VolumeId { get; init; }
     }
 
     private readonly ConcurrentDictionary<string, MountedVolume> _mounted = new(StringComparer.Ordinal);
@@ -55,6 +59,31 @@ public sealed class ClientVolumeMountService : IDisposable
             ChunkSize = chunkSize,
             E2eeMasterKeyHandle = masterKeyHandle,
         };
+    }
+
+    /// <summary>
+    /// E2EE ボリュームをマウント（共有 v2: GroupKey 辞書 + VolumeId を保持）。
+    /// masterKeyHandle は v1 ファイルの読み取り用（masterKey を持たない v2 メンバーでは null）。
+    /// </summary>
+    public void MountE2ee(string volumeName, string? masterKeyHandle, int chunkSize, string encryptionMode,
+        string? volumeId, IReadOnlyDictionary<int, string> groupKeysByEpoch)
+    {
+        _mounted[volumeName] = new MountedVolume
+        {
+            VolumeName = volumeName,
+            EncryptionMode = encryptionMode,
+            ChunkSize = chunkSize,
+            E2eeMasterKeyHandle = masterKeyHandle,
+            VolumeId = volumeId,
+            GroupKeysByEpoch = new Dictionary<int, string>(groupKeysByEpoch),
+        };
+    }
+
+    /// <summary>共有 v2: ボリュームの GroupKey 辞書（epoch → base64）と VolumeId を取得。未マウント時は null。</summary>
+    public (string? VolumeId, IReadOnlyDictionary<int, string> GroupKeys)? GetE2eeV2Keys(string volumeName)
+    {
+        if (!_mounted.TryGetValue(volumeName, out var mv)) return null;
+        return (mv.VolumeId, mv.GroupKeysByEpoch);
     }
 
     /// <summary>ボリュームをロック（アンマウント）。</summary>

@@ -10,6 +10,7 @@
 @inject EncryptionSettingsClient EncSettingsApi
 @inject E2eeInterop E2ee
 @inject ClientVolumeMountService MountService
+@inject E2eeKeyResolverService KeyResolver
 @inject WasmAuthStateProvider Auth
 @inject NavigationManager Nav
 @inject IJSRuntime JS
@@ -340,8 +341,24 @@ else
                             <hr />
                             <h6>ECDH メンバー追加</h6>
                             <p class="form-text small">
-                                相手ユーザーが公開鍵を登録している場合、ECDH でマスターキーを共有します。
+                                相手ユーザーが公開鍵を登録している場合、ECDH で鍵を共有します。
+                                初回のみ相手の公開鍵 fingerprint を記録し（TOFU）、以降は変更を検知して警告します。
                             </p>
+                            @if (_shareKeyEpoch == 0)
+                            {
+                                <div class="alert alert-warning small">
+                                    このボリュームは共有 v2 形式（GroupKey epoch 管理・per-file 鍵・改ざん検知の強化）に未移行です。
+                                    メンバー追加・剥奪の前に移行すると、剥奪後の新データを剥奪ユーザーが読めなくなります（既読データの回収は保証しません）。
+                                </div>
+                                <button class="btn btn-sm btn-warning mb-2" disabled="@_isRotating"
+                                        @onclick="HandleUpgradeToV2">
+                                    @(_isRotating ? "移行中..." : "共有 v2 に移行（GroupKey epoch 開始）")
+                                </button>
+                            }
+                            else
+                            {
+                                <p class="form-text small text-success">共有 v2: 現行 GroupKey epoch = @_shareKeyEpoch</p>
+                            }
                             <div class="row g-2 align-items-end">
                                 <div class="col">
                                     <input class="form-control form-control-sm" placeholder="ユーザー名" @bind="_ecdhUsername" />
@@ -358,6 +375,42 @@ else
                         {
                             <button type="button" class="btn btn-primary" @onclick="HandleGrant">ユーザー追加</button>
                         }
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
+
+    <!-- 公開鍵 pin 不一致警告（TOFU trust anchor 検証） -->
+    @if (_pinMismatch is not null)
+    {
+        <div class="modal d-block modal-overlay" tabindex="-1">
+            <div class="modal-dialog modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">⚠ 公開鍵の変更を検知</h5>
+                        <button type="button" class="btn-close" @onclick="ClosePinMismatch"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="alert alert-danger">
+                            <strong>@_pinMismatch.Username</strong> の暗号化公開鍵が以前確認したものから変更されています。
+                            サーバー侵害または鍵更新の可能性があります。
+                        </div>
+                        <dl class="mb-2">
+                            <dt class="small">以前の fingerprint (SHA-256)</dt>
+                            <dd class="mb-2"><code class="text-break">@_pinMismatch.ExpectedFingerprint</code></dd>
+                            <dt class="small">現在の fingerprint (SHA-256)</dt>
+                            <dd><code class="text-break">@_pinMismatch.ActualFingerprint</code></dd>
+                        </dl>
+                        <p class="form-text small mb-0">
+                            操作は中断されました。あて先が正しいか、相手に別の経路で確認してください。
+                            「新しい鍵を信頼する」は、相手自身が鍵を更新したことを確認できた場合のみ実行してください。
+                            pin はこのブラウザにのみ保存され、サーバーには送信されません。
+                        </p>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" @onclick="ClosePinMismatch">キャンセル</button>
+                        <button type="button" class="btn btn-danger" @onclick="TrustNewKeyAsync">新しい鍵を信頼する</button>
                     </div>
                 </div>
             </div>
@@ -400,6 +453,18 @@ else
     private string _ecdhUsername = "";
 
     private string? _lockError;
+
+    // 公開鍵 pinning（TOFU trust anchor。pin は IndexedDB に origin ローカル保存）
+    private PinMismatchInfo? _pinMismatch;
+
+    // 共有 v2（GroupKey epoch）
+    private int _shareKeyEpoch;
+    private bool _isRotating;
+
+    /// <summary>公開鍵 fingerprint の pin 不一致情報（サーバー送信なし、このブラウザ内のみ）。</summary>
+    private sealed record PinMismatchInfo(string Username, string ExpectedFingerprint, string ActualFingerprint);
+
+    private enum RotateResult { NotV2, Completed, Aborted }
 
     private sealed class CreateModel
     {
@@ -590,8 +655,12 @@ else
         {
             if (_mountIsE2ee)
             {
-                // E2EE: サーバー側マウント（アクセス権チェック）+ クライアント側でマスターキー復号
+                // E2EE: サーバー側マウント（アクセス権チェック）+ クライアント側で鍵復号
                 var volInfo = await VolumeApi.MountE2eeAsync(_mountTarget!, Auth.CurrentUsername);
+
+                // 共有 v2: 自分宛ての全 epoch GroupKey をアンラップして保持
+                // （v2 形式ファイル/ファイル名の読取には GroupKey、v1 形式残置ファイルの読取には masterKey を使う）
+                var (groupKeys, volumeId) = await LoadGroupKeysForMountAsync(_mountPassword);
 
                 // wrapped key を取得してアンラップ
                 var wrappedKeyResp = await VolumeApi.GetWrappedKeyAsync(_mountTarget!, Auth.CurrentUsername);
@@ -601,72 +670,29 @@ else
                     return;
                 }
 
-                string? kekHandle = null;
                 string? mkHandle = null;
                 try
                 {
-                    if (string.Equals(wrappedKeyResp.WrapType, "ecdh", StringComparison.OrdinalIgnoreCase))
+                    if (volumeId is null)
                     {
-                        // ECDH ラップキー: localStorage の ECDH 秘密鍵（password 復号）で ECIES アンラップ
-                        if (string.IsNullOrEmpty(wrappedKeyResp.EphemeralPublicKey))
-                            throw new Exception("ECDH ラップキーに一時公開鍵が含まれていません。");
-
-                        string privJson = await JS.InvokeAsync<string>("localStorage.getItem", $"e2ee_privkey_{Auth.CurrentUsername}");
-                        if (string.IsNullOrEmpty(privJson))
-                            throw new Exception("ローカルに E2EE 秘密鍵が見つかりません。先に鍵ペアを生成してください。");
-
-                        using var privDoc = System.Text.Json.JsonDocument.Parse(privJson);
-                        var privRoot = privDoc.RootElement;
-                        string privHandle;
-                        try
-                        {
-                            privHandle = await E2ee.DecryptPrivateKey(
-                                privRoot.GetProperty("wrapped").GetString()!,
-                                privRoot.GetProperty("nonce").GetString()!,
-                                _mountPassword,
-                                privRoot.GetProperty("salt").GetString()!,
-                                E2eeInterop.ReadPrivKeyKdf(privRoot));
-                        }
-                        catch
-                        {
-                            throw new Exception("E2EE 鍵ペアのパスワードが正しくありません。E2EE 鍵ペア生成時のパスワードを入力してください。");
-                        }
-                        try
-                        {
-                            mkHandle = await E2ee.EcdhUnwrap(
-                                wrappedKeyResp.WrappedMasterKey.Nonce,
-                                wrappedKeyResp.WrappedMasterKey.Ciphertext,
-                                wrappedKeyResp.WrappedMasterKey.Tag,
-                                wrappedKeyResp.EphemeralPublicKey,
-                                privHandle);
-                        }
-                        finally { await E2ee.ClearKey(privHandle); }
+                        // v1 形式: wrapped key は masterKey
+                        mkHandle = await UnwrapMyMasterKeyAsync(wrappedKeyResp, _mountPassword);
                     }
-                    else
+                    else if (volInfo.OwnerUser == Auth.CurrentUsername
+                        && string.Equals(wrappedKeyResp.WrapType, "password", StringComparison.OrdinalIgnoreCase))
                     {
-                        kekHandle = await E2ee.DeriveKek(_mountPassword,
-                            wrappedKeyResp.Kdf.Salt,
-                            new E2eeKdfOptions(wrappedKeyResp.Kdf.Algorithm, wrappedKeyResp.Kdf.Iterations,
-                                wrappedKeyResp.Kdf.MemoryKiB, wrappedKeyResp.Kdf.TimeCost, wrappedKeyResp.Kdf.Parallelism),
-                            Auth.CurrentUsername);
-
-                        mkHandle = await E2ee.UnwrapMasterKey(
-                            wrappedKeyResp.WrappedMasterKey.Nonce,
-                            wrappedKeyResp.WrappedMasterKey.Ciphertext,
-                            wrappedKeyResp.WrappedMasterKey.Tag,
-                            kekHandle);
-
-                        await E2ee.ClearKey(kekHandle);
-                        kekHandle = null;
+                        // 共有 v2 オーナー: 残置 v1 ファイルの読取用に masterKey もアンラップ
+                        mkHandle = await UnwrapMyMasterKeyAsync(wrappedKeyResp, _mountPassword);
                     }
+                    // 共有 v2 メンバーは GroupKey のみで v2 ファイルを読む（masterKey は持たない）
 
                     // クライアント側マウント状態に登録
-                    MountService.MountE2ee(_mountTarget!, mkHandle, wrappedKeyResp.ChunkSize, volInfo.EncryptionMode);
+                    MountService.MountE2ee(_mountTarget!, mkHandle, wrappedKeyResp.ChunkSize,
+                        volInfo.EncryptionMode, volumeId, groupKeys);
                 }
                 catch
                 {
                     // 鍵残留防止
-                    if (kekHandle is not null) { try { await E2ee.ClearKey(kekHandle); } catch { } }
                     if (mkHandle is not null) { try { await E2ee.ClearKey(mkHandle); } catch { } }
                     throw;
                 }
@@ -726,6 +752,17 @@ else
         _grantGranterPassword = "";
         _ecdhUsername = "";
         _shareError = null;
+        _isRotating = false;
+        _pinMismatch = null;
+
+        // 共有 v2 の鍵 epoch（0 = 未移行）
+        _shareKeyEpoch = 0;
+        try
+        {
+            var gki = await VolumeApi.GetGroupKeyInfoAsync(name);
+            _shareKeyEpoch = gki?.KeyEpoch ?? 0;
+        }
+        catch { /* 旧サーバー等では group-key-info が無い。v2 未移行として扱う */ }
     }
 
     private void CloseShareDialog()
@@ -753,12 +790,32 @@ else
     private async Task HandleRevoke(string volumeName, string targetUser)
     {
         _shareError = null;
+        var vol = _volumes?.FirstOrDefault(v => v.Name == volumeName);
+        bool isE2eeOwner = vol is not null && vol.OwnerUser == Auth.CurrentUsername
+            && (vol.EncryptionMode is "e2ee" or "group-e2ee");
+
         try
         {
-            await VolumeApi.RevokeAccessAsync(volumeName, targetUser);
+            bool revokedByRotation = false;
+            if (isE2eeOwner)
+            {
+                if (_grantGranterPassword.Length == 0)
+                {
+                    _shareError = "共有 v2 ボリュームでは、剥奪時に GroupKey をローテーションするため自分のパスワードを入力してください。";
+                    return;
+                }
+                var result = await RotateGroupKeyAsync(volumeName, targetUser, _grantGranterPassword);
+                if (result == RotateResult.Aborted) return; // pin 不一致で中断（削除していない）
+                revokedByRotation = result == RotateResult.Completed;
+            }
+
+            if (!revokedByRotation)
+                await VolumeApi.RevokeAccessAsync(volumeName, targetUser);
+
             await LoadVolumesAsync();
-            var vol = _volumes?.FirstOrDefault(v => v.Name == _shareTarget);
-            if (vol is not null) _shareUsers = vol.AuthorizedUsers;
+            var v = _volumes?.FirstOrDefault(v => v.Name == _shareTarget);
+            if (v is not null) _shareUsers = v.AuthorizedUsers;
+            _grantGranterPassword = "";
         }
         catch (Exception ex) { _shareError = ex.Message; }
     }
@@ -802,70 +859,225 @@ else
 
         try
         {
+            string username = _ecdhUsername.Trim();
+
             // 相手の公開鍵を取得
-            string? recipientPubKey = await AccountApi.GetPublicKeyAsync(_ecdhUsername.Trim());
+            string? recipientPubKey = await AccountApi.GetPublicKeyAsync(username);
             if (recipientPubKey is null)
             {
                 _shareError = "相手ユーザーの公開鍵が登録されていません。先に設定ページで鍵ペアを生成してください。";
                 return;
             }
 
-            // 自分のパスワードでマスターキーをアンラップするため、パスワード入力が必要
+            // TOFU pin 検証: 初回は fingerprint を記録、2 回目以降は一致検証。
+            // 不一致時は中断し警告ダイアログを表示（自動的には新しい鍵を信頼しない）。
+            if (!await VerifyOrCreatePinAsync(username, recipientPubKey))
+                return;
+
+            // 自分のパスワードで鍵をアンラップするため、パスワード入力が必要
             if (string.IsNullOrWhiteSpace(_grantGranterPassword))
             {
-                _shareError = "自分のパスワードを入力してください（マスターキー復号用）。";
+                _shareError = "自分のパスワードを入力してください（鍵復号用）。";
                 return;
             }
 
-            // wrapped key を取得してアンラップ
-            var wrappedKeyResp = await VolumeApi.GetWrappedKeyAsync(_shareTarget!, Auth.CurrentUsername);
-            if (wrappedKeyResp is null)
+            UserWrappedKey wrapped;
+            var gki = await VolumeApi.GetGroupKeyInfoAsync(_shareTarget!);
+            if (gki is not null && gki.KeyEpoch >= 1)
             {
-                _shareError = "自分の wrapped key が見つかりません。";
-                return;
+                // 共有 v2: masterKey の代わりに現行 epoch GroupKey を新メンバーの公開鍵でラップ
+                // （rotation は行わない — 追加メンバーは現行 epoch 以降のデータのみ読める）
+                var myWrap = gki.MyGroupKeys.FirstOrDefault(k => k.Epoch == gki.KeyEpoch)
+                    ?? throw new Exception("自分宛ての現行 epoch GroupKey がありません。");
+                string groupKeyB64 = await UnwrapGroupKeyWithPasswordAsync(myWrap, gki.VolumeId, _grantGranterPassword);
+                var (ephPubKey, nonce, ct, tag) = await E2ee.EcdhWrapGroupKey(
+                    groupKeyB64, recipientPubKey, gki.VolumeId, gki.KeyEpoch, username);
+                wrapped = BuildEcdhWrappedKey(ephPubKey, nonce, ct, tag);
+            }
+            else
+            {
+                // v1: 自分の masterKey をアンラップして相手の公開鍵で ECIES ラップ（従来フロー）
+                var wrappedKeyResp = await VolumeApi.GetWrappedKeyAsync(_shareTarget!, Auth.CurrentUsername);
+                if (wrappedKeyResp is null)
+                {
+                    _shareError = "自分の wrapped key が見つかりません。";
+                    return;
+                }
+                string mkHandle = await UnwrapMyMasterKeyAsync(wrappedKeyResp, _grantGranterPassword);
+                try
+                {
+                    var (ephPubKey, nonce, ct, tag) = await E2ee.EcdhWrap(mkHandle, recipientPubKey);
+                    wrapped = BuildEcdhWrappedKey(ephPubKey, nonce, ct, tag);
+                }
+                finally { await E2ee.ClearKey(mkHandle); }
             }
 
-            string? kekHandle = null;
-            string? mkHandle = null;
-            try
-            {
-                kekHandle = await E2ee.DeriveKek(_grantGranterPassword,
-                    wrappedKeyResp.Kdf.Salt,
-                    new E2eeKdfOptions(wrappedKeyResp.Kdf.Algorithm, wrappedKeyResp.Kdf.Iterations,
-                        wrappedKeyResp.Kdf.MemoryKiB, wrappedKeyResp.Kdf.TimeCost, wrappedKeyResp.Kdf.Parallelism),
-                    Auth.CurrentUsername);
+            await VolumeApi.AddE2eeWrappedKeyAsync(_shareTarget!, username, wrapped);
 
-                mkHandle = await E2ee.UnwrapMasterKey(
-                    wrappedKeyResp.WrappedMasterKey.Nonce,
-                    wrappedKeyResp.WrappedMasterKey.Ciphertext,
-                    wrappedKeyResp.WrappedMasterKey.Tag,
-                    kekHandle);
-
-                await E2ee.ClearKey(kekHandle);
-                kekHandle = null;
-
-                // 相手の公開鍵で ECIES ラップ
-                var (ephPubKey, nonce, ct, tag) = await E2ee.EcdhWrap(mkHandle, recipientPubKey);
-                await E2ee.ClearKey(mkHandle);
-                mkHandle = null;
-
-                var ecdhWrappedKey = BuildEcdhWrappedKey(ephPubKey, nonce, ct, tag);
-                await VolumeApi.AddE2eeWrappedKeyAsync(_shareTarget!, _ecdhUsername.Trim(), ecdhWrappedKey);
-
-                await LoadVolumesAsync();
-                var vol = _volumes?.FirstOrDefault(v => v.Name == _shareTarget);
-                if (vol is not null) _shareUsers = vol.AuthorizedUsers;
-                _ecdhUsername = "";
-                _grantGranterPassword = "";
-            }
-            finally
-            {
-                // 異常系で残った鍵ハンドルを必ずクリア
-                if (kekHandle is not null) { try { await E2ee.ClearKey(kekHandle); } catch { } }
-                if (mkHandle is not null) { try { await E2ee.ClearKey(mkHandle); } catch { } }
-            }
+            await LoadVolumesAsync();
+            var vol = _volumes?.FirstOrDefault(v => v.Name == _shareTarget);
+            if (vol is not null) _shareUsers = vol.AuthorizedUsers;
+            _ecdhUsername = "";
+            _grantGranterPassword = "";
         }
         catch (Exception ex) { _shareError = ex.Message; }
+    }
+
+    /// <summary>共有 v2 未移行の E2EE ボリュームを owner が移行する（GroupKey epoch 1 を生成）。</summary>
+    private async Task HandleUpgradeToV2()
+    {
+        if (_shareTarget is null || _isRotating) return;
+        _shareError = null;
+        _isRotating = true;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_grantGranterPassword))
+            {
+                _shareError = "移行には自分のパスワードが必要です（現行鍵の復旧・再ラップ用）。入力してから実行してください。";
+                return;
+            }
+            var result = await RotateGroupKeyAsync(_shareTarget, targetUser: null, _grantGranterPassword);
+            if (result == RotateResult.Aborted) return;
+            _shareKeyEpoch += 1;
+            _grantGranterPassword = "";
+        }
+        catch (Exception ex) { _shareError = ex.Message; }
+        finally { _isRotating = false; }
+    }
+
+    // ---- 公開鍵 pinning（TOFU trust anchor）----
+
+    /// <summary>
+    /// TOFU pin 検証。pin 未登録なら fingerprint を記録して保存（初回使用）。
+    /// 登録済みで fingerprint が一致しない場合は操作を中断し、警告ダイアログを表示して false を返す
+    /// （自動的には新しい鍵を信頼しない。pin 更新はユーザーの明示操作のみ）。
+    /// pin はこのブラウザの IndexedDB にのみ保存され、サーバーには送信されない。
+    /// </summary>
+    /// <summary>TOFU pin 検証（初回は記録）。不一致時は警告モーダル表示して false。</summary>
+    private async Task<bool> VerifyOrCreatePinAsync(string username, string publicKeyBase64)
+    {
+        var (result, pin, fingerprint) = await KeyResolver.CheckPinAsync(username, publicKeyBase64);
+        if (result == PinCheckResult.Mismatch)
+        {
+            _pinMismatch = new PinMismatchInfo(username, pin!.FingerprintSha256, fingerprint);
+            return false;
+        }
+        return true;
+    }
+
+    private void ClosePinMismatch() => _pinMismatch = null;
+
+    /// <summary>pin 不一致検知後の明示的な pin 更新（新しい鍵を信頼する）。
+    /// pin 更新のみを行い、中断した共有操作は自動再実行しない（改めて操作を行うこと）。</summary>
+    private async Task TrustNewKeyAsync()
+    {
+        if (_pinMismatch is null) return;
+        await KeyResolver.TrustNewKeyAsync(_pinMismatch.Username, _pinMismatch.ActualFingerprint);
+        _pinMismatch = null;
+    }
+
+    // ---- 共有 v2（GroupKey epoch / per-file DEK）共通ヘルパー（実装は E2eeKeyResolverService） ----
+
+    /// <summary>localStorage の E2EE 秘密鍵を password で復号してハンドルを返す。未登録・password 不正時は例外。</summary>
+    private Task<string> LoadE2eePrivateKeyAsync(string password)
+        => KeyResolver.LoadPrivateKeyAsync(Auth.CurrentUsername, password);
+
+    /// <summary>自分宛ての wrapped masterKey をアンラップしてハンドルを返す
+    /// （ECDH wrap は E2EE 秘密鍵、password wrap は KEK 導出でアンラップ）。</summary>
+    private Task<string> UnwrapMyMasterKeyAsync(WrappedKeyResponse wrappedKeyResp, string password)
+        => KeyResolver.UnwrapMyMasterKeyAsync(wrappedKeyResp, Auth.CurrentUsername, password);
+
+    /// <summary>自分宛ての GroupKey wrap を E2EE 秘密鍵（password 復号）でアンラップして base64 を返す。</summary>
+    private Task<string> UnwrapGroupKeyWithPasswordAsync(GroupKeyWrapInfoJson wrap, string volumeId, string password)
+        => KeyResolver.UnwrapGroupKeyAsync(wrap, volumeId, Auth.CurrentUsername, password);
+
+    /// <summary>マウント時: 自分宛ての全 epoch GroupKey をアンラップする。v2 未移行ボリュームでは (空, null) を返す。</summary>
+    private Task<(IReadOnlyDictionary<int, string> GroupKeys, string? VolumeId)> LoadGroupKeysForMountAsync(string password)
+        => KeyResolver.LoadGroupKeysAsync(_mountTarget!, Auth.CurrentUsername, password);
+
+    /// <summary>
+    /// 共有 v2: 新 GroupKey を生成して remaining members（targetUser を除く全メンバー）の公開鍵で
+    /// ECIES ラップし、rotate-group-key で epoch を進める。targetUser 指定時はそのユーザーの
+    /// 鍵エントリも全削除される（revoke）。targetUser == null は v2 昇格（epoch 1 開始）。
+    /// ローテーション後、旧 epoch の per-file DEK を新 epoch GroupKey に再ラップする（チャンク本体は不変）。
+    /// v2 未移行ボリューム（昇格以外の呼び出し）では NotV2 を返し何もしない。
+    /// </summary>
+    private async Task<RotateResult> RotateGroupKeyAsync(string volumeName, string? targetUser, string password)
+    {
+        var gki = await VolumeApi.GetGroupKeyInfoAsync(volumeName);
+        if (gki is null) return RotateResult.NotV2;
+        string volumeId = gki.VolumeId;
+        int currentEpoch = gki.KeyEpoch;
+        int newEpoch = currentEpoch + 1;
+
+        // 現行 epoch の GroupKey を取得（旧 per-file DEK の再ラップ用）
+        string oldGroupKeyB64 = "";
+        if (currentEpoch >= 1)
+        {
+            var myWrap = gki.MyGroupKeys.FirstOrDefault(k => k.Epoch == currentEpoch)
+                ?? throw new Exception("自分宛ての現行 epoch GroupKey がありません。");
+            oldGroupKeyB64 = await UnwrapGroupKeyWithPasswordAsync(myWrap, volumeId, password);
+        }
+
+        // remaining members（削除対象を除く）の公開鍵を取得して pin 検証 → wrap 生成
+        var members = (await VolumeApi.GetMemberPublicKeysAsync(volumeName))
+            .Where(m => m.Username != targetUser)
+            .ToList();
+        if (members.Count == 0)
+            throw new Exception("remaining members がいません（自分宛ての wrap が少なくとも 1 つ必要です）。");
+
+        string newGroupKeyB64 = await E2ee.GenerateGroupKeyV2();
+        var wraps = new Dictionary<string, UserWrappedKey>();
+        foreach (var m in members)
+        {
+            if (m.PublicKeyBase64 is null)
+                throw new Exception($"ユーザー '{m.Username}' の公開鍵が未登録のため GroupKey をローテーションできません。");
+            if (!await VerifyOrCreatePinAsync(m.Username, m.PublicKeyBase64))
+                return RotateResult.Aborted; // pin 不一致 — 中断（鍵の削除も行わない）
+            var (ephPubKey, nonce, ct, tag) = await E2ee.EcdhWrapGroupKey(
+                newGroupKeyB64, m.PublicKeyBase64, volumeId, newEpoch, m.Username);
+            wraps[m.Username] = BuildEcdhWrappedKey(ephPubKey, nonce, ct, tag);
+        }
+
+        if (targetUser is not null && wraps.ContainsKey(targetUser))
+            throw new Exception("削除対象ユーザー宛ての wrap が含まれています。");
+        if (!wraps.ContainsKey(Auth.CurrentUsername))
+            throw new Exception("自分宛ての wrap が含まれていません（オーナーは remaining members に含まれる必要があります）。");
+
+        await VolumeApi.RotateGroupKeyAsync(volumeName, newEpoch, wraps, removedUsername: targetUser);
+
+        if (currentEpoch >= 1)
+            await RewrapAllFileKeysAsync(volumeName, volumeId, currentEpoch, oldGroupKeyB64, newGroupKeyB64, newEpoch);
+
+        return RotateResult.Completed;
+    }
+
+    /// <summary>旧 epoch の per-file DEK を新 epoch GroupKey に再ラップしてサーバーに登録する（チャンク本体は不変）。
+    /// v1 形式ファイル（KeyEpoch == 0）は再ラップ対象外（オーナーの masterKey でのみ読めるまま）。</summary>
+    private async Task RewrapAllFileKeysAsync(string volumeName, string volumeId,
+        int oldEpoch, string oldGroupKeyB64, string newGroupKeyB64, int newEpoch)
+    {
+        var files = await E2eeApi.ListFilesAsync(volumeName);
+        var rewraps = new List<E2eeRewrapFileKeyEntry>();
+        foreach (var f in files.Files)
+        {
+            if (f.KeyEpoch != oldEpoch || f.WrappedFileKey is null) continue;
+            string fileKeyB64 = await E2ee.UnwrapFileKey(
+                Convert.ToBase64String(f.WrappedFileKey.Nonce),
+                Convert.ToBase64String(f.WrappedFileKey.Ciphertext),
+                Convert.ToBase64String(f.WrappedFileKey.Tag),
+                oldGroupKeyB64, volumeId, f.FileId, f.KeyEpoch);
+            var (nonce, ct, tag) = await E2ee.WrapFileKey(fileKeyB64, newGroupKeyB64, volumeId, f.FileId, newEpoch);
+            rewraps.Add(new E2eeRewrapFileKeyEntry(f.FileId, newEpoch, new WrappedAeadKeyParams
+            {
+                Algorithm = "aes-256-gcm",
+                Nonce = Convert.FromBase64String(nonce),
+                Ciphertext = Convert.FromBase64String(ct),
+                Tag = Convert.FromBase64String(tag),
+            }));
+        }
+        if (rewraps.Count > 0)
+            await VolumeApi.RewrapFileKeysAsync(volumeName, rewraps);
     }
 
     private async void OnAuthStateChanged()

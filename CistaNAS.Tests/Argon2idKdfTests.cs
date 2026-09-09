@@ -184,6 +184,6 @@ public class Argon2idKdfTests
         // t=0 は ValidateParams で拒否される
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             KeyDerivation.DeriveKek("alice", "pw", Enumerable.Repeat((byte)0x27, 16).ToArray(),
-                new KdfSpec(KdfSpec.Argon2idRaw, 0, 1024, 1, timeCost: 0)));
+                new KdfSpec(KdfSpec.Argon2idRaw, 0, 1024, 1, TimeCost: 0)));
     }
 }

@@ -77,6 +77,21 @@ public sealed class E2eeFileService
         var header = GetE2eeHeader(volumeName);
         if (request.EncryptedLength < 0 || request.ChunkCount is <= 0 or > 100_000)
             throw new FileServiceException("ファイルサイズまたはチャンク数が不正です。");
+
+        // crypto format v2: KeyEpoch ≥ 1 は共有 v2 形式。ラップ済み DEK が必須で、
+        // epoch はボリュームの現行 epoch と一致する（旧 epoch の GroupKey で新規ファイルを作成させない）。
+        // KeyEpoch == 0 は v1 形式（単独 E2EE、masterKey 派生 fileKey）。
+        if (request.KeyEpoch < 0 || request.KeyEpoch > header.KeyEpoch)
+            throw new FileServiceException($"KeyEpoch {request.KeyEpoch} は不正です（0-{header.KeyEpoch}）。");
+        if (request.KeyEpoch >= 1)
+        {
+            if (request.WrappedFileKey is null)
+                throw new FileServiceException("KeyEpoch ≥ 1 のファイルには WrappedFileKey が必要です。");
+            if (header.GetGroupEpoch(request.KeyEpoch) is null)
+                throw new FileServiceException($"GroupKey epoch {request.KeyEpoch} が存在しません。");
+            ValidateWrappedFileKeyShape(request.WrappedFileKey);
+        }
+
         long minimumEncryptedLength = checked((long)SaltSize + (long)request.ChunkCount * TagSize);
         long maximumEncryptedLength = checked(minimumEncryptedLength
             + (long)request.ChunkCount * header.ChunkSize);
@@ -130,6 +145,8 @@ public sealed class E2eeFileService
                 Offset = offset,
                 EncryptedLength = request.EncryptedLength,
                 ChunkCount = request.ChunkCount,
+                KeyEpoch = request.KeyEpoch,
+                WrappedFileKey = request.KeyEpoch >= 1 ? request.WrappedFileKey : null,
                 CreatedAt = DateTimeOffset.UtcNow,
                 ModifiedAt = DateTimeOffset.UtcNow,
                 OwnerUsername = ownerUsername,
@@ -259,6 +276,14 @@ public sealed class E2eeFileService
                     ? entry.ChunkRevisions[chunkIndex] + 1
                     : 0;
 
+                // crypto format v2: チャンクを暗号化したときの keyEpoch を記録する。
+                // クライアントは entry.KeyEpoch（カタログ取得時点の値）を ctx に使って暗号化するため
+                // サーバーも同じ値を刻む。rotation 後の rewrap（entry.KeyEpoch のみ更新）でも
+                // 旧チャンクはここに記録された epoch で復号できる。
+                while (entry.ChunkKeyEpochs.Count <= chunkIndex)
+                    entry.ChunkKeyEpochs.Add(entry.KeyEpoch);
+                entry.ChunkKeyEpochs[chunkIndex] = entry.KeyEpoch;
+
                 if (newChunkObjectId is not null)
                 {
                     while (entry.ChunkObjectIds.Count <= chunkIndex)
@@ -296,8 +321,8 @@ public sealed class E2eeFileService
         }
     }
 
-    /// <summary>チャンクをダウンロード。</summary>
-    public async Task<(Stream Stream, long Length, int Revision)> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex, CancellationToken ct = default)
+    /// <summary>チャンクをダウンロード。revision と（v2 の場合）暗号化時の keyEpoch を返す。</summary>
+    public async Task<(Stream Stream, long Length, int Revision, int KeyEpoch)> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
 
@@ -315,6 +340,7 @@ public sealed class E2eeFileService
                 throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です。");
 
             int revision = chunkIndex < entry.ChunkRevisions.Count ? entry.ChunkRevisions[chunkIndex] : 0;
+            int keyEpoch = chunkIndex < entry.ChunkKeyEpochs.Count ? entry.ChunkKeyEpochs[chunkIndex] : entry.KeyEpoch;
 
             long chunkLength = chunkIndex < entry.ChunkSizes.Count
                 ? entry.ChunkSizes[chunkIndex]
@@ -326,7 +352,7 @@ public sealed class E2eeFileService
                 byte[]? chunkData = await _chunkStore.ReadChunkAsync(volumeName, chunkObjectId, chunkIndex, ct);
                 if (chunkData is null)
                     throw new FileServiceException($"チャンク {chunkIndex} が見つかりません。");
-                return (new GateReadStream(new MemoryStream(chunkData), readLock), chunkData.Length, revision);
+                return (new GateReadStream(new MemoryStream(chunkData), readLock), chunkData.Length, revision, keyEpoch);
             }
 
             long chunkOffset = entry.Offset;
@@ -338,7 +364,7 @@ public sealed class E2eeFileService
             try
             {
                 fs.Seek(chunkOffset, SeekOrigin.Begin);
-                return (new GateReadStream(new SubStream(fs, chunkLength), readLock), chunkLength, revision);
+                return (new GateReadStream(new SubStream(fs, chunkLength), readLock), chunkLength, revision, keyEpoch);
             }
             catch
             {
@@ -445,6 +471,60 @@ public sealed class E2eeFileService
         {
             volGate.Release();
         }
+    }
+
+    /// <summary>
+    /// crypto format v2: ファイル鍵を新しい GroupKey epoch に再ラップする（GroupKey ローテーション後の
+    /// epoch migration / 更新時 migration）。チャンク本体は不変 — WrappedFileKey と KeyEpoch のみ更新。
+    /// オーナーまたは現行メンバーがクライアント側で DEK をアンラップ → 新 epoch の GroupKey で再ラップして送信。
+    /// </summary>
+    public async Task RewrapFileKeysAsync(string volumeName, E2eeRewrapFileKeysRequest request, string requesterUsername, CancellationToken ct = default)
+    {
+        var header = GetE2eeHeader(volumeName);
+        if (string.IsNullOrEmpty(header.VolumeId))
+            throw new FileServiceException("このボリュームは共有 v2 形式に移行されていません。");
+        if (!header.HasUserAccess(requesterUsername))
+            throw new FileServiceException("このボリュームへのアクセス権がありません。");
+
+        var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await volGate.WaitAsync(ct);
+        try
+        {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
+            var catalog = await LoadCatalogAsync(volumeName, ct);
+            foreach (var rewrap in request.Rewraps)
+            {
+                if (!catalog.Files.TryGetValue(rewrap.FileId, out var entry))
+                    throw new FileServiceException($"ファイル '{rewrap.FileId}' が見つかりません。");
+                // 再ラップ先 epoch は現行 epoch のみ（旧 epoch への巻き戻しを防止）。
+                if (rewrap.KeyEpoch != header.KeyEpoch || header.GetGroupEpoch(rewrap.KeyEpoch) is null)
+                    throw new FileServiceException($"KeyEpoch {rewrap.KeyEpoch} は不正です（現行: {header.KeyEpoch}）。");
+                if (rewrap.KeyEpoch < entry.KeyEpoch)
+                    throw new FileServiceException($"ファイル '{rewrap.FileId}' の KeyEpoch を巻き戻せません。");
+                ValidateWrappedFileKeyShape(rewrap.WrappedFileKey);
+
+                entry.KeyEpoch = rewrap.KeyEpoch;
+                entry.WrappedFileKey = rewrap.WrappedFileKey;
+            }
+            await SaveCatalogAsync(volumeName, catalog, ct);
+        }
+        finally
+        {
+            volGate.Release();
+        }
+    }
+
+    /// <summary>WrappedFileKey の形状検証（algorithm / サイズ）。</summary>
+    private static void ValidateWrappedFileKeyShape(VolumeHeader.WrappedKey wrapped)
+    {
+        if (!string.Equals(wrapped.Algorithm, "aes-256-gcm", StringComparison.Ordinal))
+            throw new FileServiceException("WrappedFileKey のアルゴリズムは aes-256-gcm のみサポートです。");
+        if (wrapped.Nonce.Length != E2eeCrypto.GcmNonceSize)
+            throw new FileServiceException("WrappedFileKey の nonce サイズが不正です。");
+        if (wrapped.Ciphertext.Length != E2eeCrypto.MasterKeySize)
+            throw new FileServiceException("WrappedFileKey の ciphertext サイズが不正です。");
+        if (wrapped.Tag.Length != E2eeCrypto.GcmTagSize)
+            throw new FileServiceException("WrappedFileKey の tag サイズが不正です。");
     }
 
     private static long GetReservedEncryptedLength(VolumeHeader header, int chunkCount, long declaredLength)

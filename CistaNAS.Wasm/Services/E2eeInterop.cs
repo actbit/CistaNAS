@@ -35,6 +35,7 @@ public sealed record E2eeKdfOptions(string Algorithm, int Iterations, int Memory
 public sealed class E2eeInterop(IJSRuntime js) : IAsyncDisposable
 {
     private IJSObjectReference? _module;
+    private IJSObjectReference? _pinModule;
 
     private async ValueTask<IJSObjectReference> GetModule()
     {
@@ -164,6 +165,11 @@ public sealed class E2eeInterop(IJSRuntime js) : IAsyncDisposable
             await _module.DisposeAsync();
             _module = null;
         }
+        if (_pinModule is not null)
+        {
+            await _pinModule.DisposeAsync();
+            _pinModule = null;
+        }
     }
 
     // ---- ECDH key pair management ----
@@ -260,4 +266,153 @@ public sealed class E2eeInterop(IJSRuntime js) : IAsyncDisposable
         return await mod.InvokeAsync<string>(
             "decryptFromInvitation", ciphertextBase64, nonceBase64, invitationKeyHandle);
     }
+
+    // ---- crypto format v2: GroupKey / per-file DEK / AAD bind ----
+
+    /// <summary>v2: GroupKey (32B) を CSPRNG 生成して base64 で返す。</summary>
+    public async Task<string> GenerateGroupKeyV2()
+    {
+        var mod = await GetModule();
+        return await mod.InvokeAsync<string>("generateGroupKeyV2");
+    }
+
+    /// <summary>v2: per-file DEK (32B) を CSPRNG 生成して base64 で返す。</summary>
+    public async Task<string> GenerateFileKeyV2()
+    {
+        var mod = await GetModule();
+        return await mod.InvokeAsync<string>("generateFileKeyV2");
+    }
+
+    /// <summary>
+    /// v2: raw 鍵 (base64, 32B) を AES-GCM CryptoKey として JS 側に登録してハンドルを返す。
+    /// 共有 v2 では GroupKey でファイル名も暗号化する（<see cref="EncryptFilename"/>/<see cref="DecryptFilename"/> に渡す）。
+    /// </summary>
+    public async Task<string> ImportKeyHandleFromB64(string keyBase64)
+    {
+        var mod = await GetModule();
+        return await mod.InvokeAsync<string>("importKeyHandleFromB64", keyBase64);
+    }
+
+    /// <summary>v2: 公開鍵 (raw 65B, base64) の SHA-256 fingerprint（大文字 hex）を計算する。</summary>
+    public async Task<string> ComputeFingerprint(string publicKeyBase64)
+    {
+        var mod = await GetModule();
+        return await mod.InvokeAsync<string>("computeFingerprint", publicKeyBase64);
+    }
+
+    /// <summary>v2: GroupKey を recipient 公開鍵で ECIES-V2 ラップ（AAD に volumeId/keyEpoch/username を bind）。</summary>
+    public async Task<(string EphemeralPublicKey, string Nonce, string Ciphertext, string Tag)> EcdhWrapGroupKey(
+        string groupKeyBase64, string recipientPublicKeyBase64, string volumeId, int keyEpoch, string username)
+    {
+        var mod = await GetModule();
+        var result = await mod.InvokeAsync<JsonElement>(
+            "ecdhWrapGroupKey", groupKeyBase64, recipientPublicKeyBase64, volumeId, keyEpoch, username);
+        return (
+            result.GetProperty("ephemeralPublicKey").GetString()!,
+            result.GetProperty("nonce").GetString()!,
+            result.GetProperty("ciphertext").GetString()!,
+            result.GetProperty("tag").GetString()!
+        );
+    }
+
+    /// <summary>v2: 自分の秘密鍵で ECIES-V2 アンラップして GroupKey (base64) を返す。</summary>
+    public async Task<string> EcdhUnwrapGroupKey(
+        string nonceBase64, string ciphertextBase64, string tagBase64,
+        string ephemeralPublicKeyBase64, string privateKeyHandle, string volumeId, int keyEpoch, string username)
+    {
+        var mod = await GetModule();
+        return await mod.InvokeAsync<string>(
+            "ecdhUnwrapGroupKey", nonceBase64, ciphertextBase64, tagBase64,
+            ephemeralPublicKeyBase64, privateKeyHandle, volumeId, keyEpoch, username);
+    }
+
+    /// <summary>v2: per-file DEK を GroupKey で AEAD ラップ（AAD に volumeId/fileId/keyEpoch を bind）。</summary>
+    public async Task<(string Nonce, string Ciphertext, string Tag)> WrapFileKey(
+        string fileKeyBase64, string groupKeyBase64, string volumeId, string fileId, int keyEpoch)
+    {
+        var mod = await GetModule();
+        var result = await mod.InvokeAsync<JsonElement>(
+            "wrapFileKey", fileKeyBase64, groupKeyBase64, volumeId, fileId, keyEpoch);
+        return (
+            result.GetProperty("nonce").GetString()!,
+            result.GetProperty("ciphertext").GetString()!,
+            result.GetProperty("tag").GetString()!
+        );
+    }
+
+    /// <summary>v2: GroupKey で per-file DEK をアンラップして fileKey (base64) を返す。</summary>
+    public async Task<string> UnwrapFileKey(
+        string nonceBase64, string ciphertextBase64, string tagBase64,
+        string groupKeyBase64, string volumeId, string fileId, int keyEpoch)
+    {
+        var mod = await GetModule();
+        return await mod.InvokeAsync<string>(
+            "unwrapFileKey", nonceBase64, ciphertextBase64, tagBase64,
+            groupKeyBase64, volumeId, fileId, keyEpoch);
+    }
+
+    /// <summary>v2: per-file DEK でチャンクを暗号化（AAD に volumeId/fileId/chunkIndex/revision/keyEpoch を bind）。</summary>
+    public async Task<string> EncryptChunkV2(
+        byte[] plainBytes, string fileKeyBase64, int chunkIndex, int revision, int keyEpoch,
+        string volumeId, string fileId, string fileSaltBase64, bool isFirstChunk)
+    {
+        var mod = await GetModule();
+        string plainBase64 = Convert.ToBase64String(plainBytes);
+        return await mod.InvokeAsync<string>(
+            "encryptChunkV2", plainBase64, fileKeyBase64, chunkIndex, revision, keyEpoch,
+            volumeId, fileId, fileSaltBase64, isFirstChunk);
+    }
+
+    /// <summary>v2: per-file DEK でチャンクを復号。</summary>
+    public async Task<byte[]> DecryptChunkV2(
+        string encBase64, string fileKeyBase64, int chunkIndex, int revision, int keyEpoch,
+        string volumeId, string fileId, string fileSaltBase64)
+    {
+        var mod = await GetModule();
+        string plainBase64 = await mod.InvokeAsync<string>(
+            "decryptChunkV2", encBase64, fileKeyBase64, chunkIndex, revision, keyEpoch,
+            volumeId, fileId, fileSaltBase64);
+        return Convert.FromBase64String(plainBase64);
+    }
+
+    // ---- 公開鍵 pin（TOFU trust anchor。IndexedDB に origin ローカル保存、サーバー送信なし）----
+
+    /// <summary>pinStore.js モジュール（e2ee.js とは別）を遅延ロードする。</summary>
+    private async ValueTask<IJSObjectReference> GetPinModule()
+    {
+        _pinModule ??= await js.InvokeAsync<IJSObjectReference>("import", "./js/pinStore.js");
+        return _pinModule;
+    }
+
+    /// <summary>username の pin レコードを取得。未登録なら null。</summary>
+    public async Task<PinRecord?> GetPinAsync(string username)
+    {
+        var mod = await GetPinModule();
+        var result = await mod.InvokeAsync<JsonElement?>("getPin", username);
+        if (result is null || result.Value.ValueKind != JsonValueKind.Object)
+            return null;
+        var r = result.Value;
+        return new PinRecord(
+            r.GetProperty("username").GetString()!,
+            r.GetProperty("fingerprintSha256").GetString()!,
+            r.TryGetProperty("createdAt", out var c) ? c.GetString() : null,
+            r.TryGetProperty("updatedAt", out var u) ? u.GetString() : null);
+    }
+
+    /// <summary>pin を保存（既存レコードの createdAt は維持し updatedAt を更新）。</summary>
+    public async Task PutPinAsync(string username, string fingerprintSha256)
+    {
+        var mod = await GetPinModule();
+        await mod.InvokeVoidAsync("putPin", username, fingerprintSha256);
+    }
+
+    /// <summary>pin を削除（pin 更新フローの「現在の pin を破棄」用）。</summary>
+    public async Task DeletePinAsync(string username)
+    {
+        var mod = await GetPinModule();
+        await mod.InvokeVoidAsync("deletePin", username);
+    }
 }
+
+/// <summary>IndexedDB に保存される公開鍵 pin レコード（pinStore.js と同じ形）。</summary>
+public sealed record PinRecord(string Username, string FingerprintSha256, string? CreatedAt, string? UpdatedAt);
