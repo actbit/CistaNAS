@@ -131,4 +131,39 @@ public class UiRegressionTests(PlaywrightWebAppFixture fixture)
         var sidebar = await page.Locator(".sidebar").InnerTextAsync();
         Assert.Contains("ログイン", sidebar);
     }
+
+    /// <summary>
+    /// SPA シェル (index.html) が Blazor / razor から呼ばれるグローバル JS 関数を
+    /// すべて読み込んでいること。script タグ漏れがあると IJSRuntime 呼び出しが
+    /// 実行時まで気づきにくい形で壊れる（cistaDownload 未定義で E2EE ダウンロードが
+    /// 機能しなかった実バグの回帰防止）。
+    /// </summary>
+    [Fact]
+    public async Task BrowserShell_LoadsAllRequiredGlobalFunctions()
+    {
+        await using var context = await fixture.CreateAnonymousContextAsync();
+        var page = await context.NewPageAsync();
+
+        await page.GotoAsync(fixture.BaseUrl + "/",
+            options: new PageGotoOptions { WaitUntil = WaitUntilState.Load });
+
+        // load イベント時点で classic script も module script (e2ee.js) も実行済み
+        var missing = await page.EvaluateAsync<string[]>(@"() => {
+            const required = [
+                ['cista.openUrl',              () => window.cista?.openUrl],
+                ['cista.closeNavbar',          () => window.cista?.closeNavbar],
+                ['cistaDownload',              () => window.cistaDownload],
+                ['cistaCreateMediaBlobUrl',    () => window.cistaCreateMediaBlobUrl],
+                ['cistaMedia.setStreamUrl',    () => window.cistaMedia?.setStreamUrl],
+                ['cistaMedia.streamE2eeDirect',() => window.cistaMedia?.streamE2eeDirect],
+                ['cistaE2ee.decryptChunk',     () => window.cistaE2ee?.decryptChunk],
+                ['cistaE2ee.generateFileSalt', () => window.cistaE2ee?.generateFileSalt],
+                ['hashwasm.argon2id',          () => window.hashwasm?.argon2id],
+            ];
+            return required.filter(([, get]) => typeof get() !== 'function').map(([name]) => name);
+        }");
+
+        Assert.True(missing.Length == 0,
+            $"index.html が読み込んでいないグローバル関数: {string.Join(", ", missing)}");
+    }
 }
