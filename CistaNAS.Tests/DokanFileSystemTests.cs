@@ -319,8 +319,8 @@ public class DokanFileSystemTests
         });
 
         // SetFileKey 前は false、後は true が混在しているはず
-        Assert.True(results.Contains(true));
-        Assert.True(results.Contains(false));
+        Assert.Contains(true, results);
+        Assert.Contains(false, results);
     }
 
     [Fact]

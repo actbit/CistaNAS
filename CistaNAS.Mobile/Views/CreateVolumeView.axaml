@@ -6,7 +6,7 @@
   <ScrollViewer Padding="24,32">
     <StackPanel Spacing="16" MaxWidth="480">
       <TextBlock Text="ボリューム作成" FontSize="22" FontWeight="SemiBold" />
-      <TextBox Text="{Binding VolumeName}" Watermark="ボリューム名" />
+      <TextBox Text="{Binding VolumeName}" PlaceholderText="ボリューム名" />
 
       <StackPanel Spacing="8">
         <CheckBox Content="E2EE (クライアント側暗号化)" IsChecked="{Binding IsE2ee}" />
@@ -14,8 +14,8 @@
                    TextWrapping="Wrap" Foreground="Gray" FontSize="12" />
       </StackPanel>
 
-      <TextBox Text="{Binding Password}" Watermark="パスワード (8 文字以上)" PasswordChar="●" />
-      <TextBox Text="{Binding PasswordConfirm}" Watermark="パスワード (確認)" PasswordChar="●" />
+      <TextBox Text="{Binding Password}" PlaceholderText="パスワード (8 文字以上)" PasswordChar="●" />
+      <TextBox Text="{Binding PasswordConfirm}" PlaceholderText="パスワード (確認)" PasswordChar="●" />
 
       <Button Content="作成" Command="{Binding CreateCommand}" HorizontalAlignment="Left" Padding="24,10" />
       <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />

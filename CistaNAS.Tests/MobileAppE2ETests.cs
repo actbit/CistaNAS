@@ -80,7 +80,7 @@ public class MobileAppE2ETests(AspireFixture fixture)
         var app = new AppServices(
             new MemorySecureKeyStore(), new MemoryAppSettings(),
             new TempFileCacheProvider(), new RecordingExternalViewer(), handler);
-        app.Session.ConfigureServer(fixture.Http.BaseAddress.ToString());
+        app.Session.ConfigureServer(fixture.Http.BaseAddress!.ToString());
         return app;
     }
 
@@ -109,7 +109,7 @@ public class MobileAppE2ETests(AspireFixture fixture)
     /// <summary>Connect → Login までを実行し、VolumesViewModel へ遷移させる。</summary>
     private async Task<VolumesViewModel> LoginAsync(AppServices app)
     {
-        var connect = new ConnectViewModel(app) { ServerUrl = fixture.Http.BaseAddress.ToString() };
+        var connect = new ConnectViewModel(app) { ServerUrl = fixture.Http.BaseAddress!.ToString() };
         app.Navigation.NavigateTo(connect);
         await connect.ConnectCommand.ExecuteAsync(null);
         Assert.Null(connect.Error);
@@ -226,7 +226,7 @@ public class MobileAppE2ETests(AspireFixture fixture)
 
         // --- サーバー側暗号化ボリューム作成 ---
         volumes.CreateVolumeCommand.Execute(null);
-        var create = (CreateVolumeViewModel)app.Navigation.Current;
+        var create = (CreateVolumeViewModel)app.Navigation.Current!;
         string volName = $"m-server-{Guid.NewGuid():N}";
         create.VolumeName = volName;
         create.Password = VolumePassword;

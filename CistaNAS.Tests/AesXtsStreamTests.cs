@@ -148,7 +148,7 @@ public class AesXtsStreamTests
         Assert.Equal(seekPos, stream.Position);
 
         byte[] decrypted = new byte[SectorSize];
-        stream.Read(decrypted, 0, decrypted.Length);
+        stream.ReadExactly(decrypted, 0, decrypted.Length);
 
         byte[] expected = plain[seekPos..(seekPos + SectorSize)];
         Assert.Equal(expected, decrypted);
@@ -172,7 +172,7 @@ public class AesXtsStreamTests
         Assert.Equal(SectorSize, stream.Position);
 
         byte[] decrypted = new byte[SectorSize];
-        stream.Read(decrypted, 0, decrypted.Length);
+        stream.ReadExactly(decrypted, 0, decrypted.Length);
 
         byte[] expected = plain[SectorSize..(SectorSize * 2)];
         Assert.Equal(expected, decrypted);
@@ -193,7 +193,7 @@ public class AesXtsStreamTests
         Assert.Equal(size - SectorSize, stream.Position);
 
         byte[] decrypted = new byte[SectorSize];
-        stream.Read(decrypted, 0, decrypted.Length);
+        stream.ReadExactly(decrypted, 0, decrypted.Length);
 
         byte[] expected = plain[(size - SectorSize)..size];
         Assert.Equal(expected, decrypted);
@@ -220,7 +220,7 @@ public class AesXtsStreamTests
 
         stream.Seek(updateOffset, SeekOrigin.Begin);
         byte[] readBack = new byte[updateSize];
-        stream.Read(readBack, 0, readBack.Length);
+        stream.ReadExactly(readBack, 0, readBack.Length);
 
         Assert.Equal(updateData, readBack);
 
@@ -337,7 +337,7 @@ public class AesXtsStreamTests
 
         stream.Seek(0, SeekOrigin.Begin);
         byte[] decrypted = new byte[size];
-        stream.Read(decrypted, 0, size);
+        stream.ReadExactly(decrypted, 0, size);
 
         byte[] buf = new byte[10];
         int n = stream.Read(buf, 0, buf.Length);
@@ -453,7 +453,7 @@ public class AesXtsStreamTests
         Assert.Equal(0, stream.Position);
 
         byte[] buf = new byte[SectorSize];
-        stream.Read(buf, 0, SectorSize);
+        stream.ReadExactly(buf, 0, SectorSize);
         Assert.Equal(SectorSize, stream.Position);
 
         stream.Dispose();
@@ -518,13 +518,13 @@ public class AesXtsStreamTests
         // 先頭データを確認
         stream.Seek(0, SeekOrigin.Begin);
         byte[] readHead = new byte[SectorSize];
-        stream.Read(readHead, 0, SectorSize);
+        stream.ReadExactly(readHead, 0, SectorSize);
         Assert.Equal(headData, readHead);
 
         // 末尾データを確認
         stream.Seek(size - SectorSize, SeekOrigin.Begin);
         byte[] readTail = new byte[SectorSize];
-        stream.Read(readTail, 0, SectorSize);
+        stream.ReadExactly(readTail, 0, SectorSize);
         Assert.Equal(tailData, readTail);
 
         stream.Dispose();

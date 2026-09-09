@@ -8,7 +8,7 @@
       <TextBlock Text="CistaNAS サーバーに接続" FontSize="22" FontWeight="SemiBold" />
       <TextBlock Text="NAS のアドレスを入力してください (例: http://192.168.1.10:5000)"
                  TextWrapping="Wrap" Foreground="Gray" />
-      <TextBox Text="{Binding ServerUrl}" Watermark="http://192.168.1.10:5000" />
+      <TextBox Text="{Binding ServerUrl}" PlaceholderText="http://192.168.1.10:5000" />
 
       <Button Content="接続" Command="{Binding ConnectCommand}" HorizontalAlignment="Left"
               Padding="24,10" />
