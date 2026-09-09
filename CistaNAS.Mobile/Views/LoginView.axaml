@@ -6,8 +6,8 @@
   <ScrollViewer Padding="24,32">
     <StackPanel Spacing="16" MaxWidth="480">
       <TextBlock Text="ログイン" FontSize="22" FontWeight="SemiBold" />
-      <TextBox Text="{Binding Username}" Watermark="ユーザー名" />
-      <TextBox Text="{Binding Password}" Watermark="パスワード" PasswordChar="●" />
+      <TextBox Text="{Binding Username}" PlaceholderText="ユーザー名" />
+      <TextBox Text="{Binding Password}" PlaceholderText="パスワード" PasswordChar="●" />
       <Button Content="ログイン" Command="{Binding LoginCommand}" HorizontalAlignment="Left" Padding="24,10" />
       <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />
       <TextBlock Text="{Binding Error}" IsVisible="{Binding Error, Converter={x:Static ObjectConverters.IsNotNull}}"

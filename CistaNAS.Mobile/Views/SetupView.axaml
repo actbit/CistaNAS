@@ -8,9 +8,9 @@
       <TextBlock Text="初期セットアップ" FontSize="22" FontWeight="SemiBold" />
       <TextBlock Text="このサーバーにはまだユーザーがいません。管理者アカウントを作成してください。"
                  TextWrapping="Wrap" Foreground="Gray" />
-      <TextBox Text="{Binding Username}" Watermark="ユーザー名" />
-      <TextBox Text="{Binding Password}" Watermark="パスワード (8 文字以上)" PasswordChar="●" />
-      <TextBox Text="{Binding PasswordConfirm}" Watermark="パスワード (確認)" PasswordChar="●" />
+      <TextBox Text="{Binding Username}" PlaceholderText="ユーザー名" />
+      <TextBox Text="{Binding Password}" PlaceholderText="パスワード (8 文字以上)" PasswordChar="●" />
+      <TextBox Text="{Binding PasswordConfirm}" PlaceholderText="パスワード (確認)" PasswordChar="●" />
       <Button Content="管理者を作成してログイン" Command="{Binding SetupCommand}" HorizontalAlignment="Left" Padding="24,10" />
       <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />
       <TextBlock Text="{Binding Error}" IsVisible="{Binding Error, Converter={x:Static ObjectConverters.IsNotNull}}"

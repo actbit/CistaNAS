@@ -34,7 +34,7 @@ public class ChaCha20Poly1305Tests
 
         if (method != null)
         {
-            uint[] state = (uint[])method.Invoke(null, new object[] { key, nonce, counter });
+            uint[] state = (uint[])method.Invoke(null, new object[] { key, nonce, counter })!;
 
             // RFC 7539 §2.4.1 期待値
             Assert.Equal(0x61707865u, state[0]);  // "expa"
@@ -95,7 +95,7 @@ public class ChaCha20Poly1305Tests
 
         if (blockMethod != null)
         {
-            uint[] result = (uint[])blockMethod.Invoke(null, new object[] { initialState });
+            uint[] result = (uint[])blockMethod.Invoke(null, new object[] { initialState })!;
 
             // すべての状態要素を検証（最初の不一致で詳細を表示）
             for (int i = 0; i < 16; i++)
@@ -250,7 +250,7 @@ public class ChaCha20Poly1305Tests
 
         if (method != null)
         {
-            uint[] state = (uint[])method.Invoke(null, new object[] { key, nonce, counter });
+            uint[] state = (uint[])method.Invoke(null, new object[] { key, nonce, counter })!;
 
             for (int i = 0; i < 16; i++)
             {
@@ -292,7 +292,7 @@ public class ChaCha20Poly1305Tests
 
         if (blockMethod != null)
         {
-            uint[] result = (uint[])blockMethod.Invoke(null, new object[] { initialState });
+            uint[] result = (uint[])blockMethod.Invoke(null, new object[] { initialState })!;
 
             // すべての状態要素を検証（最初の不一致で詳細を表示）
             for (int i = 0; i < 16; i++)
@@ -563,7 +563,7 @@ public class ChaCha20Poly1305Tests
         byte[] decrypted = ClientChaCha20.Decrypt(ciphertext, tag, nonce, key);
 
         Assert.Equal(plaintext, decrypted);
-        Assert.Equal(0, ciphertext.Length);
+        Assert.Empty(ciphertext);
         Assert.Equal(16, tag.Length);
     }
 

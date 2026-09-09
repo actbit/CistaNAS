@@ -205,12 +205,12 @@ public class ChunkedReadStreamTests
         {
             // 1回目: チャンク読み込み
             byte[] buf1 = new byte[100];
-            stream.Read(buf1, 0, 100);
+            stream.ReadExactly(buf1, 0, 100);
 
             // 2回目: 先頭に戻って同じチャンク読み込み（キャッシュヒット）
             stream.Seek(0, SeekOrigin.Begin);
             byte[] buf2 = new byte[100];
-            stream.Read(buf2, 0, 100);
+            stream.ReadExactly(buf2, 0, 100);
 
             Assert.Equal(buf1, buf2);
         }

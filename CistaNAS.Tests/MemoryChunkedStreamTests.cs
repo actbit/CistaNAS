@@ -151,11 +151,11 @@ public class MemoryChunkedStreamTests
         using (stream)
         {
             byte[] buf1 = new byte[100];
-            stream.Read(buf1, 0, 100);
+            stream.ReadExactly(buf1, 0, 100);
 
             stream.Seek(0, SeekOrigin.Begin);
             byte[] buf2 = new byte[100];
-            stream.Read(buf2, 0, 100);
+            stream.ReadExactly(buf2, 0, 100);
 
             Assert.Equal(buf1, buf2);
         }
