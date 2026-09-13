@@ -13,4 +13,9 @@
     <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.Authentication" Version="10.0.8" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- 暗号化長計算などの共有プリミティブ（実 crypto はブラウザ側 JS が担う） -->
+    <ProjectReference Include="..\CistaNAS.Shared\CistaNAS.Shared.csproj" />
+  </ItemGroup>
+
 </Project>

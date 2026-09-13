@@ -1,3 +1,4 @@
+using CistaNAS.Shared.Crypto;
 using CistaNAS.Wasm.Models;
 using Microsoft.JSInterop;
 
@@ -20,7 +21,8 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
     /// <summary>E2EE ファイルをチャンク暗号化しながらアップロードする。
     /// 失敗時は作成済みの fileId をロールバック削除し、リースを確実に解放する。</summary>
     public async Task UploadAsync(string volumeName, string fileName, Stream content,
-        long totalSize, int chunkSize, string masterKeyHandle)
+        long totalSize, int chunkSize, string masterKeyHandle,
+        IProgress<double>? progress = null, CancellationToken ct = default)
     {
         string encName = await e2ee.EncryptFilename(fileName, masterKeyHandle);
         string fileSaltB64 = await e2ee.GenerateFileSalt();
@@ -39,12 +41,13 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
             long bytesRemaining = totalSize;
             for (int i = 0; i < totalChunks; i++)
             {
+                ct.ThrowIfCancellationRequested();
                 int readLen = (int)Math.Min(chunkSize, bytesRemaining);
                 byte[] buffer = new byte[readLen];
                 int read = 0;
                 while (read < readLen)
                 {
-                    int n = await content.ReadAsync(buffer, read, readLen - read);
+                    int n = await content.ReadAsync(buffer, read, readLen - read, ct);
                     if (n == 0) break;
                     read += n;
                 }
@@ -55,10 +58,12 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
 
                 await api.UploadChunkAsync(volumeName, entry.FileId, i, encBytes, writeLease);
                 bytesRemaining -= read;
+                progress?.Report((double)(i + 1) / totalChunks * 100);
             }
 
+            // chunkCount も確定させる（Mobile.Core と同じプロトコル。縮小確定に必要）。
             await api.FinalizeFileAsync(volumeName, entry.FileId,
-                ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease);
+                ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease, totalChunks);
         }
         catch
         {
@@ -76,25 +81,31 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
     /// <summary>E2EE ファイルを全チャンクダウンロードして復号・結合した平文を返す。
     /// Dokan 差分保存で再暗号化されたチャンク (revision >= 1) にも対応。</summary>
     public async Task<byte[]> DownloadAsync(string volumeName, string fileId,
-        int chunkCount, string masterKeyHandle)
+        int chunkCount, string masterKeyHandle,
+        IProgress<double>? progress = null, CancellationToken ct = default)
     {
         var decryptedChunks = new List<byte[]>(chunkCount);
         string? fileSaltB64 = null;
 
         for (int i = 0; i < chunkCount; i++)
         {
+            ct.ThrowIfCancellationRequested();
             (byte[] encData, int revision, _) = await api.DownloadChunkAsync(volumeName, fileId, i);
 
             if (i == 0 && fileSaltB64 is null)
             {
-                byte[] salt = new byte[16];
-                Buffer.BlockCopy(encData, 0, salt, 0, 16);
+                // チャンク 0 の先頭 16B は fileSalt。短い場合は暗号文が壊れている。
+                if (encData.Length <= E2eeCrypto.SaltSize)
+                    throw new InvalidDataException("チャンク 0 が不正です（fileSalt を含みません）。");
+                byte[] salt = new byte[E2eeCrypto.SaltSize];
+                Buffer.BlockCopy(encData, 0, salt, 0, E2eeCrypto.SaltSize);
                 fileSaltB64 = Convert.ToBase64String(salt);
             }
 
             string encB64 = Convert.ToBase64String(encData);
             // revision >= 1 のチャンク（Dokan 差分保存で再暗号化済み）は nonce 導出に revision が必須
             decryptedChunks.Add(await e2ee.DecryptChunk(encB64, masterKeyHandle, i, fileSaltB64 ?? "", revision));
+            progress?.Report((double)(i + 1) / chunkCount * 100);
         }
 
         return CombineChunks(decryptedChunks);
@@ -109,7 +120,8 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
     /// チャンク AAD には volumeId/fileId/chunkIndex/revision/keyEpoch が bind される。
     /// </summary>
     public async Task<E2eeFileEntry> UploadV2Async(string volumeName, string fileName, Stream content,
-        long totalSize, int chunkSize, E2eeV2KeyContext keyContext)
+        long totalSize, int chunkSize, E2eeV2KeyContext keyContext,
+        IProgress<double>? progress = null, CancellationToken ct = default)
     {
         string fileKeyB64 = await e2ee.GenerateFileKeyV2();
         string groupKeyHandle = await e2ee.ImportKeyHandleFromB64(keyContext.GroupKeyB64);
@@ -150,12 +162,13 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
             long bytesRemaining = totalSize;
             for (int i = 0; i < totalChunks; i++)
             {
+                ct.ThrowIfCancellationRequested();
                 int readLen = (int)Math.Min(chunkSize, bytesRemaining);
                 byte[] buffer = new byte[readLen];
                 int read = 0;
                 while (read < readLen)
                 {
-                    int n = await content.ReadAsync(buffer, read, readLen - read);
+                    int n = await content.ReadAsync(buffer, read, readLen - read, ct);
                     if (n == 0) break;
                     read += n;
                 }
@@ -168,10 +181,12 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
 
                 await api.UploadChunkAsync(volumeName, entry.FileId, i, encBytes, writeLease);
                 bytesRemaining -= read;
+                progress?.Report((double)(i + 1) / totalChunks * 100);
             }
 
+            // chunkCount も確定させる（Mobile.Core と同じプロトコル。縮小確定に必要）。
             await api.FinalizeFileAsync(volumeName, entry.FileId,
-                ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease);
+                ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease, totalChunks);
             return entry;
         }
         catch
@@ -191,7 +206,8 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
     /// GroupKey は epoch → base64 の辞書で渡す（旧 epoch ファイルは旧 epoch GroupKey で復号）。
     /// v1 ファイル（KeyEpoch == 0）は masterKey 版 <see cref="DownloadAsync(string,string,int,string)"/> を使用。</summary>
     public async Task<byte[]> DownloadAsync(string volumeName, E2eeFileEntry entry, string volumeId,
-        IReadOnlyDictionary<int, string> groupKeysByEpoch)
+        IReadOnlyDictionary<int, string> groupKeysByEpoch,
+        IProgress<double>? progress = null, CancellationToken ct = default)
     {
         string fileKeyB64 = await UnwrapFileKeyAsync(volumeId, entry, groupKeysByEpoch);
         var decryptedChunks = new List<byte[]>(entry.ChunkCount);
@@ -199,12 +215,16 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
 
         for (int i = 0; i < entry.ChunkCount; i++)
         {
+            ct.ThrowIfCancellationRequested();
             (byte[] encData, int revision, int chunkEpoch) = await api.DownloadChunkAsync(volumeName, entry.FileId, i);
 
             if (i == 0 && fileSaltB64 is null)
             {
-                byte[] salt = new byte[16];
-                Buffer.BlockCopy(encData, 0, salt, 0, 16);
+                // チャンク 0 の先頭 16B は fileSalt。短い場合は暗号文が壊れている。
+                if (encData.Length <= E2eeCrypto.SaltSize)
+                    throw new InvalidDataException("チャンク 0 が不正です（fileSalt を含みません）。");
+                byte[] salt = new byte[E2eeCrypto.SaltSize];
+                Buffer.BlockCopy(encData, 0, salt, 0, E2eeCrypto.SaltSize);
                 fileSaltB64 = Convert.ToBase64String(salt);
             }
 
@@ -213,6 +233,7 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
             // サーバーがチャンクごとに返す epoch を使う（旧サーバー / ヘッダ欠如時は entry.KeyEpoch）。
             decryptedChunks.Add(await e2ee.DecryptChunkV2(encB64, fileKeyB64, i, revision,
                 chunkEpoch > 0 ? chunkEpoch : entry.KeyEpoch, volumeId, entry.FileId, fileSaltB64 ?? ""));
+            progress?.Report((double)(i + 1) / entry.ChunkCount * 100);
         }
 
         return CombineChunks(decryptedChunks);
@@ -303,10 +324,7 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
         }
     }
 
-    /// <summary>暗号化後サイズの推定 (salt 16 bytes + chunk ごとに tag 16 bytes)。</summary>
+    /// <summary>暗号化後サイズの推定。計算式は <see cref="E2eeCrypto.ComputeEncryptedLength"/>（Shared）に一元管理。</summary>
     public static long ComputeEncryptedLength(long plainSize, int chunkSize)
-    {
-        int totalChunks = Math.Max(1, (int)((plainSize + chunkSize - 1) / chunkSize));
-        return plainSize + 16 + (long)totalChunks * 16;
-    }
+        => E2eeCrypto.ComputeEncryptedLength(plainSize, chunkSize);
 }
