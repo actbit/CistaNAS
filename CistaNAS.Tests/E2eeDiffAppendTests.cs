@@ -5,6 +5,7 @@ using System.Text.Json;
 using CistaNAS.Client;
 using CistaNAS.Client.Api;
 using CistaNAS.Shared.Crypto;
+using DokanNet;
 
 namespace CistaNAS.Tests;
 
@@ -252,6 +253,9 @@ public class E2eeDiffAppendTests
         /// <summary>受理された upload-chunk の呼び出し順（順序検証用）。</summary>
         public List<int> UploadOrder { get; } = new();
 
+        /// <summary>finalize-file リクエストの記録（actualEncryptedLength, chunkCount）。</summary>
+        public List<(long ActualEncryptedLength, int? ChunkCount)> FinalizeRequests { get; } = new();
+
         /// <summary>サーバーが記録しているチャンク数（追記で拡張、truncate で縮小）。</summary>
         public int ChunkCount { get; private set; }
 
@@ -347,7 +351,21 @@ public class E2eeDiffAppendTests
             }
 
             if (op == "finalize-file" && request.Method == HttpMethod.Patch)
+            {
+                string body = request.Content!.ReadAsStringAsync(ct).GetAwaiter().GetResult();
+                using var doc = JsonDocument.Parse(body);
+                long encLen = doc.RootElement.GetProperty("actualEncryptedLength").GetInt64();
+                int? chunkCount = doc.RootElement.TryGetProperty("chunkCount", out var cc)
+                    && cc.ValueKind == JsonValueKind.Number ? cc.GetInt32() : null;
+                FinalizeRequests.Add((encLen, chunkCount));
+                // 縮小確定: 実サーバーと同様に chunkCount 以降を論理切り詰め
+                if (chunkCount is int n && n < ChunkCount)
+                {
+                    for (int i = n; i < ChunkCount; i++) Chunks.Remove(i);
+                    ChunkCount = n;
+                }
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+            }
 
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
         }
@@ -454,5 +472,117 @@ public class E2eeDiffAppendTests
         byte[] expected2 = new byte[150];
         data.CopyTo(expected2, 100);
         Assert.Equal(expected2, chunk2);
+    }
+
+    private static (CistaNasFileSystem Fs, FakeStatefulE2eeServer Server, byte[] FileSalt, byte[] FileKey, byte[] Plain)
+        CreateStatefulExistingFile(int plainLength)
+    {
+        byte[] masterKey = RandomNumberGenerator.GetBytes(32);
+        byte[] plain = new byte[plainLength];
+        for (int i = 0; i < plainLength; i++) plain[i] = (byte)(i % 251);
+        byte[] fileSalt = RandomNumberGenerator.GetBytes(16);
+        byte[] fileKey = E2eeCrypto.DeriveFileKey(masterKey, fileSalt);
+
+        var server = new FakeStatefulE2eeServer(masterKey, plain, fileKey, fileSalt).Init();
+        var api = new CistaNasApiClient(new HttpClient(server) { BaseAddress = new Uri("http://test/") });
+        var fs = new CistaNasFileSystem(api, masterKey, Volume, chunkSize: ChunkSize);
+        return (fs, server, fileSalt, fileKey, plain);
+    }
+
+    /// <summary>Dokan コールバック（Cleanup / SetEndOfFile / FlushFileBuffers）を
+    /// 実 Dokan なしで呼ぶための <see cref="IDokanFileInfo"/> スタブ。</summary>
+    private sealed class StubFileInfo(object? context = null) : IDokanFileInfo
+    {
+        public object? Context { get; set; } = context;
+        public bool DeletePending { get; set; }
+        public bool IsDirectory { get; set; }
+        public bool NoCache { get; set; }
+        public bool PagingIo { get; set; }
+        public int ProcessId => 1;
+        public bool SynchronousIo { get; set; }
+        public bool WriteToEndOfFile { get; set; }
+        public System.Security.Principal.WindowsIdentity GetRequestor() => throw new NotSupportedException();
+        public bool TryResetTimeout(int milliseconds) => true;
+    }
+
+    [Fact]
+    public void Cleanupでバッファが永続化されゲートは破棄されない()
+    {
+        // 回帰: Cleanup がゲートを Release せずに WriteState.Dispose → Gate.Dispose すると、
+        // ゲート待ちの Dokan ディスパッチスレッドが永久にブロックする。
+        // SemaphoreSlim.Dispose は待機者を起こさないため、待機中タスクが永久に完了しなくなる。
+        var (fs, server, fileSalt, fileKey, plain) = CreateStatefulExistingFile(5000);
+        byte[] data = Enumerable.Range(0, 100).Select(i => (byte)(30 + i % 60)).ToArray();
+
+        var ws = new CistaNasFileSystem.E2eeChunkWriteState(fs, PlainName, FakeStatefulE2eeServer.FileId);
+        var info = new StubFileInfo { Context = ws };
+        ws.Write(data, 0, data.Length, 0); // 未永続化の書き込みを残したまま Cleanup
+
+        // 別スレッドでゲート待ちをキューイングしてから Cleanup を呼ぶ
+        Task waiter = Task.Run(() =>
+        {
+            ws.Gate.Wait();
+            ws.Gate.Release();
+        });
+        SpinWait.SpinUntil(() => waiter.Status == TaskStatus.WaitingForActivation, 1000);
+
+        fs.Cleanup("\\" + PlainName, info);
+        Assert.True(waiter.Wait(TimeSpan.FromSeconds(10)), "Cleanup 後もゲート待ちスレッドがブロックされています");
+
+        // Cleanup 経由で永続化されている
+        Assert.Null(info.Context);
+        Assert.Equal(1, server.Chunks[0].Revision);
+        byte[] decrypted = E2eeCrypto.DecryptChunk(server.Chunks[0].Cipher, fileKey, 0, fileSalt, revision: 1);
+        byte[] expected = plain[..ChunkSize]; // ファイル 5000B のチャンク 0 はフル 4096B
+        data.CopyTo(expected, 0);
+        Assert.Equal(expected, decrypted);
+
+        // Cleanup 後もゲートは使用可能（Dispose が SemaphoreSlim を破棄しないことの確認）
+        ws.Gate.Wait();
+        ws.Gate.Release();
+
+        // finalize は暗号化長の統一関数と一致する（手書き式 16L + len + n*16 の排除）
+        Assert.Equal(
+            (E2eeCrypto.ComputeEncryptedLength(5000, ChunkSize), 2),
+            server.FinalizeRequests[^1]);
+    }
+
+    [Fact]
+    public void SetEndOfFileはゲートで直列化されtruncationがfinalizeに反映される()
+    {
+        // 回帰 1: SetEndOfFile がゲート外で SetDeclaredSize すると、アップロード中の
+        //   MarkPersisted により truncation が無音に欠落する。
+        // 回帰 2: FinalizeFile に chunkCount が渡らず縮小が確定しない。
+        var (fs, server, fileSalt, fileKey, plain) = CreateStatefulExistingFile(5000);
+
+        var ws = new CistaNasFileSystem.E2eeChunkWriteState(fs, PlainName, FakeStatefulE2eeServer.FileId);
+        var info = new StubFileInfo { Context = ws };
+
+        // ゲートを保持している間、SetEndOfFile はブロックする（直列化の確認）。
+        // 回帰 1 の状態（ゲート外実行）ではブロックせず即座に完了してしまう。
+        ws.Gate.Wait();
+        Task<NtStatus> setEnd = Task.Run(() => fs.SetEndOfFile("\\" + PlainName, 3000, info));
+        Assert.False(setEnd.Wait(300), "SetEndOfFile がゲートを待機していません（直列化されていない）");
+        ws.Gate.Release();
+
+        Assert.True(setEnd.Wait(TimeSpan.FromSeconds(10)));
+        Assert.Equal(DokanResult.Success, setEnd.Result);
+
+        // FlushFileBuffers で truncation を永続化。回帰 1 の状態では
+        // HasPending が MarkPersisted で失われ finalize 自体が走らない。
+        Assert.Equal(DokanResult.Success, fs.FlushFileBuffers("\\" + PlainName, info));
+
+        // finalize: 統一関数の暗号化長 + 縮小後のチャンク数
+        Assert.Single(server.FinalizeRequests);
+        Assert.Equal(
+            (E2eeCrypto.ComputeEncryptedLength(3000, ChunkSize), 1),
+            server.FinalizeRequests[0]);
+        Assert.Equal(1, server.ChunkCount);
+        Assert.False(server.Chunks.ContainsKey(1)); // 縮小でチャンク 1 は論理削除
+
+        // チャンク 0 は末尾チャンク化（4096 → 3000 バイト）のため RMW で再アップロードされている
+        Assert.Equal(1, server.Chunks[0].Revision);
+        byte[] decrypted = E2eeCrypto.DecryptChunk(server.Chunks[0].Cipher, fileKey, 0, fileSalt, revision: 1);
+        Assert.Equal(plain[..3000], decrypted);
     }
 }
