@@ -234,4 +234,171 @@ public class E2eeDiffAppendTests
         byte[] decrypted = E2eeCrypto.DecryptChunk(server.UploadedChunks[1], fileKey, 1, fileSalt, revision: 1);
         Assert.Equal(expected, decrypted);
     }
+
+    /// <summary>
+    /// サーバー側状態（チャンク数・チャンクごとの revision・暗号文）を追跡する Fake。
+    /// upload-chunk は実サーバー（E2eeFileService）と同じ規則で revision を進める:
+    /// 置換（index が既存チャンク数未満）は rev+1、追記（index == 既存チャンク数）は rev 0。
+    /// chunk-hash は未アップロードのチャンクに対して 404 を返す。
+    /// </summary>
+    private sealed class FakeStatefulE2eeServer(byte[] masterKey, byte[] plain, byte[] fileKey, byte[] fileSalt) : HttpMessageHandler
+    {
+        public const string FileId = "f1";
+
+        /// <summary>サーバーに保存済みのチャンク（暗号文, revision）。</summary>
+        public Dictionary<int, (byte[] Cipher, int Revision)> Chunks { get; } = new();
+
+        /// <summary>サーバーが記録しているチャンク数（追記で拡張、truncate で縮小）。</summary>
+        public int ChunkCount { get; private set; }
+
+        /// <summary>初期平文をチャンク分割してサーバー状態を初期化する。</summary>
+        public FakeStatefulE2eeServer Init()
+        {
+            int count = (plain.Length + ChunkSize - 1) / ChunkSize;
+            for (int i = 0; i < count; i++)
+            {
+                int len = Math.Min(ChunkSize, plain.Length - i * ChunkSize);
+                byte[] enc = E2eeCrypto.EncryptChunk(
+                    plain[(i * ChunkSize)..(i * ChunkSize + len)], fileKey, i, fileSalt, isFirstChunk: i == 0);
+                Chunks[i] = (enc, 0);
+            }
+            ChunkCount = count;
+            return this;
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            string path = request.RequestUri!.AbsolutePath;
+            var segments = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            string op = segments.Length >= 5 ? segments[4] : "";
+
+            if (op == "files" && request.Method == HttpMethod.Get && segments.Length == 5)
+            {
+                string encName = E2eeCrypto.EncryptFilename(PlainName, masterKey);
+                long encLength = E2eeCrypto.SaltSize + plain.Length + (long)E2eeCrypto.GcmTagSize * Chunks.Count;
+                var payload = new
+                {
+                    files = new[]
+                    {
+                        new
+                        {
+                            fileId = FileId,
+                            encryptedName = encName,
+                            encryptedLength = encLength,
+                            chunkCount = ChunkCount,
+                            createdAt = "2026-01-01T00:00:00Z",
+                            modifiedAt = "2026-01-01T00:00:00Z",
+                        },
+                    },
+                };
+                return JsonR(HttpStatusCode.OK, JsonSerializer.Serialize(payload));
+            }
+
+            // .../files/{id}/write-lease/renew
+            if (op == "files" && segments.Length >= 7 && segments[6] == "write-lease"
+                && segments[^1] == "renew" && request.Method == HttpMethod.Post)
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+
+            // .../files/{id}/write-lease
+            if (op == "files" && segments.Length >= 6 && segments[^1] == "write-lease")
+            {
+                if (request.Method == HttpMethod.Post)
+                    return JsonR(HttpStatusCode.OK, """{"token":"lease-1"}""");
+                if (request.Method == HttpMethod.Delete)
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+            }
+
+            if (op == "chunk-hash" && request.Method == HttpMethod.Get)
+            {
+                int index = int.Parse(segments[6]);
+                if (index >= ChunkCount || !Chunks.ContainsKey(index))
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+                return JsonR(HttpStatusCode.OK,
+                    $$"""{"hash":"fake-hash","revision":{{Chunks[index].Revision}}}""");
+            }
+
+            if (op == "download-chunk" && request.Method == HttpMethod.Get)
+            {
+                int index = int.Parse(segments[6]);
+                if (index >= ChunkCount || !Chunks.ContainsKey(index))
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+                byte[] enc = Chunks[index].Cipher;
+                var res = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(enc) };
+                res.Headers.Add("X-Chunk-Revision", Chunks[index].Revision.ToString());
+                return Task.FromResult(res);
+            }
+
+            if (op == "upload-chunk" && request.Method == HttpMethod.Post)
+            {
+                int index = int.Parse(segments[6]);
+                byte[] cipher = request.Content!.ReadAsByteArrayAsync(ct).GetAwaiter().GetResult();
+                bool isReplace = index < ChunkCount && Chunks.ContainsKey(index);
+                int revision = isReplace ? Chunks[index].Revision + 1 : 0;
+                Chunks[index] = (cipher, revision);
+                if (index >= ChunkCount) ChunkCount = index + 1; // 末尾追記: チャンクを拡張
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+            }
+
+            if (op == "finalize-file" && request.Method == HttpMethod.Patch)
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+        }
+
+        private static Task<HttpResponseMessage> JsonR(HttpStatusCode code, string json) => Task.FromResult(new HttpResponseMessage(code)
+        {
+            Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json"),
+        });
+    }
+
+    [Fact]
+    public void 同一ハンドル内で追記したチャンクは次回保存でゼロ上書きされずrevisionも一致する()
+    {
+        // 回帰 1: ClearPersistedChunks 後も _existingChunkCount が handle-open 時点で凍結され、
+        //   同一ハンドル内で追記アップロードしたチャンクが「未存在」扱いになって全ゼロで
+        //   再アップロードされ、永続化データがサイレントに破壊される。
+        // 回帰 2: 追記チャンクの 2 回目以降の置換が rev 0 で暗号化され、サーバー記録の
+        //   revision（rev+1）と食い違って復号不能になる（ノンス再利用にもなる）。
+        byte[] masterKey = RandomNumberGenerator.GetBytes(32);
+        byte[] plain = new byte[3000];
+        for (int i = 0; i < plain.Length; i++) plain[i] = (byte)(i % 251);
+        byte[] fileSalt = RandomNumberGenerator.GetBytes(16);
+        byte[] fileKey = E2eeCrypto.DeriveFileKey(masterKey, fileSalt);
+
+        var server = new FakeStatefulE2eeServer(masterKey, plain, fileKey, fileSalt).Init();
+        var api = new CistaNasApiClient(new HttpClient(server) { BaseAddress = new Uri("http://test/") });
+        var fs = new CistaNasFileSystem(api, masterKey, Volume, chunkSize: ChunkSize);
+
+        byte[] append = Enumerable.Range(0, 2000).Select(i => (byte)(50 + i % 200)).ToArray();
+        byte[] patch = Enumerable.Range(0, 100).Select(i => (byte)(220 + i % 30)).ToArray();
+
+        var ws = new CistaNasFileSystem.E2eeChunkWriteState(fs, PlainName, FakeStatefulE2eeServer.FileId);
+        try
+        {
+            // 1 回目の persist: 3000..5000 への追記でチャンク 0（置換）とチャンク 1（追記 rev 0）を送る
+            ws.Write(append, 0, append.Length, 3000);
+            fs.UploadWriteState(ws);
+
+            Assert.Equal(2, server.ChunkCount);
+            Assert.Equal(0, server.Chunks[1].Revision);
+
+            // 永続化済みチャンク解放後の 2 回目の書き込み: 追記済みチャンク 1 内を部分更新
+            ws.Write(patch, 0, patch.Length, 4500);
+            fs.UploadWriteState(ws);
+        }
+        finally { ws.Dispose(); }
+
+        // サーバー記録 revision は rev+1。クライアントが同じ revision で暗号化している前提で
+        // 復号できること（回帰 2: 食い違うとタグ検証が失敗する）
+        Assert.Equal(1, server.Chunks[1].Revision);
+        byte[] decrypted = E2eeCrypto.DecryptChunk(server.Chunks[1].Cipher, fileKey, 1, fileSalt, revision: 1);
+        Assert.ThrowsAny<CryptographicException>(
+            () => E2eeCrypto.DecryptChunk(server.Chunks[1].Cipher, fileKey, 1, fileSalt, revision: 0));
+
+        // チャンク 1 の内容: 追記データ（RMW でサーバーから再取得）に 2 回目の書き込みを反映。
+        // 回帰 1: 凍結された _existingChunkCount のせいでゼロバッファが再アップロードされると破綻する
+        byte[] expected = append[(ChunkSize - 3000)..].ToArray();
+        patch.CopyTo(expected, 4500 - ChunkSize);
+        Assert.Equal(expected, decrypted);
+    }
 }

@@ -430,16 +430,25 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         }
 
         /// <summary>
-        /// サーバーへの永続化が完了したダーティチャンクを解放する（ゼロクリア）。
+        /// サーバーへの永続化が完了したダーティチャンクを解放し、既存状態を永続化後のものへ進める（ゼロクリア）。
         /// 保持し続けると WriteFile のたびに全蓄積チャンクが再送（+ revision 取分の
         /// 追加 HTTP）され転送量が O(N²) に膨らむため、差分アップロード成功後に呼ぶ。
         /// 以降の RMW は GetOrLoadChunk がサーバーから最新を再取得するため正しさは維持される。
         /// </summary>
-        public void ClearPersistedChunks()
+        /// <remarks>
+        /// <paramref name="persistedChunkCount"/> / <paramref name="persistedPlainLength"/> は
+        /// FinalizeFile で確定したサーバー状態。ここで既存状態を進めないと、このハンドル内で
+        /// 追記アップロードしたチャンクが「未存在」扱いになり、次の persist で
+        /// PrepareForPersist / GetOrLoadChunk が全ゼロバッファを作って永続化データを
+        /// ゼロで上書きする（無音のデータロス）。
+        /// </remarks>
+        public void ClearPersistedChunks(int persistedChunkCount, long persistedPlainLength)
         {
             foreach (var (_, chunk) in _dirtyChunks)
                 CryptographicOperations.ZeroMemory(chunk);
             _dirtyChunks.Clear();
+            _existingChunkCount = persistedChunkCount;
+            _existingPlainLength = persistedPlainLength;
         }
 
         private byte[] GetOrLoadChunk(int ci)
@@ -1483,9 +1492,13 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             int chunkLen = (int)Math.Min(_chunkSize, newPlainLength - (long)ci * _chunkSize);
             byte[] toEncrypt = chunk.Length == chunkLen ? chunk : ResizeChunk(chunk, chunkLen);
 
-            // 現在 revision を取得し +1 で暗号化（AES-GCM の nonce 再利用回避）
-            var (_, currentRev) = _api.GetChunkHashAsync(_volumeName, fileId, ci).GetAwaiter().GetResult();
-            int nextRevision = ci < ws.ExistingChunkCount ? currentRev + 1 : 0;
+            // 現在 revision を取得し +1 で暗号化（AES-GCM の nonce 再利用回避）。
+            // 存在判定はサーバーの応答（404 → hash null）で行う。handle-open 時点の
+            // ExistingChunkCount で判定すると、同一ハンドル内で作成・アップロードした
+            // 追記チャンクの 2 回目以降の置換が rev 0 で暗号化され、サーバー記録の
+            // revision と食い違って復号不能になる（同一 nonce で 2 平文 = ノンス再利用にもなる）。
+            var (currentHash, currentRev) = _api.GetChunkHashAsync(_volumeName, fileId, ci).GetAwaiter().GetResult();
+            int nextRevision = currentHash is null ? 0 : currentRev + 1;
 
             byte[] encChunk = keyEpoch >= 1
                 ? E2eeV2.EncryptChunk(toEncrypt, fileKey,
@@ -1512,8 +1525,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         }
 
         // 全チャンク + FinalizeFile が成功した時点でサーバーに永続化済み。
-        // 蓄積チャンクを保持すると次の書き込みで全量が再送されるため解放する。
-        ws.ClearPersistedChunks();
+        // 蓄積チャンクを保持すると次の書き込みで全量が再送されるため解放し、
+        // 既存状態を FinalizeFile で確定したサーバー状態へ進める。
+        ws.ClearPersistedChunks(finalizeChunkCount, newPlainLength);
     }
 
     private static byte[] ResizeChunk(byte[] chunk, int newLen)
