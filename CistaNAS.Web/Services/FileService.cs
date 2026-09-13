@@ -381,6 +381,10 @@ public sealed class FileService
                 byte[]? patchFileSalt = existing is not null
                     ? DecodeKeySalt(existing.KeySalt)
                     : encrypted ? RandomNumberGenerator.GetBytes(16) : null;
+                // ファイルスコープ鍵はループの前に一度だけ導出する（チャンクごとの HKDF 再導出を避ける）。
+                byte[]? patchScopedKey = patchFileSalt is null
+                    ? null
+                    : ChunkEncryptor.DeriveFileScopedKey(masterKey!, patchFileSalt, algorithm);
                 long existingLength = existing?.Length ?? 0;
                 long writeEnd = checked(offset + contentLength);
                 long newLength = Math.Max(existingLength, writeEnd);
@@ -427,7 +431,7 @@ public sealed class FileService
                     {
                         int origLen = Math.Min(chunkSizes[ci], curPlainSize);
                         byte[] previous = encrypted
-                            ? ChunkEncryptor.DecryptChunk(masterKey!, algorithm, ci, sectorSize, chunkSize, oldStored, origLen, patchFileSalt)
+                            ? ChunkEncryptor.DecryptChunkWithScopedKey(masterKey!, patchScopedKey, algorithm, ci, sectorSize, chunkSize, oldStored, origLen)
                             : oldStored;
                         Array.Copy(previous, plain, Math.Min(previous.Length, plain.Length));
                     }
@@ -444,7 +448,7 @@ public sealed class FileService
                     }
 
                     byte[] stored = encrypted
-                        ? ChunkEncryptor.EncryptChunk(masterKey!, algorithm, ci, sectorSize, chunkSize, plain, patchFileSalt)
+                        ? ChunkEncryptor.EncryptChunkWithScopedKey(masterKey!, patchScopedKey, algorithm, ci, sectorSize, chunkSize, plain)
                         : plain;
                     using var ms = new MemoryStream(stored);
                     await _chunkStore.WriteChunkAsync(volumeName, newObjectId, ci, ms, ct);
@@ -452,6 +456,9 @@ public sealed class FileService
                     while (chunkSizes.Count <= ci) chunkSizes.Add(0);
                     chunkSizes[ci] = curPlainSize;
                 }
+
+                if (patchScopedKey is not null)
+                    CryptographicOperations.ZeroMemory(patchScopedKey);
 
                 var meta = new FileMetadata
                 {
@@ -544,6 +551,10 @@ public sealed class FileService
             byte[]? uploadFileSalt = header.Encrypted && masterKey is not null
                 ? RandomNumberGenerator.GetBytes(16)
                 : null;
+            // ファイルスコープ鍵はループの前に一度だけ導出する（チャンクごとの HKDF 再導出を避ける）。
+            byte[]? uploadScopedKey = uploadFileSalt is null
+                ? null
+                : ChunkEncryptor.DeriveFileScopedKey(masterKey!, uploadFileSalt, header.EffectiveCipherAlgorithm);
 
             while (remaining > 0)
             {
@@ -556,9 +567,9 @@ public sealed class FileService
                 // 暗号化ボリュームの場合はチャンク暗号化
                 if (header.Encrypted && masterKey is not null)
                 {
-                    chunkData = ChunkEncryptor.EncryptChunk(
-                        masterKey, header.EffectiveCipherAlgorithm,
-                        chunkIndex, sectorSize, chunkSize, chunkData, uploadFileSalt);
+                    chunkData = ChunkEncryptor.EncryptChunkWithScopedKey(
+                        masterKey, uploadScopedKey, header.EffectiveCipherAlgorithm,
+                        chunkIndex, sectorSize, chunkSize, chunkData);
                 }
 
                 // S3 にチャンクを保存
@@ -569,6 +580,9 @@ public sealed class FileService
                 chunkIndex++;
                 remaining -= read;
             }
+
+            if (uploadScopedKey is not null)
+                CryptographicOperations.ZeroMemory(uploadScopedKey);
 
             var meta = new FileMetadata
             {
