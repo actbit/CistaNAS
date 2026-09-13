@@ -307,6 +307,75 @@ public class FileServiceChunkModeTests : IAsyncDisposable
         Assert.Equal(0, n);
     }
 
+    [Fact]
+    public async Task Patch_ChunkMode_NewFile_GeneratesKeySalt_AndAvoidsCrossFileCiphertextCollision()
+    {
+        // 回帰: PATCH 経由で新規作成したファイル（Dokan クライアントの新規書き込み主経路）が
+        // レガシー形式（KeySalt=null、マスターキー直用）に固定され、別ファイルの同一位置
+        // チャンクと XTS tweak が衝突して同一暗号文になる（C⊕C = P⊕P 漏洩）。
+        string vol = await MountEncryptedVol("chunk-patch-salt");
+        var fs = GetFileService();
+        var chunkStore = _sp.GetRequiredService<IChunkStore>();
+        byte[] content = new byte[1000]; // 両ファイルに同一平文を書く
+
+        FileMetadata f1, f2;
+        using (var ms = new MemoryStream(content))
+            f1 = await fs.PatchRangeAsync(vol, "a.bin", 0, ms, content.Length);
+        using (var ms = new MemoryStream(content))
+            f2 = await fs.PatchRangeAsync(vol, "b.bin", 0, ms, content.Length);
+
+        // 新規ファイルでもソルトが生成され、レガシー（null）に固定されない
+        Assert.NotNull(f1.KeySalt);
+        Assert.NotNull(f2.KeySalt);
+        Assert.NotEqual(f1.KeySalt, f2.KeySalt);
+
+        // 別ファイルの同一位置チャンクは別暗号文（ファイルスコープ鍵で tweak 衝突なし）
+        byte[]? c1 = await chunkStore.ReadChunkAsync(vol, Assert.IsType<string>(f1.ChunkObjectId), 0);
+        byte[]? c2 = await chunkStore.ReadChunkAsync(vol, Assert.IsType<string>(f2.ChunkObjectId), 0);
+        Assert.NotNull(c1);
+        Assert.NotNull(c2);
+        Assert.NotEqual(c1, c2);
+
+        // 両ファイルとも正しく復号できる
+        foreach (var (name, expected) in new[] { ("a.bin", content), ("b.bin", content) })
+        {
+            var dl = await fs.DownloadAsync(vol, name);
+            await using var stream = dl.Stream;
+            byte[] actual = new byte[dl.Length];
+            await stream.ReadExactlyAsync(actual);
+            Assert.Equal(expected, actual);
+        }
+    }
+
+    [Fact]
+    public async Task Patch_ChunkMode_EmptyCreate_StoresKeySaltForLaterPatches()
+    {
+        // 回帰: 空ファイル作成（contentLength == 0）で KeySalt=null のメタデータが作られると、
+        // 後続の PATCH がレガシー形式に固定される。空作成時点でソルトを確定させる。
+        string vol = await MountEncryptedVol("chunk-empty-salt");
+        var fs = GetFileService();
+
+        FileMetadata empty;
+        using (var ms = new MemoryStream())
+            empty = await fs.PatchRangeAsync(vol, "empty.bin", 0, ms, 0);
+        Assert.NotNull(empty.KeySalt);
+
+        // 後続の PATCH は空作成時のソルトを引き継ぐ（暗号化して正しく復号できる）
+        byte[] content = new byte[5000];
+        for (int i = 0; i < content.Length; i++) content[i] = (byte)(i % 251);
+        FileMetadata updated;
+        using (var ms = new MemoryStream(content))
+            updated = await fs.PatchRangeAsync(vol, "empty.bin", 0, ms, content.Length);
+
+        Assert.Equal(empty.KeySalt, updated.KeySalt);
+
+        var dl = await fs.DownloadAsync(vol, "empty.bin");
+        await using var stream = dl.Stream;
+        byte[] actual = new byte[dl.Length];
+        await stream.ReadExactlyAsync(actual);
+        Assert.Equal(content, actual);
+    }
+
     public async ValueTask DisposeAsync()
     {
         foreach (var v in await _vs.ListAllAsync())

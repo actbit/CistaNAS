@@ -354,6 +354,9 @@ public sealed class FileService
                         ChunkCount = 0,
                         ChunkSizes = [],
                         ChunkObjectId = newObjectId,
+                        // 空ファイルでもここでソルトを確定させる。後続の PATCH がこのソルトで
+                        // 暗号化し、全チャンクが一貫した鍵スコープに収まる。
+                        KeySalt = encrypted ? Convert.ToBase64String(RandomNumberGenerator.GetBytes(16)) : null,
                         CreatedAt = DateTimeOffset.UtcNow,
                         ModifiedAt = DateTimeOffset.UtcNow,
                     };
@@ -371,7 +374,13 @@ public sealed class FileService
                 // 既存ファイルのソルトをそのまま使う（範囲外チャンクは暗号文のまま
                 // コピーされるため、鍵スコープを跨いで混在させてはいけない）。
                 // null は旧形式（レガシー: マスターキー直接使用）として透過的に扱う。
-                byte[]? patchFileSalt = DecodeKeySalt(existing?.KeySalt);
+                // 新規ファイルはここで新しいソルトを生成する。生成しないと生マスターキーでの
+                // 暗号化（レガシー形式）に永久固定され、別ファイル同一位置チャンクとの
+                // XTS tweak 衝突（C⊕C = P⊕P 漏洩）が残る。Dokan クライアントの新規ファイル
+                // 書き込みはこの PATCH 経路が主経路のため。
+                byte[]? patchFileSalt = existing is not null
+                    ? DecodeKeySalt(existing.KeySalt)
+                    : encrypted ? RandomNumberGenerator.GetBytes(16) : null;
                 long existingLength = existing?.Length ?? 0;
                 long writeEnd = checked(offset + contentLength);
                 long newLength = Math.Max(existingLength, writeEnd);
@@ -452,7 +461,7 @@ public sealed class FileService
                     ChunkCount = lastNeeded + 1,
                     ChunkSizes = chunkSizes,
                     ChunkObjectId = newObjectId,
-                    KeySalt = existing?.KeySalt,
+                    KeySalt = patchFileSalt is null ? null : Convert.ToBase64String(patchFileSalt),
                     CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
                     ModifiedAt = DateTimeOffset.UtcNow,
                 };
