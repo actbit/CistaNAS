@@ -247,10 +247,13 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         }
 
         // 平文バッファをゼロクリア
+        // 注: Gate は Dispose しない（Cleanup が Release 済みであることを前提とする。
+        // 破棄済みゲートへの Release は ObjectDisposedException を起こすため、
+        // ゲート自体は解放せず GC に任せる。SemaphoreSlim は待機ハンドルを
+        // 使わない限りアンマネージリソースを持たないためリークはない）。
         public override void Dispose()
         {
             ZeroAndClearRanges();
-            Gate.Dispose();
         }
 
         /// <summary>
@@ -438,7 +441,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             }
             if (_existingFileSalt is not null) CryptographicOperations.ZeroMemory(_existingFileSalt);
             ZeroAndClearDirtyChunks();
-            Gate.Dispose();
+            // Gate は Dispose しない（PlainRangeWriteState.Dispose のコメント参照）。
         }
 
         /// <summary>
@@ -542,7 +545,12 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 }
                 finally
                 {
-                    ws.Dispose(); // 機密データ（ファイルキー・平文チャンク）をゼロクリア
+                    // Gate.Release の前に Context を外す（以降の Read/Write がこの WriteState を見ないように）
+                    info.Context = null;
+                    // Dispose の前に必ず Release する。SemaphoreSlim.Dispose は待機者を
+                    // 起こさないため、Release せずに破棄するとゲート待ちの
+                    // Read/Write スレッドが永久にブロックする。
+                    ws.Gate.Release();
                 }
             }
             catch { /* Cleanup は void なのでエラーを飲む */ }
@@ -550,6 +558,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             {
                 info.Context = null;
             }
+            ws.Dispose(); // 機密データ（ファイルキー・平文チャンク）をゼロクリア
         }
     }
 
@@ -1275,8 +1284,26 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
     {
         if (info.Context is WriteState ws)
         {
-            ws.SetDeclaredSize(length);
-            return DokanResult.Success;
+            try
+            {
+                // Write/Flush/Cleanup のアップロードと直列化する。
+                // ゲート外で SetDeclaredSize（HasPendingChanges 書き換え）を行うと、
+                // アップロード完了時の MarkPersisted により truncation が無音に欠落する。
+                ws.Gate.Wait();
+                try
+                {
+                    ws.SetDeclaredSize(length);
+                }
+                finally
+                {
+                    ws.Gate.Release();
+                }
+                return DokanResult.Success;
+            }
+            catch
+            {
+                return DokanResult.InternalError;
+            }
         }
         return DokanResult.Success;
     }
@@ -1428,7 +1455,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
             long plainLength = ws.CurrentSize;
             int chunkCount = plainLength == 0 ? 1 : (int)((plainLength + _chunkSize - 1) / _chunkSize);
-            long encLength = 16L + plainLength + (long)chunkCount * 16;
+            long encLength = E2eeCrypto.ComputeEncryptedLength(plainLength, _chunkSize);
 
             string fileId;
             string? initialWriteLease;
@@ -1544,7 +1571,11 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         int newChunkCount = newPlainLength == 0 ? 1 : (int)((newPlainLength + _chunkSize - 1) / _chunkSize);
 
         // 汚れたチャンクだけ再暗号化して replace（未変更チャンクは維持 → 末尾保持）。
-        foreach (var (ci, chunk) in ws.DirtyChunks)
+        // チャンクインデックス順に送ること。サーバーは chunkIndex > ChunkCount を
+        // 拒否するため、sparse 書き込み（例: 1 チャンクのファイルに index 2 へ書き込み →
+        // index 1 がギャップ埋めで後から挿入される）で挿入順に送ると範囲外エラーになり、
+        // persist 全体が失敗してバッファ済みデータが失われる。
+        foreach (var (ci, chunk) in ws.DirtyChunks.OrderBy(kv => kv.Key))
         {
             if (ci >= newChunkCount) continue; // 縮小で不要になったチャンクは送らない
             int chunkLen = (int)Math.Min(_chunkSize, newPlainLength - (long)ci * _chunkSize);
@@ -1572,7 +1603,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
         // FinalizeFile で長さ確定（縮小時は ChunkCount 指定で論理切り詰め）
         int finalizeChunkCount = newChunkCount;
-        long encLength = 16L + newPlainLength + (long)finalizeChunkCount * 16;
+        long encLength = E2eeCrypto.ComputeEncryptedLength(newPlainLength, _chunkSize);
         _api.FinalizeFileAsync(_volumeName, fileId, encLength, ws.WriteLeaseToken!, finalizeChunkCount).GetAwaiter().GetResult();
 
         // キャッシュ更新

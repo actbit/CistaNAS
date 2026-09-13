@@ -58,7 +58,9 @@ public static class ChunkEncryptor
     /// <summary>
     /// 導出済みのファイルスコープ鍵でチャンクを暗号化する。ホットループ（チャンク列の連続処理）では
     /// 事前に <see cref="DeriveFileScopedKey"/> を一度だけ呼び、その結果を渡すことで
-    /// チャンクごとの HKDF 再導出と鍵スケジュール再構築を避ける。
+    /// チャンクごとのファイルスコープ鍵 HKDF 導出を避ける。
+    /// 注: 内部ではチャンクごとに <see cref="AesXtsTransform"/>（鍵スケジュール）を構築し、
+    /// ChaCha20 パスでもチャンク鍵 HKDF が走る。これらは本 API では hoist されない。
     /// </summary>
     /// <param name="masterKey">マスターキー。レガシー（scopedKey = null）の場合に直接使う。</param>
     /// <param name="scopedKey"><see cref="DeriveFileScopedKey"/> の戻り値（レガシー = null）。</param>
@@ -144,8 +146,8 @@ public static class ChunkEncryptor
 
     /// <summary>
     /// 導出済みのファイルスコープ鍵でチャンクを復号する。
-    /// <see cref="EncryptChunkWithScopedKey"/> の復号側。<paramref name="fileSalt"/> を
-    /// 毎チャンク再導出しない。
+    /// <see cref="EncryptChunkWithScopedKey"/> の復号側。ファイルスコープ鍵の
+    /// HKDF 導出を毎チャンク再実行しない。
     /// </summary>
     /// <param name="masterKey">マスターキー。レガシー（scopedKey = null）の場合に直接使う。</param>
     /// <param name="scopedKey"><see cref="DeriveFileScopedKey"/> の戻り値（レガシー = null）。</param>

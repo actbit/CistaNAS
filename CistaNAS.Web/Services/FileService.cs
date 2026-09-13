@@ -404,61 +404,67 @@ public sealed class FileService
                 if (totalRead != contentLength)
                     throw new FileServiceException("リクエスト本文がContent-Lengthより短いです。");
 
-                for (int ci = 0; ci <= lastNeeded; ci++)
+                try
                 {
-                    bool inWriteRange = ci >= firstChunk && ci <= lastChunk;
-                    bool isExisting = ci < chunkSizes.Count;
-                    byte[]? oldStored = isExisting
-                        ? await _chunkStore.ReadChunkAsync(volumeName, oldObjectId, ci, ct)
-                        : null;
-                    if (isExisting && oldStored is null)
-                        throw new FileServiceException($"既存チャンク {ci} が見つかりません。");
-
-                    // 新しいオブジェクトへ全チャンクをコピーしてからカタログを切り替える。
-                    // 範囲外チャンクは暗号文のままコピーできる。
-                    if (!inWriteRange && oldStored is not null)
+                    // 例外パスでも scoped key をゼロクリアする（ループ脱出の全経路をカバー）。
+                    for (int ci = 0; ci <= lastNeeded; ci++)
                     {
-                        using var copyStream = new MemoryStream(oldStored, writable: false);
-                        await _chunkStore.WriteChunkAsync(volumeName, newObjectId, ci, copyStream, ct);
-                        continue;
+                        bool inWriteRange = ci >= firstChunk && ci <= lastChunk;
+                        bool isExisting = ci < chunkSizes.Count;
+                        byte[]? oldStored = isExisting
+                            ? await _chunkStore.ReadChunkAsync(volumeName, oldObjectId, ci, ct)
+                            : null;
+                        if (isExisting && oldStored is null)
+                            throw new FileServiceException($"既存チャンク {ci} が見つかりません。");
+
+                        // 新しいオブジェクトへ全チャンクをコピーしてからカタログを切り替える。
+                        // 範囲外チャンクは暗号文のままコピーできる。
+                        if (!inWriteRange && oldStored is not null)
+                        {
+                            using var copyStream = new MemoryStream(oldStored, writable: false);
+                            await _chunkStore.WriteChunkAsync(volumeName, newObjectId, ci, copyStream, ct);
+                            continue;
+                        }
+
+                        int curPlainSize = (int)Math.Min(chunkSize, newLength - (long)ci * chunkSize);
+                        if (curPlainSize <= 0) break;
+
+                        byte[] plain = new byte[curPlainSize];
+                        if (oldStored is not null && chunkSizes[ci] > 0)
+                        {
+                            int origLen = Math.Min(chunkSizes[ci], curPlainSize);
+                            byte[] previous = encrypted
+                                ? ChunkEncryptor.DecryptChunkWithScopedKey(masterKey!, patchScopedKey, algorithm, ci, sectorSize, chunkSize, oldStored, origLen)
+                                : oldStored;
+                            Array.Copy(previous, plain, Math.Min(previous.Length, plain.Length));
+                        }
+
+                        if (inWriteRange)
+                        {
+                            long chunkStart = (long)ci * chunkSize;
+                            long relStart = Math.Max(0, offset - chunkStart);
+                            long relEnd = Math.Min(curPlainSize, offset + totalRead - chunkStart);
+                            long srcStart = Math.Max(0, chunkStart - offset);
+                            int copyLen = (int)(relEnd - relStart);
+                            if (copyLen > 0)
+                                Array.Copy(contentData, (int)srcStart, plain, (int)relStart, copyLen);
+                        }
+
+                        byte[] stored = encrypted
+                            ? ChunkEncryptor.EncryptChunkWithScopedKey(masterKey!, patchScopedKey, algorithm, ci, sectorSize, chunkSize, plain)
+                            : plain;
+                        using var ms = new MemoryStream(stored);
+                        await _chunkStore.WriteChunkAsync(volumeName, newObjectId, ci, ms, ct);
+
+                        while (chunkSizes.Count <= ci) chunkSizes.Add(0);
+                        chunkSizes[ci] = curPlainSize;
                     }
-
-                    int curPlainSize = (int)Math.Min(chunkSize, newLength - (long)ci * chunkSize);
-                    if (curPlainSize <= 0) break;
-
-                    byte[] plain = new byte[curPlainSize];
-                    if (oldStored is not null && chunkSizes[ci] > 0)
-                    {
-                        int origLen = Math.Min(chunkSizes[ci], curPlainSize);
-                        byte[] previous = encrypted
-                            ? ChunkEncryptor.DecryptChunkWithScopedKey(masterKey!, patchScopedKey, algorithm, ci, sectorSize, chunkSize, oldStored, origLen)
-                            : oldStored;
-                        Array.Copy(previous, plain, Math.Min(previous.Length, plain.Length));
-                    }
-
-                    if (inWriteRange)
-                    {
-                        long chunkStart = (long)ci * chunkSize;
-                        long relStart = Math.Max(0, offset - chunkStart);
-                        long relEnd = Math.Min(curPlainSize, offset + totalRead - chunkStart);
-                        long srcStart = Math.Max(0, chunkStart - offset);
-                        int copyLen = (int)(relEnd - relStart);
-                        if (copyLen > 0)
-                            Array.Copy(contentData, (int)srcStart, plain, (int)relStart, copyLen);
-                    }
-
-                    byte[] stored = encrypted
-                        ? ChunkEncryptor.EncryptChunkWithScopedKey(masterKey!, patchScopedKey, algorithm, ci, sectorSize, chunkSize, plain)
-                        : plain;
-                    using var ms = new MemoryStream(stored);
-                    await _chunkStore.WriteChunkAsync(volumeName, newObjectId, ci, ms, ct);
-
-                    while (chunkSizes.Count <= ci) chunkSizes.Add(0);
-                    chunkSizes[ci] = curPlainSize;
                 }
-
-                if (patchScopedKey is not null)
-                    CryptographicOperations.ZeroMemory(patchScopedKey);
+                finally
+                {
+                    if (patchScopedKey is not null)
+                        CryptographicOperations.ZeroMemory(patchScopedKey);
+                }
 
                 var meta = new FileMetadata
                 {
@@ -556,33 +562,39 @@ public sealed class FileService
                 ? null
                 : ChunkEncryptor.DeriveFileScopedKey(masterKey!, uploadFileSalt, header.EffectiveCipherAlgorithm);
 
-            while (remaining > 0)
+            try
             {
-                int toRead = (int)Math.Min(buffer.Length, remaining);
-                int read = await content.ReadAsync(buffer.AsMemory(0, toRead), ct);
-                if (read == 0) break;
-
-                byte[] chunkData = buffer[..read].ToArray();
-
-                // 暗号化ボリュームの場合はチャンク暗号化
-                if (header.Encrypted && masterKey is not null)
+                // 例外パスでも scoped key をゼロクリアする（ループ脱出の全経路をカバー）。
+                while (remaining > 0)
                 {
-                    chunkData = ChunkEncryptor.EncryptChunkWithScopedKey(
-                        masterKey, uploadScopedKey, header.EffectiveCipherAlgorithm,
-                        chunkIndex, sectorSize, chunkSize, chunkData);
+                    int toRead = (int)Math.Min(buffer.Length, remaining);
+                    int read = await content.ReadAsync(buffer.AsMemory(0, toRead), ct);
+                    if (read == 0) break;
+
+                    byte[] chunkData = buffer[..read].ToArray();
+
+                    // 暗号化ボリュームの場合はチャンク暗号化
+                    if (header.Encrypted && masterKey is not null)
+                    {
+                        chunkData = ChunkEncryptor.EncryptChunkWithScopedKey(
+                            masterKey, uploadScopedKey, header.EffectiveCipherAlgorithm,
+                            chunkIndex, sectorSize, chunkSize, chunkData);
+                    }
+
+                    // S3 にチャンクを保存
+                    using var ms = new MemoryStream(chunkData);
+                    await _chunkStore.WriteChunkAsync(volumeName, objectId, chunkIndex, ms, ct);
+
+                    chunkSizes.Add(read);
+                    chunkIndex++;
+                    remaining -= read;
                 }
-
-                // S3 にチャンクを保存
-                using var ms = new MemoryStream(chunkData);
-                await _chunkStore.WriteChunkAsync(volumeName, objectId, chunkIndex, ms, ct);
-
-                chunkSizes.Add(read);
-                chunkIndex++;
-                remaining -= read;
             }
-
-            if (uploadScopedKey is not null)
-                CryptographicOperations.ZeroMemory(uploadScopedKey);
+            finally
+            {
+                if (uploadScopedKey is not null)
+                    CryptographicOperations.ZeroMemory(uploadScopedKey);
+            }
 
             var meta = new FileMetadata
             {

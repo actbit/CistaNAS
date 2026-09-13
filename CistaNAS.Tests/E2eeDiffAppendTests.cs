@@ -239,6 +239,7 @@ public class E2eeDiffAppendTests
     /// サーバー側状態（チャンク数・チャンクごとの revision・暗号文）を追跡する Fake。
     /// upload-chunk は実サーバー（E2eeFileService）と同じ規則で revision を進める:
     /// 置換（index が既存チャンク数未満）は rev+1、追記（index == 既存チャンク数）は rev 0。
+    /// index &gt; チャンク数は実サーバーと同様に拒否する（範囲外差分上書き）。
     /// chunk-hash は未アップロードのチャンクに対して 404 を返す。
     /// </summary>
     private sealed class FakeStatefulE2eeServer(byte[] masterKey, byte[] plain, byte[] fileKey, byte[] fileSalt) : HttpMessageHandler
@@ -247,6 +248,9 @@ public class E2eeDiffAppendTests
 
         /// <summary>サーバーに保存済みのチャンク（暗号文, revision）。</summary>
         public Dictionary<int, (byte[] Cipher, int Revision)> Chunks { get; } = new();
+
+        /// <summary>受理された upload-chunk の呼び出し順（順序検証用）。</summary>
+        public List<int> UploadOrder { get; } = new();
 
         /// <summary>サーバーが記録しているチャンク数（追記で拡張、truncate で縮小）。</summary>
         public int ChunkCount { get; private set; }
@@ -331,7 +335,10 @@ public class E2eeDiffAppendTests
             if (op == "upload-chunk" && request.Method == HttpMethod.Post)
             {
                 int index = int.Parse(segments[6]);
+                if (index > ChunkCount)
+                    return JsonR(HttpStatusCode.BadRequest, $"チャンク {index} は範囲外です（差分上書きは 0-{ChunkCount}）");
                 byte[] cipher = request.Content!.ReadAsByteArrayAsync(ct).GetAwaiter().GetResult();
+                UploadOrder.Add(index);
                 bool isReplace = index < ChunkCount && Chunks.ContainsKey(index);
                 int revision = isReplace ? Chunks[index].Revision + 1 : 0;
                 Chunks[index] = (cipher, revision);
@@ -400,5 +407,52 @@ public class E2eeDiffAppendTests
         byte[] expected = append[(ChunkSize - 3000)..].ToArray();
         patch.CopyTo(expected, 4500 - ChunkSize);
         Assert.Equal(expected, decrypted);
+    }
+
+    [Fact]
+    public void ファイル終端を超えるsparse書き込みのダーティチャンクはインデックス順に送信される()
+    {
+        // 回帰: DirtyChunks の挿入順でアップロードすると、sparse 書き込みでは
+        // ギャップ埋めチャンクより先に範囲外チャンクが送られ、サーバーに拒否されて
+        // persist 全体が失敗する（Cleanup ではエラーが飲まれバッファが破棄される = 無音のデータロス）。
+        byte[] masterKey = RandomNumberGenerator.GetBytes(32);
+        byte[] plain = new byte[3000]; // 1 チャンク
+        for (int i = 0; i < plain.Length; i++) plain[i] = (byte)(i % 251);
+        byte[] fileSalt = RandomNumberGenerator.GetBytes(16);
+        byte[] fileKey = E2eeCrypto.DeriveFileKey(masterKey, fileSalt);
+
+        var server = new FakeStatefulE2eeServer(masterKey, plain, fileKey, fileSalt).Init();
+        var api = new CistaNasApiClient(new HttpClient(server) { BaseAddress = new Uri("http://test/") });
+        var fs = new CistaNasFileSystem(api, masterKey, Volume, chunkSize: ChunkSize);
+
+        byte[] data = Enumerable.Range(0, 50).Select(i => (byte)(10 + i)).ToArray();
+
+        var ws = new CistaNasFileSystem.E2eeChunkWriteState(fs, PlainName, FakeStatefulE2eeServer.FileId);
+        try
+        {
+            // チャンク 2（範囲外）への書き込み → チャンク 1（ギャップ埋め）が後から挿入される
+            ws.Write(data, 0, data.Length, 2 * ChunkSize + 100);
+            fs.UploadWriteState(ws);
+        }
+        finally { ws.Dispose(); }
+
+        // ギャップ埋めチャンク 1 → チャンク 2 の順で送信される（順不同だとサーバーが拒否する）。
+        // チャンク 0 は旧末尾部分チャンク（3000B）がフルチャンク化（4096B）するため再送される。
+        Assert.Equal([0, 1, 2], server.UploadOrder);
+        Assert.Equal(3, server.ChunkCount);
+
+        // チャンク 0 は既存内容 + ゼロパディング（置換なので rev 1）
+        byte[] chunk0 = E2eeCrypto.DecryptChunk(server.Chunks[0].Cipher, fileKey, 0, fileSalt, revision: 1);
+        byte[] expected0 = new byte[ChunkSize];
+        plain.CopyTo(expected0, 0);
+        Assert.Equal(expected0, chunk0);
+
+        // チャンク 1 はゼロ埋め、チャンク 2 は rel 100 に書き込みデータ
+        byte[] chunk1 = E2eeCrypto.DecryptChunk(server.Chunks[1].Cipher, fileKey, 1, fileSalt, revision: 0);
+        Assert.Equal(new byte[ChunkSize], chunk1);
+        byte[] chunk2 = E2eeCrypto.DecryptChunk(server.Chunks[2].Cipher, fileKey, 2, fileSalt, revision: 0);
+        byte[] expected2 = new byte[150];
+        data.CopyTo(expected2, 100);
+        Assert.Equal(expected2, chunk2);
     }
 }

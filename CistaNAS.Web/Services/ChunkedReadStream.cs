@@ -44,7 +44,7 @@ public sealed class ChunkedReadStream : Stream
         _objectId = objectId;
         _masterKey = masterKey.ToArray();
         // ファイルスコープ鍵はストリーム生成時に一度だけ導出する
-        // （チャンクごとの HKDF 再導出・鍵スケジュール再構築を避ける）。
+        // （チャンクごとのファイルスコープ鍵 HKDF 再導出を避ける）。
         _scopedKey = fileSalt.IsEmpty ? null : ChunkEncryptor.DeriveFileScopedKey(masterKey, fileSalt, cipherAlgorithm);
         _cipherAlgorithm = cipherAlgorithm;
         _sectorSize = sectorSize;
