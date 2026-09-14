@@ -27,11 +27,10 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
         string encName = await e2ee.EncryptFilename(fileName, masterKeyHandle);
         string fileSaltB64 = await e2ee.GenerateFileSalt();
 
-        int totalChunks = (int)((totalSize + chunkSize - 1) / chunkSize);
-        if (totalChunks == 0) totalChunks = 1;
+        int totalChunks = E2eeCrypto.ComputeChunkCount(totalSize, chunkSize);
 
         // 暗号化後サイズの推定 (salt 16 bytes + chunk ごとに tag 16 bytes)
-        long estimatedLength = ComputeEncryptedLength(totalSize, chunkSize);
+        long estimatedLength = E2eeCrypto.ComputeEncryptedLength(totalSize, chunkSize);
 
         var entry = await api.CreateFileAsync(volumeName, encName, estimatedLength, totalChunks);
         string writeLease = entry.WriteLeaseToken
@@ -63,7 +62,7 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
 
             // chunkCount も確定させる（Mobile.Core と同じプロトコル。縮小確定に必要）。
             await api.FinalizeFileAsync(volumeName, entry.FileId,
-                ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease, totalChunks);
+                E2eeCrypto.ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease, totalChunks);
         }
         catch
         {
@@ -136,9 +135,8 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
         }
         string fileSaltB64 = await e2ee.GenerateFileSalt();
 
-        int totalChunks = (int)((totalSize + chunkSize - 1) / chunkSize);
-        if (totalChunks == 0) totalChunks = 1;
-        long estimatedLength = ComputeEncryptedLength(totalSize, chunkSize);
+        int totalChunks = E2eeCrypto.ComputeChunkCount(totalSize, chunkSize);
+        long estimatedLength = E2eeCrypto.ComputeEncryptedLength(totalSize, chunkSize);
 
         // WrappedFileKey の AAD に fileId が bind されるため、fileId をクライアント側で
         // 確定させてから 1 リクエストで create-file する（カタログ状態を一貫させる）。
@@ -186,7 +184,7 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
 
             // chunkCount も確定させる（Mobile.Core と同じプロトコル。縮小確定に必要）。
             await api.FinalizeFileAsync(volumeName, entry.FileId,
-                ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease, totalChunks);
+                E2eeCrypto.ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease, totalChunks);
             return entry;
         }
         catch
@@ -323,8 +321,4 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
             catch { }
         }
     }
-
-    /// <summary>暗号化後サイズの推定。計算式は <see cref="E2eeCrypto.ComputeEncryptedLength"/>（Shared）に一元管理。</summary>
-    public static long ComputeEncryptedLength(long plainSize, int chunkSize)
-        => E2eeCrypto.ComputeEncryptedLength(plainSize, chunkSize);
 }

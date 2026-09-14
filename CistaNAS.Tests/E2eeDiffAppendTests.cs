@@ -259,6 +259,19 @@ public class E2eeDiffAppendTests
         /// <summary>サーバーが記録しているチャンク数（追記で拡張、truncate で縮小）。</summary>
         public int ChunkCount { get; private set; }
 
+        // ---- テスト用フック（ゲートスコープ / 失敗ロールバックの検証） ----
+
+        private readonly TaskCompletionSource _uploadReached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>upload-chunk リクエストがサーバーに到達したことを通知する。</summary>
+        public Task UploadReached => _uploadReached.Task;
+
+        /// <summary>設定すると upload-chunk をこの Task が完了するまでブロックする（ゲート解放の検証用）。</summary>
+        public TaskCompletionSource? UploadRelease { get; set; }
+
+        /// <summary>指定回数だけ upload-chunk を 500 で失敗させる（ロールバック検証用）。</summary>
+        public int FailNextUploads { get; set; }
+
         /// <summary>初期平文をチャンク分割してサーバー状態を初期化する。</summary>
         public FakeStatefulE2eeServer Init()
         {
@@ -341,6 +354,13 @@ public class E2eeDiffAppendTests
                 int index = int.Parse(segments[6]);
                 if (index > ChunkCount)
                     return JsonR(HttpStatusCode.BadRequest, $"チャンク {index} は範囲外です（差分上書きは 0-{ChunkCount}）");
+                if (FailNextUploads > 0)
+                {
+                    FailNextUploads--;
+                    return JsonR(HttpStatusCode.InternalServerError, "テスト用のアップロード失敗");
+                }
+                _uploadReached.TrySetResult();
+                UploadRelease?.Task.Wait();
                 byte[] cipher = request.Content!.ReadAsByteArrayAsync(ct).GetAwaiter().GetResult();
                 UploadOrder.Add(index);
                 bool isReplace = index < ChunkCount && Chunks.ContainsKey(index);
@@ -584,5 +604,126 @@ public class E2eeDiffAppendTests
         Assert.Equal(1, server.Chunks[0].Revision);
         byte[] decrypted = E2eeCrypto.DecryptChunk(server.Chunks[0].Cipher, fileKey, 0, fileSalt, revision: 1);
         Assert.Equal(plain[..3000], decrypted);
+    }
+
+    [Fact]
+    public void 同一ハンドル内で書き込み後に切り詰めると切り詰め後の長さで永続化される()
+    {
+        // 回帰: Write で進んだ _maxWritten が CurrentSize = Max(DeclaredSize, _maxWritten)
+        // で SetEndOfFile の切り詰めを握りつぶし、truncation が無音に無視されていた。
+        // （ゲート内 SetDeclaredSize 導入前はスナップショットとの競合で欠落する恐れもあった）
+        var (fs, server, fileSalt, fileKey, plain) = CreateStatefulExistingFile(10000); // 3 チャンク
+        byte[] data = Enumerable.Range(0, 9000).Select(i => (byte)(10 + i % 240)).ToArray();
+
+        var ws = new CistaNasFileSystem.E2eeChunkWriteState(fs, PlainName, FakeStatefulE2eeServer.FileId);
+        var info = new StubFileInfo { Context = ws };
+
+        ws.Write(data, 0, data.Length, 100);                        // 100..9100 を書き込み
+        Assert.Equal(DokanResult.Success, fs.SetEndOfFile("\\" + PlainName, 5000, info)); // 9100 → 5000 に切り詰め
+        Assert.Equal(5000, ws.CurrentSize);
+        Assert.Equal(DokanResult.Success, fs.FlushFileBuffers("\\" + PlainName, info));
+
+        // finalize は切り詰め後の長さ・チャンク数 2（回帰: 3 チャンクのまま残らない）
+        Assert.Equal(
+            (E2eeCrypto.ComputeEncryptedLength(5000, ChunkSize), 2),
+            server.FinalizeRequests[^1]);
+        Assert.Equal(2, server.ChunkCount);
+        Assert.False(server.Chunks.ContainsKey(2));
+
+        // チャンク 1（末尾チャンク 4096..5000 = 904 バイト）は書き込みデータのみ
+        byte[] chunk1 = E2eeCrypto.DecryptChunk(server.Chunks[1].Cipher, fileKey, 1, fileSalt, revision: 1);
+        Assert.Equal(data[3996..4900], chunk1);
+
+        // チャンク 0 は既存先頭 100 バイト + 書き込みデータ
+        byte[] chunk0 = E2eeCrypto.DecryptChunk(server.Chunks[0].Cipher, fileKey, 0, fileSalt, revision: 1);
+        byte[] expected0 = new byte[ChunkSize];
+        plain.AsSpan(0, 100).CopyTo(expected0);
+        data.AsSpan(0, ChunkSize - 100).CopyTo(expected0.AsSpan(100));
+        Assert.Equal(expected0, chunk0);
+    }
+
+    [Fact]
+    public void アップロード中もバッファゲートは解放されReadとWriteが完了する()
+    {
+        // 回帰: persist（ネットワークアップロード全体）をバッファゲートで保持すると、
+        // アップロード中の同一ハンドル ReadFile / WriteFile がブロックされ、
+        // Dokan の IRP タイムアウトで失敗していた。アップロードはスナップショット +
+        // ゲート外実行とし、ゲートはバッファ操作だけを短く保護する。
+        var (fs, server, fileSalt, fileKey, plain) = CreateStatefulExistingFile(5000);
+        byte[] data = Enumerable.Range(0, 100).Select(i => (byte)(30 + i % 60)).ToArray();
+        byte[] patch = Enumerable.Range(0, 50).Select(i => (byte)(200 + i % 56)).ToArray();
+
+        var ws = new CistaNasFileSystem.E2eeChunkWriteState(fs, PlainName, FakeStatefulE2eeServer.FileId);
+        var info = new StubFileInfo { Context = ws };
+
+        ws.Write(data, 0, data.Length, 0);
+
+        // upload-chunk をサーバー側でブロックしてから Flush を別スレッドで走らせる
+        server.UploadRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<NtStatus> flush = Task.Run(() => fs.FlushFileBuffers("\\" + PlainName, info));
+        Assert.True(server.UploadReached.Wait(TimeSpan.FromSeconds(10)), "upload-chunk に到達しませんでした");
+
+        // アップロード（ネットワーク I/O）中はバッファゲートが解放されている
+        // 回帰: ゲート保持中は 0 になり、以降の Read/Write がタイムアウトまで詰まっていた
+        Assert.Equal(1, ws.Gate.CurrentCount);
+
+        // 同一ハンドルの ReadFile がアップロード中に完了する
+        byte[] readBuf = new byte[100];
+        Assert.Equal(DokanResult.Success, fs.ReadFile("\\" + PlainName, readBuf, out int bytesRead, 0, info));
+        Assert.Equal(data.Length, bytesRead);
+        Assert.Equal(data, readBuf);
+
+        // 同一ハンドルへの追加バッファ書き込みもゲートだけで完了する。
+        // （Dokan の WriteFile は既存 E2EE ファイルで書き込み後に同期 persist するため、
+        // 進行中の persist の _persistGate 解放待ちになる — これは直列化として正しい挙動。
+        // ここで検証するのはバッファゲートの解放なので、WriteState への直接書き込みにする）
+        Task wsWrite = Task.Run(() => ws.Write(patch, 0, patch.Length, 200));
+        Assert.True(wsWrite.Wait(TimeSpan.FromSeconds(10)), "アップロード中のバッファ書き込みがブロックされました");
+
+        // ブロック解除 → 1 回目の flush が完了
+        server.UploadRelease.TrySetResult();
+        Assert.True(flush.Wait(TimeSpan.FromSeconds(10)));
+        Assert.Equal(DokanResult.Success, flush.Result);
+
+        // 追い越し書き込みは 1 回目のスナップショットに含まれないため、2 回目の persist で送られる
+        Assert.Equal(DokanResult.Success, fs.FlushFileBuffers("\\" + PlainName, info));
+
+        // チャンク 0 の最終内容: 書き込みデータ + 既存 + 追い越し分（回帰: 追い越し分が失われるとここで失敗）
+        Assert.Equal(2, server.Chunks[0].Revision);
+        byte[] decrypted = E2eeCrypto.DecryptChunk(server.Chunks[0].Cipher, fileKey, 0, fileSalt, revision: 2);
+        byte[] expected = plain[..ChunkSize];
+        data.CopyTo(expected, 0);
+        patch.CopyTo(expected, 200);
+        Assert.Equal(expected, decrypted);
+    }
+
+    [Fact]
+    public void アップロード失敗時はバッファが保持され再persistで完成する()
+    {
+        // 事後条件: persist 失敗時にスナップショットがロールバックされ、
+        // ダーティバッファが未永続化のまま保持される（Cleanup / 再 Flush で再試行できる）。
+        var (fs, server, fileSalt, fileKey, plain) = CreateStatefulExistingFile(5000);
+        byte[] data = Enumerable.Range(0, 100).Select(i => (byte)(30 + i % 60)).ToArray();
+
+        var ws = new CistaNasFileSystem.E2eeChunkWriteState(fs, PlainName, FakeStatefulE2eeServer.FileId);
+        var info = new StubFileInfo { Context = ws };
+        ws.Write(data, 0, data.Length, 0);
+
+        server.FailNextUploads = 1;
+        Assert.Equal(DokanResult.InternalError, fs.FlushFileBuffers("\\" + PlainName, info));
+
+        // finalize は走っていない（チャンクアップロード失敗の時点で中断）
+        Assert.Empty(server.FinalizeRequests);
+        // ダーティバッファは未永続化として保持される
+        Assert.True(ws.HasPending);
+
+        // 再 persist で成功し、内容は失われない
+        Assert.Equal(DokanResult.Success, fs.FlushFileBuffers("\\" + PlainName, info));
+        Assert.Single(server.FinalizeRequests);
+        Assert.Equal(1, server.Chunks[0].Revision);
+        byte[] decrypted = E2eeCrypto.DecryptChunk(server.Chunks[0].Cipher, fileKey, 0, fileSalt, revision: 1);
+        byte[] expected = plain[..ChunkSize];
+        data.CopyTo(expected, 0);
+        Assert.Equal(expected, decrypted);
     }
 }

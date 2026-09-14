@@ -29,6 +29,39 @@ public class DokanUploadWriteStateTests
         }
     }
 
+    /// <summary>POST（全体アップロード）/ PATCH / GET（ダウンロード）で 1 ファイルの内容を保持するモック。</summary>
+    private sealed class StatefulPlainFileHandler(byte[] initial) : HttpMessageHandler
+    {
+        public byte[] Content { get; private set; } = initial;
+        public int PutCount { get; private set; }
+        public int PatchCount { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (request.Method == HttpMethod.Post)
+            {
+                Content = request.Content!.ReadAsByteArrayAsync(cancellationToken).GetAwaiter().GetResult();
+                PutCount++;
+                return Metadata();
+            }
+            if (request.Method == HttpMethod.Patch)
+            {
+                PatchCount++;
+                return Metadata();
+            }
+            if (request.Method == HttpMethod.Get)
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Content) });
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+        }
+
+        private Task<HttpResponseMessage> Metadata() => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(
+                $"{{\"name\":\"file.txt\",\"length\":{Content.Length},\"createdAt\":\"2026-01-01T00:00:00Z\",\"modifiedAt\":\"2026-01-01T00:00:00Z\"}}",
+                Encoding.UTF8, "application/json"),
+        });
+    }
+
     /// <summary>create-file は fileId 応答、upload-chunk は 500 で失敗を注入するモック。</summary>
     private sealed class FailUploadChunkHandler : HttpMessageHandler
     {
@@ -103,5 +136,41 @@ public class DokanUploadWriteStateTests
         // 作成中 fileId の DELETE（ロールバック）が呼ばれる
         Assert.Contains(handler.Requests,
             r => r.Method == "DELETE" && r.Uri.Contains(FailUploadChunkHandler.CreatedFileId));
+    }
+
+    /// <summary>
+    /// 非E2EE 既存ファイルへの書き込み後に SetEndOfFile で切り詰めると、
+    /// PATCH（長さを縮められない）ではなく全体 PUT で切り詰め後の内容が確定すること。
+    /// 回帰: Write で進んだ _maxWritten が CurrentSize = Max(DeclaredSize, _maxWritten) で
+    /// 切り詰めを握りつぶし、PATCH のみでファイルが切り詰め前の長さのまま残っていた。
+    /// </summary>
+    [Fact]
+    public void UploadWriteState_NonE2eeTruncateAfterWrite_SendsFullPutWithShortenedContent()
+    {
+        byte[] existing = new byte[10000];
+        for (int i = 0; i < existing.Length; i++) existing[i] = (byte)(i % 251);
+        var handler = new StatefulPlainFileHandler(existing);
+        var api = new CistaNasApiClient(new HttpClient(handler) { BaseAddress = new Uri("http://test/") });
+        var fs = new CistaNasFileSystem(api, "vol");
+
+        var ws = new CistaNasFileSystem.PlainRangeWriteState(fs, "file.txt", "file.txt", existingLength: 10000);
+        byte[] data = Enumerable.Range(0, 200).Select(i => (byte)(100 + i % 156)).ToArray();
+        ws.Write(data, 0, data.Length, 100); // 100..300 を書き込み
+        ws.SetDeclaredSize(5000);            // 同一ハンドル内での切り詰め
+
+        // 回帰: 書き込み後の切り詰めが _maxWritten に握りつぶされないこと
+        Assert.Equal(5000, ws.CurrentSize);
+
+        fs.UploadWriteState(ws);
+
+        // PATCH では長さを縮められないため、全体 PUT で確定する
+        Assert.Equal(1, handler.PutCount);
+        Assert.Equal(0, handler.PatchCount);
+        Assert.Equal(5000, handler.Content.Length);
+
+        // 内容: 既存 5000 バイトの切り詰め + 先頭付近の書き込みデータ
+        byte[] expected = existing[..5000];
+        data.CopyTo(expected, 100);
+        Assert.Equal(expected, handler.Content);
     }
 }

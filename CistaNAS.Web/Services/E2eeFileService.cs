@@ -28,13 +28,6 @@ public sealed class E2eeFileService
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    /// <summary>
-    /// E2EE 暗号化後のサイズを計算する pure 関数。
-    /// 計算式は <see cref="E2eeCrypto.ComputeEncryptedLength"/>（Shared）に一元管理。
-    /// </summary>
-    public static long ComputeEncryptedLength(long plainSize, int chunkSize)
-        => E2eeCrypto.ComputeEncryptedLength(plainSize, chunkSize);
-
     private readonly VolumeService _volumeService;
     private readonly IStorageProvider _storage;
     private readonly IChunkStore _chunkStore;

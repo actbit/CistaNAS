@@ -1,9 +1,10 @@
+using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Services;
 
 namespace CistaNAS.Tests;
 
 /// <summary>
-/// E2eeFileService.ComputeEncryptedLength の単体テスト (C-6)。
+/// E2eeCrypto.ComputeEncryptedLength の単体テスト (C-6)。
 /// 計算式が salt + chunkCount * tag + plainSize と一致することを確認。
 /// </summary>
 public class E2eeLengthCalcTests
@@ -11,7 +12,7 @@ public class E2eeLengthCalcTests
     [Fact]
     public void ComputeEncryptedLength_EmptyFile()
     {
-        long len = E2eeFileService.ComputeEncryptedLength(0, 1048576);
+        long len = E2eeCrypto.ComputeEncryptedLength(0, 1048576);
         // salt(16) + tag(16) = 32
         Assert.Equal(32L, len);
     }
@@ -20,7 +21,7 @@ public class E2eeLengthCalcTests
     public void ComputeEncryptedLength_OneByte()
     {
         // 1 byte ファイル: salt + 1 chunk 分の tag + 1 byte 平文
-        long len = E2eeFileService.ComputeEncryptedLength(1, 1048576);
+        long len = E2eeCrypto.ComputeEncryptedLength(1, 1048576);
         Assert.Equal(E2eeFileService.SaltSize + 1L + E2eeFileService.TagSize, len);
     }
 
@@ -28,7 +29,7 @@ public class E2eeLengthCalcTests
     public void ComputeEncryptedLength_ExactlyOneChunk()
     {
         const int chunkSize = 1048576;
-        long len = E2eeFileService.ComputeEncryptedLength(chunkSize, chunkSize);
+        long len = E2eeCrypto.ComputeEncryptedLength(chunkSize, chunkSize);
         // salt + chunkSize + 1*tag
         Assert.Equal(E2eeFileService.SaltSize + chunkSize + E2eeFileService.TagSize, len);
     }
@@ -38,7 +39,7 @@ public class E2eeLengthCalcTests
     {
         const int chunkSize = 1024; // テストしやすいサイズ
         long plainSize = chunkSize * 3 + 100; // 4 チャンク
-        long len = E2eeFileService.ComputeEncryptedLength(plainSize, chunkSize);
+        long len = E2eeCrypto.ComputeEncryptedLength(plainSize, chunkSize);
         // salt + plainSize + chunks * tag
         long expected = E2eeFileService.SaltSize + plainSize + 4L * E2eeFileService.TagSize;
         Assert.Equal(expected, len);
@@ -48,14 +49,14 @@ public class E2eeLengthCalcTests
     public void ComputeEncryptedLength_NegativePlainSize_Throws()
     {
         Assert.Throws<ArgumentOutOfRangeException>(
-            () => E2eeFileService.ComputeEncryptedLength(-1, 1024));
+            () => E2eeCrypto.ComputeEncryptedLength(-1, 1024));
     }
 
     [Fact]
     public void ComputeEncryptedLength_ZeroChunkSize_Throws()
     {
         Assert.Throws<ArgumentOutOfRangeException>(
-            () => E2eeFileService.ComputeEncryptedLength(100, 0));
+            () => E2eeCrypto.ComputeEncryptedLength(100, 0));
     }
 
     [Fact]
@@ -63,7 +64,7 @@ public class E2eeLengthCalcTests
     {
         // 1PB = 2^50 bytes は許容される
         long onePB = 1L << 50; // 1,125,899,906,842,624 bytes
-        long len = E2eeFileService.ComputeEncryptedLength(onePB, 1048576);
+        long len = E2eeCrypto.ComputeEncryptedLength(onePB, 1048576);
         // 計算がオーバーフローせずに完了することを確認
         Assert.True(len > onePB);
     }
@@ -73,7 +74,7 @@ public class E2eeLengthCalcTests
     {
         // 1PB - 1 バイトは許容される
         long justUnder = (1L << 50) - 1;
-        long len = E2eeFileService.ComputeEncryptedLength(justUnder, 1048576);
+        long len = E2eeCrypto.ComputeEncryptedLength(justUnder, 1048576);
         Assert.True(len > justUnder);
     }
 
@@ -83,7 +84,7 @@ public class E2eeLengthCalcTests
         // 1PB + 1 バイトは例外
         long over = (1L << 50) + 1;
         var ex = Assert.Throws<ArgumentOutOfRangeException>(
-            () => E2eeFileService.ComputeEncryptedLength(over, 1048576));
+            () => E2eeCrypto.ComputeEncryptedLength(over, 1048576));
         Assert.Contains("1PB", ex.Message);
     }
 }
