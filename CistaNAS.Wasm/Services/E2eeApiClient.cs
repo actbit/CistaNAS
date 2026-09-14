@@ -92,11 +92,11 @@ public sealed class E2eeApiClient
     }
 
     /// <summary>ファイルファイナライズ。</summary>
-    public async Task FinalizeFileAsync(string volumeName, string fileId, long actualEncryptedLength, string writeLeaseToken)
+    public async Task FinalizeFileAsync(string volumeName, string fileId, long actualEncryptedLength, string writeLeaseToken, int? chunkCount = null)
     {
         using var request = new HttpRequestMessage(HttpMethod.Patch,
             $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/finalize-file/{Uri.EscapeDataString(fileId)}")
-        { Content = JsonContent.Create(new E2eeFinalizeFileRequest(actualEncryptedLength)) };
+        { Content = JsonContent.Create(new E2eeFinalizeFileRequest(actualEncryptedLength, chunkCount)) };
         request.Headers.Add("X-CistaNAS-Write-Lease", writeLeaseToken);
         using var response = await _http.SendAsync(request);
         response.EnsureSuccessStatusCode();

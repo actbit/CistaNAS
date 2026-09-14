@@ -88,7 +88,7 @@ public sealed record E2eeCreateVolumeRequest(string VolumeName, string? Username
 public sealed record E2eeCreateFileRequest(
     string EncryptedName, long EncryptedLength, int ChunkCount,
     int KeyEpoch = 0, WrappedAeadKeyParams? WrappedFileKey = null, string? FileId = null);
-public sealed record E2eeFinalizeFileRequest(long ActualEncryptedLength);
+public sealed record E2eeFinalizeFileRequest(long ActualEncryptedLength, int? ChunkCount = null);
 public sealed record E2eeListFilesResponse(IReadOnlyList<E2eeFileEntry> Files);
 public sealed record E2eeMountResponse(int ChunkSize, string EncryptionMode);
 

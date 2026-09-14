@@ -43,6 +43,42 @@ public static class ChunkEncryptor
         ReadOnlySpan<byte> plaintext,
         ReadOnlySpan<byte> fileSalt = default)
     {
+        byte[]? derivedKey = DeriveFileScopedKeyIfAny(masterKey, fileSalt, algorithm);
+        try
+        {
+            return EncryptChunkWithScopedKey(masterKey, derivedKey, algorithm, chunkIndex, sectorSize, chunkSize, plaintext);
+        }
+        finally
+        {
+            if (derivedKey is not null)
+                CryptographicOperations.ZeroMemory(derivedKey);
+        }
+    }
+
+    /// <summary>
+    /// 導出済みのファイルスコープ鍵でチャンクを暗号化する。ホットループ（チャンク列の連続処理）では
+    /// 事前に <see cref="DeriveFileScopedKey"/> を一度だけ呼び、その結果を渡すことで
+    /// チャンクごとのファイルスコープ鍵 HKDF 導出を避ける。
+    /// 注: 内部ではチャンクごとに <see cref="AesXtsTransform"/>（鍵スケジュール）を構築し、
+    /// ChaCha20 パスでもチャンク鍵 HKDF が走る。これらは本 API では hoist されない。
+    /// </summary>
+    /// <param name="masterKey">マスターキー。レガシー（scopedKey = null）の場合に直接使う。</param>
+    /// <param name="scopedKey"><see cref="DeriveFileScopedKey"/> の戻り値（レガシー = null）。</param>
+    /// <param name="algorithm">暗号化アルゴリズム。</param>
+    /// <param name="chunkIndex">チャンクインデックス（0 起算）。</param>
+    /// <param name="sectorSize">セクタサイズ（ボリュームの SectorSize）。</param>
+    /// <param name="chunkSize">チャンクサイズ（バイト）。</param>
+    /// <param name="plaintext">平文データ。</param>
+    /// <returns>暗号化済みデータ（16 の倍数にパディング済み）。</returns>
+    public static byte[] EncryptChunkWithScopedKey(
+        ReadOnlySpan<byte> masterKey,
+        byte[]? scopedKey,
+        CipherAlgorithm algorithm,
+        int chunkIndex,
+        int sectorSize,
+        int chunkSize,
+        ReadOnlySpan<byte> plaintext)
+    {
         // セクタサイズが未設定（E2EE 等）の場合はブロックサイズ（16）を使用
         if (sectorSize <= 0) sectorSize = 16;
 
@@ -53,33 +89,25 @@ public static class ChunkEncryptor
 
         long firstSector = (long)chunkIndex * (chunkSize / sectorSize);
 
-        byte[]? derivedKey = DeriveFileScopedKeyIfAny(masterKey, fileSalt, algorithm);
-        try
+        ReadOnlySpan<byte> key;
+        if (scopedKey is not null) key = scopedKey; else key = masterKey;
+        switch (algorithm)
         {
-            ReadOnlySpan<byte> key = derivedKey ?? masterKey;
-            switch (algorithm)
-            {
-                case CipherAlgorithm.Aes256Xts:
-                    using (var transform = new AesXtsTransform(key, sectorSize))
-                    {
-                        transform.Encrypt(firstSector, padded, padded);
-                    }
-                    break;
+            case CipherAlgorithm.Aes256Xts:
+                using (var transform = new AesXtsTransform(key, sectorSize))
+                {
+                    transform.Encrypt(firstSector, padded, padded);
+                }
+                break;
 
-                case CipherAlgorithm.ChaCha20:
-                    return EncryptChaCha20V2(key, padded);
+            case CipherAlgorithm.ChaCha20:
+                return EncryptChaCha20V2(key, padded);
 
-                default:
-                    throw new ArgumentException($"サポートされていない暗号化アルゴリズム: {algorithm}");
-            }
-
-            return padded;
+            default:
+                throw new ArgumentException($"サポートされていない暗号化アルゴリズム: {algorithm}");
         }
-        finally
-        {
-            if (derivedKey is not null)
-                CryptographicOperations.ZeroMemory(derivedKey);
-        }
+
+        return padded;
     }
 
     /// <summary>
@@ -104,6 +132,35 @@ public static class ChunkEncryptor
         int originalLength,
         ReadOnlySpan<byte> fileSalt = default)
     {
+        byte[]? derivedKey = DeriveFileScopedKeyIfAny(masterKey, fileSalt, algorithm);
+        try
+        {
+            return DecryptChunkWithScopedKey(masterKey, derivedKey, algorithm, chunkIndex, sectorSize, chunkSize, ciphertext, originalLength);
+        }
+        finally
+        {
+            if (derivedKey is not null)
+                CryptographicOperations.ZeroMemory(derivedKey);
+        }
+    }
+
+    /// <summary>
+    /// 導出済みのファイルスコープ鍵でチャンクを復号する。
+    /// <see cref="EncryptChunkWithScopedKey"/> の復号側。ファイルスコープ鍵の
+    /// HKDF 導出を毎チャンク再実行しない。
+    /// </summary>
+    /// <param name="masterKey">マスターキー。レガシー（scopedKey = null）の場合に直接使う。</param>
+    /// <param name="scopedKey"><see cref="DeriveFileScopedKey"/> の戻り値（レガシー = null）。</param>
+    public static byte[] DecryptChunkWithScopedKey(
+        ReadOnlySpan<byte> masterKey,
+        byte[]? scopedKey,
+        CipherAlgorithm algorithm,
+        int chunkIndex,
+        int sectorSize,
+        int chunkSize,
+        ReadOnlySpan<byte> ciphertext,
+        int originalLength)
+    {
         // セクタサイズが未設定（E2EE 等）の場合はブロックサイズ（16）を使用
         if (sectorSize <= 0) sectorSize = 16;
 
@@ -111,34 +168,26 @@ public static class ChunkEncryptor
 
         long firstSector = (long)chunkIndex * (chunkSize / sectorSize);
 
-        byte[]? derivedKey = DeriveFileScopedKeyIfAny(masterKey, fileSalt, algorithm);
-        try
+        ReadOnlySpan<byte> key;
+        if (scopedKey is not null) key = scopedKey; else key = masterKey;
+        switch (algorithm)
         {
-            ReadOnlySpan<byte> key = derivedKey ?? masterKey;
-            switch (algorithm)
-            {
-                case CipherAlgorithm.Aes256Xts:
-                    using (var transform = new AesXtsTransform(key, sectorSize))
-                    {
-                        transform.Decrypt(firstSector, padded, padded);
-                    }
-                    break;
+            case CipherAlgorithm.Aes256Xts:
+                using (var transform = new AesXtsTransform(key, sectorSize))
+                {
+                    transform.Decrypt(firstSector, padded, padded);
+                }
+                break;
 
-                case CipherAlgorithm.ChaCha20:
-                    if (IsChaCha20V2(ciphertext))
-                        padded = DecryptChaCha20V2(key, ciphertext);
-                    else
-                        ChaCha20Decrypt(key, firstSector, padded, sectorSize);
-                    break;
+            case CipherAlgorithm.ChaCha20:
+                if (IsChaCha20V2(ciphertext))
+                    padded = DecryptChaCha20V2(key, ciphertext);
+                else
+                    ChaCha20Decrypt(key, firstSector, padded, sectorSize);
+                break;
 
-                default:
-                    throw new ArgumentException($"サポートされていない暗号化アルゴリズム: {algorithm}");
-            }
-        }
-        finally
-        {
-            if (derivedKey is not null)
-                CryptographicOperations.ZeroMemory(derivedKey);
+            default:
+                throw new ArgumentException($"サポートされていない暗号化アルゴリズム: {algorithm}");
         }
 
         // 元の長さにトリム
@@ -211,6 +260,15 @@ public static class ChunkEncryptor
         HKDF.DeriveKey(HashAlgorithmName.SHA256, masterKey, key, ReadOnlySpan<byte>.Empty, ChaCha20V2KeyInfo);
         return key;
     }
+
+    /// <summary>
+    /// ファイルスコープ鍵を導出する（<see cref="EncryptChunk"/> がチャンクごとに内部で行う
+    /// 導出の公開版）。ホットループの前に一度だけ呼び、結果を
+    /// <see cref="EncryptChunkWithScopedKey"/> / <see cref="DecryptChunkWithScopedKey"/> に渡すこと。
+    /// XTS は 64 バイト（2×32）、ChaCha20 は 32 バイト。ソルトが空なら null（レガシー: マスターキー直用）。
+    /// </summary>
+    public static byte[]? DeriveFileScopedKey(ReadOnlySpan<byte> masterKey, ReadOnlySpan<byte> fileSalt, CipherAlgorithm algorithm)
+        => DeriveFileScopedKeyIfAny(masterKey, fileSalt, algorithm);
 
     /// <summary>
     /// fileSalt が指定されていればマスターキーからファイルスコープ鍵を導出する。

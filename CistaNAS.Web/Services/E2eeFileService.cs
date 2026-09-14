@@ -30,18 +30,10 @@ public sealed class E2eeFileService
 
     /// <summary>
     /// E2EE 暗号化後のサイズを計算する pure 関数。
-    /// 構造: [salt(16)] + [チャンク 0..n-1: 平文 + tag(16)]
-    /// 空ファイルでも salt + tag のみで構成される（暗号化時にタグが生成されるため）。
+    /// 計算式は <see cref="E2eeCrypto.ComputeEncryptedLength"/>（Shared）に一元管理。
     /// </summary>
     public static long ComputeEncryptedLength(long plainSize, int chunkSize)
-    {
-        if (plainSize < 0) throw new ArgumentOutOfRangeException(nameof(plainSize));
-        if (plainSize > MaxPlainSize) throw new ArgumentOutOfRangeException(nameof(plainSize), $"ファイルサイズは1PB以下である必要があります。");
-        if (chunkSize <= 0) throw new ArgumentOutOfRangeException(nameof(chunkSize));
-        if (plainSize == 0) return SaltSize + TagSize;
-        long chunks = (plainSize + chunkSize - 1) / chunkSize;
-        return SaltSize + plainSize + chunks * TagSize;
-    }
+        => E2eeCrypto.ComputeEncryptedLength(plainSize, chunkSize);
 
     private readonly VolumeService _volumeService;
     private readonly IStorageProvider _storage;

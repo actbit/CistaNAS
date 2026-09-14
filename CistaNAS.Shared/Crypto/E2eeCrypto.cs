@@ -38,6 +38,26 @@ public static class E2eeCrypto
 
     public static byte[] GenerateFileSalt() => RandomNumberGenerator.GetBytes(SaltSize);
 
+    /// <summary>最大平文サイズ（1PB）。整数オーバーフロー防止。</summary>
+    public const long MaxPlainSize = 1L << 50;
+
+    /// <summary>
+    /// E2EE 暗号化後のサイズを計算する canonical な pure 関数。
+    /// 構造: [salt(16)] + [平文] + [チャンクごと tag(16)]。
+    /// 空ファイルでも salt + tag のみで構成される（暗号化時にタグが生成されるため）。
+    /// 全クライアント（Web / Wasm / Mobile / Dokan）の CreateFile / FinalizeFile は
+    /// この関数に統一すること（計算式の分岐はプロトコル不整合の原因になる）。
+    /// </summary>
+    public static long ComputeEncryptedLength(long plainSize, int chunkSize)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(plainSize);
+        if (plainSize > MaxPlainSize)
+            throw new ArgumentOutOfRangeException(nameof(plainSize), plainSize, "ファイルサイズは1PB以下である必要があります。");
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(chunkSize, 0, nameof(chunkSize));
+        long chunks = plainSize == 0 ? 1 : (plainSize + chunkSize - 1) / chunkSize;
+        return SaltSize + plainSize + chunks * GcmTagSize;
+    }
+
     // ---- マスターキー Wrap/Unwrap ----
 
     /// <summary>マスターキーをラップする。</summary>

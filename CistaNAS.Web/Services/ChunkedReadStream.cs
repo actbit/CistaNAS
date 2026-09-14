@@ -15,7 +15,7 @@ public sealed class ChunkedReadStream : Stream
     private readonly string _volumeName;
     private readonly string _objectId;
     private readonly byte[] _masterKey;
-    private readonly byte[]? _fileSalt; // FileMetadata.KeySalt（レガシーな salt なしファイルは null）
+    private readonly byte[]? _scopedKey; // ファイルスコープ鍵（レガシーな salt なしファイルは null）
     private readonly CipherAlgorithm _cipherAlgorithm;
     private readonly int _sectorSize;
     private readonly int _chunkSize;
@@ -43,7 +43,9 @@ public sealed class ChunkedReadStream : Stream
         _volumeName = volumeName;
         _objectId = objectId;
         _masterKey = masterKey.ToArray();
-        _fileSalt = fileSalt.IsEmpty ? null : fileSalt.ToArray();
+        // ファイルスコープ鍵はストリーム生成時に一度だけ導出する
+        // （チャンクごとのファイルスコープ鍵 HKDF 再導出を避ける）。
+        _scopedKey = fileSalt.IsEmpty ? null : ChunkEncryptor.DeriveFileScopedKey(masterKey, fileSalt, cipherAlgorithm);
         _cipherAlgorithm = cipherAlgorithm;
         _sectorSize = sectorSize;
         _chunkSize = chunkSize;
@@ -175,9 +177,8 @@ public sealed class ChunkedReadStream : Stream
             throw new InvalidOperationException($"チャンク {chunkIndex} がストレージに見つかりません。");
 
         int originalLength = chunkIndex < _chunkSizes.Count ? _chunkSizes[chunkIndex] : encrypted.Length;
-        byte[] plain = ChunkEncryptor.DecryptChunk(
-            _masterKey, _cipherAlgorithm, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength,
-            _fileSalt);
+        byte[] plain = ChunkEncryptor.DecryptChunkWithScopedKey(
+            _masterKey, _scopedKey, _cipherAlgorithm, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength);
 
         _cachedDecrypted = plain;
         _cachedChunkIndex = chunkIndex;
@@ -196,9 +197,8 @@ public sealed class ChunkedReadStream : Stream
             throw new InvalidOperationException($"チャンク {chunkIndex} がストレージに見つかりません。");
 
         int originalLength = chunkIndex < _chunkSizes.Count ? _chunkSizes[chunkIndex] : encrypted.Length;
-        byte[] plain = ChunkEncryptor.DecryptChunk(
-            _masterKey, _cipherAlgorithm, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength,
-            _fileSalt);
+        byte[] plain = ChunkEncryptor.DecryptChunkWithScopedKey(
+            _masterKey, _scopedKey, _cipherAlgorithm, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength);
 
         _cachedDecrypted = plain;
         _cachedChunkIndex = chunkIndex;
@@ -215,6 +215,7 @@ public sealed class ChunkedReadStream : Stream
         if (disposing)
         {
             _cachedDecrypted = null;
+            if (_scopedKey is not null) CryptographicOperations.ZeroMemory(_scopedKey);
             CryptographicOperations.ZeroMemory(_masterKey);
         }
         _disposed = true;
