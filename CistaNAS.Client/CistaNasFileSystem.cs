@@ -42,12 +42,6 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
     private (long UserUsedBytes, long UserQuotaBytes)? _cachedStats;
     private readonly object _statsLock = new();
 
-    // 同一 WriteState への persist（ネットワークアップロード）を直列化するゲート。
-    // バッファゲート（WriteState.Gate）とは別系統: バッファゲートは保持しない状態で
-    // このゲートを取得するためデッドロックしない。overlapped WriteFile の write-through と
-    // FlushFileBuffers / Cleanup の同時 persist が revision やリースで競合するのを防ぐ。
-    private readonly SemaphoreSlim _persistGate = new(1, 1);
-
     /// <summary>
     /// E2EE モードでファイルシステムを作成。
     /// 共有 v2 ボリュームでは <paramref name="masterKey"/> は null 可（v2 メンバーは GroupKey のみ）。
@@ -178,7 +172,10 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
     internal abstract class WriteState
     {
         public readonly string PlainName;
-        public readonly string? ExistingFileId; // 上書き時の旧ファイルID（E2EE は fileId、非E2EE は plainName または null）
+        // 上書き時の旧ファイルID（E2EE は fileId、非E2EE は plainName または null）。
+        // setter を公開しているのは新規 E2EE ファイルの persist 成功後に派生クラスが
+        // 「既存ファイル」へ昇格できるようにするため（E2eeChunkWriteState.PromoteToExisting）。
+        public string? ExistingFileId { get; protected set; }
         protected readonly CistaNasFileSystem Fs;
         public long DeclaredSize = -1; // SetEndOfFile で指定されたサイズ
 
@@ -198,6 +195,20 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         /// （UploadWriteState がスナップショット → ゲート解放 → アップロード → 再取得の順で行う）。
         /// </summary>
         public readonly SemaphoreSlim Gate = new(1, 1);
+
+        /// <summary>
+        /// 同一 WriteState の persist（ネットワークアップロード）を直列化するゲート。
+        /// バッファゲート（Gate）とは別系統: Gate は保持しない状態で取得するためデッドロックしない。
+        /// overlapped WriteFile の write-through と FlushFileBuffers / Cleanup の同時 persist が
+        /// revision やリースで競合するのを防ぐ。
+        /// ファイルシステム全体のゲートにはしない — 無関係なファイルの persist まで
+        /// 阻塞され、Dokan の IRP タイムアウト（MountService の options.TimeOut = 10s）に達する。
+        /// また進行中 persist のスナップショット後は HasPending が false になるため、
+        /// Cleanup / 再 persist の「永続化済み判定」は必ずこのゲート取得後に行う
+        /// （取得前に行うと Cleanup がアップロード中のバッファを Dispose してしまう）。
+        /// ロック順序: PersistGate → Gate（UploadWriteState → 各 Upload* の Gate 取得のみ）。
+        /// </summary>
+        public readonly SemaphoreSlim PersistGate = new(1, 1);
 
         protected WriteState(CistaNasFileSystem fs, string plainName, string? existingFileId)
         {
@@ -335,7 +346,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         // crypto format v2: 既存チャンク復号に使う鍵 epoch（0 = v1）と volumeId（AAD bind 用）
         private int _existingFileKeyEpoch;
         private string? _existingVolumeId;
-        private readonly Timer? _leaseRenewal;
+        private Timer? _leaseRenewal;
 
         public E2eeChunkWriteState(CistaNasFileSystem fs, string plainName, string? existingFileId)
             : base(fs, plainName, existingFileId)
@@ -408,11 +419,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                     }
 
                     WriteLeaseToken = leaseToken;
-                    _leaseRenewal = new Timer(_ =>
-                    {
-                        try { fs._api.RenewWriteLeaseAsync(fs._volumeName, existingFileId, leaseToken).GetAwaiter().GetResult(); }
-                        catch { /* 次の保存時にサーバーが期限切れを返す */ }
-                    }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+                    StartLeaseRenewal(leaseToken);
                 }
                 catch
                 {
@@ -432,7 +439,52 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public int ExistingFileKeyEpoch => _existingFileKeyEpoch;
         /// <summary>crypto format v2: volumeId（チャンク AAD bind 用）。v1 では null。</summary>
         public string? ExistingVolumeId => _existingVolumeId;
-        public string? WriteLeaseToken { get; }
+        public string? WriteLeaseToken { get; private set; }
+
+        /// <summary>
+        /// persist 開始時（PersistGate 保持中・Gate 非保持）に呼ぶ。書き込みリースが未取得なら
+        /// 取得して更新タイマーを開始する。handle-open で既存ファイルとして生成された場合は
+        /// ctor で取得済みのためそのまま返す。新規ファイルの persist 成功後に昇格した状態は
+        /// 初期リースを persist の finally で解放済みのため、ここで改めて取得する
+        /// （昇格時に取得すると、リース取得失敗が「成功済み persist の失敗」扱いになってしまう）。
+        /// </summary>
+        internal string EnsureWriteLease()
+        {
+            if (WriteLeaseToken is not null) return WriteLeaseToken;
+            string token = Fs._api.AcquireWriteLeaseAsync(Fs._volumeName, ExistingFileId!).GetAwaiter().GetResult();
+            WriteLeaseToken = token;
+            StartLeaseRenewal(token);
+            return token;
+        }
+
+        private void StartLeaseRenewal(string token)
+        {
+            _leaseRenewal?.Dispose();
+            _leaseRenewal = new Timer(_ =>
+            {
+                try { Fs._api.RenewWriteLeaseAsync(Fs._volumeName, ExistingFileId!, token).GetAwaiter().GetResult(); }
+                catch { /* 次の保存時にサーバーが期限切れを返す */ }
+            }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+        }
+
+        /// <summary>
+        /// Gate 保持中に呼ぶ。新規ファイルの persist 成功後、同一ハンドルでの次回 persist が
+        /// 再び新規作成（CreateFile + 全チャンク再アップロード。永続化済みチャンクは解放済みのため
+        /// 実質全ゼロ上書き）しないよう「既存ファイル」状態へ昇格する。
+        /// </summary>
+        internal void PromoteToExisting(string fileId, byte[] fileKey, byte[] fileSalt, int keyEpoch,
+            string? volumeId, int chunkCount, long plainLength)
+        {
+            ExistingFileId = fileId;
+            _existingChunkCount = chunkCount;
+            _existingPlainLength = plainLength;
+            // 呼び出し元の finally で fileKey（dek）がゼロ化されるため複製する。
+            // fileSalt は所有権ごと渡す（Dispose でゼロクリアされる）。
+            _existingFileKey = (byte[])fileKey.Clone();
+            _existingFileSalt = fileSalt;
+            _existingFileKeyEpoch = keyEpoch;
+            _existingVolumeId = volumeId;
+        }
 
         public override long CurrentSize
         {
@@ -524,7 +576,10 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         /// Gate 保持中に呼ぶ。ダーティチャンクをアップロードへ引き抜く。
         /// dict の各エントリを同一内容のクローンと置き換えることで、ゲート解放後のアップロード中に
         /// WriteFile がバッファへ追記しても、暗号化対象のオリジナルバッファが破壊されない。
-        /// 切り詰めで不要になったチャンク（index ≥ <paramref name="chunkCount"/>）はここで破棄する。
+        /// 切り詰めで不要になったチャンク（index ≥ <paramref name="chunkCount"/>）もクローン対象に
+        /// 含める — ここで破棄するとスナップショット外になり、アップロード失敗時に
+        /// ロールバックできず書き込みデータが失われる。アップロード側は
+        /// index ≥ chunkCount をスキップし、確定時に破棄する。
         /// </summary>
         internal List<(int ChunkIndex, byte[] Original)> TakeDirtyChunksForUpload(int chunkCount)
         {
@@ -533,13 +588,6 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             foreach (int ci in _dirtyChunks.Keys.OrderBy(ci => ci))
             {
                 byte[] original = _dirtyChunks[ci];
-                if (ci >= chunkCount)
-                {
-                    // 切り詰め領域のチャンクはサーバー側も論理切り詰められるため破棄する
-                    _dirtyChunks.Remove(ci);
-                    CryptographicOperations.ZeroMemory(original);
-                    continue;
-                }
                 _dirtyChunks[ci] = (byte[])original.Clone();
                 result.Add((ci, original));
             }
@@ -596,8 +644,19 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             if (ExistingFileId is not null && ci < _existingChunkCount
                 && _existingFileKey is not null && _existingFileSalt is not null)
             {
-                return Fs.LoadPlainChunkForWrite(ExistingFileId, ci, _existingFileKey, _existingFileSalt,
+                byte[] chunk = Fs.LoadPlainChunkForWrite(ExistingFileId, ci, _existingFileKey, _existingFileSalt,
                     _existingFileKeyEpoch, _existingVolumeId);
+                // SetEndOfFile で切り詰め宣言中の場合、宣言サイズ以降の旧サーバー内容を
+                // バッファへ取り込まない。取り込むと切り詰め後の拡張書き込み（RMW）で
+                // 切り詰め点〜書き込み位置の隙間に旧内容が復活する
+                // （truncate-then-extend のセマンティクスでは隙間はゼロ）。
+                if (DeclaredSize >= 0)
+                {
+                    long preserved = Math.Max(0, DeclaredSize - (long)ci * chunkSize);
+                    if (preserved < chunk.Length)
+                        Array.Clear(chunk, (int)preserved, chunk.Length - (int)preserved);
+                }
+                return chunk;
             }
             // 新規チャンク: chunkSize のゼロ
             return new byte[chunkSize];
@@ -1519,22 +1578,27 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
     /// <summary>
     /// WriteState の未永続化データをサーバーへ persist する。
     /// 呼び出し規約: Gate 非保持で呼ぶこと。内部で (1) バッファゲートでスナップショットを取得して解放
-    /// → (2) persist ゲートでネットワークアップロード（バッファゲート非保持）
+    /// → (2) ネットワークアップロード（バッファゲート非保持）
     /// → (3) バッファゲートで後処理（解放 / 失敗ロールバック）、の順に進める。
     /// バッファゲートをネットワーク I/O 中に保持しないことで、同一ハンドルの ReadFile / WriteFile /
     /// SetEndOfFile がアップロード（低速回線では数秒〜10秒超）の間ブロックされて
     /// Dokan の IRP タイムアウト（MountService の options.TimeOut = 10s）で失敗しないようにする。
-    /// persist ゲートは同時 persist（overlapped WriteFile の write-through と FlushFileBuffers /
-    /// Cleanup の競合）を直列化し、revision・リースの競合を防ぐ。
+    /// persist ゲート（WriteState.PersistGate）は同一ハンドルの同時 persist
+    /// （overlapped WriteFile の write-through と FlushFileBuffers / Cleanup の競合）を
+    /// 直列化し、revision・リースの競合を防ぐ。ファイル単位のため、他ファイルの
+    /// persist で阻塞されて無関係なハンドルが IRP タイムアウトになることはない。
     /// 例外はそのまま上位（Cleanup は void 制約でエラーを飲む）に伝播させる。
     /// </summary>
     internal void UploadWriteState(WriteState ws)
     {
-        if (!ws.HasPending) return;
-
-        _persistGate.Wait();
+        // 永続化済み判定（HasPending）は persist ゲート取得後に行う。ゲートの外で行うと、
+        // 進行中の persist がスナップショット済み（HasPending == false）の間に
+        // Cleanup が早期 return して Dispose（リース解放・バッファゼロ化）してしまう。
+        ws.PersistGate.Wait();
         try
         {
+            if (!ws.HasPending) return;
+
             switch (ws)
             {
                 case PlainRangeWriteState plain:
@@ -1550,7 +1614,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         }
         finally
         {
-            _persistGate.Release();
+            ws.PersistGate.Release();
         }
 
         _listingCache.Invalidate();
@@ -1594,24 +1658,30 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 return;
             }
 
-            if (taken.Count == 0 && snapshotSize >= serverLength)
+            if (taken.Count == 0 && snapshotSize == serverLength)
             {
-                // 既存ファイルで書き込みなし・切り詰めなし → 何もしない
+                // 既存ファイルで書き込みなし・長さ変更なし → 何もしない。
+                // 回帰: 「>= serverLength」で早期 return すると純粋な SetEndOfFile 拡張が
+                // 消費済み pending ごと捨てられ、拡張が永続化されなかった。
                 return;
             }
 
-            if (snapshotSize < serverLength)
+            if (snapshotSize < serverLength || (taken.Count == 0 && snapshotSize > serverLength))
             {
-                // 切り詰め: PATCH は長さを縮められないため、サーバー内容 + ダーティ + 短縮で全体 PUT する。
+                // 切り詰め、または書き込みなしの純粋な拡張: PATCH では長さを変更できないため、
+                // サーバー内容 + ダーティ + 指定長で全体 PUT する。
                 byte[] full = new byte[Math.Max(0, snapshotSize)];
                 if (!isNew)
                 {
-                    try
-                    {
-                        byte[] existing = CistaNasApiClientFiles.DownloadFileAsync(_api, _volumeName, ws.PlainName).GetAwaiter().GetResult();
-                        Buffer.BlockCopy(existing, 0, full, 0, (int)Math.Min(existing.Length, full.Length));
-                    }
-                    catch { /* サーバー内容の取得に失敗した場合はゼロで確定する */ }
+                    // 回帰: サーバー内容の取得に失敗して全ゼロで PUT すると既存内容を破壊するため、
+                    // 例外は握りつぶさず persist 全体を失敗させロールバックする。
+                    byte[] existing = CistaNasApiClientFiles.DownloadFileAsync(_api, _volumeName, ws.PlainName).GetAwaiter().GetResult();
+                    // 回帰: 切り詰め→拡張（縮小後に終端を越える書き込み）では、宣言サイズ以降の
+                    // 旧サーバー内容を復活させてはいけない（隙間はゼロ）。
+                    long preserve = full.Length;
+                    if (ws.DeclaredSize >= 0)
+                        preserve = Math.Min(preserve, Math.Max(0, ws.DeclaredSize));
+                    Buffer.BlockCopy(existing, 0, full, 0, (int)Math.Min(existing.Length, preserve));
                 }
                 foreach (var (off, data) in taken)
                 {
@@ -1701,42 +1771,44 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 ws.Gate.Release();
             }
 
-            string fileId;
-            string? initialWriteLease;
+            // スナップショット（pending 取り込み）より後の失敗はすべて未永続化へ戻す必要がある。
+            // 回帰: CreateFileAsync が try の外にあると、作成失敗時にロールバックされず
+            // pending = 0 のまま例外が流れ、以降の再試行経路（Cleanup / 再 persist）が死ぬ。
+            string? fileId = null;
+            string? writeLease = null;
             WrappedAeadKey? localWrappedFileKey = null;
-            if (isV2)
-            {
-                // v2: fileId を先に決定する（WrappedFileKey の AAD に fileId が bind されるため）
-                string preallocatedFileId = Guid.NewGuid().ToString("N");
-                var (wnonce, wct, wtag) = E2eeV2.WrapFileKey(fileKey, groupKey!, _v2!.VolumeIdString, preallocatedFileId, keyEpoch);
-                localWrappedFileKey = new WrappedAeadKey { Algorithm = "aes-256-gcm", Nonce = wnonce, Ciphertext = wct, Tag = wtag };
-                (fileId, initialWriteLease) = _api.CreateFileAsync(
-                    _volumeName, encName, encLength, chunkCount, keyEpoch,
-                    new WrappedAeadKey { Algorithm = "aes-256-gcm", Nonce = wnonce, Ciphertext = wct, Tag = wtag },
-                    preallocatedFileId).GetAwaiter().GetResult();
-            }
-            else
-            {
-                (fileId, initialWriteLease) = _api.CreateFileAsync(
-                    _volumeName, encName, encLength, chunkCount).GetAwaiter().GetResult();
-            }
-
-            string? writeLease = initialWriteLease;
             bool finalized = false;
             try
             {
+                if (isV2)
+                {
+                    // v2: fileId を先に決定する（WrappedFileKey の AAD に fileId が bind されるため）
+                    string preallocatedFileId = Guid.NewGuid().ToString("N");
+                    var (wnonce, wct, wtag) = E2eeV2.WrapFileKey(fileKey, groupKey!, _v2!.VolumeIdString, preallocatedFileId, keyEpoch);
+                    localWrappedFileKey = new WrappedAeadKey { Algorithm = "aes-256-gcm", Nonce = wnonce, Ciphertext = wct, Tag = wtag };
+                    (fileId, writeLease) = _api.CreateFileAsync(
+                        _volumeName, encName, encLength, chunkCount, keyEpoch,
+                        new WrappedAeadKey { Algorithm = "aes-256-gcm", Nonce = wnonce, Ciphertext = wct, Tag = wtag },
+                        preallocatedFileId).GetAwaiter().GetResult();
+                }
+                else
+                {
+                    (fileId, writeLease) = _api.CreateFileAsync(
+                        _volumeName, encName, encLength, chunkCount).GetAwaiter().GetResult();
+                }
+
                 foreach (var (i, dirty) in snapshot)
                 {
                     int chunkLen = (int)Math.Min(_chunkSize, plainLength - (long)i * _chunkSize);
                     byte[] chunk = dirty.Length == chunkLen ? dirty : ResizeChunk(dirty, chunkLen);
                     byte[] encChunk = isV2
                         ? E2eeV2.EncryptChunk(chunk, fileKey,
-                            new E2eeChunkContext(_v2!.VolumeIdString, fileId, i, Revision: 0, keyEpoch),
+                            new E2eeChunkContext(_v2!.VolumeIdString, fileId!, i, Revision: 0, keyEpoch),
                             isFirstChunk: i == 0, fileSalt)
                         : E2eeCrypto.EncryptChunk(chunk, fileKey, i, fileSalt, isFirstChunk: i == 0);
-                    _api.UploadChunkAsync(_volumeName, fileId, i, encChunk, writeLease).GetAwaiter().GetResult();
+                    _api.UploadChunkAsync(_volumeName, fileId!, i, encChunk, writeLease).GetAwaiter().GetResult();
                 }
-                _api.FinalizeFileAsync(_volumeName, fileId, encLength, writeLease).GetAwaiter().GetResult();
+                _api.FinalizeFileAsync(_volumeName, fileId!, encLength, writeLease).GetAwaiter().GetResult();
                 finalized = true;
             }
             catch
@@ -1745,7 +1817,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 // バッファ側は RollbackChunkUpload で未永続化に戻す（クローンがデータを保持）。
                 try
                 {
-                    if (writeLease is not null)
+                    if (fileId is not null && writeLease is not null)
                         _api.DeleteFileAsync(_volumeName, fileId, writeLease).GetAwaiter().GetResult();
                 }
                 catch { /* ベストエフォート */ }
@@ -1758,18 +1830,18 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             {
                 if (writeLease is not null)
                 {
-                    try { _api.ReleaseWriteLeaseAsync(_volumeName, fileId, writeLease).GetAwaiter().GetResult(); }
+                    try { _api.ReleaseWriteLeaseAsync(_volumeName, fileId!, writeLease).GetAwaiter().GetResult(); }
                     catch { }
                 }
             }
 
             if (finalized)
             {
-                _fileIdCache[ws.PlainName] = fileId;
-                _cache[fileId] = new FileCache
+                _fileIdCache[ws.PlainName] = fileId!;
+                _cache[fileId!] = new FileCache
                 {
                     PlainName = ws.PlainName,
-                    FileId = fileId,
+                    FileId = fileId!,
                     ChunkCount = chunkCount,
                     PlainLength = plainLength,
                     KeyEpoch = keyEpoch,
@@ -1777,7 +1849,17 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 };
 
                 ws.Gate.Wait();
-                try { ws.CompleteChunkUpload(chunkCount, plainLength, snapshot); }
+                try
+                {
+                    ws.CompleteChunkUpload(chunkCount, plainLength, snapshot);
+                    // 回帰: CompleteChunkUpload がダーティチャンクを解放し既存状態を進めた後も
+                    // ExistingFileId が null のままだと、同一ハンドルの次の persist が再び新規作成を
+                    // 試みて（解放済みチャンクの全ゼロ再作成）承認済みデータを破壊する。
+                    // 「既存ファイル」へ昇格し、次回から差分保存させる。fileKey は外側の finally で
+                    // ゼロ化されるため昇格側で複製される。初期リースは上の finally で解放済みのため、
+                    // 次回 persist の EnsureWriteLease で改めて取得する。
+                    ws.PromoteToExisting(fileId!, dek!, fileSalt, keyEpoch, VolumeIdString, chunkCount, plainLength);
+                }
                 finally { ws.Gate.Release(); }
             }
         }
@@ -1828,6 +1910,10 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
         try
         {
+            // リースは persist 開始時に確保する。新規ファイル persist 成功後に昇格した状態は
+            // 初期リース解放済みのため、ここで改めて取得される（PersistGate 内で直列化される）。
+            string writeLease = ws.EnsureWriteLease();
+
             // 汚れたチャンクだけ再暗号化して replace（未変更チャンクは維持 → 末尾保持）。
             // スナップショットはチャンクインデックス順に送ること。サーバーは chunkIndex > ChunkCount を
             // 拒否するため、sparse 書き込み（例: 1 チャンクのファイルに index 2 へ書き込み →
@@ -1835,6 +1921,11 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             // persist 全体が失敗してバッファ済みデータが失われる。
             foreach (var (ci, chunk) in snapshot)
             {
+                // 切り詰め領域（index ≥ 確定チャンク数）は送らない — finalize の ChunkCount 指定で
+                // サーバー側も論理切り詰められる。スナップショットに含めているのは
+                // ロールバック（切り詰め取り消し）に備えてデータを保持するため。
+                if (ci >= newChunkCount) continue;
+
                 int chunkLen = (int)Math.Min(_chunkSize, newPlainLength - (long)ci * _chunkSize);
                 byte[] toEncrypt = chunk.Length == chunkLen ? chunk : ResizeChunk(chunk, chunkLen);
 
@@ -1852,7 +1943,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                         isFirstChunk: ci == 0, fileSalt)
                     : E2eeCrypto.EncryptChunk(toEncrypt, fileKey, ci, fileSalt,
                         isFirstChunk: ci == 0, revision: nextRevision);
-                _api.UploadChunkAsync(_volumeName, fileId, ci, encChunk, ws.WriteLeaseToken!, replace: true).GetAwaiter().GetResult();
+                _api.UploadChunkAsync(_volumeName, fileId, ci, encChunk, writeLease, replace: true).GetAwaiter().GetResult();
 
                 // チャンクプールのキャッシュを更新（新しい暗号文ハッシュで）
                 PutChunkToPool(fileId, ci, toEncrypt, ComputeHashHex(encChunk));
@@ -1861,7 +1952,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             // FinalizeFile で長さ確定（縮小時は ChunkCount 指定で論理切り詰め）
             int finalizeChunkCount = newChunkCount;
             long encLength = E2eeCrypto.ComputeEncryptedLength(newPlainLength, _chunkSize);
-            _api.FinalizeFileAsync(_volumeName, fileId, encLength, ws.WriteLeaseToken!, finalizeChunkCount).GetAwaiter().GetResult();
+            _api.FinalizeFileAsync(_volumeName, fileId, encLength, writeLease, finalizeChunkCount).GetAwaiter().GetResult();
 
             // キャッシュ更新
             if (_cache.TryGetValue(fileId, out var cache))
