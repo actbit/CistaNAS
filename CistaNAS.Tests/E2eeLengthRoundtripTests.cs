@@ -1,3 +1,4 @@
+using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Services;
 
 namespace CistaNAS.Tests;
@@ -16,23 +17,23 @@ public class E2eeLengthRoundtripTests
         
         // 0 バイト: 空ファイルでも salt(16) + tag(16) = 32 バイトの暗号化データが存在し、
         // 1チャンク相当のタグが含まれるため chunkCount=1 を指定
-        long encrypted0 = E2eeFileService.ComputeEncryptedLength(0, chunkSize);
+        long encrypted0 = E2eeCrypto.ComputeEncryptedLength(0, chunkSize);
         long plain0 = E2eeFileService.ComputePlainSize(encrypted0, 1); // chunkCount=1 が正しい
         Assert.Equal(0L, plain0);
 
         // 1 バイト
-        long encrypted1 = E2eeFileService.ComputeEncryptedLength(1, chunkSize);
+        long encrypted1 = E2eeCrypto.ComputeEncryptedLength(1, chunkSize);
         long plain1 = E2eeFileService.ComputePlainSize(encrypted1, 1);
         Assert.Equal(1L, plain1);
 
         // チャンクサイズちょうど
-        long encryptedChunk = E2eeFileService.ComputeEncryptedLength(chunkSize, chunkSize);
+        long encryptedChunk = E2eeCrypto.ComputeEncryptedLength(chunkSize, chunkSize);
         long plainChunk = E2eeFileService.ComputePlainSize(encryptedChunk, 1);
         Assert.Equal((long)chunkSize, plainChunk);
 
         // 複数チャンク: 2.5チャンクなので実際には3チャンクになる
         long plainMulti = chunkSize * 2 + 500;
-        long encryptedMulti = E2eeFileService.ComputeEncryptedLength(plainMulti, chunkSize);
+        long encryptedMulti = E2eeCrypto.ComputeEncryptedLength(plainMulti, chunkSize);
         int actualChunkCount = (int)((plainMulti + chunkSize - 1) / chunkSize);
         long recovered = E2eeFileService.ComputePlainSize(encryptedMulti, actualChunkCount);
         Assert.Equal(plainMulti, recovered);
@@ -45,7 +46,7 @@ public class E2eeLengthRoundtripTests
         long plainSize = chunkSize * 10 + 100;
         int chunkCount = (int)((plainSize + chunkSize - 1) / chunkSize);
         
-        long encrypted = E2eeFileService.ComputeEncryptedLength(plainSize, chunkSize);
+        long encrypted = E2eeCrypto.ComputeEncryptedLength(plainSize, chunkSize);
         long recovered = E2eeFileService.ComputePlainSize(encrypted, chunkCount);
         
         Assert.Equal(plainSize, recovered);
@@ -60,7 +61,7 @@ public class E2eeLengthRoundtripTests
     public void ComputeEncryptedLength_Then_ComputePlainSize(long plainSize, int expectedChunkCount)
     {
         const int chunkSize = 1024;
-        long encrypted = E2eeFileService.ComputeEncryptedLength(plainSize, chunkSize);
+        long encrypted = E2eeCrypto.ComputeEncryptedLength(plainSize, chunkSize);
         long plain = E2eeFileService.ComputePlainSize(encrypted, expectedChunkCount);
         Assert.Equal(plainSize, plain);
     }

@@ -381,10 +381,6 @@ public sealed class FileService
                 byte[]? patchFileSalt = existing is not null
                     ? DecodeKeySalt(existing.KeySalt)
                     : encrypted ? RandomNumberGenerator.GetBytes(16) : null;
-                // ファイルスコープ鍵はループの前に一度だけ導出する（チャンクごとの HKDF 再導出を避ける）。
-                byte[]? patchScopedKey = patchFileSalt is null
-                    ? null
-                    : ChunkEncryptor.DeriveFileScopedKey(masterKey!, patchFileSalt, algorithm);
                 long existingLength = existing?.Length ?? 0;
                 long writeEnd = checked(offset + contentLength);
                 long newLength = Math.Max(existingLength, writeEnd);
@@ -403,6 +399,13 @@ public sealed class FileService
                 }
                 if (totalRead != contentLength)
                     throw new FileServiceException("リクエスト本文がContent-Lengthより短いです。");
+
+                // ファイルスコープ鍵はループの前に一度だけ導出する（チャンクごとの HKDF 再導出を避ける）。
+                // 導出は totalRead 検証などの throw 経路より後（try の直前）に行う。
+                // try の前に導出すると、その間の例外で finally のゼロクリアが走らず生鍵がメモリに残留する。
+                byte[]? patchScopedKey = patchFileSalt is null
+                    ? null
+                    : ChunkEncryptor.DeriveFileScopedKey(masterKey!, patchFileSalt, algorithm);
 
                 try
                 {

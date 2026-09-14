@@ -53,9 +53,22 @@ public static class E2eeCrypto
         ArgumentOutOfRangeException.ThrowIfNegative(plainSize);
         if (plainSize > MaxPlainSize)
             throw new ArgumentOutOfRangeException(nameof(plainSize), plainSize, "ファイルサイズは1PB以下である必要があります。");
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(chunkSize, 0, nameof(chunkSize));
-        long chunks = plainSize == 0 ? 1 : (plainSize + chunkSize - 1) / chunkSize;
+        long chunks = ComputeChunkCount(plainSize, chunkSize);
         return SaltSize + plainSize + chunks * GcmTagSize;
+    }
+
+    /// <summary>
+    /// E2EE チャンク数を計算する canonical な pure 関数。
+    /// 空ファイルでも 1（タグのみのチャンクが 1 つ生成されるため）。
+    /// 全クライアント（Web / Wasm / Mobile / Dokan）の CreateFile / FinalizeFile は
+    /// <see cref="ComputeEncryptedLength"/> と本関数のペアで計算すること。
+    /// サーバーは両者の整合を検証するため、片方だけの手書き式はプロトコル不整合になる。
+    /// </summary>
+    public static int ComputeChunkCount(long plainSize, int chunkSize)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(plainSize);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(chunkSize, 0, nameof(chunkSize));
+        return plainSize == 0 ? 1 : checked((int)((plainSize + chunkSize - 1) / chunkSize));
     }
 
     // ---- マスターキー Wrap/Unwrap ----

@@ -6,6 +6,7 @@
 @using CistaNAS.Web.Services
 @using CistaNAS.Web.Volume
 @using CistaNAS.Web.Helpers
+@using CistaNAS.Shared.Crypto
 @using Microsoft.JSInterop
 @inject AuthenticationStateService AuthState
 @inject VolumeService VolumeSvc
@@ -602,11 +603,9 @@ else
 
             await using var stream = file.OpenReadStream(maxAllowedSize: 10L * 1024 * 1024 * 1024);
             long totalSize = file.Size;
-            int totalChunks = (int)((totalSize + chunkSize - 1) / chunkSize);
-            if (totalChunks == 0) totalChunks = 1;
-
-            // E2eeFileService.ComputeEncryptedLength で一元管理された計算式を使う（salt + chunk ごとの tag）
-            long estimatedLength = E2eeComputeEncryptedLength(totalSize, chunkSize);
+            // E2eeCrypto（Shared）の統一関数でチャンク数・暗号化後サイズを計算する（salt + chunk ごとの tag）
+            int totalChunks = E2eeCrypto.ComputeChunkCount(totalSize, chunkSize);
+            long estimatedLength = E2eeCrypto.ComputeEncryptedLength(totalSize, chunkSize);
             var entry = await E2eeFileSvc.CreateFileAsync(VolumeName, new E2eeCreateFileRequest(encName, estimatedLength, totalChunks), CurrentUsername);
 
             long bytesRemaining = totalSize;
@@ -767,10 +766,6 @@ else
         < 1024 * 1024 * 1024 => $"{bytes / (1024.0 * 1024):F1} MB",
         _ => $"{bytes / (1024.0 * 1024 * 1024):F2} GB",
     };
-
-    /// <summary>E2EE 暗号化後のサイズを E2eeFileService.ComputeEncryptedLength に委譲（計算式の一元管理）。</summary>
-    private static long E2eeComputeEncryptedLength(long plainSize, int chunkSize)
-        => E2eeFileService.ComputeEncryptedLength(plainSize, chunkSize);
 
     private class E2eeFileViewItem
     {

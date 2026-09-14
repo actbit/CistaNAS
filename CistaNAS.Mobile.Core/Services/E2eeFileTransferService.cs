@@ -126,7 +126,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
         byte[] masterKey = e2eeSession.GetMasterKey(volumeName);
         int chunkSize = e2eeSession.GetChunkSize(volumeName);
 
-        int chunkCount = Math.Max(1, (int)((plainLength + chunkSize - 1) / chunkSize));
+        int chunkCount = E2eeCrypto.ComputeChunkCount(plainLength, chunkSize);
         long encryptedLength = E2eeCrypto.ComputeEncryptedLength(plainLength, chunkSize);
         byte[] fileSalt = E2eeCrypto.GenerateFileSalt();
         byte[] fileKey = E2eeCrypto.DeriveFileKey(masterKey, fileSalt);
@@ -170,7 +170,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
         byte[] groupKey = v2.GetGroupKey(keyEpoch);
         int chunkSize = e2eeSession.GetChunkSize(volumeName);
 
-        int chunkCount = Math.Max(1, (int)((plainLength + chunkSize - 1) / chunkSize));
+        int chunkCount = E2eeCrypto.ComputeChunkCount(plainLength, chunkSize);
         long encryptedLength = E2eeCrypto.ComputeEncryptedLength(plainLength, chunkSize);
         byte[] fileSalt = E2eeV2.GenerateFileSalt();
         byte[] fileKey = E2eeV2.GenerateFileKey();

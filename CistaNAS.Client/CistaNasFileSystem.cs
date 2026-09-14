@@ -42,6 +42,12 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
     private (long UserUsedBytes, long UserQuotaBytes)? _cachedStats;
     private readonly object _statsLock = new();
 
+    // 同一 WriteState への persist（ネットワークアップロード）を直列化するゲート。
+    // バッファゲート（WriteState.Gate）とは別系統: バッファゲートは保持しない状態で
+    // このゲートを取得するためデッドロックしない。overlapped WriteFile の write-through と
+    // FlushFileBuffers / Cleanup の同時 persist が revision やリースで競合するのを防ぐ。
+    private readonly SemaphoreSlim _persistGate = new(1, 1);
+
     /// <summary>
     /// E2EE モードでファイルシステムを作成。
     /// 共有 v2 ボリュームでは <paramref name="masterKey"/> は null 可（v2 メンバーは GroupKey のみ）。
@@ -175,15 +181,21 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public readonly string? ExistingFileId; // 上書き時の旧ファイルID（E2EE は fileId、非E2EE は plainName または null）
         protected readonly CistaNasFileSystem Fs;
         public long DeclaredSize = -1; // SetEndOfFile で指定されたサイズ
-        protected bool HasPendingChanges;
-        public bool HasPending => HasPendingChanges;
+
+        // 未永続化操作数。Gate 保護。Write / SetDeclaredSize で増加し、アップロードの
+        // スナップショット時に取り込む（0 にリセット）。アップロード中の新規書き込みは
+        // 再び増加するため、完了時に誤って「永続化済み」として潰されない。
+        private int _pendingOps;
+        public bool HasPending => Volatile.Read(ref _pendingOps) > 0;
 
         /// <summary>
         /// 同一ハンドル内の操作を直列化するゲート。Dokan は同一ハンドルへ並列コールバック
         /// （overlapped 書き込み、別スレッドからの FlushFileBuffers / Cleanup と Write の競合）を
         /// ディスパッチし得るため、書き込みバッファ（_ranges / _dirtyChunks）へのアクセスは
-        /// このゲートで直列化する。ReadFromWriteState がゲート保持中に await するため
-        /// SemaphoreSlim を使う。ゲート保持中のメソッドから再取得しないこと（再入不可）。
+        /// このゲートで直列化する。ゲート保持中に await するため SemaphoreSlim を使う。
+        /// ゲート保持中のメソッドから再取得しないこと（再入不可）。
+        /// ネットワークアップロード（persist）はこのゲートを保持しない
+        /// （UploadWriteState がスナップショット → ゲート解放 → アップロード → 再取得の順で行う）。
         /// </summary>
         public readonly SemaphoreSlim Gate = new(1, 1);
 
@@ -198,9 +210,16 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public abstract void Write(byte[] data, int dataOffset, int count, long fileOffset);
         public abstract void SetDeclaredSize(long size);
 
-        public void MarkPersisted() => HasPendingChanges = false;
+        /// <summary>Gate 保持中に呼ぶ。未永続化としてマークする。</summary>
+        protected void MarkPending() => _pendingOps++;
 
-        /// <summary>機密データ（ファイルキー、平文チャンク等）をゼロクリア。Cleanup/アンマウント時に呼ぶ。</summary>
+        /// <summary>Gate 保持中に呼ぶ。スナップショット時点までの未永続化分を取り込む（アップロード対象にする）。</summary>
+        internal void TakePending() => _pendingOps = 0;
+
+        /// <summary>Gate 保持中に呼ぶ。アップロード失敗時に未永続化へ戻す。</summary>
+        internal void RestorePending() => _pendingOps++;
+
+        /// <summary>機密データ（ファイルキー、平文チャンク等）をゼロクリア。Cleanup 時に Gate 保持中で呼ぶ。</summary>
         public virtual void Dispose() { }
     }
 
@@ -215,16 +234,26 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             : base(fs, plainName, existingFileId)
         {
             _existingLength = existingLength;
+            PersistedLength = existingLength;
         }
 
         public IReadOnlyList<(long Offset, byte[] Data)> Ranges => _ranges;
+
+        /// <summary>ハンドル開始時点のサーバー上のファイル長（切り詰め判定用）。</summary>
+        public long ExistingLength => _existingLength;
+
+        /// <summary>直近の persist で確認済みのサーバー上のファイル長（Gate 保護で更新）。</summary>
+        internal long PersistedLength { get; set; }
 
         public override long CurrentSize
         {
             get
             {
-                long basis = Math.Max(_maxWritten, _existingLength);
-                return DeclaredSize >= 0 ? Math.Max(DeclaredSize, basis) : basis;
+                // SetEndOfFile が指定されている場合は切り詰めを優先する。
+                // _maxWritten は SetDeclaredSize でクランプ済みのため、ここでの Max が
+                // 「切り詰め後の追記（write past EOF）」由来だけになる。
+                if (DeclaredSize >= 0) return Math.Max(DeclaredSize, _maxWritten);
+                return Math.Max(_maxWritten, _existingLength);
             }
         }
 
@@ -234,7 +263,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             byte[] copy = new byte[count];
             Buffer.BlockCopy(data, dataOffset, copy, 0, count);
             _ranges.Add((fileOffset, copy));
-            HasPendingChanges = true;
+            MarkPending();
             long end = fileOffset + count;
             if (end > _maxWritten) _maxWritten = end;
         }
@@ -242,8 +271,11 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public override void SetDeclaredSize(long size)
         {
             DeclaredSize = size;
-            HasPendingChanges = true;
-            if (size > _maxWritten) _maxWritten = size;
+            MarkPending();
+            // grow / shrink 両方を反映する。shrink を無視すると、同一ハンドル内の
+            // 先行書き込み（_maxWritten）が DeclaredSize を上書きし、SetEndOfFile の
+            // 切り詰めが CurrentSize → persist の全経路で無音に無視される。
+            if (size >= 0) _maxWritten = size;
         }
 
         // 平文バッファをゼロクリア
@@ -257,13 +289,30 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         }
 
         /// <summary>
-        /// サーバーへの永続化が完了した範囲を解放する（ゼロクリア）。
-        /// 保持し続けると WriteFile のたびに全蓄積レンジが再送され転送量が O(N²) に
-        /// 膨らむため、PATCH 成功後に呼ぶ。以降の書き込みは新しいレンジだけを送る。
+        /// Gate 保持中に呼ぶ。未永続化レンジをアップロードへ引き抜く（参照を返し、リストからは除去する）。
+        /// 除去しておくことでゲート解放後のアップロード中も、新規 Write が安全に新しいレンジを追加できる。
+        /// アップロード失敗時は <see cref="RollbackRangeUpload"/> で戻す。
         /// </summary>
-        public void ClearPersistedRanges()
+        internal List<(long Offset, byte[] Data)> TakeRangesForUpload()
         {
-            ZeroAndClearRanges();
+            var taken = new List<(long, byte[])>(_ranges);
+            _ranges.Clear();
+            TakePending();
+            return taken;
+        }
+
+        /// <summary>Gate 保持中に呼ぶ。アップロード済みレンジの平文を解放する（ゼロクリア）。</summary>
+        internal void CompleteRangeUpload(List<(long Offset, byte[] Data)> taken)
+        {
+            foreach (var (_, data) in taken)
+                CryptographicOperations.ZeroMemory(data);
+        }
+
+        /// <summary>Gate 保持中に呼ぶ。アップロード失敗: レンジを未永続化としてバッファへ戻す。</summary>
+        internal void RollbackRangeUpload(List<(long Offset, byte[] Data)> taken)
+        {
+            _ranges.InsertRange(0, taken);
+            RestorePending();
         }
 
         private void ZeroAndClearRanges()
@@ -389,6 +438,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         {
             get
             {
+                // SetEndOfFile が指定されている場合は切り詰めを優先する（PlainRangeWriteState と同じ規約）。
                 if (DeclaredSize >= 0) return Math.Max(DeclaredSize, _maxWritten);
                 return Math.Max(_maxWritten, ExistingFileId is not null ? _existingPlainLength : 0);
             }
@@ -418,7 +468,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 long srcStart = Math.Max(0, chunkStart - fileOffset);
                 Buffer.BlockCopy(data, dataOffset + (int)srcStart, chunk, (int)relStart, copyLen);
                 _dirtyChunks[ci] = chunk;
-                HasPendingChanges = true;
+                MarkPending();
+                _touchedDuringUpload.Add(ci);
             }
             if (endOffset > _maxWritten) _maxWritten = endOffset;
         }
@@ -426,8 +477,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public override void SetDeclaredSize(long size)
         {
             DeclaredSize = size;
-            HasPendingChanges = true;
-            if (size > _maxWritten) _maxWritten = size;
+            MarkPending();
+            // grow / shrink 両方を反映する（PlainRangeWriteState と同じ規約）。
+            if (size >= 0) _maxWritten = size;
         }
 
         // salt・平文チャンクをゼロクリア（_existingFileKey は FileCache が管理するためここでは消さない）
@@ -464,6 +516,70 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             _existingPlainLength = persistedPlainLength;
         }
 
+        /// <summary>アップロード中に書き換えられたチャンクインデックス（Gate 保護）。
+        /// 完了時に「アップロード済みだが未追記 → 除去できるクローン」の判定に使う。</summary>
+        private readonly HashSet<int> _touchedDuringUpload = new();
+
+        /// <summary>
+        /// Gate 保持中に呼ぶ。ダーティチャンクをアップロードへ引き抜く。
+        /// dict の各エントリを同一内容のクローンと置き換えることで、ゲート解放後のアップロード中に
+        /// WriteFile がバッファへ追記しても、暗号化対象のオリジナルバッファが破壊されない。
+        /// 切り詰めで不要になったチャンク（index ≥ <paramref name="chunkCount"/>）はここで破棄する。
+        /// </summary>
+        internal List<(int ChunkIndex, byte[] Original)> TakeDirtyChunksForUpload(int chunkCount)
+        {
+            var result = new List<(int, byte[])>();
+            _touchedDuringUpload.Clear();
+            foreach (int ci in _dirtyChunks.Keys.OrderBy(ci => ci))
+            {
+                byte[] original = _dirtyChunks[ci];
+                if (ci >= chunkCount)
+                {
+                    // 切り詰め領域のチャンクはサーバー側も論理切り詰められるため破棄する
+                    _dirtyChunks.Remove(ci);
+                    CryptographicOperations.ZeroMemory(original);
+                    continue;
+                }
+                _dirtyChunks[ci] = (byte[])original.Clone();
+                result.Add((ci, original));
+            }
+            TakePending();
+            return result;
+        }
+
+        /// <summary>
+        /// Gate 保持中に呼ぶ。永続化成功後: オリジナルを解放し、アップロード中に追い越し書き込み
+        /// されていないチャンク（= アップロード内容と同一のクローン）を除去して、既存状態を
+        /// FinalizeFile で確定したサーバー状態へ進める。保持し続けると次の書き込みで
+        /// 全蓄積チャンクが再送（O(N²)）になるため。
+        /// </summary>
+        internal void CompleteChunkUpload(int chunkCount, long plainLength, List<(int ChunkIndex, byte[] Original)> snapshot)
+        {
+            foreach (var (_, original) in snapshot)
+                CryptographicOperations.ZeroMemory(original);
+            foreach (var (ci, _) in snapshot)
+            {
+                // アップロード中の書き込みで触れられたチャンクはサーバーより新しいため保持する
+                if (_touchedDuringUpload.Contains(ci)) continue;
+                if (_dirtyChunks.Remove(ci, out var stale))
+                    CryptographicOperations.ZeroMemory(stale);
+            }
+            _touchedDuringUpload.Clear();
+            _existingChunkCount = chunkCount;
+            _existingPlainLength = plainLength;
+        }
+
+        /// <summary>
+        /// Gate 保持中に呼ぶ。アップロード失敗: dict にはスナップショット時点の内容（＋以降の追記）を
+        /// 持つクローンが残っているため、オリジナルの解放と未永続化マークのみでよい。
+        /// </summary>
+        internal void RollbackChunkUpload(List<(int ChunkIndex, byte[] Original)> snapshot)
+        {
+            foreach (var (_, original) in snapshot)
+                CryptographicOperations.ZeroMemory(original);
+            RestorePending();
+        }
+
         private void ZeroAndClearDirtyChunks()
         {
             foreach (var (_, chunk) in _dirtyChunks)
@@ -490,9 +606,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public void PrepareForPersist()
         {
             long targetLength = CurrentSize;
-            int targetChunkCount = targetLength == 0
-                ? 1
-                : checked((int)((targetLength + Fs._chunkSize - 1) / Fs._chunkSize));
+            int targetChunkCount = E2eeCrypto.ComputeChunkCount(targetLength, Fs._chunkSize);
 
             for (int ci = 0; ci < targetChunkCount; ci++)
             {
@@ -538,19 +652,30 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         {
             try
             {
-                ws.Gate.Wait();
                 try
                 {
+                    // UploadWriteState は Gate 非保持で呼ぶ（内部でゲート管理する）
                     UploadWriteState(ws);
                 }
                 finally
                 {
-                    // Gate.Release の前に Context を外す（以降の Read/Write がこの WriteState を見ないように）
-                    info.Context = null;
-                    // Dispose の前に必ず Release する。SemaphoreSlim.Dispose は待機者を
-                    // 起こさないため、Release せずに破棄するとゲート待ちの
-                    // Read/Write スレッドが永久にブロックする。
-                    ws.Gate.Release();
+                    // Dispose は Gate 保持中に行う。Release 後に Dispose すると、Cleanup 開始前に
+                    // info.Context をキャプチャした Read/Write がゲートを取得した直後に
+                    // ゼロ化中・クリア中のバッファ（_ranges / _dirtyChunks / salt）を走査し、
+                    // 例外や引き裂かれたデータを返す。
+                    ws.Gate.Wait();
+                    try
+                    {
+                        ws.Dispose(); // 機密データ（ファイルキー・平文チャンク）をゼロクリア
+                    }
+                    finally
+                    {
+                        // Gate.Release の前に Context を外す（以降の Read/Write がこの WriteState を見ないように）
+                        info.Context = null;
+                        // Release は Dispose の後。SemaphoreSlim.Dispose は行わない
+                        // （待機者を起こさないため、待機中の Read/Write スレッドが永久にブロックする）。
+                        ws.Gate.Release();
+                    }
                 }
             }
             catch { /* Cleanup は void なのでエラーを飲む */ }
@@ -558,7 +683,6 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             {
                 info.Context = null;
             }
-            ws.Dispose(); // 機密データ（ファイルキー・平文チャンク）をゼロクリア
         }
     }
 
@@ -693,17 +817,10 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         {
             int totalRead = Task.Run(async () =>
             {
-                // 書き込み（WriteFile）・保存（Flush/Cleanup）と直列化する。
-                // ゲート保持中に await するため SemaphoreSlim の WaitAsync を使う。
-                await ws.Gate.WaitAsync();
-                try
-                {
-                    return await ReadBufferFromWriteStateAsync(ws, buffer, offset);
-                }
-                finally
-                {
-                    ws.Gate.Release();
-                }
+                // ReadBufferFromWriteStateAsync 内部でダーティバッファへアクセスする際に
+                // 短いゲート取得を行う（ネットワーク I/O はゲート非保持）。ゲート保持中に
+                // await するため SemaphoreSlim の WaitAsync を使う。
+                return await ReadBufferFromWriteStateAsync(ws, buffer, offset);
             }).GetAwaiter().GetResult();
 
             bytesRead = totalRead;
@@ -715,7 +832,12 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         }
     }
 
-    /// <summary>WriteState のバッファ（dirty）+ 既存データをマージして読み出す本体。Gate 保持中に呼ぶこと。</summary>
+    /// <summary>
+    /// WriteState のバッファ（dirty）+ 既存データをマージして読み出す本体。
+    /// ネットワーク I/O（既存チャンク / サーバーレンジの取得）は Gate 非保持で行い、
+    /// ダーティバッファの走査・コピーだけ短く Gate で保護する。
+    /// これにより同一ハンドルの persist（アップロード）中でも読み取りがブロックされない。
+    /// </summary>
     private async Task<int> ReadBufferFromWriteStateAsync(WriteState ws, byte[] buffer, long offset)
     {
         byte[] result = new byte[buffer.Length];
@@ -723,7 +845,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
         if (ws is PlainRangeWriteState plain)
         {
-            // 既存データ（サーバー Range）を下地にする
+            // 既存データ（サーバー Range）を下地にする（ゲート外のネットワーク I/O）
             if (plain.ExistingFileId is not null)
             {
                 try
@@ -734,19 +856,28 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 }
                 catch { }
             }
-            // dirty ranges で上書き
-            foreach (var (off, data) in plain.Ranges)
+            // dirty ranges で上書き。レンジのデータ配列は追加後に不変だが、リスト自体が
+            // persist のスナップショットで入れ替わるため走査は Gate で保護する。
+            await plain.Gate.WaitAsync();
+            try
             {
-                long overlapStart = Math.Max(off, offset);
-                long overlapEnd = Math.Min(off + data.Length, offset + buffer.Length);
-                if (overlapEnd > overlapStart)
+                foreach (var (off, data) in plain.Ranges)
                 {
-                    int copyOff = (int)(overlapStart - offset);
-                    int srcOff = (int)(overlapStart - off);
-                    int copyLen = (int)(overlapEnd - overlapStart);
-                    Array.Copy(data, srcOff, result, copyOff, copyLen);
-                    filled = Math.Max(filled, copyOff + copyLen);
+                    long overlapStart = Math.Max(off, offset);
+                    long overlapEnd = Math.Min(off + data.Length, offset + buffer.Length);
+                    if (overlapEnd > overlapStart)
+                    {
+                        int copyOff = (int)(overlapStart - offset);
+                        int srcOff = (int)(overlapStart - off);
+                        int copyLen = (int)(overlapEnd - overlapStart);
+                        Array.Copy(data, srcOff, result, copyOff, copyLen);
+                        filled = Math.Max(filled, copyOff + copyLen);
+                    }
                 }
+            }
+            finally
+            {
+                plain.Gate.Release();
             }
         }
         else if (ws is E2eeChunkWriteState e2ee)
@@ -754,13 +885,32 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             int chunkSize = _chunkSize;
             int startChunk = (int)(offset / chunkSize);
 
+            // まず Gate でダーティチャンクのコピー（スナップショット）を取り、
+            // 以降のダウンロード・復号（ネットワーク I/O）をゲート外で行う。
+            var dirtyCopies = new Dictionary<int, byte[]>();
+            await e2ee.Gate.WaitAsync();
+            try
+            {
+                for (int ci = startChunk; ; ci++)
+                {
+                    long chunkStart = (long)ci * chunkSize;
+                    if (chunkStart >= offset + buffer.Length) break;
+                    if (e2ee.DirtyChunks.TryGetValue(ci, out var dirty))
+                        dirtyCopies[ci] = (byte[])dirty.Clone();
+                }
+            }
+            finally
+            {
+                e2ee.Gate.Release();
+            }
+
             for (int ci = startChunk; filled < buffer.Length; ci++)
             {
                 long chunkStart = (long)ci * chunkSize;
                 if (chunkStart >= offset + buffer.Length) break;
 
                 byte[] chunk;
-                if (e2ee.DirtyChunks.TryGetValue(ci, out var dirty))
+                if (dirtyCopies.TryGetValue(ci, out var dirty))
                 {
                     chunk = dirty;
                 }
@@ -1019,22 +1169,25 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         {
             try
             {
-                // 別スレッドからの Flush/Cleanup がアップロード中のときは完了まで待つ
-                // （アップロード中のバッファ書き換え・解放はデータ破壊になるため）。
+                // バッファへのマージはゲートで直列化する（別スレッドからの
+                // Flush/Cleanup のスナップショット・読み取りと競合するため）。
                 ws.Gate.Wait();
                 try
                 {
                     ws.Write(buffer, 0, buffer.Length, offset);
-                    // 既存E2EEファイルはdirtyチャンクだけを同期保存してから
-                    // Windowsへ書き込み成功を返す。Cleanupまで遅延させると、
-                    // OSキャッシュがサーバー未反映の内容を保持するため。
-                    if (ws.ExistingFileId is not null)
-                        UploadWriteState(ws);
                 }
                 finally
                 {
                     ws.Gate.Release();
                 }
+                // 既存E2EEファイルはdirtyチャンクだけを同期保存してから
+                // Windowsへ書き込み成功を返す。Cleanupまで遅延させると、
+                // OSキャッシュがサーバー未反映の内容を保持するため。
+                // アップロードはバッファゲートを保持しない（UploadWriteState 参照）ため、
+                // アップロード中も同一ハンドルの ReadFile / SetEndOfFile / 追加 Write は
+                // 長時間ブロックされず、Dokan の IRP タイムアウトを回避できる。
+                if (ws.ExistingFileId is not null)
+                    UploadWriteState(ws);
                 bytesWritten = buffer.Length;
                 return DokanResult.Success;
             }
@@ -1055,16 +1208,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
         try
         {
-            ws.Gate.Wait();
-            try
-            {
-                UploadWriteState(ws);
-                ws.MarkPersisted();
-            }
-            finally
-            {
-                ws.Gate.Release();
-            }
+            // UploadWriteState は Gate 非保持で呼ぶ（未永続化の取り込みと後処理は内部で行う）
+            UploadWriteState(ws);
             return DokanResult.Success;
         }
         catch
@@ -1286,9 +1431,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         {
             try
             {
-                // Write/Flush/Cleanup のアップロードと直列化する。
-                // ゲート外で SetDeclaredSize（HasPendingChanges 書き換え）を行うと、
-                // アップロード完了時の MarkPersisted により truncation が無音に欠落する。
+                // Write/Flush/Cleanup の persist と直列化する。
+                // ゲート外で SetDeclaredSize（未永続化マーク）を行うと、
+                // スナップショット取得と競合して truncation が無音に欠落する。
                 ws.Gate.Wait();
                 try
                 {
@@ -1371,63 +1516,145 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
     // 内部ヘルパー
     // ====================================================================
 
+    /// <summary>
+    /// WriteState の未永続化データをサーバーへ persist する。
+    /// 呼び出し規約: Gate 非保持で呼ぶこと。内部で (1) バッファゲートでスナップショットを取得して解放
+    /// → (2) persist ゲートでネットワークアップロード（バッファゲート非保持）
+    /// → (3) バッファゲートで後処理（解放 / 失敗ロールバック）、の順に進める。
+    /// バッファゲートをネットワーク I/O 中に保持しないことで、同一ハンドルの ReadFile / WriteFile /
+    /// SetEndOfFile がアップロード（低速回線では数秒〜10秒超）の間ブロックされて
+    /// Dokan の IRP タイムアウト（MountService の options.TimeOut = 10s）で失敗しないようにする。
+    /// persist ゲートは同時 persist（overlapped WriteFile の write-through と FlushFileBuffers /
+    /// Cleanup の競合）を直列化し、revision・リースの競合を防ぐ。
+    /// 例外はそのまま上位（Cleanup は void 制約でエラーを飲む）に伝播させる。
+    /// </summary>
     internal void UploadWriteState(WriteState ws)
     {
         if (!ws.HasPending) return;
 
-        // 例外はそのまま上位（Cleanup）に伝播させる。Cleanup が void 制約でエラーを飲む。
-        switch (ws)
+        _persistGate.Wait();
+        try
         {
-            case PlainRangeWriteState plain:
-                UploadPlain(plain);
-                break;
-            case E2eeChunkWriteState e2ee:
-                if (e2ee.ExistingFileId is null)
-                    UploadE2eeNewFile(e2ee);
-                else
-                    UploadE2eeDiff(e2ee);
-                break;
+            switch (ws)
+            {
+                case PlainRangeWriteState plain:
+                    UploadPlain(plain);
+                    break;
+                case E2eeChunkWriteState e2ee:
+                    if (e2ee.ExistingFileId is null)
+                        UploadE2eeNewFile(e2ee);
+                    else
+                        UploadE2eeDiff(e2ee);
+                    break;
+            }
         }
-
-        ws.MarkPersisted();
+        finally
+        {
+            _persistGate.Release();
+        }
 
         _listingCache.Invalidate();
         lock (_statsLock) { _cachedStats = null; }
     }
 
     // 非E2EE: 汚れた範囲を PATCH（差分保存）。Critical-3 と同様、DELETE は呼ばない。
+    // 切り詰め（SetEndOfFile での縮小）が入った場合は PATCH では長さを縮められないため、
+    // サーバー内容 + ダーティレンジを合成した全体 PUT で確定する。
     private void UploadPlain(PlainRangeWriteState ws)
     {
         bool isNew = ws.ExistingFileId is null;
-
-        // 新規ファイルで offset=0 から始まらない（sparse）または空の場合は全体アップロードで確実に作成。
-        if (isNew && (ws.Ranges.Count == 0 || ws.Ranges[0].Offset != 0))
+        List<(long Offset, byte[] Data)> taken;
+        long serverLength;
+        long snapshotSize;
+        ws.Gate.Wait();
+        try
         {
-            long size = ws.CurrentSize;
-            byte[] full = new byte[Math.Max(0, size)];
-            foreach (var (off, data) in ws.Ranges)
+            serverLength = ws.PersistedLength;
+            snapshotSize = ws.CurrentSize;
+            taken = ws.TakeRangesForUpload();
+        }
+        finally
+        {
+            ws.Gate.Release();
+        }
+
+        try
+        {
+            // 新規ファイルで offset=0 から始まらない（sparse）または空の場合は全体アップロードで確実に作成。
+            if (isNew && (taken.Count == 0 || taken[0].Offset != 0))
             {
-                if (off >= 0 && off + data.Length <= full.Length)
-                    Buffer.BlockCopy(data, 0, full, (int)off, data.Length);
+                byte[] full = new byte[Math.Max(0, snapshotSize)];
+                foreach (var (off, data) in taken)
+                {
+                    if (off >= 0 && off + data.Length <= full.Length)
+                        Buffer.BlockCopy(data, 0, full, (int)off, data.Length);
+                }
+                CistaNasApiClientFiles.UploadFileAsync(_api, _volumeName, ws.PlainName, full).GetAwaiter().GetResult();
+                CommitPlainLength(ws, snapshotSize, taken);
+                return;
             }
-            CistaNasApiClientFiles.UploadFileAsync(_api, _volumeName, ws.PlainName, full).GetAwaiter().GetResult();
-            ws.ClearPersistedRanges();
-            return;
-        }
 
-        if (ws.Ranges.Count == 0)
-        {
-            // 既存ファイルで書き込みなし → 何もしない
-            return;
-        }
+            if (taken.Count == 0 && snapshotSize >= serverLength)
+            {
+                // 既存ファイルで書き込みなし・切り詰めなし → 何もしない
+                return;
+            }
 
-        // 各範囲を PATCH（サーバー AesXtsStream がセクタ RMW で安全に部分上書き）。
-        // 成功した範囲は解放する（保持すると次の書き込みで全蓄積分が再送される）。
-        foreach (var (off, data) in ws.Ranges)
-        {
-            CistaNasApiClientFiles.PatchFileRangeAsync(_api, _volumeName, ws.PlainName, off, data).GetAwaiter().GetResult();
+            if (snapshotSize < serverLength)
+            {
+                // 切り詰め: PATCH は長さを縮められないため、サーバー内容 + ダーティ + 短縮で全体 PUT する。
+                byte[] full = new byte[Math.Max(0, snapshotSize)];
+                if (!isNew)
+                {
+                    try
+                    {
+                        byte[] existing = CistaNasApiClientFiles.DownloadFileAsync(_api, _volumeName, ws.PlainName).GetAwaiter().GetResult();
+                        Buffer.BlockCopy(existing, 0, full, 0, (int)Math.Min(existing.Length, full.Length));
+                    }
+                    catch { /* サーバー内容の取得に失敗した場合はゼロで確定する */ }
+                }
+                foreach (var (off, data) in taken)
+                {
+                    if (off < 0 || off >= full.Length) continue;
+                    Buffer.BlockCopy(data, 0, full, (int)off, (int)Math.Min(data.Length, full.Length - off));
+                }
+                CistaNasApiClientFiles.UploadFileAsync(_api, _volumeName, ws.PlainName, full).GetAwaiter().GetResult();
+                CommitPlainLength(ws, snapshotSize, taken);
+                return;
+            }
+
+            // 各範囲を PATCH（サーバー AesXtsStream がセクタ RMW で安全に部分上書き）。
+            long persisted = serverLength;
+            foreach (var (off, data) in taken)
+            {
+                CistaNasApiClientFiles.PatchFileRangeAsync(_api, _volumeName, ws.PlainName, off, data).GetAwaiter().GetResult();
+                persisted = Math.Max(persisted, off + data.Length);
+            }
+            CommitPlainLength(ws, persisted, taken);
         }
-        ws.ClearPersistedRanges();
+        catch
+        {
+            // 失敗: 引き抜いたレンジを未永続化としてバッファへ戻す（Cleanup までに再試行される）
+            ws.Gate.Wait();
+            try { ws.RollbackRangeUpload(taken); }
+            finally { ws.Gate.Release(); }
+            throw;
+        }
+    }
+
+    /// <summary>persist 成功後: 平文レンジを解放し、確認済みサーバー長を進める。</summary>
+    private static void CommitPlainLength(PlainRangeWriteState ws, long persistedLength, List<(long Offset, byte[] Data)> taken)
+    {
+        ws.Gate.Wait();
+        try
+        {
+            ws.CompleteRangeUpload(taken);
+            ws.PersistedLength = persistedLength;
+        }
+        finally
+        {
+            ws.Gate.Release();
+        }
     }
 
     // E2EE 新規ファイル: 新 fileSalt で全チャンク作成（従来方式、Critical-4 ロールバック維持）。
@@ -1453,9 +1680,26 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 dek = E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, fileSalt);
             byte[] fileKey = dek;
 
-            long plainLength = ws.CurrentSize;
-            int chunkCount = plainLength == 0 ? 1 : (int)((plainLength + _chunkSize - 1) / _chunkSize);
-            long encLength = E2eeCrypto.ComputeEncryptedLength(plainLength, _chunkSize);
+            // Gate 内で長さ確定 + スナップショット（ダーティチャンク引き抜き）。
+            // PrepareForPersist が全チャンクを dict に揃えるため、スナップショットが
+            // 0..chunkCount-1 をちょうど覆う。
+            long plainLength;
+            int chunkCount;
+            long encLength;
+            List<(int ChunkIndex, byte[] Original)> snapshot;
+            ws.Gate.Wait();
+            try
+            {
+                plainLength = ws.CurrentSize;
+                chunkCount = E2eeCrypto.ComputeChunkCount(plainLength, _chunkSize);
+                encLength = E2eeCrypto.ComputeEncryptedLength(plainLength, _chunkSize);
+                ws.PrepareForPersist();
+                snapshot = ws.TakeDirtyChunksForUpload(chunkCount);
+            }
+            finally
+            {
+                ws.Gate.Release();
+            }
 
             string fileId;
             string? initialWriteLease;
@@ -1481,27 +1725,16 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             bool finalized = false;
             try
             {
-                long written = 0;
-                for (int i = 0; i < chunkCount; i++)
+                foreach (var (i, dirty) in snapshot)
                 {
-                    int chunkLen = (int)Math.Min(_chunkSize, plainLength - written);
-                    byte[] chunk;
-                    if (ws.DirtyChunks.TryGetValue(i, out var dirty))
-                    {
-                        chunk = new byte[chunkLen];
-                        Array.Copy(dirty, chunk, Math.Min(dirty.Length, chunkLen));
-                    }
-                    else
-                    {
-                        chunk = new byte[chunkLen]; // ゼロ
-                    }
+                    int chunkLen = (int)Math.Min(_chunkSize, plainLength - (long)i * _chunkSize);
+                    byte[] chunk = dirty.Length == chunkLen ? dirty : ResizeChunk(dirty, chunkLen);
                     byte[] encChunk = isV2
                         ? E2eeV2.EncryptChunk(chunk, fileKey,
                             new E2eeChunkContext(_v2!.VolumeIdString, fileId, i, Revision: 0, keyEpoch),
                             isFirstChunk: i == 0, fileSalt)
                         : E2eeCrypto.EncryptChunk(chunk, fileKey, i, fileSalt, isFirstChunk: i == 0);
                     _api.UploadChunkAsync(_volumeName, fileId, i, encChunk, writeLease).GetAwaiter().GetResult();
-                    written += chunkLen;
                 }
                 _api.FinalizeFileAsync(_volumeName, fileId, encLength, writeLease).GetAwaiter().GetResult();
                 finalized = true;
@@ -1509,12 +1742,16 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             catch
             {
                 // ロールバック: 作成中の fileId を削除し、サーバーに孤児ファイルを残さない（Critical-4）。
+                // バッファ側は RollbackChunkUpload で未永続化に戻す（クローンがデータを保持）。
                 try
                 {
                     if (writeLease is not null)
                         _api.DeleteFileAsync(_volumeName, fileId, writeLease).GetAwaiter().GetResult();
                 }
                 catch { /* ベストエフォート */ }
+                ws.Gate.Wait();
+                try { ws.RollbackChunkUpload(snapshot); }
+                finally { ws.Gate.Release(); }
                 throw;
             }
             finally
@@ -1538,6 +1775,10 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                     KeyEpoch = keyEpoch,
                     WrappedFileKey = localWrappedFileKey, // v2: 自分で wrap した DEK ラップ（差分保存時に再利用）
                 };
+
+                ws.Gate.Wait();
+                try { ws.CompleteChunkUpload(chunkCount, plainLength, snapshot); }
+                finally { ws.Gate.Release(); }
             }
         }
         finally
@@ -1566,57 +1807,84 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 keyEpoch = entry.KeyEpoch;
         }
 
-        ws.PrepareForPersist();
-        long newPlainLength = ws.CurrentSize;
-        int newChunkCount = newPlainLength == 0 ? 1 : (int)((newPlainLength + _chunkSize - 1) / _chunkSize);
-
-        // 汚れたチャンクだけ再暗号化して replace（未変更チャンクは維持 → 末尾保持）。
-        // チャンクインデックス順に送ること。サーバーは chunkIndex > ChunkCount を
-        // 拒否するため、sparse 書き込み（例: 1 チャンクのファイルに index 2 へ書き込み →
-        // index 1 がギャップ埋めで後から挿入される）で挿入順に送ると範囲外エラーになり、
-        // persist 全体が失敗してバッファ済みデータが失われる。
-        foreach (var (ci, chunk) in ws.DirtyChunks.OrderBy(kv => kv.Key))
+        // Gate 内で長さ確定 + PrepareForPersist + スナップショット（ダーティチャンク引き抜き）。
+        // スナップショット済みのオリジナルを暗号化するため、ゲート解放後のアップロード中に
+        // WriteFile が dict 内のクローンへ追記してもデータ破壊しない。
+        long newPlainLength;
+        int newChunkCount;
+        List<(int ChunkIndex, byte[] Original)> snapshot;
+        ws.Gate.Wait();
+        try
         {
-            if (ci >= newChunkCount) continue; // 縮小で不要になったチャンクは送らない
-            int chunkLen = (int)Math.Min(_chunkSize, newPlainLength - (long)ci * _chunkSize);
-            byte[] toEncrypt = chunk.Length == chunkLen ? chunk : ResizeChunk(chunk, chunkLen);
-
-            // 現在 revision を取得し +1 で暗号化（AES-GCM の nonce 再利用回避）。
-            // 存在判定はサーバーの応答（404 → hash null）で行う。handle-open 時点の
-            // ExistingChunkCount で判定すると、同一ハンドル内で作成・アップロードした
-            // 追記チャンクの 2 回目以降の置換が rev 0 で暗号化され、サーバー記録の
-            // revision と食い違って復号不能になる（同一 nonce で 2 平文 = ノンス再利用にもなる）。
-            var (currentHash, currentRev) = _api.GetChunkHashAsync(_volumeName, fileId, ci).GetAwaiter().GetResult();
-            int nextRevision = currentHash is null ? 0 : currentRev + 1;
-
-            byte[] encChunk = keyEpoch >= 1
-                ? E2eeV2.EncryptChunk(toEncrypt, fileKey,
-                    new E2eeChunkContext(volumeId!, fileId, ci, nextRevision, keyEpoch),
-                    isFirstChunk: ci == 0, fileSalt)
-                : E2eeCrypto.EncryptChunk(toEncrypt, fileKey, ci, fileSalt,
-                    isFirstChunk: ci == 0, revision: nextRevision);
-            _api.UploadChunkAsync(_volumeName, fileId, ci, encChunk, ws.WriteLeaseToken!, replace: true).GetAwaiter().GetResult();
-
-            // チャンクプールのキャッシュを更新（新しい暗号文ハッシュで）
-            PutChunkToPool(fileId, ci, toEncrypt, ComputeHashHex(encChunk));
+            ws.PrepareForPersist();
+            newPlainLength = ws.CurrentSize;
+            newChunkCount = E2eeCrypto.ComputeChunkCount(newPlainLength, _chunkSize);
+            snapshot = ws.TakeDirtyChunksForUpload(newChunkCount);
+        }
+        finally
+        {
+            ws.Gate.Release();
         }
 
-        // FinalizeFile で長さ確定（縮小時は ChunkCount 指定で論理切り詰め）
-        int finalizeChunkCount = newChunkCount;
-        long encLength = E2eeCrypto.ComputeEncryptedLength(newPlainLength, _chunkSize);
-        _api.FinalizeFileAsync(_volumeName, fileId, encLength, ws.WriteLeaseToken!, finalizeChunkCount).GetAwaiter().GetResult();
-
-        // キャッシュ更新
-        if (_cache.TryGetValue(fileId, out var cache))
+        try
         {
-            cache.ChunkCount = finalizeChunkCount;
-            cache.PlainLength = newPlainLength;
-        }
+            // 汚れたチャンクだけ再暗号化して replace（未変更チャンクは維持 → 末尾保持）。
+            // スナップショットはチャンクインデックス順に送ること。サーバーは chunkIndex > ChunkCount を
+            // 拒否するため、sparse 書き込み（例: 1 チャンクのファイルに index 2 へ書き込み →
+            // index 1 がギャップ埋めで後から挿入される）で挿入順に送ると範囲外エラーになり、
+            // persist 全体が失敗してバッファ済みデータが失われる。
+            foreach (var (ci, chunk) in snapshot)
+            {
+                int chunkLen = (int)Math.Min(_chunkSize, newPlainLength - (long)ci * _chunkSize);
+                byte[] toEncrypt = chunk.Length == chunkLen ? chunk : ResizeChunk(chunk, chunkLen);
 
-        // 全チャンク + FinalizeFile が成功した時点でサーバーに永続化済み。
-        // 蓄積チャンクを保持すると次の書き込みで全量が再送されるため解放し、
-        // 既存状態を FinalizeFile で確定したサーバー状態へ進める。
-        ws.ClearPersistedChunks(finalizeChunkCount, newPlainLength);
+                // 現在 revision を取得し +1 で暗号化（AES-GCM の nonce 再利用回避）。
+                // 存在判定はサーバーの応答（404 → hash null）で行う。handle-open 時点の
+                // ExistingChunkCount で判定すると、同一ハンドル内で作成・アップロードした
+                // 追記チャンクの 2 回目以降の置換が rev 0 で暗号化され、サーバー記録の
+                // revision と食い違って復号不能になる（同一 nonce で 2 平文 = ノンス再利用にもなる）。
+                var (currentHash, currentRev) = _api.GetChunkHashAsync(_volumeName, fileId, ci).GetAwaiter().GetResult();
+                int nextRevision = currentHash is null ? 0 : currentRev + 1;
+
+                byte[] encChunk = keyEpoch >= 1
+                    ? E2eeV2.EncryptChunk(toEncrypt, fileKey,
+                        new E2eeChunkContext(volumeId!, fileId, ci, nextRevision, keyEpoch),
+                        isFirstChunk: ci == 0, fileSalt)
+                    : E2eeCrypto.EncryptChunk(toEncrypt, fileKey, ci, fileSalt,
+                        isFirstChunk: ci == 0, revision: nextRevision);
+                _api.UploadChunkAsync(_volumeName, fileId, ci, encChunk, ws.WriteLeaseToken!, replace: true).GetAwaiter().GetResult();
+
+                // チャンクプールのキャッシュを更新（新しい暗号文ハッシュで）
+                PutChunkToPool(fileId, ci, toEncrypt, ComputeHashHex(encChunk));
+            }
+
+            // FinalizeFile で長さ確定（縮小時は ChunkCount 指定で論理切り詰め）
+            int finalizeChunkCount = newChunkCount;
+            long encLength = E2eeCrypto.ComputeEncryptedLength(newPlainLength, _chunkSize);
+            _api.FinalizeFileAsync(_volumeName, fileId, encLength, ws.WriteLeaseToken!, finalizeChunkCount).GetAwaiter().GetResult();
+
+            // キャッシュ更新
+            if (_cache.TryGetValue(fileId, out var cache))
+            {
+                cache.ChunkCount = finalizeChunkCount;
+                cache.PlainLength = newPlainLength;
+            }
+
+            // 全チャンク + FinalizeFile が成功した時点でサーバーに永続化済み。
+            // オリジナルを解放し、アップロード中に追い越しされていないクローンを除去して
+            // 既存状態を確定したサーバー状態へ進める（追い越し書き込み分は未永続化として残る）。
+            ws.Gate.Wait();
+            try { ws.CompleteChunkUpload(finalizeChunkCount, newPlainLength, snapshot); }
+            finally { ws.Gate.Release(); }
+        }
+        catch
+        {
+            // 失敗: オリジナルを解放し（dict のクローンがデータを保持）、未永続化に戻す
+            ws.Gate.Wait();
+            try { ws.RollbackChunkUpload(snapshot); }
+            finally { ws.Gate.Release(); }
+            throw;
+        }
     }
 
     private static byte[] ResizeChunk(byte[] chunk, int newLen)
