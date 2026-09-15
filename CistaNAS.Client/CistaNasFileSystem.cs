@@ -718,22 +718,33 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 }
                 finally
                 {
-                    // Dispose は Gate 保持中に行う。Release 後に Dispose すると、Cleanup 開始前に
-                    // info.Context をキャプチャした Read/Write がゲートを取得した直後に
-                    // ゼロ化中・クリア中のバッファ（_ranges / _dirtyChunks / salt）を走査し、
-                    // 例外や引き裂かれたデータを返す。
-                    ws.Gate.Wait();
+                    // Dispose（リース解放・タイマー破棄・バッファゼロ化）と進行中 persist の競合を
+                    // 避けるため PersistGate を保持してから Gate を取る
+                    // （ロック順序は UploadWriteState と同じ PersistGate → Gate）。
+                    ws.PersistGate.Wait();
                     try
                     {
-                        ws.Dispose(); // 機密データ（ファイルキー・平文チャンク）をゼロクリア
+                        // Dispose は Gate 保持中に行う。Release 後に Dispose すると、Cleanup 開始前に
+                        // info.Context をキャプチャした Read/Write がゲートを取得した直後に
+                        // ゼロ化中・クリア中のバッファ（_ranges / _dirtyChunks / salt）を走査し、
+                        // 例外や引き裂かれたデータを返す。
+                        ws.Gate.Wait();
+                        try
+                        {
+                            ws.Dispose(); // 機密データ（ファイルキー・平文チャンク）をゼロクリア
+                        }
+                        finally
+                        {
+                            // Gate.Release の前に Context を外す（以降の Read/Write がこの WriteState を見ないように）
+                            info.Context = null;
+                            // Release は Dispose の後。SemaphoreSlim.Dispose は行わない
+                            // （待機者を起こさないため、待機中の Read/Write スレッドが永久にブロックする）。
+                            ws.Gate.Release();
+                        }
                     }
                     finally
                     {
-                        // Gate.Release の前に Context を外す（以降の Read/Write がこの WriteState を見ないように）
-                        info.Context = null;
-                        // Release は Dispose の後。SemaphoreSlim.Dispose は行わない
-                        // （待機者を起こさないため、待機中の Read/Write スレッドが永久にブロックする）。
-                        ws.Gate.Release();
+                        ws.PersistGate.Release();
                     }
                 }
             }
@@ -1262,12 +1273,17 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
     public NtStatus FlushFileBuffers(string fileName, IDokanFileInfo info)
     {
-        if (info.Context is not WriteState ws || ws.ExistingFileId is null || !ws.HasPending)
+        // 新規ファイル（ExistingFileId == null）は Cleanup で永続化するため、ここでは何もしない。
+        if (info.Context is not WriteState ws || ws.ExistingFileId is null)
             return DokanResult.Success;
 
         try
         {
-            // UploadWriteState は Gate 非保持で呼ぶ（未永続化の取り込みと後処理は内部で行う）
+            // HasPending == false でも UploadWriteState を経由する。進行中の persist が
+            // スナップショット済み（HasPending == false）の間に flush が早期 return すると、
+            // その persist が失敗しても Windows には「永続化成功」と報告されたままになる。
+            // persist ゲートの取得を待つことで、進行中 persist の成否をこの IRP の結果に反映する
+            // （失敗時は UploadWriteState 内でロールバックされ、この呼び出しが再試行する）。
             UploadWriteState(ws);
             return DokanResult.Success;
         }
@@ -1799,6 +1815,12 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
                 foreach (var (i, dirty) in snapshot)
                 {
+                    // 切り詰め領域（index ≥ 確定チャンク数）は送らない — snapshot には
+                    // ロールバックに備えて含まれているが、この経路にはロールバック後も
+                    // 切り詰めが確定する（finalize が chunkCount で確定する）ため破棄で正しい。
+                    // スキップしないと chunkLen が負になり persist 全体が失敗する。
+                    if (i >= chunkCount) continue;
+
                     int chunkLen = (int)Math.Min(_chunkSize, plainLength - (long)i * _chunkSize);
                     byte[] chunk = dirty.Length == chunkLen ? dirty : ResizeChunk(dirty, chunkLen);
                     byte[] encChunk = isV2
@@ -1808,7 +1830,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                         : E2eeCrypto.EncryptChunk(chunk, fileKey, i, fileSalt, isFirstChunk: i == 0);
                     _api.UploadChunkAsync(_volumeName, fileId!, i, encChunk, writeLease).GetAwaiter().GetResult();
                 }
-                _api.FinalizeFileAsync(_volumeName, fileId!, encLength, writeLease).GetAwaiter().GetResult();
+                // FinalizeFile で長さ確定。新規ファイルでも切り詰め宣言（SetEndOfFile）が
+                // ある場合は ChunkCount を渡してサーバー側も確実に論理切り詰めさせる。
+                _api.FinalizeFileAsync(_volumeName, fileId!, encLength, writeLease, chunkCount).GetAwaiter().GetResult();
                 finalized = true;
             }
             catch
