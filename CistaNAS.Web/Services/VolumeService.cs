@@ -33,6 +33,23 @@ public sealed partial class VolumeService : IAsyncDisposable
     private VolumeOptions VolOpts => _options.Value.Volume;
     private string StorageProvider => _options.Value.Storage.Provider.ToLowerInvariant();
 
+    /// <summary>1 ファイルの最大サイズ（バイト）。FileService の Upload / Patch 上限検査用。</summary>
+    internal long MaxFileSizeBytes => _options.Value.Volume.MaxFileSizeBytes;
+
+    /// <summary>指定ユーザーがオーナーのボリューム名一覧（home__ プレフィックスを除く）。</summary>
+    public async Task<List<string>> GetOwnedVolumeNamesAsync(string username)
+    {
+        var result = new List<string>();
+        foreach (string name in await _metaStore.ListVolumeNamesAsync())
+        {
+            if (name.StartsWith(VolumeHeader.HomePrefix, StringComparison.Ordinal)) continue;
+            var header = await _metaStore.LoadAsync(name);
+            if (header is not null && string.Equals(header.OwnerUser, username, StringComparison.Ordinal))
+                result.Add(name);
+        }
+        return result;
+    }
+
     public VolumeService(
         IOptions<CistaNasOptions> options,
         IServiceScopeFactory scopeFactory,

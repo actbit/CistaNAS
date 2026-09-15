@@ -16,6 +16,17 @@ public sealed partial class VolumeService
         return CreateInternalAsync(name, username, password, encrypted);
     }
 
+    /// <summary>
+    /// サーバー側暗号化（AES-XTS で volume.dat を暗号化）の要否を決定する。
+    /// "server" / "e2ee"（ボリューム暗号化 + クライアント側 E2EE を重ねる）→ true、"none" → false。
+    /// ユーザー設定が未設定（null / 空）なら既定 "server" 扱いで requested を尊重する。
+    /// 回帰 (Critical): 旧実装は `!= "server"` 比較のため、既定値 "server" のユーザーが
+    /// encrypted=true で作成しても shouldEncrypt が false になり、「サーバー暗号化」ボリュームが
+    /// 平文 volume.dat として作成されていた。
+    /// </summary>
+    internal static bool ResolveServerSideEncryption(bool requested, string? userEncryptionMode)
+        => requested && userEncryptionMode != "none";
+
     /// <summary>ホームボリューム等、内部用途の作成（home__ プレフィックスを許可）。</summary>
     public Task<VolumeInfo> CreateInternalAsync(string name, string? username, string? password, bool encrypted = true)
     {
@@ -27,6 +38,7 @@ public sealed partial class VolumeService
             // ユーザー設定を取得して暗号化モードとアルゴリズムを決定
             string cipherAlgorithm = "aes-256-xts";  // デフォルト
             bool shouldEncrypt = encrypted;
+            string? userEncryptionMode = null;
 
             if (encrypted && !string.IsNullOrEmpty(username))
             {
@@ -35,17 +47,15 @@ public sealed partial class VolumeService
                 var user = await userManager.FindByNameAsync(username);
                 if (user is not null)
                 {
-                    // ユーザーのデフォルト設定を使用
-                    if (!string.IsNullOrEmpty(user.DefaultEncryptionMode))
-                    {
-                        shouldEncrypt = user.DefaultEncryptionMode != "server";
-                    }
+                    userEncryptionMode = user.DefaultEncryptionMode;
                     if (!string.IsNullOrEmpty(user.DefaultCipherAlgorithm))
                     {
                         cipherAlgorithm = user.DefaultCipherAlgorithm;
                     }
                 }
             }
+
+            shouldEncrypt = ResolveServerSideEncryption(encrypted, userEncryptionMode);
 
             if (shouldEncrypt) { ArgumentException.ThrowIfNullOrEmpty(username); ArgumentException.ThrowIfNullOrEmpty(password); }
 

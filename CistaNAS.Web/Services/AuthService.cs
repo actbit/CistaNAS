@@ -71,6 +71,10 @@ public sealed class AuthService(
         {
             new Claim(JwtRegisteredClaimNames.Sub, user.UserName ?? user.Id),
             new Claim(ClaimTypes.Name, user.UserName ?? user.Id),
+            // 認証失効用: SecurityStamp をトークンへ bind する。
+            // パスワード変更・ロール変更・ユーザー削除で stamp が変わると
+            // OnTokenValidated の検査で既発行トークンが拒否される。
+            new Claim("secst", user.SecurityStamp ?? ""),
         };
         foreach (var r in roles)
             claims.Add(new Claim(ClaimTypes.Role, r));

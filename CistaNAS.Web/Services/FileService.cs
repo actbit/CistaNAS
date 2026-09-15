@@ -76,6 +76,7 @@ public sealed class FileService
     {
         ArgumentException.ThrowIfNullOrEmpty(fileName);
         if (contentLength < 0) throw new ArgumentOutOfRangeException(nameof(contentLength));
+        ValidateSizeBound(contentLength);
 
         if (_volumeService.IsChunkMode(volumeName))
             return await UploadChunkedAsync(volumeName, fileName, content, contentLength, ct);
@@ -86,6 +87,22 @@ public sealed class FileService
         {
             return await UploadInternalAsync(volumeName, fileName, content, contentLength, ct);
         }
+    }
+
+    /// <summary>
+    /// サイズ上限（Volume:MaxFileSizeBytes）の検査。checked でオーバーフローも捕捉する。
+    /// 回帰 (High): PATCH の巨大 offset（上限なし）で新規ファイルへの sparse 埋めが
+    /// 大量 I/O・ディスク枯渇を引き起こせていた。
+    /// </summary>
+    private void ValidateSizeBound(long endPosition)
+    {
+        long max = _volumeService.MaxFileSizeBytes;
+        long end;
+        try { end = checked(endPosition); }
+        catch (OverflowException) { throw new FileServiceException("要求サイズが大きすぎます。"); }
+        if (end > max)
+            throw new FileServiceException(
+                $"ファイルサイズが上限 ({max:N0} バイト) を超えています。末端位置: {end:N0} バイト。");
     }
 
     /// <summary>非チャンクモードのアップロード本体。</summary>
@@ -200,6 +217,8 @@ public sealed class FileService
         ArgumentException.ThrowIfNullOrEmpty(fileName);
         if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
         if (contentLength < 0) throw new ArgumentOutOfRangeException(nameof(contentLength));
+        // offset + contentLength が末端位置。オーバーフローと上限超過を事前排斥する
+        ValidateSizeBound(checked(offset + contentLength));
 
         if (_volumeService.IsChunkMode(volumeName))
             return await PatchChunkedAsync(volumeName, fileName, offset, content, contentLength, ct);

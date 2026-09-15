@@ -83,7 +83,15 @@ public sealed partial class VolumeService
         });
     }
 
-    /// <summary>ユーザーのパスワード変更時に全ボリュームの鍵を再ラップ。</summary>
+    /// <summary>
+    /// ユーザーのパスワード変更時に全ボリュームの鍵を再ラップする（二相コミット）。
+    /// 第 1 相: 全ボリュームのラップを新パスワードへ張り替え、旧ラップを Previous* に退避して保存。
+    /// 第 2 相: 全ボリュームの準備完了後に旧ラップを除去して確定。
+    /// 途中で失敗した場合は処理済みボリュームを旧エントリへ復元するため、
+    /// 「旧パスワードでしか開けない / 新パスワードでしか開けない」ボリュームが混在する
+    /// KEK 分裂（データ可用性の喪失）が発生しない。復元の保存に失敗した場合も
+    /// 退避中のボリュームは旧・新どちらのパスワードでもアンラップ可能。
+    /// </summary>
     public async Task RewrapAllForUserAsync(string username, string oldPassword, string newPassword)
     {
         // ボリューム一覧はゲート外で取得し、ゲート保持時間を最小化する
@@ -91,14 +99,62 @@ public sealed partial class VolumeService
 
         await UnderMountGateAsync(async () =>
         {
-            foreach (var name in volumeNames)
-            {
-                var header = await LoadHeaderIfExistsAsync(name);
-                if (header is null || !header.HasUserAccess(username)) continue;
+            // ロールバック用に旧エントリをスナップショット（第 1 相 / 第 2 相のどちらで
+            // 失敗しても、このエントリへ戻せば旧パスワードで開ける状態に戻る）
+            var prepared = new List<string>();
+            var oldEntries = new Dictionary<string, VolumeHeader.UserWrappedKey>(StringComparer.Ordinal);
 
-                header.RewrapUser(username, oldPassword, newPassword, VolOpts.ToKdfSpec());
-                await _metaStore.SaveAsync(name, header);
-                RefreshMountedHeader(name, header);
+            try
+            {
+                // 第 1 相: 新ラップへ張り替え（旧ラップ退避つき）
+                foreach (var name in volumeNames)
+                {
+                    var header = await LoadHeaderIfExistsAsync(name);
+                    if (header is null || !header.HasUserAccess(username)) continue;
+
+                    oldEntries[name] = header.UserKeys[username];
+                    header.BeginRewrapUser(username, oldPassword, newPassword, VolOpts.ToKdfSpec());
+                    await _metaStore.SaveAsync(name, header);
+                    RefreshMountedHeader(name, header);
+                    prepared.Add(name);
+                }
+
+                // 第 2 相: 旧ラップを除去して確定
+                foreach (var name in prepared)
+                {
+                    var header = await LoadHeaderIfExistsAsync(name);
+                    if (header is null) continue;
+                    header.CommitRewrapUser(username);
+                    await _metaStore.SaveAsync(name, header);
+                    RefreshMountedHeader(name, header);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "パスワード変更の KEK 再ラップが失敗しました（ユーザー: {Username}）。処理済み {Count} ボリュームを旧ラップへ復元します。",
+                    username, prepared.Count);
+
+                // ベストエフォートで旧エントリへ復元（第 1 相・第 2 相どちらで失敗しても有効）。
+                // 復元の保存にも失敗したボリュームは Previous* 退避中のため旧パスワードで開ける。
+                foreach (var name in prepared)
+                {
+                    try
+                    {
+                        var header = await LoadHeaderIfExistsAsync(name);
+                        if (header is null || !oldEntries.TryGetValue(name, out var oldEntry)) continue;
+                        header.UserKeys[username] = oldEntry;
+                        await _metaStore.SaveAsync(name, header);
+                        RefreshMountedHeader(name, header);
+                    }
+                    catch (Exception restoreEx)
+                    {
+                        _logger.LogCritical(restoreEx,
+                            "ボリューム '{Volume}' の旧ラップ復元に失敗しました（ユーザー: {Username}）。Previous ラップが残存するため旧・新どちらのパスワードでも開けます。手動での整合確認を推奨。",
+                            name, username);
+                    }
+                }
+                throw;
             }
         });
     }
