@@ -152,12 +152,12 @@ public class WritePathRound3Tests
                 int index = int.Parse(segments[6]);
                 if (index > ChunkCount)
                     return JsonR(HttpStatusCode.BadRequest, "範囲外");
+                _uploadReached.TrySetResult();
                 if (FailNextUploads > 0)
                 {
                     FailNextUploads--;
                     return JsonR(HttpStatusCode.InternalServerError, "テスト用のアップロード失敗");
                 }
-                _uploadReached.TrySetResult();
                 UploadRelease?.Task.Wait();
                 byte[] cipher = request.Content!.ReadAsByteArrayAsync(ct).GetAwaiter().GetResult();
                 bool isReplace = index < ChunkCount && Chunks.ContainsKey(index);
@@ -540,6 +540,84 @@ public class WritePathRound3Tests
         byte[] expectedTail = new byte[100];
         data.CopyTo(expectedTail, 0);
         Assert.Equal(expectedTail, content[6000..6100]);
+    }
+
+    // ---- Round 4 回帰: 新規 E2EE ファイルの切り詰めを含む保存 ----
+
+    [Fact]
+    public void 新規E2EEファイルの切り詰め領域を含む保存が失敗しない()
+    {
+        // 回帰 (round 4): TakeDirtyChunksForUpload が切り詰め領域 (ci >= chunkCount) を
+        // スナップショットに含めるようになったことで、新規ファイル経路のアップロードループで
+        // chunkLen = min(chunkSize, plainLength - ci*chunkSize) が負になり
+        // ResizeChunk が例外を投げ、persist が必ず失敗していた。
+        // （既存ファイル経路には ci >= chunkCount スキップがあるが新規経路になかった）
+        byte[] masterKey = RandomNumberGenerator.GetBytes(32);
+        byte[] fileSalt = RandomNumberGenerator.GetBytes(16);
+        byte[] fileKey = E2eeCrypto.DeriveFileKey(masterKey, fileSalt);
+        var server = new FakeE2eeServer(masterKey, Array.Empty<byte>(), fileKey, fileSalt);
+        var api = new CistaNasApiClient(new HttpClient(server) { BaseAddress = new Uri("http://test/") });
+        var fs = new CistaNasFileSystem(api, masterKey, Volume, chunkSize: ChunkSize);
+
+        byte[] data = Pattern(100, seed: 120);
+        var ws = new CistaNasFileSystem.E2eeChunkWriteState(fs, "new.txt", null);
+        ws.Write(data, 0, data.Length, 9000); // チャンク 2 に書き込み（チャンク 0-1 は隙間）
+        ws.SetDeclaredSize(1000);             // 切り詰め → チャンク 2 は切り詰め領域になる
+
+        // 回帰: chunkLen が負になり例外で persist 全体が失敗する
+        fs.UploadWriteState(ws);
+
+        // 切り詰め後の 1 チャンク（1000B）だけが確定する
+        Assert.Equal(
+            (E2eeCrypto.ComputeEncryptedLength(1000, ChunkSize), 1),
+            server.FinalizeRequests[^1]);
+        Assert.Equal(1, server.ChunkCount);
+        byte[] salt0 = new byte[E2eeCrypto.SaltSize];
+        Buffer.BlockCopy(server.Chunks[0].Cipher, 0, salt0, 0, E2eeCrypto.SaltSize);
+        byte[] newFileKey = E2eeCrypto.DeriveFileKey(masterKey, salt0);
+        // 切り詰め後はチャンク 0 のみが残る。書き込み (offset 9000) は切り詰め領域に消え、
+        // チャンク 0 は未書き込みの隙間なので RMW ゼロ埋めであるべき（旧内容の復活なし）
+        byte[] expected = new byte[1000];
+        Assert.Equal(expected, E2eeCrypto.DecryptChunk(server.Chunks[0].Cipher, newFileKey, 0, salt0, revision: 0));
+    }
+
+    // ---- Round 4 回帰: FlushFileBuffers が進行中 persist の成否を待たない ----
+
+    [Fact]
+    public void FlushFileBuffersは進行中の保存の完了を待ってから結果を返す()
+    {
+        // 回帰 (round 4): HasPending == false の間（進行中 persist がスナップショット済み）の
+        // FlushFileBuffers が即座に Success を返すため、その persist が失敗しても
+        // Windows には「永続化成功」と報告されたままになる。
+        var (fs, server, fileSalt, fileKey, plain) = CreateExistingE2eeFile(5000);
+        byte[] data = Pattern(100, seed: 130);
+
+        var ws = new CistaNasFileSystem.E2eeChunkWriteState(fs, "plain.txt", FakeE2eeServer.FileId);
+        var info = new StubFileInfo { Context = ws };
+        ws.Write(data, 0, data.Length, 0);
+
+        // 1 回目の flush が進行中の間に 2 回目の flush を呼ぶ
+        server.FailNextUploads = 1;
+        server.UploadRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<NtStatus> flush1 = Task.Run(() => fs.FlushFileBuffers("\\" + "plain.txt", info));
+        Assert.True(server.UploadReached.Wait(TimeSpan.FromSeconds(10)), "upload-chunk に到達しませんでした");
+
+        Task<NtStatus> flush2 = Task.Run(() => fs.FlushFileBuffers("\\" + "plain.txt", info));
+        // 回帰: 進行中 persist の結果を待たずに即 Success を返してしまう
+        Assert.False(flush2.Wait(300), "2 回目の flush が進行中の persist を待たずに完了しました");
+
+        // ブロック解除 → 1 回目は失敗（FailNextUploads）、2 回目は再試行で成功
+        server.UploadRelease.TrySetResult();
+        Assert.True(flush1.Wait(TimeSpan.FromSeconds(10)));
+        Assert.Equal(DokanResult.InternalError, flush1.Result);
+        Assert.True(flush2.Wait(TimeSpan.FromSeconds(10)));
+        Assert.Equal(DokanResult.Success, flush2.Result);
+
+        // データは再試行で永続化されている
+        byte[] chunk0 = E2eeCrypto.DecryptChunk(server.Chunks[0].Cipher, fileKey, 0, fileSalt, revision: 1);
+        byte[] expected = plain[..ChunkSize];
+        data.CopyTo(expected, 0);
+        Assert.Equal(expected, chunk0);
     }
 
     // ---- F8: グローバル persist ゲート ----
