@@ -351,46 +351,6 @@ public sealed class VolumeHeader
         }
     }
 
-    /// <summary>指定ユーザーのエントリを新しいパスワードで再ラップ。</summary>
-    public void RewrapUser(string username, string oldPassword, string newPassword, KdfSpec kdf)
-    {
-        if (!UserKeys.TryGetValue(username, out var entry))
-            throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
-
-        byte[] oldKek = DeriveKek(username, oldPassword, entry.Kdf.Salt, entry.Kdf.ToKdfSpec());
-        try
-        {
-            byte[] masterKey = UnwrapKey(entry.WrappedMasterKey, oldKek);
-            try
-            {
-                // 新しいソルトで再ラップ（KDF も現行スペックへ昇格）
-                byte[] newSalt = KeyDerivation.NewSalt();
-                byte[] newKek = DeriveKek(username, newPassword, newSalt, kdf);
-                try
-                {
-                    var (nonce, ct, tag) = WrapKey(masterKey, newKek);
-                    UserKeys[username] = new UserWrappedKey
-                    {
-                        Kdf = KdfParams.FromSpec(kdf, newSalt),
-                        WrappedMasterKey = new WrappedKey { Nonce = nonce, Ciphertext = ct, Tag = tag },
-                    };
-                }
-                finally
-                {
-                    CryptographicOperations.ZeroMemory(newKek);
-                }
-            }
-            finally
-            {
-                CryptographicOperations.ZeroMemory(masterKey);
-            }
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(oldKek);
-        }
-    }
-
     /// <summary>ユーザーのアクセス権を削除。オーナーは削除不可。</summary>
     public bool RemoveUserWrap(string username)
     {
@@ -404,7 +364,9 @@ public sealed class VolumeHeader
     // 全ボリュームの再ラップをアトミックに行うことはできないため、旧ラップを
     // Previous* に退避させたまま新ラップへ切り替える。全ボリュームの準備が
     // 完了してから CommitRewrapUser で旧ラップを除去する。途中で失敗した場合は
-    // 呼び出し側が RollbackRewrapUser（または旧エントリの復元）で元に戻せる。
+    // 呼び出し側が第 1 相前に取得した旧エントリのスナップショットへ復元する。
+// コミット前にプロセスが死んだ場合は Previous* が残留するため、次回マウント時に
+// <see cref="ClearStalePreviousWrap"/> で撤去する。
 
     /// <summary>
     /// 再ラップの第 1 相: 旧ラップを Previous* に退避し、新パスワードで再ラップした
@@ -455,20 +417,21 @@ public sealed class VolumeHeader
         entry.PreviousWrappedMasterKey = null;
     }
 
-    /// <summary>BeginRewrapUser の取り消し: 退避した旧ラップへ戻す。旧ラップがなければ何もしない。</summary>
-    public void RollbackRewrapUser(string username)
+    /// <summary>
+    /// 二相コミットの第 2 相完了前にプロセスが死んだ場合、Previous* がヘッダに永続化したまま残る
+    /// （旧パスワードが失効しない）。現行ラップでのアンラップに成功した後（= マウント認証成功後）に
+    /// 呼ぶと、そのユーザーの Previous* は確実に中断物なので除去する。
+    /// 除去が発生したら true を返す。呼び出し側はヘッダを保存して撤去を永続化すること。
+    /// </summary>
+    public bool ClearStalePreviousWrap(string username)
     {
-        if (!UserKeys.TryGetValue(username, out var entry)
-            || entry.PreviousKdf is null || entry.PreviousWrappedMasterKey is null)
-            return;
-        UserKeys[username] = new UserWrappedKey
-        {
-            WrapType = entry.WrapType,
-            Kdf = entry.PreviousKdf,
-            WrappedMasterKey = entry.PreviousWrappedMasterKey,
-            EphemeralPublicKey = entry.EphemeralPublicKey,
-            Extensions = entry.Extensions,
-        };
+        if (!UserKeys.TryGetValue(username, out var entry))
+            return false;
+        if (entry.PreviousKdf is null && entry.PreviousWrappedMasterKey is null)
+            return false;
+        entry.PreviousKdf = null;
+        entry.PreviousWrappedMasterKey = null;
+        return true;
     }
 
     /// <summary>ユーザーがアクセス権を持つか。</summary>

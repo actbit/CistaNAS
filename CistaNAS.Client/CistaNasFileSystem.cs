@@ -179,6 +179,15 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         protected readonly CistaNasFileSystem Fs;
         public long DeclaredSize = -1; // SetEndOfFile で指定されたサイズ
 
+        /// <summary>
+        /// CREATE_ALWAYS / TRUNCATE_EXISTING で既存ファイルを切り詰めて開いたか。
+        /// true の場合、旧サーバー内容はすべて無効（オープン時点で論理的にゼロ）。
+        /// 以降の SetEndOfFile(N) が DeclaredSize を上書きしても、旧内容を [0,N) に
+        /// 復活させてはならない（round 6: SetEndOfFile が SetDeclaredSize(0) を
+        /// 上書きし、truncated ファイルに旧内容の先頭 N バイトが残る缺陷）。
+        /// </summary>
+        public bool TruncatedAtOpen { get; internal set; }
+
         // 未永続化操作数。Gate 保護。Write / SetDeclaredSize で増加し、アップロードの
         // スナップショット時に取り込む（0 にリセット）。アップロード中の新規書き込みは
         // 再び増加するため、完了時に誤って「永続化済み」として潰されない。
@@ -440,6 +449,20 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         /// <summary>crypto format v2: volumeId（チャンク AAD bind 用）。v1 では null。</summary>
         public string? ExistingVolumeId => _existingVolumeId;
         public string? WriteLeaseToken { get; private set; }
+
+        /// <summary>
+        /// CREATE_ALWAYS / TRUNCATE_EXISTING で既存ファイルを切り詰めて開いた。
+        /// 既存チャンクをすべて無効化する（_existingChunkCount / _existingPlainLength を 0 に）。
+        /// 以降の SetEndOfFile(N) は「空ファイルを N へ拡張」を意味し、旧サーバー内容を
+        /// [0,N) に復活させてはならない。fileSalt / fileKey は差分保存（UploadE2eeDiff）の
+        /// 暗号化に必要なため保持する。
+        /// </summary>
+        public void MarkTruncatedAtOpen()
+        {
+            _existingChunkCount = 0;
+            _existingPlainLength = 0;
+            SetDeclaredSize(0);
+        }
 
         /// <summary>
         /// persist 開始時（PersistGate 保持中・Gate 非保持）に呼ぶ。書き込みリースが未取得なら
@@ -765,6 +788,26 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
     public NtStatus CreateFile(string fileName, DokanNet.FileAccess access, FileShare share,
         FileMode mode, FileOptions options, FileAttributes attributes, IDokanFileInfo info)
     {
+        // 一覧取得（存在確認）等の一時的失敗を「ファイル無し」へ変換しない。変換すると
+        // CreateNew が既存ファイルを黙って上書きし（データロス）、Truncate が存在するのに
+        // FileNotFound を返す。フェイルクローズ（InternalError）でアプリにリトライさせる。
+        try
+        {
+            return CreateFileCore(fileName, access, share, mode, options, attributes, info);
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Locked)
+        {
+            return DokanResult.SharingViolation;
+        }
+        catch
+        {
+            return DokanResult.InternalError;
+        }
+    }
+
+    private NtStatus CreateFileCore(string fileName, DokanNet.FileAccess access, FileShare share,
+        FileMode mode, FileOptions options, FileAttributes attributes, IDokanFileInfo info)
+    {
         string plainName = fileName.TrimStart('\\');
 
         if (mode == FileMode.Open || mode == FileMode.OpenOrCreate)
@@ -780,8 +823,18 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             {
                 if ((access & (DokanNet.FileAccess.WriteData | DokanNet.FileAccess.GenericWrite)) != 0)
                 {
-                    long existingLength = GetExistingPlainLength(plainName);
-                    info.Context = new PlainRangeWriteState(this, plainName, plainName, existingLength);
+                    long? existingLength = GetExistingPlainLengthOrNull(plainName);
+                    if (existingLength is null && mode == FileMode.OpenOrCreate)
+                    {
+                        // 存在しない → 新規作成。ExistingFileId を plainName のままにすると
+                        // UploadPlain が「既存・書込なし・長さ一致」で persist をスキップし、
+                        // ファイルが作られない（round 6: CREATE_ALWAYS 新規ファイルの欠落）。
+                        info.Context = new PlainRangeWriteState(this, plainName, null);
+                    }
+                    else
+                    {
+                        info.Context = new PlainRangeWriteState(this, plainName, plainName, existingLength ?? 0);
+                    }
                 }
                 else
                 {
@@ -814,7 +867,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         if (mode == FileMode.CreateNew)
         {
             // 非E2EE モード: 新規作成（既存なら FileExists — CREATE_NEW の契約。
-            // 回帰: 存在チェック無しで上書きしていた round 5 H3）
+            // 回帰: 存在チェック無しで上書きしていた round 5 H3。
+            // GetExistingPlainLengthOrNull は一覧取得失敗時に例外を投げるため、
+            // 一時的ネットワーク障害でフェイルオープン（既存ファイルの黙って上書き）にはならない）
             if (!_isE2ee)
             {
                 if (GetExistingPlainLengthOrNull(plainName) is not null)
@@ -836,14 +891,27 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             // Create (CREATE_ALWAYS): オープン時点でサイズ 0 に切り詰める。
             // 回帰 (round 5 H1): 旧実装は既存長を保持して開いていたため、小さいファイルで
             // 上書きすると旧内容の末尾が残り、サイズも旧長のまま報告されていた。
-            // SetDeclaredSize(0) により CurrentSize は書き込み分だけになり、persist も
-            // 切り詰め PUT（plain）/ finalize チャンク数確定（E2EE）でサーバー側も縮む。
+            // TruncatedAtOpen / MarkTruncatedAtOpen により旧サーバー内容はすべて無効化され、
+            // 以降の SetEndOfFile(N) でも旧内容が復活しない（round 6）。
             if (!_isE2ee)
             {
-                long existingLength = GetExistingPlainLength(plainName);
-                var created = new PlainRangeWriteState(this, plainName, plainName, existingLength);
-                created.SetDeclaredSize(0);
-                info.Context = created;
+                long? existingLength = GetExistingPlainLengthOrNull(plainName);
+                if (existingLength is null)
+                {
+                    // 新規ファイル: ExistingFileId=null で persist が新規作成 PUT を行う
+                    var newState = new PlainRangeWriteState(this, plainName, null);
+                    newState.SetDeclaredSize(0);
+                    info.Context = newState;
+                }
+                else
+                {
+                    var created = new PlainRangeWriteState(this, plainName, plainName, existingLength.Value)
+                    {
+                        TruncatedAtOpen = true,
+                    };
+                    created.SetDeclaredSize(0);
+                    info.Context = created;
+                }
                 return DokanResult.Success;
             }
 
@@ -851,7 +919,12 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             var existing = FindFileId(plainName);
             NtStatus createStatus = OpenE2eeWriteHandle(plainName, existing, info);
             if (createStatus == DokanResult.Success && info.Context is E2eeChunkWriteState createdE2ee)
-                createdE2ee.SetDeclaredSize(0);
+            {
+                if (existing is not null)
+                    createdE2ee.MarkTruncatedAtOpen();
+                else
+                    createdE2ee.SetDeclaredSize(0);
+            }
             return createStatus;
         }
 
@@ -864,7 +937,10 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             {
                 long? existingLength = GetExistingPlainLengthOrNull(plainName);
                 if (existingLength is null) return DokanResult.FileNotFound;
-                var truncated = new PlainRangeWriteState(this, plainName, plainName, existingLength.Value);
+                var truncated = new PlainRangeWriteState(this, plainName, plainName, existingLength.Value)
+                {
+                    TruncatedAtOpen = true,
+                };
                 truncated.SetDeclaredSize(0);
                 info.Context = truncated;
                 return DokanResult.Success;
@@ -874,7 +950,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             if (truncFileId is null) return DokanResult.FileNotFound;
             NtStatus truncStatus = OpenE2eeWriteHandle(plainName, truncFileId, info);
             if (truncStatus == DokanResult.Success && info.Context is E2eeChunkWriteState truncWs)
-                truncWs.SetDeclaredSize(0);
+                truncWs.MarkTruncatedAtOpen();
             return truncStatus;
         }
 
@@ -900,21 +976,19 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         }
     }
 
-    /// <summary>非E2EE: 既存ファイルの平文長を取得（差分保存で末尾保持のため）。存在しなければ null。</summary>
+    /// <summary>
+    /// 非E2EE: 既存ファイルの平文長を取得（差分保存で末尾保持のため）。存在しなければ null。
+    /// 一覧取得の失敗（ネットワーク障害・5xx）は例外のまま伝播する — 失敗を null（= 存在しない）
+    /// に変換すると CreateNew / Truncate / Create の存在確認がフェイルオープンになり、
+    /// 既存ファイルの黙って上書き（データロス）や偽 FileNotFound を引き起こす（round 6）。
+    /// CreateFile 呼び出し元で InternalError へ変換される。
+    /// </summary>
     private long? GetExistingPlainLengthOrNull(string plainName)
     {
-        try
-        {
-            var entries = CistaNasApiClientFiles.ListFilesAsync(_api, _volumeName).GetAwaiter().GetResult();
-            var e = entries.FirstOrDefault(x => string.Equals(x.Name, plainName, StringComparison.OrdinalIgnoreCase));
-            return e?.Length;
-        }
-        catch { return null; }
+        var entries = CistaNasApiClientFiles.ListFilesAsync(_api, _volumeName).GetAwaiter().GetResult();
+        var e = entries.FirstOrDefault(x => string.Equals(x.Name, plainName, StringComparison.OrdinalIgnoreCase));
+        return e?.Length;
     }
-
-    /// <summary>非E2EE: 既存ファイルの平文長を取得（存在しない場合は 0）。</summary>
-    private long GetExistingPlainLength(string plainName)
-        => GetExistingPlainLengthOrNull(plainName) ?? 0;
 
     /// <summary>書き込み中のハンドル（WriteState）からの読み込み: 書き込みバッファ（dirty）+ 既存をマージして返す。</summary>
     private NtStatus ReadFromWriteState(WriteState ws, byte[] buffer, out int bytesRead, long offset)
@@ -957,21 +1031,24 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             // persist は DeclaredSize でサーバー側も切り詰めるため、隙間読み取りで旧内容が
             // 復活する非整合（round 5 H4）になる。EOF 以内は write-through persist 済みの
             // 最新サーバー内容が正となる。
-            if (plain.ExistingFileId is not null)
+            // CREATE_ALWAYS / TRUNCATE_EXISTING で開いたハンドル（TruncatedAtOpen）では
+            // 旧サーバー内容自体が無効のため、SetEndOfFile で宣言サイズが変わっても取得しない
+            //（round 6: SetEndOfFile が宣言を上書きし旧内容が [0,N) に復活する缺陷）。
+            if (plain.ExistingFileId is not null && !plain.TruncatedAtOpen)
             {
-                try
+                long availForDownload = ws.CurrentSize - offset;
+                int downloadLen = availForDownload <= 0 ? 0
+                    : (int)Math.Min((long)buffer.Length, availForDownload);
+                if (downloadLen > 0)
                 {
-                    long availForDownload = ws.CurrentSize - offset;
-                    int downloadLen = availForDownload <= 0 ? 0
-                        : (int)Math.Min((long)buffer.Length, availForDownload);
-                    if (downloadLen > 0)
-                    {
-                        var existing = await CistaNasApiClientFiles.DownloadFileRangeAsync(_api, _volumeName, ws.PlainName, offset, downloadLen);
-                        Array.Copy(existing, 0, result, 0, Math.Min(existing.Length, result.Length));
-                        filled = Math.Min(existing.Length, buffer.Length);
-                    }
+                    // 取得失敗は握りつぶさない。ゼロ埋め成功 read に変換すると RMW 型アプリが
+                    // ゼロを書き戻してファイル内容を破壊する（round 6）。例外は
+                    // ReadFromWriteState が InternalError に変換しアプリにリトライさせる。
+                    var existing = await CistaNasApiClientFiles.DownloadFileRangeAsync(_api, _volumeName, ws.PlainName, offset, downloadLen);
+                    int copied = Math.Min(existing.Length, result.Length);
+                    Array.Copy(existing, 0, result, 0, copied);
+                    filled = copied;
                 }
-                catch { }
             }
             // dirty ranges で上書き。レンジのデータ配列は追加後に不変だが、リスト自体が
             // persist のスナップショットで入れ替わるため走査は Gate で保護する。
@@ -1061,9 +1138,11 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             }
         }
 
-        // 論理 EOF（CurrentSize）で厳密にクランプする: EOF まではゼロで埋め（隙間読み取り —
-        // result はゼロ初期化済み）、EOF 以降は短縮する。persist は DeclaredSize でサーバー側も
+        // 論理 EOF（CurrentSize）で厳密にクランプする: EOF 以内の隙間はゼロ（sparse セマンティクス
+        // — result はゼロ初期化済み）、EOF 以降は短縮する。persist は DeclaredSize でサーバー側も
         // 切り詰めるため、EOF 以降の旧サーバー内容が隙間読み取りで復活する非整合（round 5 H4）を防ぐ。
+        // EOF 以内のダウンロード失敗は上で例外として伝播済みのため、ここでのゼロ埋めが
+        // 「失敗を成功に変換する」ことはない（round 6: 握りつぶし削除）。
         long availFromOffset = ws.CurrentSize - offset;
         int eofLimit = availFromOffset <= 0 ? 0 : (int)Math.Min((long)buffer.Length, availFromOffset);
         filled = eofLimit;
@@ -1394,7 +1473,16 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         }
 
         // E2EE モード: fileId から取得
-        var fileId = info.Context as string ?? FindFileId(fileName.TrimStart('\\'));
+        string? fileId;
+        try
+        {
+            fileId = info.Context as string ?? FindFileId(fileName.TrimStart('\\'));
+        }
+        catch
+        {
+            // 一覧取得失敗を「ファイル無し」に変換しない（フェイルクローズ）
+            return DokanResult.InternalError;
+        }
         if (fileId is null) return DokanResult.FileNotFound;
 
         var cache = GetOrCreateCache(fileId);
@@ -1523,7 +1611,16 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         }
 
         // E2EE モード: fileId で削除
-        var fileId = FindFileId(plainName);
+        string? fileId;
+        try
+        {
+            fileId = FindFileId(plainName);
+        }
+        catch
+        {
+            // 一覧取得失敗を「ファイル無し」に変換しない（フェイルクローズ）
+            return DokanResult.InternalError;
+        }
         if (fileId is null) return DokanResult.FileNotFound;
 
         string? deleteLease = null;
@@ -1722,6 +1819,23 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
         try
         {
+            // CREATE_ALWAYS / TRUNCATE_EXISTING で開いたハンドル: 旧サーバー内容はすべて無効。
+            // 現在の論理長（snapshotSize）をゼロ + ダーティレンジで全体 PUT する。PATCH を使うと
+            // 書き込み位置以前の旧内容（切り詰め済みのはず）が残り、SetEndOfFile で拡張した場合も
+            // 旧内容が復活するため、このハンドルは常に全体 PUT で確定する（round 6 H1）。
+            if (ws.TruncatedAtOpen)
+            {
+                byte[] full = new byte[Math.Max(0, snapshotSize)];
+                foreach (var (off, data) in taken)
+                {
+                    if (off >= 0 && off + data.Length <= full.Length)
+                        Buffer.BlockCopy(data, 0, full, (int)off, data.Length);
+                }
+                CistaNasApiClientFiles.UploadFileAsync(_api, _volumeName, ws.PlainName, full).GetAwaiter().GetResult();
+                CommitPlainLength(ws, snapshotSize, taken);
+                return;
+            }
+
             // 新規ファイルで offset=0 から始まらない（sparse）または空の場合は全体アップロードで確実に作成。
             if (isNew && (taken.Count == 0 || taken[0].Offset != 0))
             {
@@ -1751,15 +1865,21 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 byte[] full = new byte[Math.Max(0, snapshotSize)];
                 if (!isNew)
                 {
+                    // 切り詰め後も保持する先頭部分だけ Range 取得する。丸ごと DownloadFileAsync
+                    // すると multi-GB ファイルの上書きで IRP 内に全体ダウンロードが発生し、
+                    // メモリスパイク・タイムアウトの原因になっていた（round 6 H7）。
                     // 回帰: サーバー内容の取得に失敗して全ゼロで PUT すると既存内容を破壊するため、
                     // 例外は握りつぶさず persist 全体を失敗させロールバックする。
-                    byte[] existing = CistaNasApiClientFiles.DownloadFileAsync(_api, _volumeName, ws.PlainName).GetAwaiter().GetResult();
-                    // 回帰: 切り詰め→拡張（縮小後に終端を越える書き込み）では、宣言サイズ以降の
-                    // 旧サーバー内容を復活させてはいけない（隙間はゼロ）。
+                    // 切り詰め宣言（DeclaredSize）以降・サーバー長以降はゼロで埋める。
                     long preserve = full.Length;
                     if (ws.DeclaredSize >= 0)
                         preserve = Math.Min(preserve, Math.Max(0, ws.DeclaredSize));
-                    Buffer.BlockCopy(existing, 0, full, 0, (int)Math.Min(existing.Length, preserve));
+                    preserve = Math.Min(preserve, serverLength);
+                    if (preserve > 0)
+                    {
+                        byte[] existing = CistaNasApiClientFiles.DownloadFileRangeAsync(_api, _volumeName, ws.PlainName, 0, (int)preserve).GetAwaiter().GetResult();
+                        Buffer.BlockCopy(existing, 0, full, 0, (int)Math.Min(existing.Length, preserve));
+                    }
                 }
                 foreach (var (off, data) in taken)
                 {
@@ -2199,27 +2319,27 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         catch (CryptographicException) { return null; }
     }
 
+    /// <summary>
+    /// E2EE: plainName に対応する fileId を検索する。見つからなければ null。
+    /// 一覧取得の失敗（ネットワーク障害・5xx）は例外のまま伝播する — 失敗を null に変換すると
+    /// CreateNew の二重作成・Truncate の偽 FileNotFound を引き起こす（round 6）。
+    /// CreateFile 呼び出し元で InternalError へ変換される。
+    /// </summary>
     private string? FindFileId(string plainName)
     {
         if (_fileIdCache.TryGetValue(plainName, out var fileId))
             return fileId;
 
-        try
+        // キャッシュミス: 一覧を取得して名前インデックスを構築
+        var entries = _api.ListFilesAsync(_volumeName).GetAwaiter().GetResult();
+        foreach (var entry in entries)
         {
-            // キャッシュミス: 一覧を取得して名前インデックスを構築
-            var entries = _api.ListFilesAsync(_volumeName).GetAwaiter().GetResult();
-            foreach (var entry in entries)
-            {
-                // 復号できないエントリ（他ユーザーの鍵の v1 ファイル等）は名前索引から外れる
-                string? decrypted = TryDecryptNameForEntry(entry);
-                if (decrypted is not null)
-                    _fileIdCache.TryAdd(decrypted, entry.FileId);
-            }
-            return _fileIdCache.TryGetValue(plainName, out var found) ? found : null;
+            // 復号できないエントリ（他ユーザーの鍵の v1 ファイル等）は名前索引から外れる
+            string? decrypted = TryDecryptNameForEntry(entry);
+            if (decrypted is not null)
+                _fileIdCache.TryAdd(decrypted, entry.FileId);
         }
-        catch { }
-
-        return null;
+        return _fileIdCache.TryGetValue(plainName, out var found) ? found : null;
     }
 
     /// <summary>アンマウント時: マスターキー（VirtualUnlock 含む）・GroupKey・ファイルキー・平文チャンクをゼロクリア。</summary>

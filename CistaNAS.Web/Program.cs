@@ -15,6 +15,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 
@@ -75,6 +76,12 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         // 認証失効: トークンの "secst" クレームと DB の SecurityStamp を突き合わせる。
         // パスワード変更・ロール変更・ユーザー削除で stamp が更新 / ユーザーが不在になるため、
         // 既発行 JWT が即座に拒否される（それ以前に発行された secst 無しのトークンも拒否）。
+        //
+        // 検証結果は Auth:JwtSecurityStampCacheSeconds（既定 300 秒）だけキャッシュする。
+        // 毎リクエスト FindByNameAsync（DB 往復）を行うと Dokan / rclone の高頻度アクセスで
+        // DB 負荷が比例増加し、一時的な DB 障害で全認証リクエストが一斉に失敗するため。
+        // キャッシュは (username, stamp) をキーとするため、stamp が変われば即座に無効になる
+        // （= 失効遅延は stamp 不変のまま期間切れになる場合のみ、最大でキャッシュ TTL）。
         options.Events = new JwtBearerEvents
         {
             OnTokenValidated = async ctx =>
@@ -86,8 +93,29 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                     return;
                 }
 
-                await using var scope = ctx.HttpContext.RequestServices.CreateAsyncScope();
-                var userManager = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+                string? stamp = ctx.Principal!.FindFirst("secst")?.Value;
+                if (string.IsNullOrEmpty(stamp))
+                {
+                    ctx.Fail("トークンに資格情報バージョンがありません。");
+                    return;
+                }
+
+                // HttpContext.RequestServices は既にリクエストスコープのため、
+                // 追加の DI スコープ生成は不要（ネストしたスコープは毎リクエストの
+                // 無駄なアロケーションになっていた）。
+                var userManager = ctx.HttpContext.RequestServices
+                    .GetRequiredService<UserManager<ApplicationUser>>();
+                var cache = ctx.HttpContext.RequestServices.GetRequiredService<IMemoryCache>();
+                int cacheSeconds = cista.Auth.JwtSecurityStampCacheSeconds;
+
+                string cacheKey = $"secst:{username}";
+                if (cacheSeconds > 0
+                    && cache.TryGetValue(cacheKey, out string? cachedStamp)
+                    && string.Equals(cachedStamp, stamp, StringComparison.Ordinal))
+                {
+                    return; // TTL 内かつ stamp 不変 → DB 検証を省略
+                }
+
                 var user = await userManager.FindByNameAsync(username);
                 if (user is null)
                 {
@@ -95,10 +123,16 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                     return;
                 }
 
-                string? stamp = ctx.Principal!.FindFirst("secst")?.Value;
                 if (!string.Equals(stamp, user.SecurityStamp, StringComparison.Ordinal))
                 {
                     ctx.Fail("資格情報が失効しています（再ログインが必要です）。");
+                    return;
+                }
+
+                if (cacheSeconds > 0)
+                {
+                    cache.Set(cacheKey, user.SecurityStamp,
+                        new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(cacheSeconds) });
                 }
             },
         };
@@ -209,6 +243,9 @@ builder.Services.Configure<ForwardedHeadersOptions>(forwarded =>
 
 // ---- Service 層 DI 登録 ----
 builder.Services.AddCistaNasServices(cista);
+
+// JWT SecurityStamp 検証結果のキャッシュ（OnTokenValidated 参照）
+builder.Services.AddMemoryCache();
 
 // ---- WebDAV ----
 builder.Services.AddScoped<WebDavHandler>();

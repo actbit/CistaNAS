@@ -21,10 +21,20 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
 {
     private readonly AuthService _authService;
     private readonly int _cacheSeconds;
+    private readonly int _failedAuthLimitPerMinute;
 
     /// <summary>成功資格情報キャッシュ。キー = SHA256(user:pass)（平文保存を避ける）。</summary>
     private static readonly ConcurrentDictionary<string, CachedAuth> CredentialCache = new();
     private const int CacheCapacity = 1024;
+
+    /// <summary>
+    /// 認証失敗カウンタ（1 IP あたり 1 分の固定ウィンドウ）。
+    /// 閾値超過の IP は Argon2id 検証（1 回あたり 64 MiB 相当のメモリ）を実行せず即座に失敗させる。
+    /// webdav レートポリシー（既定 600 req/min）は正常操作用のため、失敗への絞りはここで行う
+    /// （無いと Basic 総当たりがログインエンドポイント比 60 倍の速度 + CPU/メモリ負荷で攻撃可能）。
+    /// </summary>
+    private static readonly ConcurrentDictionary<string, (int Count, DateTimeOffset WindowStart)> FailedAuths = new();
+    private static readonly TimeSpan FailureWindow = TimeSpan.FromMinutes(1);
 
     private sealed record CachedAuth(ClaimsPrincipal Principal, DateTimeOffset ExpiresAt, string Username);
 
@@ -52,6 +62,7 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
     {
         _authService = authService;
         _cacheSeconds = cistaOptions.Value.Auth.WebDavAuthCacheSeconds;
+        _failedAuthLimitPerMinute = cistaOptions.Value.Auth.WebDavFailedAuthLimitPerMinute;
     }
 
     protected override async Task<AuthenticateResult> HandleAuthenticateAsync()
@@ -81,17 +92,26 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
                 return AuthenticateResult.Success(new AuthenticationTicket(cached.Principal, Scheme.Name));
             }
 
+            // 失敗スロットル: 閾値超過の IP は Argon2id 検証・DB 検証を実行せず即座に失敗させる
+            string remoteIp = Context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+            if (_failedAuthLimitPerMinute > 0 && IsOverFailureLimit(remoteIp))
+                return AuthenticateResult.Fail("Too many failed authentication attempts.");
+
             var loginResponse = await _authService.AuthenticateAsync(username, password);
             if (loginResponse is null)
             {
                 // ユーザーが存在しない場合もダミー計算を実行してタイミングを均一化
                 Argon2Hasher.RunDummy();
+                RecordAuthFailure(remoteIp);
                 return AuthenticateResult.Fail("Invalid credentials.");
             }
 
             var principal = await _authService.GetPrincipalAsync(username);
             if (principal is null)
+            {
+                RecordAuthFailure(remoteIp);
                 return AuthenticateResult.Fail("認証後にユーザーが見つかりません。");
+            }
 
             if (_cacheSeconds > 0)
                 StorePrincipal(cacheKey, principal);
@@ -103,6 +123,23 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
         {
             return AuthenticateResult.Fail("Invalid Base64 in Basic Auth.");
         }
+    }
+
+    private bool IsOverFailureLimit(string remoteIp)
+    {
+        var now = DateTimeOffset.UtcNow;
+        return FailedAuths.TryGetValue(remoteIp, out var entry)
+            && now - entry.WindowStart < FailureWindow
+            && entry.Count >= _failedAuthLimitPerMinute;
+    }
+
+    private static void RecordAuthFailure(string remoteIp)
+    {
+        var now = DateTimeOffset.UtcNow;
+        FailedAuths.AddOrUpdate(
+            remoteIp,
+            _ => (1, now),
+            (_, entry) => now - entry.WindowStart >= FailureWindow ? (1, now) : (entry.Count + 1, entry.WindowStart));
     }
 
     private static string CacheKey(string username, string password)

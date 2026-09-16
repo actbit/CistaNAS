@@ -209,15 +209,31 @@ public class ServerSecurityRound5Tests
     }
 
     [Fact]
-    public void 再ラップロールバックで旧パスワードのみに戻る()
+    public void クラッシュ残留の旧ラップはマウント成功後に撤去できる()
     {
+        // round 6: RewrapAllForUserAsync のフェーズ1保存後にプロセスが落ちると、
+        // ヘッダに Previous*（旧パスワードラップ）が残留する。旧実装の RollbackRewrapUser は
+        // コミット済みボリュームで no-op になり KEK 分裂を起こすため削除し、
+        // マウント成功後に ClearStalePreviousWrap で撤去する方式に置き換えた。
         var (header, _) = CreateHeader("old-password");
         header.BeginRewrapUser("u", "old-password", "new-password", FastKdf);
 
-        header.RollbackRewrapUser("u");
+        Assert.True(header.ClearStalePreviousWrap("u"));
 
-        Assert.NotNull(header.UnwrapMasterKey("u", "old-password"));
-        Assert.Null(header.UnwrapMasterKey("u", "new-password"));
+        // 旧ラップが消え、新パスワードのみで開ける
+        Assert.NotNull(header.UnwrapMasterKey("u", "new-password"));
+        Assert.Null(header.UnwrapMasterKey("u", "old-password"));
+    }
+
+    [Fact]
+    public void ClearStalePreviousWrap_は残留が無いとき何もしない()
+    {
+        var (header, _) = CreateHeader("old-password");
+
+        // 残留なし → false（保存をスキップできるシグナル）
+        Assert.False(header.ClearStalePreviousWrap("u"));
+        // 存在しないユーザー → false
+        Assert.False(header.ClearStalePreviousWrap("nobody"));
     }
 
     [Fact]

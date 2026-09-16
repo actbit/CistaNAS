@@ -43,7 +43,18 @@ public sealed partial class VolumeService : IAsyncDisposable
         foreach (string name in await _metaStore.ListVolumeNamesAsync())
         {
             if (name.StartsWith(VolumeHeader.HomePrefix, StringComparison.Ordinal)) continue;
-            var header = await _metaStore.LoadAsync(name);
+            VolumeHeader? header;
+            try
+            {
+                header = await _metaStore.LoadAsync(name);
+            }
+            catch (Exception ex)
+            {
+                // 破損ヘッダ 1 件でアカウント削除が恒久的に不可能になるのを避けるため読み飛ばす
+                // （孤児ボリュームのリスクよりも、削除不能アカウントの残留を避けることを優先）。
+                _logger.LogWarning(ex, "ボリューム '{Volume}' のヘッダ読込に失敗したため所有判定をスキップします。", name);
+                continue;
+            }
             if (header is not null && string.Equals(header.OwnerUser, username, StringComparison.Ordinal))
                 result.Add(name);
         }

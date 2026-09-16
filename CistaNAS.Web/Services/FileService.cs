@@ -90,19 +90,22 @@ public sealed class FileService
     }
 
     /// <summary>
-    /// サイズ上限（Volume:MaxFileSizeBytes）の検査。checked でオーバーフローも捕捉する。
+    /// サイズ上限（Volume:MaxFileSizeBytes）の検査。
     /// 回帰 (High): PATCH の巨大 offset（上限なし）で新規ファイルへの sparse 埋めが
     /// 大量 I/O・ディスク枯渇を引き起こせていた。
     /// </summary>
+    /// <remarks>
+    /// オーバーフロー排除は呼び出し側の責務（<paramref name="endPosition"/> は
+    /// checked 済みの末端位置）。単一の long への checked は決してスローしないため、
+    /// ここでの try/catch はデッドコードになる（round 5 では捕捉できるように見える
+    /// コメントが付いていた）。
+    /// </remarks>
     private void ValidateSizeBound(long endPosition)
     {
         long max = _volumeService.MaxFileSizeBytes;
-        long end;
-        try { end = checked(endPosition); }
-        catch (OverflowException) { throw new FileServiceException("要求サイズが大きすぎます。"); }
-        if (end > max)
+        if (endPosition > max)
             throw new FileServiceException(
-                $"ファイルサイズが上限 ({max:N0} バイト) を超えています。末端位置: {end:N0} バイト。");
+                $"ファイルサイズが上限 ({max:N0} バイト) を超えています。末端位置: {endPosition:N0} バイト。");
     }
 
     /// <summary>非チャンクモードのアップロード本体。</summary>
@@ -217,8 +220,12 @@ public sealed class FileService
         ArgumentException.ThrowIfNullOrEmpty(fileName);
         if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
         if (contentLength < 0) throw new ArgumentOutOfRangeException(nameof(contentLength));
-        // offset + contentLength が末端位置。オーバーフローと上限超過を事前排斥する
-        ValidateSizeBound(checked(offset + contentLength));
+        // offset + contentLength が末端位置。オーバーフローは上限拒否（400）へ変換する
+        // （round 6: 生の OverflowException がハンドラをすり抜けて 500 になっていた）。
+        long endPosition;
+        try { endPosition = checked(offset + contentLength); }
+        catch (OverflowException) { throw new FileServiceException("要求サイズが大きすぎます。"); }
+        ValidateSizeBound(endPosition);
 
         if (_volumeService.IsChunkMode(volumeName))
             return await PatchChunkedAsync(volumeName, fileName, offset, content, contentLength, ct);
