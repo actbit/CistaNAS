@@ -93,7 +93,28 @@ public sealed class AccountService(
         var user = await userManager.FindByNameAsync(username)
             ?? throw new InvalidOperationException($"ユーザー '{username}' が見つかりません。");
 
+        // 最後の admin の削除を防止（管理不能状態を避ける）
+        if (await userManager.IsInRoleAsync(user, "admin"))
+        {
+            var admins = await userManager.GetUsersInRoleAsync("admin");
+            if (admins.Count <= 1)
+                throw new InvalidOperationException("最後の管理者ユーザーは削除できません。");
+        }
+
+        await using var bootScope = scopeFactory.CreateAsyncScope();
+        var volumeService = bootScope.ServiceProvider.GetRequiredService<VolumeService>();
+
+        // home 以外の所有ボリュームが残っている場合は削除を拒否する
+        // （オーナーが不在の孤児ボリュームになるのを防ぐ。削除/移管は管理者が事前に行う）
+        var ownedVolumes = await volumeService.GetOwnedVolumeNamesAsync(username);
+        if (ownedVolumes.Count > 0)
+            throw new InvalidOperationException(
+                $"ユーザー '{username}' がオーナーのボリュームが残っています: {string.Join(", ", ownedVolumes)}。削除または移管後に再度実行してください。");
+
         await userManager.DeleteAsync(user);
+
+        // WebDAV Basic 認証の資格情報キャッシュを失効させる
+        WebDav.BasicAuthHandler.InvalidateUser(username);
 
         // グループから除去
         try
@@ -111,7 +132,6 @@ public sealed class AccountService(
         try
         {
             await using var scope = scopeFactory.CreateAsyncScope();
-            var volumeService = scope.ServiceProvider.GetRequiredService<VolumeService>();
             await volumeService.DeleteVolumeAsync($"{VolumeHeader.HomePrefix}{username}", username: null);
         }
         catch (Exception ex)
@@ -133,6 +153,11 @@ public sealed class AccountService(
         if (!addResult.Succeeded)
             logger.LogWarning("ユーザー '{Username}' のロール変更に失敗: {Errors}",
                 username, string.Join(", ", addResult.Errors.Select(e => e.Description)));
+
+        // SecurityStamp 更新 → 既発行 JWT（旧ロールを主張するトークン）を失効させる。
+        // WebDAV Basic の資格情報キャッシュも失効させる。
+        await userManager.UpdateSecurityStampAsync(user);
+        WebDav.BasicAuthHandler.InvalidateUser(username);
     }
 
     public async Task<bool> IsAdminAsync(string username)
@@ -199,12 +224,18 @@ public sealed class AccountService(
         if (!await userManager.CheckPasswordAsync(user, oldPassword))
             return false;
 
-        // 先に Identity 側のパスワードを変更（失敗時は KEK 再ラップをスキップ）
+        // 先に Identity 側のパスワードを変更（失敗時は KEK 再ラップをスキップ）。
+        // Identity の ChangePasswordAsync は SecurityStamp を更新するため、
+        // この時点で既発行 JWT は全て無効化される（OnTokenValidated で検査）。
         var result = await userManager.ChangePasswordAsync(user, oldPassword, newPassword);
         if (!result.Succeeded)
             return false;
 
-        // KEK 再ラップ（失敗時は Identity 側のパスワードを旧値にロールバック）(H-5)
+        // WebDAV Basic 認証の資格情報キャッシュを失効させる（TTL 残存での旧パスワード利用を防ぐ）
+        WebDav.BasicAuthHandler.InvalidateUser(username);
+
+        // KEK 再ラップ（二相コミット: 失敗時は処理済みボリュームが旧ラップへ復元されるため、
+        // Identity 側のパスワードを旧値へロールバックすれば全ボリュームが旧パスワードで開ける） (H-5)
         try
         {
             await using var scope = scopeFactory.CreateAsyncScope();
@@ -216,9 +247,8 @@ public sealed class AccountService(
             logger.LogError(ex, "パスワード変更後の KEK 再ラップに失敗しました（ユーザー: {Username}）。Identity パスワードを旧値にロールバックします。", username);
             try
             {
-                // 一部ボリュームは新パスワードでしかアンラップできない状態になっている可能性があるため、
-                // Identity 側のパスワードを旧値に戻し、ユーザーが再ログインして整合を取れるようにする。
-                // ただし既に新パスワードで変更されたボリュームは旧値では開けない旨をログで明示。
+                // 二相コミットにより全ボリュームが旧ラップ（または Previous 退避）へ復元済みのため、
+                // Identity パスワードを旧値に戻せば一貫した状態に戻る。
                 var rollbackResult = await userManager.ChangePasswordAsync(user, newPassword, oldPassword);
                 if (!rollbackResult.Succeeded)
                 {

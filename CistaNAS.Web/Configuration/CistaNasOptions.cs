@@ -22,6 +22,14 @@ public sealed class CistaNasOptions
     /// <summary>CORS で許可するオリジンリスト。空なら CORS ポリシーは適用されない（same-origin のみ）。</summary>
     public List<string> CorsAllowedOrigins { get; set; } = [];
 
+    /// <summary>
+    /// 信頼して X-Forwarded-For / X-Forwarded-Proto を受理するリバースプロキシの IP 一覧。
+    /// ループバックは常に信頼される（同一ホスト上の nginx / Caddy は追加設定不要）。
+    /// 設定しない場合、プロキシ背後では RemoteIpAddress がプロキシの IP になり、
+    /// IP 単位のレート制限が全利用者で共有される。
+    /// </summary>
+    public List<string> TrustedProxies { get; set; } = [];
+
     /// <summary>ストリーミングトークンの TTL（秒）。デフォルト 30 秒。</summary>
     [Range(1, 3600, ErrorMessage = "StreamingTokenTtlSeconds は 1 〜 3600 の範囲で指定してください。")]
     public int StreamingTokenTtlSeconds { get; set; } = 30;
@@ -128,6 +136,13 @@ public sealed class AuthOptions
     /// </summary>
     [Range(0, 86400)]
     public int WebDavAuthCacheSeconds { get; set; } = 600;
+
+    /// <summary>
+    /// WebDAV のレート制限（1 IP あたりの req/min）。WebDAV は 1 操作で多数のリクエストを
+    /// 発行するため、認証エンドポイント（10/min）より大幅に緩い値。下限 60 にクランプ。
+    /// </summary>
+    [Range(60, 100000)]
+    public int WebDavRequestsPerMinute { get; set; } = 600;
 }
 
 public sealed class VolumeOptions
@@ -181,4 +196,12 @@ public sealed class VolumeOptions
     /// <summary>チャンクモード時のサーバー側チャンクサイズ（バイト）。4 MiB デフォルト。</summary>
     [Range(1048576, 67108864)]
     public int ServerChunkSize { get; set; } = 4194304;
+
+    /// <summary>
+    /// 1 ファイルの最大サイズ（バイト）。UPLOAD（全体 PUT）と PATCH（差分書き込み）の
+    /// offset + 長さ に対して検査する。PATCH の巨大 offset によるディスク枯渇
+    /// （sparse 埋めで大量 I/O）を防ぐ上限。既定 1 TiB。
+    /// </summary>
+    [Range(1, 1L << 50)]
+    public long MaxFileSizeBytes { get; set; } = 1L << 40;
 }

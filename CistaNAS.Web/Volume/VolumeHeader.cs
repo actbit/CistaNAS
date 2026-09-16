@@ -99,9 +99,16 @@ public sealed class VolumeHeader
         public byte[]? EphemeralPublicKey { get; set; } // ECDH only: raw 65B uncompressed point
 
         /// <summary>
-        /// 将来拡張用のメタデータ（KeyId / DeviceId / Signature 等）。
-        /// Identity key 署名モデル導入時に使用。現行プロトコルでは未使用。
+        /// 二相コミット用の旧ラップ。パスワード変更の BeginRewrapUser で旧エントリを退避し、
+        /// 全ボリュームの再ラップ完了（CommitRewrapUser）で除去する。
+        /// 退避中は旧・新どちらのパスワードでもアンラップ可能なため、途中失敗しても
+        /// 「旧パスワードで開けないボリューム」（KEK 分裂）が発生しない。
         /// </summary>
+        public KdfParams? PreviousKdf { get; set; }
+        public WrappedKey? PreviousWrappedMasterKey { get; set; }
+
+        /// <summary>将来拡張用のメタデータ（KeyId / DeviceId / Signature 等）。
+        /// Identity key 署名モデル導入時に使用。現行プロトコルでは未使用。</summary>
         public Dictionary<string, string>? Extensions { get; set; }
     }
 
@@ -392,6 +399,78 @@ public sealed class VolumeHeader
         return UserKeys.Remove(username);
     }
 
+    // ---- 二相コミット再ラップ（パスワード変更時の KEK 分裂防止） ----
+    //
+    // 全ボリュームの再ラップをアトミックに行うことはできないため、旧ラップを
+    // Previous* に退避させたまま新ラップへ切り替える。全ボリュームの準備が
+    // 完了してから CommitRewrapUser で旧ラップを除去する。途中で失敗した場合は
+    // 呼び出し側が RollbackRewrapUser（または旧エントリの復元）で元に戻せる。
+
+    /// <summary>
+    /// 再ラップの第 1 相: 旧ラップを Previous* に退避し、新パスワードで再ラップした
+    /// エントリへ置き換える。この時点では旧パスワードでもアンラップ可能（<see cref="UnwrapMasterKey"/>）。
+    /// </summary>
+    public void BeginRewrapUser(string username, string oldPassword, string newPassword, KdfSpec kdf)
+    {
+        if (!UserKeys.TryGetValue(username, out var entry))
+            throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
+
+        byte[] oldKek = DeriveKek(username, oldPassword, entry.Kdf.Salt, entry.Kdf.ToKdfSpec());
+        try
+        {
+            byte[] masterKey = UnwrapKey(entry.WrappedMasterKey, oldKek);
+            try
+            {
+                byte[] newSalt = KeyDerivation.NewSalt();
+                byte[] newKek = DeriveKek(username, newPassword, newSalt, kdf);
+                try
+                {
+                    var (nonce, ct, tag) = WrapKey(masterKey, newKek);
+                    var updated = new UserWrappedKey
+                    {
+                        WrapType = entry.WrapType,
+                        Kdf = KdfParams.FromSpec(kdf, newSalt),
+                        WrappedMasterKey = new WrappedKey { Nonce = nonce, Ciphertext = ct, Tag = tag },
+                        EphemeralPublicKey = entry.EphemeralPublicKey,
+                        Extensions = entry.Extensions,
+                        // 旧ラップを退避（二相コミットの第 2 相で除去）
+                        PreviousKdf = entry.Kdf,
+                        PreviousWrappedMasterKey = entry.WrappedMasterKey,
+                    };
+                    UserKeys[username] = updated;
+                }
+                finally { CryptographicOperations.ZeroMemory(newKek); }
+            }
+            finally { CryptographicOperations.ZeroMemory(masterKey); }
+        }
+        finally { CryptographicOperations.ZeroMemory(oldKek); }
+    }
+
+    /// <summary>再ラップの第 2 相: 退避した旧ラップを除去し、新ラップへ確定する。</summary>
+    public void CommitRewrapUser(string username)
+    {
+        if (!UserKeys.TryGetValue(username, out var entry))
+            throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
+        entry.PreviousKdf = null;
+        entry.PreviousWrappedMasterKey = null;
+    }
+
+    /// <summary>BeginRewrapUser の取り消し: 退避した旧ラップへ戻す。旧ラップがなければ何もしない。</summary>
+    public void RollbackRewrapUser(string username)
+    {
+        if (!UserKeys.TryGetValue(username, out var entry)
+            || entry.PreviousKdf is null || entry.PreviousWrappedMasterKey is null)
+            return;
+        UserKeys[username] = new UserWrappedKey
+        {
+            WrapType = entry.WrapType,
+            Kdf = entry.PreviousKdf,
+            WrappedMasterKey = entry.PreviousWrappedMasterKey,
+            EphemeralPublicKey = entry.EphemeralPublicKey,
+            Extensions = entry.Extensions,
+        };
+    }
+
     /// <summary>ユーザーがアクセス権を持つか。</summary>
     public bool HasUserAccess(string username) => UserKeys.ContainsKey(username);
 
@@ -401,10 +480,25 @@ public sealed class VolumeHeader
         if (!Encrypted) return null;
         if (!UserKeys.TryGetValue(username, out var entry)) return null;
 
+        byte[]? unwrapped = TryUnwrapWith(username, password, entry.Kdf, entry.WrappedMasterKey);
+        if (unwrapped is not null) return unwrapped;
+
+        // 二相コミット再ラップ中: 旧ラップ（Previous*）でも試す。
+        // 全ボリュームの CommitRewrapUser 完了前・完了失敗後に旧パスワードで
+        // マウントできることを保証する（KEK 分裂の防止）。
+        if (entry.PreviousKdf is not null && entry.PreviousWrappedMasterKey is not null)
+            return TryUnwrapWith(username, password, entry.PreviousKdf, entry.PreviousWrappedMasterKey);
+
+        return null;
+    }
+
+    /// <summary>指定 KDF/ラップでアンラップを試みる。失敗時は null（例外を外出ししない）。</summary>
+    private static byte[]? TryUnwrapWith(string username, string password, KdfParams kdf, WrappedKey wrap)
+    {
         byte[] kek;
         try
         {
-            kek = DeriveKek(username, password, entry.Kdf.Salt, entry.Kdf.ToKdfSpec());
+            kek = DeriveKek(username, password, kdf.Salt, kdf.ToKdfSpec());
         }
         catch (ArgumentException)
         {
@@ -418,7 +512,7 @@ public sealed class VolumeHeader
         }
         try
         {
-            return UnwrapKey(entry.WrappedMasterKey, kek);
+            return UnwrapKey(wrap, kek);
         }
         catch (AuthenticationTagMismatchException)
         {

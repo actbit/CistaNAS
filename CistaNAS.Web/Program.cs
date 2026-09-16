@@ -12,6 +12,8 @@ using CistaNAS.Web.Storage;
 using CistaNAS.Web.WebDav;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
@@ -68,6 +70,37 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateLifetime = true,
             ValidAlgorithms = [SecurityAlgorithms.HmacSha256],
             ClockSkew = TimeSpan.FromSeconds(30),
+        };
+
+        // 認証失効: トークンの "secst" クレームと DB の SecurityStamp を突き合わせる。
+        // パスワード変更・ロール変更・ユーザー削除で stamp が更新 / ユーザーが不在になるため、
+        // 既発行 JWT が即座に拒否される（それ以前に発行された secst 無しのトークンも拒否）。
+        options.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = async ctx =>
+            {
+                string? username = ctx.Principal?.Identity?.Name;
+                if (string.IsNullOrEmpty(username))
+                {
+                    ctx.Fail("トークンにユーザー識別子がありません。");
+                    return;
+                }
+
+                await using var scope = ctx.HttpContext.RequestServices.CreateAsyncScope();
+                var userManager = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+                var user = await userManager.FindByNameAsync(username);
+                if (user is null)
+                {
+                    ctx.Fail("ユーザーが存在しません。");
+                    return;
+                }
+
+                string? stamp = ctx.Principal!.FindFirst("secst")?.Value;
+                if (!string.Equals(stamp, user.SecurityStamp, StringComparison.Ordinal))
+                {
+                    ctx.Fail("資格情報が失効しています（再ログインが必要です）。");
+                }
+            },
         };
     })
     .AddScheme<Microsoft.AspNetCore.Authentication.AuthenticationSchemeOptions, BasicAuthHandler>(
@@ -142,6 +175,36 @@ builder.Services.AddRateLimiter(options =>
                 QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
                 QueueLimit = 0,
             }));
+    // WebDAV: 1 IP あたり 600req/min。WebDAV は PROPFIND / GET / PUT 等を 1 操作で
+    // 大量に発行するため、認証エンドポイント並みの厳しい制限では通常のブラウズでも
+    // 429 になる（回帰: 全メソッドに "auth" ポリシー 10req/min を適用していた）。
+    int webDavPerMinute = Math.Max(60, cista.Auth.WebDavRequestsPerMinute);
+    options.AddPolicy("webdav", httpContext =>
+        RateLimitPartition.GetSlidingWindowLimiter(
+            partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new SlidingWindowRateLimiterOptions
+            {
+                PermitLimit = webDavPerMinute,
+                Window = TimeSpan.FromMinutes(1),
+                SegmentsPerWindow = 4,
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = 0,
+            }));
+});
+
+// ---- リバースプロキシ（nginx / Caddy / Traefik）背後での正しいクライアント IP 取得 ----
+// 既定の ForwardedHeaders は None。明示的に X-Forwarded-For / X-Forwarded-Proto を有効化し、
+// 信頼するプロキシ（既定はループバックのみ。CistaNas:TrustedProxies で追加）を限定する。
+// これが無いと RemoteIpAddress が常にプロキシの IP になり、レート制限が全利用者で
+// 共有されてしまう。
+builder.Services.Configure<ForwardedHeadersOptions>(forwarded =>
+{
+    forwarded.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+    foreach (string proxy in cista.TrustedProxies)
+    {
+        if (System.Net.IPAddress.TryParse(proxy, out var ip))
+            forwarded.KnownProxies.Add(ip);
+    }
 });
 
 // ---- Service 層 DI 登録 ----
@@ -331,7 +394,7 @@ app.MapCistaNasApi(api);
 // ---- /dav : WebDAV ----
 var dav = app.MapGroup("/dav/{volumeName}")
     .RequireAuthorization("AnyAuth")
-    .RequireRateLimiting("auth");
+    .RequireRateLimiting("webdav");
 
 dav.MapMethods("", ["OPTIONS"], (WebDavHandler h, HttpContext ctx) => h.OptionsAsync(ctx));
 dav.MapMethods("{*path}", ["PROPFIND"],

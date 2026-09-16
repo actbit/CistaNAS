@@ -26,7 +26,21 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
     private static readonly ConcurrentDictionary<string, CachedAuth> CredentialCache = new();
     private const int CacheCapacity = 1024;
 
-    private sealed record CachedAuth(ClaimsPrincipal Principal, DateTimeOffset ExpiresAt);
+    private sealed record CachedAuth(ClaimsPrincipal Principal, DateTimeOffset ExpiresAt, string Username);
+
+    /// <summary>
+    /// 指定ユーザーのキャッシュエントリを全て無効化する。
+    /// パスワード変更・削除・ロール変更時に呼ぶ（キャッシュ TTL 内でも旧パスワード /
+    /// 旧ロールの WebDAV リクエストを拒否させるため）。
+    /// </summary>
+    public static void InvalidateUser(string username)
+    {
+        foreach (var (key, value) in CredentialCache)
+        {
+            if (string.Equals(value.Username, username, StringComparison.OrdinalIgnoreCase))
+                CredentialCache.TryRemove(key, out _);
+        }
+    }
 
     public BasicAuthHandler(
         IOptionsMonitor<AuthenticationSchemeOptions> options,
@@ -105,7 +119,7 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
                     CredentialCache.TryRemove(key, out _);
             }
         }
-        CredentialCache[cacheKey] = new CachedAuth(principal, DateTimeOffset.UtcNow.AddSeconds(_cacheSeconds));
+        CredentialCache[cacheKey] = new CachedAuth(principal, DateTimeOffset.UtcNow.AddSeconds(_cacheSeconds), principal.Identity?.Name ?? "");
     }
 
     protected override Task HandleChallengeAsync(AuthenticationProperties properties)
