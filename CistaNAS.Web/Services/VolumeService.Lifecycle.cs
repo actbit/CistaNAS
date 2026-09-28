@@ -105,6 +105,18 @@ public sealed partial class VolumeService
                 ArgumentException.ThrowIfNullOrEmpty(password);
                 masterKey = header.UnwrapMasterKey(username, password)
                     ?? throw new VolumeException("認証情報が正しくありません。");
+
+                // 二相コミット再ラップの第 2 相完了前にプロセスが死んだ場合、Previous* ラップ
+                // （旧パスワード）がヘッダに永続化したまま残る。現行ラップでのアンラップに成功
+                // した今、このユーザーの Previous* は確実に中断物なので撤去して保存する
+                // （撤去しないと侵害後のパスワード変更でも旧資格情報がボリュームに対して有効なまま）。
+                if (header.ClearStalePreviousWrap(username))
+                {
+                    await _metaStore.SaveAsync(name, header);
+                    _logger.LogInformation(
+                        "ボリューム '{Volume}' に残留した Previous ラップを検出・撤去しました（ユーザー: {Username}）。",
+                        name, username);
+                }
             }
 
             if (header.StorageMode == "chunk")

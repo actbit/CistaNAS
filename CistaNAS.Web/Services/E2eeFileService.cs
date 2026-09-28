@@ -84,6 +84,13 @@ public sealed class E2eeFileService
             || request.EncryptedLength > maximumEncryptedLength)
             throw new FileServiceException("暗号化後ファイルサイズがチャンク構成と一致しません。");
 
+        // ファイルサイズ上限（Volume:MaxFileSizeBytes）。FileService（plain PUT/PATCH）と
+        // 同じ不変条件を作成時点でも強制する。
+        long plainSize = ComputePlainSize(request.EncryptedLength, request.ChunkCount);
+        if (plainSize > _volumeService.MaxFileSizeBytes)
+            throw new FileServiceException(
+                $"ファイルサイズが上限 ({_volumeService.MaxFileSizeBytes:N0} バイト) を超えています。");
+
         var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
         await volGate.WaitAsync(ct);
         try
@@ -175,6 +182,21 @@ public sealed class E2eeFileService
 
                 if (chunkIndex < 0)
                     throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です。");
+
+                // ファイルサイズ上限（Volume:MaxFileSizeBytes）。round 5 ではこの上限が
+                // plain 側（FileService）にしかなく、E2EE upload-chunk の replace=true による
+                // 末尾追記（chunkIndex == ChunkCount）が無制限にディスクを消費できた（sparse-fill DoS）。
+                // 保存済みチャンク長の合計に対して投影後の平文サイズで判定する。
+                long storedSoFar = 0;
+                for (int i = 0; i < entry.ChunkSizes.Count; i++)
+                    storedSoFar = checked(storedSoFar + entry.ChunkSizes[i]);
+                long oldChunkLen = chunkIndex < entry.ChunkSizes.Count ? entry.ChunkSizes[chunkIndex] : 0;
+                long projectedStored = Math.Max(0, checked(storedSoFar - oldChunkLen + dataLength));
+                int projectedChunkCount = Math.Max(entry.ChunkCount, replace ? chunkIndex + 1 : entry.ChunkCount);
+                long projectedPlain = ComputePlainSize(projectedStored, projectedChunkCount);
+                if (projectedPlain > _volumeService.MaxFileSizeBytes)
+                    throw new FileServiceException(
+                        $"ファイルサイズが上限 ({_volumeService.MaxFileSizeBytes:N0} バイト) を超えています。");
 
                 // 差分上書き（replace）か新規順次アップロードかで範囲チェックを切替。
                 // replace=true: 既存チャンク（chunkIndex < ChunkCount）の上書き、または末尾追記（== ChunkCount）を許可。

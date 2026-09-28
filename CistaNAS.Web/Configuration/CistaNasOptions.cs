@@ -143,6 +143,23 @@ public sealed class AuthOptions
     /// </summary>
     [Range(60, 100000)]
     public int WebDavRequestsPerMinute { get; set; } = 600;
+
+    /// <summary>
+    /// WebDAV Basic 認証の失敗スロットル（1 IP あたり 1 分間の失敗許容回数）。
+    /// 超過した IP は Argon2id 検証（1 回あたり 64 MiB 相当のメモリ）を実行せず即座に 401 を返す。
+    /// webdav ポリシー（600 req/min）は正常操作用であり、認証失敗への絞りが無いと
+    /// Basic 総当たりがログインエンドポイント比 60 倍の速度で攻撃可能だったため追加。0 で無効化。
+    /// </summary>
+    [Range(0, 100000)]
+    public int WebDavFailedAuthLimitPerMinute { get; set; } = 10;
+
+    /// <summary>
+    /// JWT の SecurityStamp 検証結果のキャッシュ秒数。検証はリクエスト毎の DB 往復を伴うため、
+    /// (username, stamp) をキーにこの TTL 内の再検証を省略する。stamp はパスワード / ロール変更・
+    /// ユーザー削除で更新されるため、失効遅延はこの TTL が上限。0 でキャッシュ無効（毎回検証）。
+    /// </summary>
+    [Range(0, 86400)]
+    public int JwtSecurityStampCacheSeconds { get; set; } = 300;
 }
 
 public sealed class VolumeOptions

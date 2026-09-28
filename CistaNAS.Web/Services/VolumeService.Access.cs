@@ -103,6 +103,11 @@ public sealed partial class VolumeService
             // 失敗しても、このエントリへ戻せば旧パスワードで開ける状態に戻る）
             var prepared = new List<string>();
             var oldEntries = new Dictionary<string, VolumeHeader.UserWrappedKey>(StringComparer.Ordinal);
+            // 第 1 相で読み込んだヘッダを第 2 相でも使い回す。ここで再読込すると、
+            // 読込失敗時にコミットが無音にスキップされて Previous* ラップ（旧パスワード）
+            // が永続化したまま残る（round 6: コミット漏れ撤去）。二重読込のゲート保持時間
+            // 増大も避けられる。
+            var preparedHeaders = new Dictionary<string, VolumeHeader>(StringComparer.Ordinal);
 
             try
             {
@@ -117,13 +122,13 @@ public sealed partial class VolumeService
                     await _metaStore.SaveAsync(name, header);
                     RefreshMountedHeader(name, header);
                     prepared.Add(name);
+                    preparedHeaders[name] = header;
                 }
 
-                // 第 2 相: 旧ラップを除去して確定
+                // 第 2 相: 旧ラップを除去して確定（ヘッダは第 1 相のインスタンスをそのまま使う）
                 foreach (var name in prepared)
                 {
-                    var header = await LoadHeaderIfExistsAsync(name);
-                    if (header is null) continue;
+                    var header = preparedHeaders[name];
                     header.CommitRewrapUser(username);
                     await _metaStore.SaveAsync(name, header);
                     RefreshMountedHeader(name, header);
@@ -141,8 +146,10 @@ public sealed partial class VolumeService
                 {
                     try
                     {
-                        var header = await LoadHeaderIfExistsAsync(name);
-                        if (header is null || !oldEntries.TryGetValue(name, out var oldEntry)) continue;
+                        if (!oldEntries.TryGetValue(name, out var oldEntry)) continue;
+                        var header = await LoadHeaderIfExistsAsync(name)
+                            ?? preparedHeaders.GetValueOrDefault(name);
+                        if (header is null) continue;
                         header.UserKeys[username] = oldEntry;
                         await _metaStore.SaveAsync(name, header);
                         RefreshMountedHeader(name, header);
