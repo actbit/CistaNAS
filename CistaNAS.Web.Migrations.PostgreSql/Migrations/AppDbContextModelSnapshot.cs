@@ -68,6 +68,13 @@ namespace CistaNAS.Web.Migrations.PostgreSql.Migrations
                         .IsRequired()
                         .HasColumnType("text");
 
+                    b.Property<int>("EcdhDerivationVersion")
+                        .HasColumnType("integer");
+
+                    b.Property<byte[]>("EcdhIdentitySalt")
+                        .HasMaxLength(64)
+                        .HasColumnType("bytea");
+
                     b.Property<string>("Email")
                         .HasMaxLength(256)
                         .HasColumnType("character varying(256)");
@@ -104,6 +111,9 @@ namespace CistaNAS.Web.Migrations.PostgreSql.Migrations
 
                     b.Property<string>("SecurityStamp")
                         .HasColumnType("text");
+
+                    b.Property<bool>("SharingEnabled")
+                        .HasColumnType("boolean");
 
                     b.Property<bool>("TwoFactorEnabled")
                         .HasColumnType("boolean");

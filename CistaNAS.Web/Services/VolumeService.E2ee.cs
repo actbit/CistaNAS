@@ -192,18 +192,32 @@ public sealed partial class VolumeService
         return members;
     }
 
-    /// <summary>E2EEボリュームにECDHラップ済み鍵を一括追加。v2 ボリュームでは現行 epoch の GroupKey wrap として登録。</summary>
-    public Task AddE2eeWrappedKeysBatchAsync(string volumeName, string requesterUsername,
+    /// <summary>
+    /// E2EEボリュームにECDHラップ済み鍵を一括追加。v2 ボリュームでは現行 epoch の GroupKey wrap として登録。
+    /// SharingEnabled=false のユーザー宛ての wrap は生成せず skip し、skip された username 一覧を返す
+    /// （呼び出し元へ「Shared with N users. M skipped」の形で通知するため。silent skip はしない）。
+    /// </summary>
+    public async Task<IReadOnlyList<string>> AddE2eeWrappedKeysBatchAsync(string volumeName, string requesterUsername,
         Dictionary<string, VolumeHeader.UserWrappedKey> wrappedKeys)
     {
-        return UnderMountGateAsync(async () =>
+        var skipped = new List<string>();
+        await UnderMountGateAsync(async () =>
         {
             var header = await LoadHeaderOrThrowAsync(volumeName);
             if (header.OwnerUser != requesterUsername)
                 throw new VolumeException("オーナーのみが鍵を追加できます。");
 
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var accountService = scope.ServiceProvider.GetRequiredService<AccountService>();
+
             foreach (var (username, wrappedKey) in wrappedKeys)
             {
+                // 共有無効ユーザー宛ての新規付与は禁止（revoke は別経路で常に可能）
+                if (!await accountService.IsSharingEnabledAsync(username))
+                {
+                    skipped.Add(username);
+                    continue;
+                }
                 if (!header.HasUserAccess(username))
                     header.AddWrappedKey(username, wrappedKey);
                 if (header.KeyEpoch >= 1)
@@ -212,6 +226,7 @@ public sealed partial class VolumeService
             await _metaStore.SaveAsync(volumeName, header);
             RefreshMountedHeader(volumeName, header);
         });
+        return skipped;
     }
 
     // ---- 共有 v2: GroupKey epoch ----
@@ -222,18 +237,24 @@ public sealed partial class VolumeService
     /// サーバーは epoch の連続性（n+1 のみ許可）と、削除対象ユーザーへの wrap が含まれないことを検証し、
     /// epoch 登録 + 剥奪ユーザーの全 wraps / UserKeys 削除を原子的に適用する。
     /// 旧 epoch の wraps は remaining members が旧ファイルを読むために保持する。
+    /// SharingEnabled=false の remaining member 宛ての wrap は登録せず skip し、
+    /// skip された username 一覧を返す（revoke 操作自体は共有ポリシーで拒否しない）。
     /// </summary>
-    public Task RotateGroupKeyAsync(string volumeName, string requesterUsername, E2eeRotateGroupKeyRequest request)
+    public async Task<IReadOnlyList<string>> RotateGroupKeyAsync(string volumeName, string requesterUsername, E2eeRotateGroupKeyRequest request)
     {
         ArgumentException.ThrowIfNullOrEmpty(requesterUsername);
 
-        return UnderMountGateAsync(async () =>
+        var skipped = new List<string>();
+        await UnderMountGateAsync(async () =>
         {
             var header = await LoadHeaderOrThrowAsync(volumeName);
             if (!header.IsE2ee)
                 throw new VolumeException($"ボリューム '{volumeName}' は E2EE ボリュームではありません。");
             if (header.OwnerUser != requesterUsername)
                 throw new VolumeException("オーナーのみが GroupKey をローテーションできます。");
+
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var accountService = scope.ServiceProvider.GetRequiredService<AccountService>();
 
             // epoch は厳密に +1（巻き戻し・スキップ防止）
             if (request.NewEpoch != header.KeyEpoch + 1)
@@ -265,7 +286,21 @@ public sealed partial class VolumeService
             }
 
             header.EnsureVolumeId();
-            header.AddGroupEpoch(request.NewEpoch, request.WrappedGroupKeys);
+
+            // 共有無効ユーザー宛ての新規 wrap は生成しない（既存 wraps / アクセス権は変更しない =
+            // SharingEnabled 切替で既存アクセスを破壊しない方針）。呼び出し元へは skip を返す。
+            var acceptedWraps = new Dictionary<string, VolumeHeader.UserWrappedKey>();
+            foreach (var (username, wrap) in request.WrappedGroupKeys)
+            {
+                if (!await accountService.IsSharingEnabledAsync(username))
+                {
+                    skipped.Add(username);
+                    continue;
+                }
+                acceptedWraps[username] = wrap;
+            }
+            if (acceptedWraps.Count > 0)
+                header.AddGroupEpoch(request.NewEpoch, acceptedWraps);
 
             if (request.RemovedUsername is not null)
                 header.RemoveUserEverywhere(request.RemovedUsername);
@@ -273,6 +308,7 @@ public sealed partial class VolumeService
             await _metaStore.SaveAsync(volumeName, header);
             RefreshMountedHeader(volumeName, header);
         });
+        return skipped;
     }
 
     /// <summary>

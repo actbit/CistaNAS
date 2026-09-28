@@ -57,31 +57,6 @@ public sealed class E2eeInterop(IJSRuntime js) : IAsyncDisposable
         return await mod.InvokeAsync<string>("deriveKek", password, saltBase64, kdf, username as object);
     }
 
-    /// <summary>
-    /// localStorage の ECDH 秘密鍵 JSON（wrapped/nonce/salt/iterations + 任意の kdf フィールド）から
-    /// KDF スペックを読み取る。旧スキーマ（iterations のみ）はレガシー PBKDF2 として扱う。
-    /// </summary>
-    public static E2eeKdfOptions ReadPrivKeyKdf(System.Text.Json.JsonElement root)
-    {
-        int iterations = root.TryGetProperty("iterations", out var it) && it.ValueKind == System.Text.Json.JsonValueKind.Number && it.TryGetInt32(out var i)
-            ? i : 0;
-        if (root.TryGetProperty("algorithm", out var alg) && alg.ValueKind == System.Text.Json.JsonValueKind.String)
-        {
-            string algorithm = alg.GetString()!;
-            if (string.Equals(algorithm, E2eeKdfOptions.Argon2id, StringComparison.Ordinal)
-                || string.Equals(algorithm, E2eeKdfOptions.Argon2idRaw, StringComparison.Ordinal))
-            {
-                return new E2eeKdfOptions(
-                    algorithm,
-                    iterations,
-                    root.TryGetProperty("memoryKiB", out var m) && m.TryGetInt32(out var mv) ? mv : 0,
-                    root.TryGetProperty("timeCost", out var t) && t.TryGetInt32(out var tv) ? tv : 0,
-                    root.TryGetProperty("parallelism", out var p) && p.TryGetInt32(out var pv) ? pv : 0);
-            }
-        }
-        return E2eeKdfOptions.LegacyPbkdf2(iterations);
-    }
-
     /// <summary>マスターキーを JS 側で生成してハンドルを返す。</summary>
     public async Task<string> GenerateMasterKey()
     {
@@ -172,48 +147,28 @@ public sealed class E2eeInterop(IJSRuntime js) : IAsyncDisposable
         }
     }
 
-    // ---- ECDH key pair management ----
+    // ---- 決定論的 ECDH identity 導出 ----
 
-    public async Task<(string PublicKeyHandle, string PrivateKeyHandle)> GenerateKeyPair()
+    /// <summary>
+    /// E2EE パスワードから決定論的に ECDH identity 鍵ペアを導出する（C# EcdhIdentityKey と同一仕様）。
+    /// 秘密鍵は non-extractable WebCrypto CryptoKey として JS 側メモリにのみ保持され、
+    /// localStorage 等の永続化ストレージには一切書き込まない。
+    /// </summary>
+    public async Task<(string PublicKeyHandle, string PrivateKeyHandle, string PublicKeyBase64)> DeriveIdentityKeyPair(
+        string username, string password, string identitySaltBase64, E2eeKdfOptions kdf)
     {
         var mod = await GetModule();
-        var result = await mod.InvokeAsync<JsonElement>("generateKeyPair");
+        var result = await mod.InvokeAsync<JsonElement>(
+            "deriveIdentityKeyPair", username, password, identitySaltBase64, kdf);
         return (result.GetProperty("publicKeyHandle").GetString()!,
-                result.GetProperty("privateKeyHandle").GetString()!);
+                result.GetProperty("privateKeyHandle").GetString()!,
+                result.GetProperty("publicKeyBase64").GetString()!);
     }
 
     public async Task<string> ExportPublicKey(string publicKeyHandle)
     {
         var mod = await GetModule();
         return await mod.InvokeAsync<string>("exportPublicKey", publicKeyHandle);
-    }
-
-    /// <summary>レガシー PBKDF2 で ECDH 秘密鍵をラップする（既存呼び出し互換）。</summary>
-    public Task<(string Nonce, string Wrapped)> EncryptPrivateKey(
-        string privateKeyHandle, string password, string saltBase64, int iterations)
-        => EncryptPrivateKey(privateKeyHandle, password, saltBase64, E2eeKdfOptions.LegacyPbkdf2(iterations));
-
-    public async Task<(string Nonce, string Wrapped)> EncryptPrivateKey(
-        string privateKeyHandle, string password, string saltBase64, E2eeKdfOptions kdf)
-    {
-        var mod = await GetModule();
-        var result = await mod.InvokeAsync<JsonElement>(
-            "encryptPrivateKey", privateKeyHandle, password, saltBase64, kdf);
-        return (result.GetProperty("nonce").GetString()!,
-                result.GetProperty("wrapped").GetString()!);
-    }
-
-    /// <summary>レガシー PBKDF2 で ECDH 秘密鍵をアンラップする（既存呼び出し互換）。</summary>
-    public Task<string> DecryptPrivateKey(
-        string wrappedBase64, string nonceBase64, string password, string saltBase64, int iterations)
-        => DecryptPrivateKey(wrappedBase64, nonceBase64, password, saltBase64, E2eeKdfOptions.LegacyPbkdf2(iterations));
-
-    public async Task<string> DecryptPrivateKey(
-        string wrappedBase64, string nonceBase64, string password, string saltBase64, E2eeKdfOptions kdf)
-    {
-        var mod = await GetModule();
-        return await mod.InvokeAsync<string>(
-            "decryptPrivateKey", wrappedBase64, nonceBase64, password, saltBase64, kdf);
     }
 
     // ---- ECIES wrap/unwrap ----

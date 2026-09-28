@@ -489,55 +489,184 @@ function concatBufs(...bufs) {
     return result;
 }
 
-// ---- ECDH key pair management ----
+// ---- 決定論的 ECDH identity 導出（C# EcdhIdentityKey と同一仕様） ----
+// 秘密鍵はランダム生成してストレージへ保存するのではなく、username / E2EE password /
+// identity salt から必要時に決定論的に導出する。localStorage 等の永続化ストレージには
+// 一切書き込まず、non-extractable な WebCrypto CryptoKey としてメモリ上にのみ保持する。
 
-export async function generateKeyPair() {
-    const keyPair = await crypto.subtle.generateKey(
-        { name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
-    return {
-        publicKeyHandle: storeKey(keyPair.publicKey),
-        privateKeyHandle: storeKey(keyPair.privateKey)
-    };
+const ECDH_IDENTITY_KDF_CONTEXT = "CistaNAS-ECDH-Identity-v1";
+const P256_SCALAR_CONTEXT = "CistaNAS-P256-Scalar-v1";
+
+// NIST P-256 ドメインパラメータ（BigInt）
+const P256_P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn;
+const P256_A = modP(-3n);
+const P256_GX = 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n;
+const P256_GY = 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n;
+const P256_N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n;
+
+function modP(v) {
+    const r = v % P256_P;
+    return r < 0n ? r + P256_P : r;
+}
+
+// 拡張ユークリッド法による mod P 逆元
+function modInvP(v) {
+    let [old_r, r] = [modP(v), P256_P];
+    let [old_s, s] = [1n, 0n];
+    while (r !== 0n) {
+        const q = old_r / r;
+        [old_r, r] = [r, old_r - q * r];
+        [old_s, s] = [s, old_s - q * s];
+    }
+    return modP(old_s);
+}
+
+// アフィン座標の楕円曲線演算（null = 無限遠点）
+function ecDouble(pt) {
+    if (!pt) return null;
+    const [x, y] = pt;
+    if (y === 0n) return null;
+    const lam = modP(3n * x * x + P256_A) * modInvP(modP(2n * y));
+    const x3 = modP(lam * lam - 2n * x);
+    const y3 = modP(lam * (x - x3) - y);
+    return [x3, y3];
+}
+
+function ecAdd(p1, p2) {
+    if (!p1) return p2;
+    if (!p2) return p1;
+    const [x1, y1] = p1, [x2, y2] = p2;
+    if (x1 === x2) {
+        if (modP(y1 + y2) === 0n) return null;
+        return ecDouble(p1);
+    }
+    const lam = modP(y2 - y1) * modInvP(modP(x2 - x1));
+    const x3 = modP(lam * lam - x1 - x2);
+    const y3 = modP(lam * (x1 - x3) - y1);
+    return [x3, y3];
+}
+
+function ecMul(k, pt) {
+    let result = null, addend = pt;
+    while (k > 0n) {
+        if (k & 1n) result = ecAdd(result, addend);
+        addend = ecDouble(addend);
+        k >>= 1n;
+    }
+    return result;
+}
+
+function bytes32ToBigint(bytes) {
+    let v = 0n;
+    for (const b of bytes) v = (v << 8n) | BigInt(b);
+    return v;
+}
+
+function bigintToBytes32(v) {
+    const out = new Uint8Array(32);
+    for (let i = 31; i >= 0; i--) {
+        out[i] = Number(v & 0xffn);
+        v >>= 8n;
+    }
+    return out;
+}
+
+// JWK 用 base64url（32 バイト固定長）
+function b64urlFromBytes32(bytes) {
+    let s = "";
+    for (const b of bytes) s += String.fromCharCode(b);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function hmacSha256(keyBytes, dataBytes) {
+    const key = await crypto.subtle.importKey(
+        "raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return new Uint8Array(await crypto.subtle.sign("HMAC", key, dataBytes));
+}
+
+async function hkdfSha256Bits(ikm, salt, info, lengthBits) {
+    const key = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
+    return new Uint8Array(await crypto.subtle.deriveBits(
+        { name: "HKDF", hash: "SHA-256", salt, info }, key, lengthBits));
+}
+
+// username / password / identity salt から ECDH identity 鍵ペアを決定論的に導出する。
+// C# EcdhIdentityKey.DeriveKeyPair とバイト等価（テストベクトルで相互運性を検証）:
+//   ikm  = KDF(password, SHA256(username) || identitySalt)   … ボリューム KEK と同一の入力規約
+//   seed = HKDF-SHA256(ikm, salt = identitySalt,
+//                      info = "CistaNAS-ECDH-Identity-v1" || normalizedUsername, 32)
+//   d    = HMAC-SHA256(seed, "CistaNAS-P256-Scalar-v1" || le32(counter)) の rejection sampling
+//          （1 <= d < n。mod n は bias のため不使用）
+// normalizedUsername は username.trim().toLowerCase()（C# の ToLowerInvariant 相当）。
+// 秘密鍵は non-extractable（ext=false, d の export 不可）として WebCrypto に登録する。
+// 注意: JS の BigInt はイミュータブルなため scalar の zeroize は不可能（言語制限）。
+// 秘密鍵の保持は non-extractable CryptoKey に限定され、raw bytes は関数外に出ない。
+export async function deriveIdentityKeyPair(username, password, identitySaltBase64, kdf) {
+    const spec = normalizeKdf(kdf);
+    const normalized = username.trim().toLowerCase();
+    const identitySalt = uint8FromBase64(identitySaltBase64);
+
+    // 1. ikm = KDF（CombineUserSalt 規約。username は正規化して渡す — C# 側も導出前に正規化する）
+    const combinedSalt = await combineUserSalt(normalized, identitySalt);
+    const ikm = await deriveKekBits(password, combinedSalt, spec);
+    combinedSalt.fill(0);
+    try {
+        // 2. seed = HKDF-SHA256(ikm, salt = identitySalt, info = context || normalizedUsername)
+        const seed = await hkdfSha256Bits(
+            ikm, identitySalt,
+            concatBufs(utf8Bytes(ECDH_IDENTITY_KDF_CONTEXT), utf8Bytes(normalized)), 256);
+        try {
+            // 3. d = rejection sampling（1 <= d < n）
+            const prefix = utf8Bytes(P256_SCALAR_CONTEXT);
+            let d = null;
+            for (let counter = 0; ; counter++) {
+                const candidate = await hmacSha256(seed, concatBufs(prefix, le32(counter)));
+                const cd = bytes32ToBigint(candidate);
+                if (cd >= 1n && cd < P256_N) {
+                    d = cd;
+                    break;
+                }
+            }
+            seed.fill(0);
+
+            // 4. 公開鍵 Q = d * G（raw 非圧縮 65B: 0x04 || X || Y）
+            const q = ecMul(d, [P256_GX, P256_GY]);
+            if (!q) throw new Error("P-256 公開鍵の導出に失敗しました。");
+            const x = bigintToBytes32(q[0]);
+            const y = bigintToBytes32(q[1]);
+            const publicKeyRaw = concatBufs(new Uint8Array([0x04]), x, y);
+
+            const privKey = await crypto.subtle.importKey(
+                "jwk",
+                {
+                    kty: "EC", crv: "P-256", ext: false,
+                    x: b64urlFromBytes32(x),
+                    y: b64urlFromBytes32(y),
+                    d: b64urlFromBytes32(bigintToBytes32(d)),
+                },
+                { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+            // 公開鍵は非秘密のため extractable（exportPublicKey で raw 取得可）。
+            // 秘密鍵のみ non-extractable にして raw bytes の取り出しを防ぐ。
+            const pubKey = await crypto.subtle.importKey(
+                "raw", publicKeyRaw, { name: "ECDH", namedCurve: "P-256" }, true, []);
+
+            return {
+                publicKeyHandle: storeKey(pubKey),
+                privateKeyHandle: storeKey(privKey),
+                publicKeyBase64: uint8ToBase64(publicKeyRaw),
+            };
+        } finally {
+            seed.fill(0);
+        }
+    } finally {
+        ikm.fill(0);
+    }
 }
 
 export async function exportPublicKey(handle) {
     const key = getKey(handle);
     const raw = await crypto.subtle.exportKey("raw", key);
     return uint8ToBase64(new Uint8Array(raw));
-}
-
-// kdf: { algorithm, iterations, memoryKiB, timeCost, parallelism }（数値はレガシー PBKDF2）。
-// ソルトは username を含まない raw salt（C# 側 encryptPrivateKey 経路と同一規約）。
-export async function encryptPrivateKey(privKeyHandle, password, saltBase64, kdf) {
-    const spec = normalizeKdf(kdf);
-    const salt = uint8FromBase64(saltBase64);
-    const kekBits = await deriveKekBits(password, salt, spec);
-    const kek = await crypto.subtle.importKey(
-        "raw", kekBits, { name: "AES-GCM", length: 256 }, false, ["wrapKey"]);
-    kekBits.fill(0);
-    const privateKey = getKey(privKeyHandle);
-    const nonce = crypto.getRandomValues(new Uint8Array(GCM_NONCE_SIZE));
-    const wrapped = await crypto.subtle.wrapKey("jwk", privateKey, kek,
-        { name: "AES-GCM", iv: nonce });
-    return {
-        nonce: uint8ToBase64(nonce),
-        wrapped: uint8ToBase64(new Uint8Array(wrapped))
-    };
-}
-
-export async function decryptPrivateKey(wrappedBase64, nonceBase64, password, saltBase64, kdf) {
-    const spec = normalizeKdf(kdf);
-    const salt = uint8FromBase64(saltBase64);
-    const kekBits = await deriveKekBits(password, salt, spec);
-    const kek = await crypto.subtle.importKey(
-        "raw", kekBits, { name: "AES-GCM", length: 256 }, false, ["unwrapKey"]);
-    kekBits.fill(0);
-    const nonce = uint8FromBase64(nonceBase64);
-    const wrapped = uint8FromBase64(wrappedBase64);
-    const privateKey = await crypto.subtle.unwrapKey("jwk", wrapped, kek,
-        { name: "AES-GCM", iv: nonce },
-        { name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
-    return storeKey(privateKey);
 }
 
 // ---- ECIES wrap/unwrap (ECDH + HKDF + AES-256-GCM) ----

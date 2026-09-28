@@ -1,3 +1,4 @@
+using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Authorization;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
@@ -67,6 +68,9 @@ public static class E2eeEndpoints
         // ---- ECDH public key management ----
         e2ee.MapGet("/public-key/{username}", GetPublicKey);
         e2ee.MapPut("/my-public-key", SetMyPublicKey);
+        // 決定論的 ECDH identity のセットアップ情報（identity salt は非秘密でサーバー管理）。
+        // 秘密鍵はクライアント側で E2EE パスワードから導出され、サーバーには公開鍵のみ送られる。
+        e2ee.MapGet("/identity-setup", GetIdentitySetup);
 
         // ---- Group E2EE volume ----
         e2ee.MapPost("/create-group-volume", CreateGroupVolume);
@@ -173,8 +177,9 @@ public static class E2eeEndpoints
 
         try
         {
-            await vs.RotateGroupKeyAsync(volumeName, username, req);
-            return Results.Ok(new { keyEpoch = req.NewEpoch });
+            // 共有無効 remaining member 宛ての wrap は skip される（revoke 自体は常に許可）
+            var skipped = await vs.RotateGroupKeyAsync(volumeName, username, req);
+            return Results.Ok(new { keyEpoch = req.NewEpoch, skippedUsers = skipped });
         }
         catch (VolumeException ex)
         {
@@ -421,15 +426,20 @@ public static class E2eeEndpoints
     }
 
     private static async Task<IResult> AddWrappedKey(string volumeName, E2eeAddWrappedKeyRequest req,
-        VolumeService volumeService, HttpContext ctx)
+        VolumeService volumeService, ISharingPolicy sharingPolicy, HttpContext ctx)
     {
         string granter = ctx.User.Identity?.Name ?? "";
-        if (string.IsNullOrEmpty(granter))
-            return Results.Unauthorized();
+        if (string.IsNullOrEmpty(granter)) return Results.Unauthorized();
 
         // 認可ポリシー VolumeOwner は granter がボリュームオーナーであることを保証する。
         // サービス層 (VolumeService.AddE2eeWrappedKeyAsync) で granter == OwnerUser を再確認しているため、
         // ここでは granter と req.Username が一致する必要はない (共有フロー: オーナーが他人宛にラップ鍵を追加する)。
+
+        // 共有ポリシー: sender（オーナー）と recipient の双方が共有可能であること（server-side enforcement）
+        if (!await sharingPolicy.IsAllowedAsync(SharingAction.Send, granter))
+            return Results.Json(new { error = "Sharing is disabled for this account." }, statusCode: 403);
+        if (!await sharingPolicy.IsAllowedAsync(SharingAction.Receive, req.Username))
+            return Results.Json(new { error = "The target user does not accept shares." }, statusCode: 409);
 
         try
         {
@@ -457,13 +467,55 @@ public static class E2eeEndpoints
             : Results.NotFound(new { error = "公開鍵が登録されていません。" });
     }
 
-    private static async Task<IResult> SetMyPublicKey(SetPublicKeyRequest req, HttpContext ctx, AccountService accountService)
+    private static async Task<IResult> GetIdentitySetup(HttpContext ctx, AccountService accountService,
+        ISharingPolicy sharingPolicy)
     {
         string username = ctx.User.Identity?.Name ?? "";
         if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+
+        // ECDH identity（共有用）は共有機能の一部。無効ユーザーにはセットアップを要求しない。
+        if (!await sharingPolicy.IsAllowedAsync(SharingAction.SetupEcdh, username))
+            return Results.Json(new { error = "Sharing is disabled for this account." }, statusCode: 403);
+
         try
         {
-            await accountService.UpdatePublicKeyAsync(username, req.PublicKey);
+            var info = await accountService.GetOrCreateEcdhIdentityAsync(username);
+            return Results.Ok(new
+            {
+                identitySalt = Convert.ToBase64String(info.IdentitySalt),
+                derivationVersion = info.DerivationVersion,
+                publicKey = info.PublicKey,
+                kdf = new
+                {
+                    algorithm = KdfSpec.DefaultArgon2id.Algorithm,
+                    iterations = KdfSpec.DefaultArgon2id.Iterations,
+                    memoryKiB = KdfSpec.DefaultArgon2id.MemoryKiB,
+                    timeCost = KdfSpec.DefaultArgon2id.TimeCost,
+                    parallelism = KdfSpec.DefaultArgon2id.Parallelism,
+                },
+            });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
+
+    private static async Task<IResult> SetMyPublicKey(SetPublicKeyRequest req, bool rotate, HttpContext ctx,
+        AccountService accountService, ISharingPolicy sharingPolicy)
+    {
+        string username = ctx.User.Identity?.Name ?? "";
+        if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+
+        // 公開鍵の登録 / 更新も共有ポリシーの対象（無効ユーザーに ECDH セットアップを要求しない）。
+        // rotation（既存鍵の更新）自体はセキュリティ操作として許可し、identity の有効性は
+        // クライアント側の unwrap 検証（既存公開鍵との一致確認）で担保する。
+        if (!await sharingPolicy.IsAllowedAsync(SharingAction.SetupEcdh, username))
+            return Results.Json(new { error = "Sharing is disabled for this account." }, statusCode: 403);
+
+        try
+        {
+            await accountService.UpdatePublicKeyAsync(username, req.PublicKey, allowRotation: rotate);
             return Results.Ok();
         }
         catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
@@ -472,10 +524,15 @@ public static class E2eeEndpoints
     // ---- Group E2EE volume ----
 
     private static async Task<IResult> CreateGroupVolume(CreateGroupE2eeVolumeRequest req,
-        VolumeService vs, HttpContext ctx)
+        VolumeService vs, ISharingPolicy sharingPolicy, HttpContext ctx)
     {
         string username = ctx.User.Identity?.Name ?? "";
         if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+
+        // グループ E2EE ボリュームの作成は共有操作。無効ユーザーには作成を許可しない。
+        if (!await sharingPolicy.IsAllowedAsync(SharingAction.Send, username))
+            return Results.Json(new { error = "Sharing is disabled for this account." }, statusCode: 403);
+
         try
         {
             var info = await vs.CreateGroupE2eeAsync(req.GroupName, username, req.OwnerWrappedKey, req.ChunkSize);
@@ -503,19 +560,27 @@ public static class E2eeEndpoints
         if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
         try
         {
-            await vs.AddE2eeWrappedKeysBatchAsync(volumeName, username, req.WrappedKeys);
-            return Results.Ok();
+            // SharingEnabled=false の受取先は skip され、呼び出し元へ返される（silent skip はしない）
+            var skipped = await vs.AddE2eeWrappedKeysBatchAsync(volumeName, username, req.WrappedKeys);
+            return Results.Ok(new { skippedUsers = skipped });
         }
         catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
     }
 
     // ---- Invitation ----
 
-    private static IResult CreateInvitation(CreateInvitationRequest req, HttpContext ctx,
-        InvitationService invSvc)
+    private static async Task<IResult> CreateInvitation(CreateInvitationRequest req, HttpContext ctx,
+        InvitationService invSvc, ISharingPolicy sharingPolicy)
     {
         string username = ctx.User.Identity?.Name ?? "";
         if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+
+        // 招待は共有操作: sender（招待者）と recipient（被招待者）の双方が共有可能であること。
+        if (!await sharingPolicy.IsAllowedAsync(SharingAction.Send, username))
+            return Results.Json(new { error = "Sharing is disabled for this account." }, statusCode: 403);
+        if (!await sharingPolicy.IsAllowedAsync(SharingAction.Receive, req.TargetUsername))
+            return Results.Json(new { error = "The target user does not accept shares." }, statusCode: 409);
+
         var record = invSvc.Create(username, req.TargetUsername);
         return Results.Ok(new { record.InvitationId });
     }
@@ -546,8 +611,8 @@ public static class E2eeEndpoints
         });
     }
 
-    private static IResult AcceptInvitation(string invitationId, AcceptInvitationRequest req,
-        InvitationService invSvc, HttpContext ctx)
+    private static async Task<IResult> AcceptInvitation(string invitationId, AcceptInvitationRequest req,
+        InvitationService invSvc, ISharingPolicy sharingPolicy, HttpContext ctx)
     {
         string caller = ctx.User.Identity?.Name ?? "";
         if (string.IsNullOrEmpty(caller))
@@ -558,6 +623,10 @@ public static class E2eeEndpoints
 
         if (!string.Equals(record.TargetUsername, caller, StringComparison.Ordinal))
             return Results.Forbid();
+
+        // 受信側も共有ポリシーの対象（無効化ユーザーは共有先になれない）。idempotent に拒否。
+        if (!await sharingPolicy.IsAllowedAsync(SharingAction.Receive, caller))
+            return Results.Json(new { error = "Sharing is disabled for this account." }, statusCode: 403);
 
         try
         {

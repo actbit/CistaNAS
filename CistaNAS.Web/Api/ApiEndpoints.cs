@@ -407,15 +407,35 @@ public static class ApiEndpoints
             .RequireAuthorization()
             .RequireRateLimiting("api");
 
-        account.MapGet("/users", async (AccountService accountSvc, HttpContext ctx) =>
+        account.MapGet("/users", async (AccountService accountSvc, HttpContext ctx, bool sharingOnly = false) =>
         {
             string? username = ctx.User.Identity?.Name;
             if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
             // ロール（誰が admin か）は admin ユーザーにのみ開示。一般ユーザーは UserName のみ。
+            // sharingOnly=true（共有先候補 picker 用）のとき SharingEnabled=false のユーザーを除外。
+            // 管理者用ユーザー管理一覧は sharingOnly=false で全員を表示する。
             bool isAdmin = ctx.User.IsInRole("admin");
-            return Results.Ok(await accountSvc.ListUserDtosAsync(includeRoles: isAdmin));
+            return Results.Ok(await accountSvc.ListUserDtosAsync(includeRoles: isAdmin, sharingOnly: sharingOnly));
         })
         .WithName("ListUsers");
+
+        account.MapPut("/users/{username}/sharing", async (string username, HttpContext ctx, AccountService accountSvc) =>
+        {
+            string? caller = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(caller)) return Results.Unauthorized();
+            if (!ctx.User.IsInRole("admin")) return Results.Forbid();
+
+            var body = await ctx.Request.ReadFromJsonAsync<SetUserSharingRequest>();
+            if (body is null) return Results.BadRequest(new { error = "リクエストボディが無効です。" });
+
+            try
+            {
+                await accountSvc.SetSharingEnabledAsync(username, body.SharingEnabled);
+                return Results.Ok(new { username, body.SharingEnabled });
+            }
+            catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .WithName("SetUserSharingEnabled");
 
         account.MapPost("/users", async (HttpContext ctx, AccountService accountSvc) =>
         {
@@ -454,6 +474,27 @@ public static class ApiEndpoints
         var settings = api.MapGroup("/settings")
             .RequireAuthorization()
             .RequireRateLimiting("api");
+
+        // ---- 共有設定 (WASM 用) ----
+        settings.MapGet("/sharing", (EncryptionSettingsService encSvc) =>
+        {
+            return Results.Ok(new { enabled = encSvc.CurrentSharingOptions().Enabled });
+        })
+        .WithName("GetSharingSettings");
+
+        settings.MapPut("/sharing", async (HttpContext ctx, EncryptionSettingsService encSvc) =>
+        {
+            string? caller = ctx.User.Identity?.Name;
+            if (string.IsNullOrEmpty(caller)) return Results.Unauthorized();
+            if (!ctx.User.IsInRole("admin")) return Results.Forbid();
+
+            var body = await ctx.Request.ReadFromJsonAsync<SetGlobalSharingRequest>();
+            if (body is null) return Results.BadRequest(new { error = "リクエストボディが無効です。" });
+
+            encSvc.SaveSharingOptions(body.Enabled);
+            return Results.Ok(new { enabled = body.Enabled });
+        })
+        .WithName("SetSharingSettings");
 
         settings.MapGet("/encryption", (EncryptionSettingsService encSvc) =>
         {

@@ -30,6 +30,8 @@ public static class ServiceCollectionExtensions
         // 認証
         services.AddScoped<AccountService>();
         services.AddScoped<AuthService>();
+        // 共有ポリシーの集約ポイント（share / invite / grant / ECDH セットアップの server-side enforcement）
+        services.AddScoped<ISharingPolicy, SharingPolicy>();
 
         // グループ
         services.AddScoped<GroupService>();

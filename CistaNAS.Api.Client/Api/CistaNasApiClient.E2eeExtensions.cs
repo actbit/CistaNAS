@@ -58,8 +58,9 @@ public static class CistaNasApiClientE2eeExtensions
         return result;
     }
 
-    /// <summary>E2EE ボリュームに複数ユーザーの ECDH ラップキーを一括追加する。</summary>
-    public static async Task AddWrappedKeysBatchAsync(this CistaNasApiClient client, string volumeName,
+    /// <summary>E2EE ボリュームに複数ユーザーの ECDH ラップキーを一括追加する。
+    /// SharingEnabled=false の受取先はサーバー側で skip され、skip された username 一覧を返す。</summary>
+    public static async Task<IReadOnlyList<string>> AddWrappedKeysBatchAsync(this CistaNasApiClient client, string volumeName,
         Dictionary<string, (byte[] nonce, byte[] ct, byte[] tag, byte[] ephemeralPublicKey)> wrappedKeys)
     {
         var http = client._http;
@@ -88,6 +89,14 @@ public static class CistaNasApiClientE2eeExtensions
         var req = new { wrappedKeys = keys };
         var res = await http.PostAsJsonAsync($"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/add-wrapped-keys-batch", req, JsonOpts);
         res.EnsureSuccessStatusCode();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var skipped = new List<string>();
+        if (json.TryGetProperty("skippedUsers", out var su) && su.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var u in su.EnumerateArray())
+                skipped.Add(u.GetString()!);
+        }
+        return skipped;
     }
 
     /// <summary>ユーザーのクオータを設定する。</summary>
@@ -109,13 +118,42 @@ public static class CistaNasApiClientE2eeExtensions
         return json.TryGetProperty("publicKey", out var pk) ? pk.GetString() : null;
     }
 
-    /// <summary>自分の公開鍵を設定する。</summary>
-    public static async Task SetMyPublicKeyAsync(this CistaNasApiClient client, byte[] publicKey)
+    /// <summary>自分の公開鍵を設定する。既存鍵の更新（rotation）は rotate=true を必須とする
+    /// （誤った E2EE パスワードからの導出結果で既存 identity を上書きしないため）。</summary>
+    public static async Task SetMyPublicKeyAsync(this CistaNasApiClient client, byte[] publicKey, bool rotate = false)
     {
         var http = client._http;
         var req = new { publicKey = Convert.ToBase64String(publicKey) };
-        var res = await http.PutAsJsonAsync("/api/v1/e2ee/my-public-key", req, JsonOpts);
+        string query = rotate ? "?rotate=true" : "";
+        var res = await http.PutAsJsonAsync($"/api/v1/e2ee/my-public-key{query}", req, JsonOpts);
         res.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>
+    /// 決定論的 ECDH identity のセットアップ情報を取得する（identity salt は非秘密）。
+    /// 秘密鍵はクライアント側で E2EE パスワードから導出し、サーバーへは送らない。
+    /// 共有機能が無効なアカウントでは 403。
+    /// </summary>
+    public static async Task<EcdhIdentitySetupInfo?> GetIdentitySetupAsync(this CistaNasApiClient client)
+    {
+        var http = client._http;
+        var res = await http.GetAsync("/api/v1/e2ee/identity-setup");
+        if (!res.IsSuccessStatusCode) return null;
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var kdf = json.GetProperty("kdf");
+        return new EcdhIdentitySetupInfo
+        {
+            IdentitySalt = Convert.FromBase64String(json.GetProperty("identitySalt").GetString()!),
+            DerivationVersion = json.GetProperty("derivationVersion").GetInt32(),
+            PublicKey = json.TryGetProperty("publicKey", out var pk) && pk.ValueKind == JsonValueKind.String
+                ? pk.GetString() : null,
+            Kdf = new KdfInfo(
+                kdf.GetProperty("algorithm").GetString()!,
+                kdf.GetProperty("iterations").GetInt32(),
+                kdf.GetProperty("memoryKiB").GetInt32(),
+                kdf.GetProperty("timeCost").GetInt32(),
+                kdf.GetProperty("parallelism").GetInt32()),
+        };
     }
 
     /// <summary>グループ専用 E2EE ボリュームを作成する（オーナー鍵は password ラップ。レガシー PBKDF2）。</summary>
@@ -175,6 +213,18 @@ public class GroupMemberInfo
     public string? PublicKey { get; set; }
 }
 
+/// <summary>決定論的 ECDH identity のセットアップ情報（サーバーから取得）。</summary>
+public class EcdhIdentitySetupInfo
+{
+    /// <summary>identity salt（非秘密、サーバー管理）。</summary>
+    public required byte[] IdentitySalt { get; set; }
+    public int DerivationVersion { get; set; }
+    /// <summary>既に登録済みの公開鍵（Base64 raw 65B）。未登録なら null。</summary>
+    public string? PublicKey { get; set; }
+    /// <summary>identity seed 導出に使う KDF スペック（サーバー設定由来）。</summary>
+    public required KdfInfo Kdf { get; set; }
+}
+
 public static class CistaNasApiClientE2eeV2Extensions
 {
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
@@ -221,8 +271,10 @@ public static class CistaNasApiClientE2eeV2Extensions
     /// <summary>
     /// crypto format v2: GroupKey をローテーションする（revoke 時）。newGroupKeys は
     /// remaining members のユーザー名 → (nonce, ct, tag, ephemeralPublicKey)。
+    /// SharingEnabled=false の remaining member 宛ての wrap はサーバー側で skip され、
+    /// skip された username 一覧を返す。
     /// </summary>
-    public static async Task RotateGroupKeyAsync(this CistaNasApiClient client, string volumeName,
+    public static async Task<IReadOnlyList<string>> RotateGroupKeyAsync(this CistaNasApiClient client, string volumeName,
         int newEpoch, Dictionary<string, (byte[] nonce, byte[] ct, byte[] tag, byte[] ephemeralPublicKey)> newGroupKeys,
         string? removedUsername = null)
     {
@@ -241,6 +293,14 @@ public static class CistaNasApiClientE2eeV2Extensions
         var req = new { newEpoch, wrappedGroupKeys = wrapped, removedUsername };
         var res = await http.PostAsJsonAsync($"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/rotate-group-key", req, JsonOpts);
         res.EnsureSuccessStatusCode();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var skipped = new List<string>();
+        if (json.TryGetProperty("skippedUsers", out var su) && su.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var u in su.EnumerateArray())
+                skipped.Add(u.GetString()!);
+        }
+        return skipped;
     }
 
     /// <summary>crypto format v2: remaining members の公開鍵一覧を取得する（owner 限定）。</summary>

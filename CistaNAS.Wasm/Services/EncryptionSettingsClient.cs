@@ -23,6 +23,23 @@ public sealed class EncryptionSettingsClient
             JsonContent.Create(settings));
         response.EnsureSuccessStatusCode();
     }
+
+    /// <summary>グローバル共有可否（SharingEnabled）を取得。</summary>
+    public async Task<bool> GetSharingEnabledAsync()
+    {
+        var result = await _http.GetFromJsonAsync<SharingSettings>("/api/v1/settings/sharing");
+        return result?.Enabled ?? true;
+    }
+
+    /// <summary>グローバル共有可否（SharingEnabled）を設定（admin）。</summary>
+    public async Task SetSharingEnabledAsync(bool enabled)
+    {
+        var response = await _http.PutAsJsonAsync("/api/v1/settings/sharing",
+            new { Enabled = enabled });
+        response.EnsureSuccessStatusCode();
+    }
+
+    public sealed record SharingSettings(bool Enabled);
 }
 
 /// <summary>暗号化設定。Kdf* は新規鍵導出スペック（KdfAlgorithm == "argon2id" は Argon2id+PBKDF2 合成、"argon2id-raw" は Argon2id 単独）。</summary>

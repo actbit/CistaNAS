@@ -210,6 +210,12 @@ public sealed record CreateUserRequest(
     [Required] string Password,
     string? Role = "user");
 
+/// <summary>ユーザー単位の共有有効フラグ変更リクエスト (admin 用)。</summary>
+public sealed record SetUserSharingRequest(bool SharingEnabled);
+
+/// <summary>サーバー全体の共有有効フラグ変更リクエスト (admin 用)。</summary>
+public sealed record SetGlobalSharingRequest(bool Enabled);
+
 /// <summary>
 /// 暗号化設定更新リクエスト (WASM 用)。Kdf* は新規ボリュームの鍵導出スペック:
 /// KdfAlgorithm=="argon2id"（既定）は Argon2id(MemoryKiB/TimeCost/Parallelism) + PBKDF2(Iterations) の合成 KDF、

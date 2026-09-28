@@ -126,10 +126,16 @@ dotnet run --project CistaNAS.Client -- <serverUrl> <username> <password> <mount
 dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword Z: my-e2ee-vol
 ```
 
-Supports shared E2EE v2: members mount with their ECDH private key (DPAPI-protected, no
-password needed for ECDH wraps), all GroupKey epochs are unlocked per mount, and file
-uploads/edits use per-file DEKs wrapped in the current epoch. The client's share dialog
-performs TOFU pin verification for ECDH grants and rotates the GroupKey as part of a revoke.
+Supports shared E2EE v2: members derive their ECDH identity key **deterministically** from
+`username + E2EE Key Password + identity salt + derivation version` (P-256 scalar via
+Argon2id/PBKDF2 KDF + HKDF domain separation + HMAC rejection sampling — see
+`CistaNAS.Shared/Crypto/EcdhIdentityKey.cs`). The private key exists **only in RAM** for the
+duration of the mount/unwrap operation and is zeroized afterwards; it is never persisted on
+any client (no DPAPI blob, no localStorage, no secure store). The server stores only the
+public key, the non-secret identity salt, and the derivation version. The client's share
+dialog performs TOFU pin verification for ECDH grants and rotates the GroupKey as part of a
+revoke. Users can be barred from sharing via the per-user/global `SharingEnabled` toggle
+(revoke always remains possible); private E2EE volumes keep working when sharing is disabled.
 
 ## Configuration
 

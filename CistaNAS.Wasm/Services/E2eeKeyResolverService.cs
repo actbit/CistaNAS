@@ -20,34 +20,84 @@ public enum PinCheckResult
 /// アンラップ、公開鍵 pinning 検証（IndexedDB、origin ローカル保存）を Blazor Pages から集約する
 /// （CLAUDE.md のレイヤー規約）。pin / 秘密鍵 / fingerprint がサーバーに保存されることはない。
 /// </summary>
-public sealed class E2eeKeyResolverService(E2eeInterop e2ee, VolumeApiClient volumeApi, IJSRuntime js)
+public sealed class E2eeKeyResolverService(E2eeInterop e2ee, VolumeApiClient volumeApi,
+    E2eeApiClient e2eeApi, IJSRuntime js)
 {
     private readonly E2eeInterop _e2ee = e2ee;
     private readonly VolumeApiClient _volumeApi = volumeApi;
+    private readonly E2eeApiClient _e2eeApi = e2eeApi;
     private readonly IJSRuntime _js = js;
 
     // ---- E2EE 秘密鍵 / masterKey ----
 
-    /// <summary>localStorage の E2EE 秘密鍵を password で復号してハンドルを返す。未登録・password 不正時は例外。</summary>
+    /// <summary>
+    /// E2EE パスワードから決定論的に ECDH identity 秘密鍵を導出してハンドルを返す。
+    /// 秘密鍵は永続化ストレージに存在せず、RAM 上の non-extractable WebCrypto key としてのみ保持する。
+    /// 導出結果はサーバー登録済み公開鍵と照合し、不一致（= パスワード誤り）時は例外で中止する
+    /// — 誤った identity での unwrap を行わず、登録済み公開鍵を変更しない。
+    /// 旧バージョンが localStorage に書き込んだ E2EE 秘密鍵 (e2ee_privkey_*) は検出次第削除する。
+    /// </summary>
     public async Task<string> LoadPrivateKeyAsync(string username, string password)
     {
-        string privJson = await _js.InvokeAsync<string>("localStorage.getItem", $"e2ee_privkey_{username}");
-        if (string.IsNullOrEmpty(privJson))
-            throw new Exception("ローカルに E2EE 秘密鍵が見つかりません。先に設定ページで E2EE 鍵ペアを生成してください。");
-        using var privDoc = System.Text.Json.JsonDocument.Parse(privJson);
-        var privRoot = privDoc.RootElement;
+        if (string.IsNullOrEmpty(password))
+            throw new Exception("E2EE 共有パスワードを入力してください。");
+        var setup = await _e2eeApi.GetIdentitySetupAsync()
+            ?? throw new Exception("このアカウントでは E2EE 共有機能が無効です。");
+        var kdf = new E2eeKdfOptions(setup.Kdf.Algorithm, setup.Kdf.Iterations,
+            setup.Kdf.MemoryKiB, setup.Kdf.TimeCost, setup.Kdf.Parallelism);
+        var derived = await _e2ee.DeriveIdentityKeyPair(
+            username, password, Convert.ToBase64String(setup.IdentitySalt), kdf);
         try
         {
-            return await _e2ee.DecryptPrivateKey(
-                privRoot.GetProperty("wrapped").GetString()!,
-                privRoot.GetProperty("nonce").GetString()!,
-                password,
-                privRoot.GetProperty("salt").GetString()!,
-                E2eeInterop.ReadPrivKeyKdf(privRoot));
+            if (!string.IsNullOrEmpty(setup.PublicKey)
+                && !string.Equals(setup.PublicKey, derived.PublicKeyBase64, StringComparison.Ordinal))
+            {
+                throw new Exception(
+                    "E2EE 共有パスワードが正しくありません。共有鍵セットアップ時に設定したパスワードを入力してください。");
+            }
+            try { await _e2ee.ClearKey(derived.PublicKeyHandle); } catch { }
+            await RemoveLegacyPrivateKeyAsync(username);
+            return derived.PrivateKeyHandle;
         }
         catch
         {
-            throw new Exception("E2EE 鍵ペアのパスワードが正しくありません。E2EE 鍵ペア生成時のパスワードを入力してください。");
+            try { await _e2ee.ClearKey(derived.PublicKeyHandle); } catch { }
+            try { await _e2ee.ClearKey(derived.PrivateKeyHandle); } catch { }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 旧バージョンが localStorage に保存した E2EE 秘密鍵 (e2ee_privkey_*) を検出して削除する。
+    /// 新方式では秘密鍵をブラウザに保存しないため、残留した旧鍵は即座に除去する。
+    /// </summary>
+    public async Task<bool> RemoveLegacyPrivateKeyAsync(string username)
+    {
+        try
+        {
+            string key = $"e2ee_privkey_{username}";
+            string? legacy = await _js.InvokeAsync<string?>("localStorage.getItem", key);
+            if (string.IsNullOrEmpty(legacy)) return false;
+            await _js.InvokeVoidAsync("localStorage.removeItem", key);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>旧 localStorage 秘密鍵が残留しているか（Settings ページの警告表示用）。</summary>
+    public async Task<bool> HasLegacyPrivateKeyAsync(string username)
+    {
+        try
+        {
+            string? legacy = await _js.InvokeAsync<string?>("localStorage.getItem", $"e2ee_privkey_{username}");
+            return !string.IsNullOrEmpty(legacy);
+        }
+        catch
+        {
+            return false;
         }
     }
 

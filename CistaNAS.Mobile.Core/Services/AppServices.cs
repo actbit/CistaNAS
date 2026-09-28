@@ -16,7 +16,7 @@ public sealed class AppServices : IDisposable
         Settings = settings;
         FileCache = fileCache;
         ExternalViewer = externalViewer;
-        EcdhKeys = new EcdhKeyManager(keyStore);
+        EcdhKeys = new EcdhKeyManager();
         Session = new ApiSession(httpHandler);
         Transfer = new E2eeFileTransferService(Session.Api, E2ee);
         Session.Unauthorized += () => SessionExpired?.Invoke();

@@ -18,6 +18,7 @@ public sealed class CistaNasOptions
     public JwtOptions Jwt { get; set; } = new();
     public AuthOptions Auth { get; set; } = new();
     public VolumeOptions Volume { get; set; } = new();
+    public SharingOptions Sharing { get; set; } = new();
 
     /// <summary>CORS で許可するオリジンリスト。空なら CORS ポリシーは適用されない（same-origin のみ）。</summary>
     public List<string> CorsAllowedOrigins { get; set; } = [];
@@ -160,6 +161,16 @@ public sealed class AuthOptions
     /// </summary>
     [Range(0, 86400)]
     public int JwtSecurityStampCacheSeconds { get; set; } = 300;
+}
+
+/// <summary>サーバー全体の共有機能設定。</summary>
+public sealed class SharingOptions
+{
+    /// <summary>
+    /// サーバー全体で共有機能（E2EE 共有・招待・グループ共有・ECDH identity セットアップ）を有効化するか。
+    /// false でも revoke 等のセキュリティ操作は常に許可され、private E2EE は影響を受けない。
+    /// </summary>
+    public bool Enabled { get; set; } = true;
 }
 
 public sealed class VolumeOptions

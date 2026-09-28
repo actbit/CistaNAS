@@ -193,7 +193,7 @@ else
                                     <button class="btn btn-sm btn-outline-primary me-1"
                                             @onclick="() => ShowMountDialog(v.Name, v.Encrypted, v.EncryptionMode)">マウント</button>
                                 }
-                                @if (v.OwnerUser == Auth.CurrentUsername && v.Encrypted && !v.IsHome)
+                                @if (v.OwnerUser == Auth.CurrentUsername && v.Encrypted && !v.IsHome && _sharingEnabled)
                                 {
                                     <button class="btn btn-sm btn-outline-secondary" @onclick="() => ShowShareDialog(v.Name)">共有</button>
                                 }
@@ -225,7 +225,7 @@ else
                         {
                             <div class="alert alert-warning">
                                 E2EE ボリュームです。パスワードを入力するとブラウザ内でマスターキーが導出されます。
-                                他のユーザーから E2EE 共有されたボリュームでは、ご自身の E2EE 鍵ペア生成時のパスワードを入力してください。
+                                他のユーザーから E2EE 共有されたボリュームでは、ご自身の E2EE Key Password（共有鍵セットアップ時に設定したパスワード）を入力してください。
                             </div>
                             <div class="mb-3">
                                 <label class="form-label">パスワード</label>
@@ -423,6 +423,8 @@ else
 @code {
     private IReadOnlyList<VolumeInfo>? _volumes;
     private bool _isLoading = true;
+    /// <summary>サーバー全体の共有可否（無効なら共有 UI を非表示。強制はサーバー側で行う）。</summary>
+    private bool _sharingEnabled = true;
     private string? _error;
     private Dictionary<string, E2eeVolumeStats> _volumeStats = new();
 
@@ -477,6 +479,7 @@ else
     protected override async Task OnInitializedAsync()
     {
         Auth.StateChanged += OnAuthStateChanged;
+        try { _sharingEnabled = await EncSettingsApi.GetSharingEnabledAsync(); } catch { }
         await LoadVolumesAsync();
     }
 
