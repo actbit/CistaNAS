@@ -36,7 +36,7 @@
                  IsVisible="{Binding !HasVolumes}" />
 
       <!-- 旧 ECDH 秘密鍵の残留警告（検出時のみ） -->
-      <Border Grid.Row="2" Background="#FFF4E5" CornerRadius="4" Padding="8" Spacing="4"
+      <Border Grid.Row="2" Background="#FFF4E5" CornerRadius="4" Padding="8"
               IsVisible="{Binding LegacyKeyWarning, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
         <StackPanel Orientation="Horizontal" Spacing="8">
           <TextBlock Text="{Binding LegacyKeyWarning}" TextWrapping="Wrap" MaxWidth="280" VerticalAlignment="Center" />
