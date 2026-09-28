@@ -573,12 +573,21 @@ public sealed class E2eeFileService
         GetE2eeHeader(volumeName);
         var catalog = await LoadCatalogAsync(volumeName, ct);
 
-        foreach (var kvp in _fileGates)
+        // ゴミゲート（カタログから消えたファイルのもの）を破棄する。
+        // _fileGates は全ボリュームで共有される static 辞書のため、自ボリュームに
+        // 紐づく fileId（_volumeFileIds）だけを対象にすること。他ボリュームの gate を
+        // 破棄すると、並行動作中のそのボリュームの UploadChunkAsync / DownloadChunkAsync が
+        // 使用中の SemaphoreSlim を破壊され（ObjectDisposedException）、
+        // アップロード中のデータが失われる。
+        if (_volumeFileIds.TryGetValue(volumeName, out var ownFileIds))
         {
-            if (!catalog.Files.ContainsKey(kvp.Key))
+            foreach (string fileId in ownFileIds)
             {
-                if (_fileGates.TryRemove(kvp.Key, out var fileGate))
+                if (!catalog.Files.ContainsKey(fileId)
+                    && _fileGates.TryRemove(fileId, out var fileGate))
+                {
                     fileGate.Dispose();
+                }
             }
         }
 
