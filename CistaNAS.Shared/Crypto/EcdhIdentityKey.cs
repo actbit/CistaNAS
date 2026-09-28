@@ -38,7 +38,7 @@ public static class EcdhIdentityKey
     private static ReadOnlySpan<byte> P256Order => new byte[]
     {
         // n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551 (big-endian)
-        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01,
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
         0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84,
         0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
@@ -54,7 +54,10 @@ public static class EcdhIdentityKey
     public static string NormalizeUsername(string username)
     {
         ArgumentException.ThrowIfNullOrEmpty(username);
-        return username.Trim().ToLowerInvariant();
+        string normalized = username.Trim().ToLowerInvariant();
+        if (normalized.Length == 0)
+            throw new ArgumentException("username が空白のみです。", nameof(username));
+        return normalized;
     }
 
     /// <summary>

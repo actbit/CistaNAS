@@ -34,7 +34,13 @@ public class AspireFixture : IAsyncLifetime
             .OfType<Aspire.Hosting.ApplicationModel.ProjectResource>()
             .First(r => r.Name == "webfrontend");
         builder.CreateResourceBuilder(proj)
-            .WithEnvironment("CistaNas__DataRoot", _tempDataRoot);
+            .WithEnvironment("CistaNas__DataRoot", _tempDataRoot)
+            // テストは多数のユーザーを連続作成・ログインするため auth レート制限を緩和
+            // （本番既定は 10 req/min のまま。CistaNasOptions.Auth.AuthRateLimitPerMinute）
+            .WithEnvironment("CistaNas__Auth__AuthRateLimitPerMinute", "100000")
+            // 全テストクラスが 1 アプリ・1 IP に直列に大量リクエストを送るため
+            // 一般 API のレート制限も緩和（本番既定は 100 req/min のまま）
+            .WithEnvironment("CistaNas__Auth__ApiRateLimitPerMinute", "100000");
 
         _app = await builder.BuildAsync();
         await _app.StartAsync();

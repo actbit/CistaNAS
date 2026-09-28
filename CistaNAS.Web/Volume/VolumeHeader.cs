@@ -376,6 +376,15 @@ public sealed class VolumeHeader
     {
         if (!UserKeys.TryGetValue(username, out var entry))
             throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
+        if (!string.Equals(entry.WrapType, "password", StringComparison.Ordinal))
+        {
+            // ECDH wrap（wrapType "ecdh"）は相手の identity 公開鍵でラップされており、
+            // login パスワードからは復号できない（Kdf も "none"）。identity 鍵の導出パスワードが
+            // 不変である限り既存 wrap は有効なので、login パスワード変更の再ラップ対象外として
+            // 無変更のままスキップする。ここで再ラップを試みると "none" の KDF 導出で例外となり
+            // 再ラップ全体が失敗 → ECDH 共有を受けたユーザーはパスワード変更できなくなる。
+            return;
+        }
 
         byte[] oldKek = DeriveKek(username, oldPassword, entry.Kdf.Salt, entry.Kdf.ToKdfSpec());
         try

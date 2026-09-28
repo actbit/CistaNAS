@@ -185,25 +185,25 @@ builder.Services.AddCascadingAuthenticationState();
 // ---- レート制限 ----
 builder.Services.AddRateLimiter(options =>
 {
-    // 認証エンドポイント: 1 IP あたり 10req/min
+    // 認証エンドポイント: 1 IP あたり AuthRateLimitPerMinute req/min（既定 10）
     options.AddPolicy("auth", httpContext =>
         RateLimitPartition.GetSlidingWindowLimiter(
             partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
             factory: _ => new SlidingWindowRateLimiterOptions
             {
-                PermitLimit = 10,
+                PermitLimit = cista.Auth.AuthRateLimitPerMinute,
                 Window = TimeSpan.FromMinutes(1),
                 SegmentsPerWindow = 2,
                 QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
                 QueueLimit = 0,
             }));
-    // 一般 API: 1 IP あたり 100req/min
+    // 一般 API: 1 IP あたり ApiRateLimitPerMinute req/min（既定 100）
     options.AddPolicy("api", httpContext =>
         RateLimitPartition.GetSlidingWindowLimiter(
             partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
             factory: _ => new SlidingWindowRateLimiterOptions
             {
-                PermitLimit = 100,
+                PermitLimit = cista.Auth.ApiRateLimitPerMinute,
                 Window = TimeSpan.FromMinutes(1),
                 SegmentsPerWindow = 4,
                 QueueProcessingOrder = QueueProcessingOrder.OldestFirst,

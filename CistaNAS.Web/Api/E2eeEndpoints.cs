@@ -501,8 +501,8 @@ public static class E2eeEndpoints
         }
     }
 
-    private static async Task<IResult> SetMyPublicKey(SetPublicKeyRequest req, bool rotate, HttpContext ctx,
-        AccountService accountService, ISharingPolicy sharingPolicy)
+    private static async Task<IResult> SetMyPublicKey(SetPublicKeyRequest req, HttpContext ctx,
+        ISharingPolicy sharingPolicy, AccountService accountService, bool rotate = false)
     {
         string username = ctx.User.Identity?.Name ?? "";
         if (string.IsNullOrEmpty(username)) return Results.Unauthorized();

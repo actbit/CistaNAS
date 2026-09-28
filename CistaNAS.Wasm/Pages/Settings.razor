@@ -636,6 +636,7 @@ else
 
     private async Task HandleSetupIdentityKey()
     {
+        if (_keyLoading) return; // 再入防止（二重クリック等で同一処理を走らせない）
         _keyLoading = true; _keyError = null; _keySuccess = null;
         try
         {
@@ -668,6 +669,10 @@ else
                 if (string.IsNullOrEmpty(setup.PublicKey))
                 {
                     await E2eeApi.SetMyPublicKeyAsync(pubKeyB64);
+                    // 登録後は _keySetup も更新する。stale な PublicKey=null のままだと
+                    // 次の「鍵を再導出して検証」が比較経路ではなく登録経路（PUT）に進み、
+                    // 誤パスワード時にサーバー側 400 の汎用エラーになってしまう
+                    _keySetup = setup with { PublicKey = pubKeyB64 };
                     _keyHasPublicKey = true;
                     _keySuccess = "identity 鍵を導出し、公開鍵を登録しました。秘密鍵はブラウザに保存されません。";
                 }
