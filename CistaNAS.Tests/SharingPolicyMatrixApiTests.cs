@@ -549,4 +549,107 @@ public class SharingPolicyMatrixApiTests(AspireFixture fixture)
             });
         Assert.True(acceptAfter.IsSuccessStatusCode, $"accept after restore failed: {acceptAfter.StatusCode}");
     }
+
+    // ---- revoke 系は共有ポリシーの対象外（常に許可）の保証 ----
+
+    /// <summary>
+    /// revoke 行 = 条件と「誰が revoke を実行するか」。revoke は共有ポリシーで
+    /// ブロックされてはならない（ブロックされると剥奪漏れの鍵が残留し、
+    /// rotate 時に存在しないメンバー扱いとの不整合が生じうる）。
+    /// 全員有効 / owner 無効 / target 無効 / global 無効の全条件で 200 を期待する。
+    /// </summary>
+    private sealed record RevokeRow(Cond Condition, string Label, string Revoker);
+
+    [Fact]
+    public async Task Revoke_Matrix_AlwaysAllowedRegardlessOfSharingPolicy()
+    {
+        RevokeRow[] rows =
+        [
+            new(Cond.AllEnabled, "全員有効（owner が実行）", "owner"),
+            new(Cond.SenderDisabled, "owner 無効（owner が実行）", "owner"),
+            new(Cond.RecipientDisabled, "target 無効（owner が実行）", "owner"),
+            new(Cond.GlobalDisabled, "global 無効（owner が実行）", "owner"),
+        ];
+
+        foreach (var row in rows)
+        {
+            string owner = $"rvk-o-{Guid.NewGuid():N}";
+            string member = $"rvk-m-{Guid.NewGuid():N}";
+            HttpClient ownerClient = await CreateUserClientAsync(owner);
+            using HttpClient memberClient = await CreateUserClientAsync(member);
+            string vol = await CreateEcdhVolumeAsync(ownerClient, owner);
+
+            // member をボリュームに参加させる（v1 経路の ECIES wrap で鍵を登録）
+            byte[] masterKey = E2eeCrypto.GenerateMasterKey();
+            var (wrapped, _) = BuildEcdhWrappedKey(masterKey, member, "password1234567");
+            var grant = await ownerClient.PostAsJsonAsync($"/api/v1/e2ee/{vol}/add-wrapped-key",
+                new { username = member, wrappedMasterKey = wrapped });
+            Assert.True(grant.IsSuccessStatusCode, $"[{row.Label}] add-wrapped-key failed: {grant.StatusCode}");
+
+            Func<Task> undo = await ApplyConditionAsync(row.Condition, owner, member);
+            try
+            {
+                // revoke は共有ポリシー（sender/recipient/global いずれの無効化）でも
+                // ブロックされないこと
+                var revoke = await ownerClient.PostAsJsonAsync($"/api/v1/volumes/{vol}/revoke",
+                    new { targetUsername = member });
+                Assert.True(revoke.IsSuccessStatusCode,
+                    $"[{row.Label}] revoke が共有ポリシーでブロックされました: {revoke.StatusCode}");
+
+                // 剥奪が実際に反映されること（効果の検証）:
+                // - member はアクセス権喪失で wrapped-key が取得不能（HasAccess 再チェック → 403）
+                var memberKey = await memberClient.GetAsync($"/api/v1/e2ee/{vol}/wrapped-key/{member}");
+                Assert.True(memberKey.StatusCode == HttpStatusCode.Forbidden || memberKey.StatusCode == HttpStatusCode.NotFound,
+                    $"[{row.Label}] revoke 後も member の wrapped-key が取得可能です: {memberKey.StatusCode}");
+                var memberVols = await memberClient.GetAsync("/api/v1/volumes");
+                var memberVolsJson = await memberVols.Content.ReadFromJsonAsync<JsonElement>();
+                Assert.DoesNotContain(memberVolsJson.EnumerateArray(),
+                    v => v.GetProperty("name").GetString() == vol);
+
+                // - owner 自身の鍵とアクセスは無傷（データ欠損なし）
+                var ownerKey = await ownerClient.GetAsync($"/api/v1/e2ee/{vol}/wrapped-key/{owner}");
+                Assert.True(ownerKey.IsSuccessStatusCode,
+                    $"[{row.Label}] revoke 後に owner の wrapped-key が失われました: {ownerKey.StatusCode}");
+            }
+            finally
+            {
+                await undo();
+            }
+        }
+    }
+
+    /// <summary>
+    /// SharingEnabled の変更は管理者のみ（非 admin は 403 で拒否され、設定は変わらない）。
+    /// 一般ユーザーが他人・自分自身の共有フラグを書き換えられないことの回帰テスト。
+    /// </summary>
+    [Fact]
+    public async Task SetUserSharing_NonAdmin_Forbidden()
+    {
+        string user = $"rvk-n-{Guid.NewGuid():N}";
+        using HttpClient userClient = await CreateUserClientAsync(user);
+
+        // 他人への変更を拒否
+        var other = $"rvk-t-{Guid.NewGuid():N}";
+        using HttpClient otherClient = await CreateUserClientAsync(other);
+        var respOther = await userClient.PutAsJsonAsync(
+            $"/api/v1/account/users/{Uri.EscapeDataString(other)}/sharing",
+            new { sharingEnabled = false });
+        Assert.Equal(HttpStatusCode.Forbidden, respOther.StatusCode);
+
+        // 自分自身への変更も拒否
+        var respSelf = await userClient.PutAsJsonAsync(
+            $"/api/v1/account/users/{Uri.EscapeDataString(user)}/sharing",
+            new { sharingEnabled = false });
+        Assert.Equal(HttpStatusCode.Forbidden, respSelf.StatusCode);
+
+        // 設定が実際に変わっていないこと（変わっていると後続の共有テストが破綻する）
+        using var admin = AuthClient(fixture.Token);
+        await SetUserSharingAsync(admin, user, true);
+        var users = await admin.GetAsync("/api/v1/account/users");
+        var usersJson = await users.Content.ReadFromJsonAsync<JsonElement>();
+        var dto = Assert.Single(usersJson.EnumerateArray(),
+            u => u.GetProperty("userName").GetString() == user);
+        Assert.True(dto.GetProperty("sharingEnabled").GetBoolean(),
+            "非 admin の呼び出しで SharingEnabled が変更されてしまいました");
+    }
 }
