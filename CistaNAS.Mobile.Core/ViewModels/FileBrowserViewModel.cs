@@ -179,8 +179,7 @@ public sealed partial class FileBrowserViewModel(AppServices app, VolumeListItem
                 app.Navigation.NavigateTo(new TextViewerViewModel(app, this, item));
                 break;
             default:
-                // 動画・音声・その他は外部アプリに委譲
-                app.Navigation.NavigateTo(new ExternalViewerViewModel(app, this, item));
+                app.Navigation.NavigateTo(new StreamingViewerViewModel(app, this, item));
                 break;
         }
     }

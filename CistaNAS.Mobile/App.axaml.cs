@@ -20,11 +20,11 @@ public class App : Avalonia.Application
 
     public override void OnFrameworkInitializationCompleted()
     {
+        DeleteLegacyViewerCache();
         Services ??= new AppServices(
             new AndroidSecureKeyStore(),
             new AndroidAppSettings(),
-            new AndroidFileCacheProvider(),
-            new AndroidExternalViewerLauncher());
+            new AndroidFileViewerLauncher());
 
         if (ApplicationLifetime is ISingleViewApplicationLifetime single)
         {
@@ -34,7 +34,8 @@ public class App : Avalonia.Application
             // 401 検知 → ログイン画面へ戻す
             Services.SessionExpired += () =>
             {
-                Services.Navigation.NavigateToRoot(new LoginViewModel(Services));
+                Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                    Services.Navigation.NavigateToRoot(new LoginViewModel(Services)));
             };
 
             // 初期画面: サーバー URL 入力 (設定済みならプリフィル)
@@ -42,5 +43,12 @@ public class App : Avalonia.Application
         }
 
         base.OnFrameworkInitializationCompleted();
+    }
+
+    private static void DeleteLegacyViewerCache()
+    {
+        // 旧版で生成された復号ファイルだけを削除し、新しいキャッシュは作らない。
+        string directory = Path.Combine(Android.App.Application.Context.CacheDir!.Path!, "externalviewer");
+        if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
     }
 }

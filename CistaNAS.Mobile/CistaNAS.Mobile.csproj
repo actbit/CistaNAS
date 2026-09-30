@@ -20,12 +20,22 @@
     <PackageReference Include="Avalonia" Version="12.0.4" />
     <PackageReference Include="Avalonia.Android" Version="12.0.4" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="12.0.4" />
-    <!-- FileProvider (外部アプリへのキャッシュファイル渡し) 用の androidx.core は
-         Avalonia.Android -> Xamarin.AndroidX.AppCompat 経由で推移的に参照される -->
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\CistaNAS.Mobile.Core\CistaNAS.Mobile.Core.csproj" />
   </ItemGroup>
+
+  <!-- Native test entry points are absent from ordinary and release APKs. -->
+  <ItemGroup>
+    <Compile Remove="Testing\**\*.cs" />
+    <Compile Include="Testing\**\*.cs" Condition="'$(EnableAndroidSmokeTests)' == 'true' And '$(Configuration)' == 'Debug'" />
+    <AndroidAsset Include="..\CistaNAS.Tests\TestResults\viewer-video.enc"
+                  Link="viewer-video.enc" Condition="'$(EnableAndroidSmokeTests)' == 'true' And '$(Configuration)' == 'Debug'" />
+  </ItemGroup>
+  <Target Name="RejectReleaseSmokeTests" BeforeTargets="PrepareForBuild"
+          Condition="'$(EnableAndroidSmokeTests)' == 'true' And '$(Configuration)' != 'Debug'">
+    <Error Text="Android smoke entry points are allowed only in Debug test APKs." />
+  </Target>
 
 </Project>

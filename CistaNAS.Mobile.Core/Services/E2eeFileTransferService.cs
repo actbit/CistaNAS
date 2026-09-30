@@ -12,7 +12,7 @@ namespace CistaNAS.Mobile.Core.Services;
 /// </summary>
 public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e2eeSession)
 {
-    /// <summary>メモリ上での復号サイズ上限。超えるファイルはキャッシュファイル経由にフォールバック。</summary>
+    /// <summary>画像・テキスト表示でRAM上に展開できるサイズ上限。</summary>
     public const long MaxInMemoryDownloadBytes = 50 * 1024 * 1024;
 
     /// <summary>
