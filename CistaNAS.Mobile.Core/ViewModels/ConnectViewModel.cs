@@ -16,6 +16,7 @@ public sealed partial class ConnectViewModel(AppServices app) : BusyViewModelBas
     [RelayCommand]
     private Task ConnectAsync(CancellationToken ct) => RunBusyAsync(async () =>
     {
+        app.ClearSession();
         app.Session.ConfigureServer(ServerUrl);
         bool hasUsers = await app.Session.Api.HasUsersAsync();
         app.Settings.ServerUrl = ServerUrl.TrimEnd('/');

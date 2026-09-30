@@ -92,21 +92,23 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         {
             lock (_fileKeyLock)
             {
+                var replacement = new SecureBuffer((byte[])key.Clone());
                 _fileKey?.Dispose(); // 古いキーを VirtualUnlock + ゼロクリア
-                _fileKey = new SecureBuffer(key); // VirtualLock でページング退避防止
+                _fileKey = replacement; // 呼び出し側とは所有権を分離する。
+                if (_fileSalt is not null) CryptographicOperations.ZeroMemory(_fileSalt);
                 // 呼び出し側の一時バッファをCleanupでゼロクリアしても、
                 // キャッシュが保持するsaltまで破壊されないよう所有権を分離する。
                 _fileSalt = (byte[])salt.Clone();
             }
         }
 
-        /// <summary>FileKey と fileSalt が設定されているか確認し、設定されていれば返す。</summary>
+        /// <summary>FileKey と fileSalt のコピーを返す。呼び出し側が使用後に消去する。</summary>
         public bool TryGetFileKey(out byte[]? key, out byte[]? salt)
         {
             lock (_fileKeyLock)
             {
-                key = _fileKey?.Buffer;
-                salt = _fileSalt;
+                key = _fileKey is null ? null : (byte[])_fileKey.Buffer.Clone();
+                salt = _fileSalt is null ? null : (byte[])_fileSalt.Clone();
                 return _fileKey is not null;
             }
         }
@@ -376,10 +378,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                     if (cache.TryGetFileKey(out var key, out var salt))
                     {
                         _existingFileKey = key;
-                        // FileCacheの内部バッファをWriteStateと共有しない。
-                        // CleanupではWriteState側のsaltをゼロクリアするため、共有すると
-                        // 保存直後の再読み込みで復号鍵が壊れる。
-                        _existingFileSalt = salt is null ? null : (byte[])salt.Clone();
+                        _existingFileSalt = salt;
                     }
                     else if (cache.KeyEpoch >= 1)
                     {
@@ -432,6 +431,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 }
                 catch
                 {
+                    if (_existingFileKey is not null) CryptographicOperations.ZeroMemory(_existingFileKey);
+                    if (_existingFileSalt is not null) CryptographicOperations.ZeroMemory(_existingFileSalt);
                     try { fs._api.ReleaseWriteLeaseAsync(fs._volumeName, existingFileId, leaseToken).GetAwaiter().GetResult(); }
                     catch { }
                     throw;
@@ -557,7 +558,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             if (size >= 0) _maxWritten = size;
         }
 
-        // salt・平文チャンクをゼロクリア（_existingFileKey は FileCache が管理するためここでは消さない）
+        // このハンドルが所有する鍵・salt・平文チャンクをゼロクリア。
         public override void Dispose()
         {
             _leaseRenewal?.Dispose();
@@ -567,6 +568,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 catch { /* 異常終了時はサーバー側の期限切れで回収する */ }
             }
             if (_existingFileSalt is not null) CryptographicOperations.ZeroMemory(_existingFileSalt);
+            if (_existingFileKey is not null) CryptographicOperations.ZeroMemory(_existingFileKey);
             ZeroAndClearDirtyChunks();
             // Gate は Dispose しない（PlainRangeWriteState.Dispose のコメント参照）。
         }
@@ -1201,124 +1203,145 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 // チャンク 0 から salt を抽出して fileKey を確定。
                 // salt は全チャンクの nonce 導出（DeriveChunkNonce）で共通して使うため保持する。
                 // v2 ファイル（KeyEpoch ≥ 1）は WrappedFileKey を GroupKey でアンラップした DEK を使う。
-                if (!cache.TryGetFileKey(out var fileKey, out var fileSalt))
-                {
-                    var (encData, rev0, chunkEpoch0) = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
-                    if (encData.Length <= 16)
-                        return (DokanResult.InternalError, 0);
-
-                    fileSalt = new byte[16];
-                    Buffer.BlockCopy(encData, 0, fileSalt, 0, 16);
-                    byte[] derivedKey = cache.KeyEpoch >= 1
-                        ? UnwrapFileKeyV2(cache)
-                        : E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, fileSalt);
-                    int keyEpoch = cache.KeyEpoch;
-
-                    // チャンク 0 を復号してキャッシュ
-                    var chunk = keyEpoch >= 1
-                        ? E2eeV2.DecryptChunk(encData, derivedKey,
-                            new E2eeChunkContext(_v2!.VolumeIdString, fileId, 0, rev0,
-                                chunkEpoch0 > 0 ? chunkEpoch0 : keyEpoch), fileSalt)
-                        : E2eeCrypto.DecryptChunk(encData, derivedKey, 0, fileSalt, rev0);
-                    PutChunkToPool(fileId, 0, chunk, ComputeHashHex(encData));
-
-                    cache.SetFileKey(derivedKey, fileSalt);
-                    fileKey = derivedKey;
-                }
-                int readFileKeyEpoch = cache.KeyEpoch;
-                string? readFileVolumeId = readFileKeyEpoch >= 1 ? _v2!.VolumeIdString : null;
-
-                // 他クライアント上書き検出のため、チャンク0のハッシュ検証を最初に行う
-                // salt が変わった場合は fileKey を再導出する必要がある
+                cache.TryGetFileKey(out var fileKey, out var fileSalt);
                 byte[]? fileKeyToUse = fileKey;
-                var chunk0Cached = TryGetChunkFromPool(fileId, 0);
-                if (chunk0Cached.HasValue)
+                try
                 {
-                    string? serverHash = null;
-                    try
+                    if (fileKey is null)
                     {
-                        var (h0c, _) = await _api.GetChunkHashAsync(_volumeName, fileId, 0);
-                        serverHash = h0c;
+                        var (encData, rev0, chunkEpoch0) = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
+                        if (encData.Length <= 16)
+                            return (DokanResult.InternalError, 0);
+
+                        fileSalt = new byte[16];
+                        Buffer.BlockCopy(encData, 0, fileSalt, 0, 16);
+                        byte[] derivedKey = cache.KeyEpoch >= 1
+                            ? UnwrapFileKeyV2(cache)
+                            : E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, fileSalt);
+                        fileKeyToUse = derivedKey;
+                        int keyEpoch = cache.KeyEpoch;
+
+                        // チャンク 0 を復号してキャッシュ
+                        var chunk = keyEpoch >= 1
+                            ? E2eeV2.DecryptChunk(encData, derivedKey,
+                                new E2eeChunkContext(_v2!.VolumeIdString, fileId, 0, rev0,
+                                    chunkEpoch0 > 0 ? chunkEpoch0 : keyEpoch), fileSalt)
+                            : E2eeCrypto.DecryptChunk(encData, derivedKey, 0, fileSalt, rev0);
+                        PutChunkToPool(fileId, 0, chunk, ComputeHashHex(encData));
+
+                        cache.SetFileKey(derivedKey, fileSalt);
+                        fileKey = derivedKey;
                     }
-                    catch { /* 通信失敗時は後で再ダウンロード */ }
+                    int readFileKeyEpoch = cache.KeyEpoch;
+                    string? readFileVolumeId = readFileKeyEpoch >= 1 ? _v2!.VolumeIdString : null;
 
-                    if (serverHash is null || serverHash != chunk0Cached.Value.EncryptedHash)
-                    {
-                        // チャンク0が変わっている可能性があるため、再ダウンロードして salt を確認
-                        var (chunk0Data, chunk0Rev, chunk0Epoch) = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
-                        if (chunk0Data.Length > E2eeCrypto.SaltSize)
-                        {
-                            byte[] newSalt = new byte[E2eeCrypto.SaltSize];
-                            Buffer.BlockCopy(chunk0Data, 0, newSalt, 0, E2eeCrypto.SaltSize);
-                            if (readFileKeyEpoch >= 1)
-                            {
-                                // v2: DEK は WrappedFileKey 由来で不変。salt 変化のみ反映して再復号する
-                                fileSalt = newSalt;
-                                cache.SetFileKey(fileKeyToUse!, newSalt);
-                                RemoveFileChunksFromPool(fileId);
-
-                                var chunk0 = E2eeV2.DecryptChunk(chunk0Data, fileKeyToUse!,
-                                    new E2eeChunkContext(readFileVolumeId!, fileId, 0, chunk0Rev,
-                                        chunk0Epoch > 0 ? chunk0Epoch : readFileKeyEpoch), newSalt);
-                                PutChunkToPool(fileId, 0, chunk0, ComputeHashHex(chunk0Data));
-                            }
-                            else
-                            {
-                                var newKey = E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, newSalt);
-
-                                // fileKey が変わった場合はキャッシュをクリアして再構築
-                                if (!CryptographicOperations.FixedTimeEquals(newKey, fileKey))
-                                {
-                                    cache.SetFileKey(newKey, newSalt);
-                                    fileKeyToUse = newKey;
-                                    fileSalt = newSalt;
-                                    RemoveFileChunksFromPool(fileId);
-
-                                    // チャンク0を復号してキャッシュ
-                                    var chunk0 = E2eeCrypto.DecryptChunk(chunk0Data, newKey, 0, newSalt, chunk0Rev);
-                                    PutChunkToPool(fileId, 0, chunk0, ComputeHashHex(chunk0Data));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // シーク最適化: offset から開始チャンクを計算
-                int startChunk = cache.ChunkCount > 0
-                    ? Math.Min((int)(offset / _chunkSize), cache.ChunkCount - 1)
-                    : 0;
-                long fileOffset = (long)startChunk * _chunkSize;
-
-                for (int i = startChunk; i < cache.ChunkCount && localBytesRead < buffer.Length; i++)
-                {
-                    if (offset + localBytesRead >= cache.PlainLength)
-                        break;
-
-                    byte[] chunk;
-
-                    // キャッシュヒット: ハッシュ検証で鮮度確認
-                    var cached = TryGetChunkFromPool(fileId, i);
-                    if (cached.HasValue)
+                    // 他クライアント上書き検出のため、チャンク0のハッシュ検証を最初に行う
+                    // salt が変わった場合は fileKey を再導出する必要がある
+                    fileKeyToUse = fileKey;
+                    var chunk0Cached = TryGetChunkFromPool(fileId, 0);
+                    if (chunk0Cached.HasValue)
                     {
                         string? serverHash = null;
                         try
                         {
-                            var (hi, _) = await _api.GetChunkHashAsync(_volumeName, fileId, i);
-                            serverHash = hi;
+                            var (h0c, _) = await _api.GetChunkHashAsync(_volumeName, fileId, 0);
+                            serverHash = h0c;
                         }
-                        catch
-                        {
-                            // ハッシュ検証の通信失敗時はキャッシュを信頼せず再ダウンロード
-                        }
+                        catch { /* 通信失敗時は後で再ダウンロード */ }
 
-                        if (serverHash is not null && serverHash == cached.Value.EncryptedHash)
+                        if (serverHash is null || serverHash != chunk0Cached.Value.EncryptedHash)
                         {
-                            // ハッシュ一致 → キャッシュ利用
-                            chunk = cached.Value.Data;
+                            // チャンク0が変わっている可能性があるため、再ダウンロードして salt を確認
+                            var (chunk0Data, chunk0Rev, chunk0Epoch) = await _api.DownloadChunkAsync(_volumeName, fileId, 0);
+                            if (chunk0Data.Length > E2eeCrypto.SaltSize)
+                            {
+                                byte[] newSalt = new byte[E2eeCrypto.SaltSize];
+                                Buffer.BlockCopy(chunk0Data, 0, newSalt, 0, E2eeCrypto.SaltSize);
+                                if (readFileKeyEpoch >= 1)
+                                {
+                                    // v2: DEK は WrappedFileKey 由来で不変。salt 変化のみ反映して再復号する
+                                    if (fileSalt is not null) CryptographicOperations.ZeroMemory(fileSalt);
+                                    fileSalt = newSalt;
+                                    cache.SetFileKey(fileKeyToUse!, newSalt);
+                                    RemoveFileChunksFromPool(fileId);
+
+                                    var chunk0 = E2eeV2.DecryptChunk(chunk0Data, fileKeyToUse!,
+                                        new E2eeChunkContext(readFileVolumeId!, fileId, 0, chunk0Rev,
+                                            chunk0Epoch > 0 ? chunk0Epoch : readFileKeyEpoch), newSalt);
+                                    PutChunkToPool(fileId, 0, chunk0, ComputeHashHex(chunk0Data));
+                                }
+                                else
+                                {
+                                    var newKey = E2eeCrypto.DeriveFileKey(_masterKey!.Buffer, newSalt);
+
+                                    // fileKey が変わった場合はキャッシュをクリアして再構築
+                                    if (!CryptographicOperations.FixedTimeEquals(newKey, fileKey))
+                                    {
+                                        cache.SetFileKey(newKey, newSalt);
+                                        if (fileKeyToUse is not null) CryptographicOperations.ZeroMemory(fileKeyToUse);
+                                        if (fileSalt is not null) CryptographicOperations.ZeroMemory(fileSalt);
+                                        fileKeyToUse = newKey;
+                                        fileSalt = newSalt;
+                                        RemoveFileChunksFromPool(fileId);
+
+                                        // チャンク0を復号してキャッシュ
+                                        var chunk0 = E2eeCrypto.DecryptChunk(chunk0Data, newKey, 0, newSalt, chunk0Rev);
+                                        PutChunkToPool(fileId, 0, chunk0, ComputeHashHex(chunk0Data));
+                                    }
+                                    else CryptographicOperations.ZeroMemory(newKey);
+                                }
+                            }
+                        }
+                    }
+
+                    // シーク最適化: offset から開始チャンクを計算
+                    int startChunk = cache.ChunkCount > 0
+                        ? Math.Min((int)(offset / _chunkSize), cache.ChunkCount - 1)
+                        : 0;
+                    long fileOffset = (long)startChunk * _chunkSize;
+
+                    for (int i = startChunk; i < cache.ChunkCount && localBytesRead < buffer.Length; i++)
+                    {
+                        if (offset + localBytesRead >= cache.PlainLength)
+                            break;
+
+                        byte[] chunk;
+
+                        // キャッシュヒット: ハッシュ検証で鮮度確認
+                        var cached = TryGetChunkFromPool(fileId, i);
+                        if (cached.HasValue)
+                        {
+                            string? serverHash = null;
+                            try
+                            {
+                                var (hi, _) = await _api.GetChunkHashAsync(_volumeName, fileId, i);
+                                serverHash = hi;
+                            }
+                            catch
+                            {
+                                // ハッシュ検証の通信失敗時はキャッシュを信頼せず再ダウンロード
+                            }
+
+                            if (serverHash is not null && serverHash == cached.Value.EncryptedHash)
+                            {
+                                // ハッシュ一致 → キャッシュ利用
+                                chunk = cached.Value.Data;
+                            }
+                            else
+                            {
+                                // ハッシュ不一致 or ハッシュなし or 通信失敗 → 再ダウンロード
+                                var (encData, rev, chunkEpoch) = await _api.DownloadChunkAsync(_volumeName, fileId, i);
+                                chunk = readFileKeyEpoch >= 1
+                                    ? E2eeV2.DecryptChunk(encData, fileKeyToUse!,
+                                        new E2eeChunkContext(readFileVolumeId!, fileId, i, rev,
+                                            chunkEpoch > 0 ? chunkEpoch : readFileKeyEpoch), fileSalt!)
+                                    : E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, fileSalt!, rev);
+                                PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));
+                            }
                         }
                         else
                         {
-                            // ハッシュ不一致 or ハッシュなし or 通信失敗 → 再ダウンロード
+                            // キャッシュミス: ダウンロード + 復号 + キャッシュ保存
                             var (encData, rev, chunkEpoch) = await _api.DownloadChunkAsync(_volumeName, fileId, i);
                             chunk = readFileKeyEpoch >= 1
                                 ? E2eeV2.DecryptChunk(encData, fileKeyToUse!,
@@ -1327,39 +1350,33 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                                 : E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, fileSalt!, rev);
                             PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));
                         }
-                    }
-                    else
-                    {
-                        // キャッシュミス: ダウンロード + 復号 + キャッシュ保存
-                        var (encData, rev, chunkEpoch) = await _api.DownloadChunkAsync(_volumeName, fileId, i);
-                        chunk = readFileKeyEpoch >= 1
-                            ? E2eeV2.DecryptChunk(encData, fileKeyToUse!,
-                                new E2eeChunkContext(readFileVolumeId!, fileId, i, rev,
-                                    chunkEpoch > 0 ? chunkEpoch : readFileKeyEpoch), fileSalt!)
-                            : E2eeCrypto.DecryptChunk(encData, fileKeyToUse!, i, fileSalt!, rev);
-                        PutChunkToPool(fileId, i, chunk, ComputeHashHex(encData));
-                    }
 
-                    long chunkStart = fileOffset;
-                    long chunkEnd = chunkStart + chunk.Length;
+                        long chunkStart = fileOffset;
+                        long chunkEnd = chunkStart + chunk.Length;
 
-                    if (offset < chunkEnd)
-                    {
-                        int copyOffset = (int)Math.Max(0, offset - chunkStart);
-                        int maxCopy = Math.Min(chunk.Length - copyOffset, buffer.Length - localBytesRead);
-                        if (offset + localBytesRead + maxCopy > cache.PlainLength)
-                            maxCopy = (int)Math.Max(0, cache.PlainLength - offset - localBytesRead);
-                        if (maxCopy > 0)
+                        if (offset < chunkEnd)
                         {
-                            Buffer.BlockCopy(chunk, copyOffset, buffer, localBytesRead, maxCopy);
-                            localBytesRead += maxCopy;
+                            int copyOffset = (int)Math.Max(0, offset - chunkStart);
+                            int maxCopy = Math.Min(chunk.Length - copyOffset, buffer.Length - localBytesRead);
+                            if (offset + localBytesRead + maxCopy > cache.PlainLength)
+                                maxCopy = (int)Math.Max(0, cache.PlainLength - offset - localBytesRead);
+                            if (maxCopy > 0)
+                            {
+                                Buffer.BlockCopy(chunk, copyOffset, buffer, localBytesRead, maxCopy);
+                                localBytesRead += maxCopy;
+                            }
                         }
+
+                        fileOffset += chunk.Length;
                     }
 
-                    fileOffset += chunk.Length;
+                    return (DokanResult.Success, localBytesRead);
                 }
-
-                return (DokanResult.Success, localBytesRead);
+                finally
+                {
+                    if (fileKeyToUse is not null) CryptographicOperations.ZeroMemory(fileKeyToUse);
+                    if (fileSalt is not null) CryptographicOperations.ZeroMemory(fileSalt);
+                }
             }).GetAwaiter().GetResult();
 
             bytesRead = result.Item2;

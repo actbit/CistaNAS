@@ -76,12 +76,12 @@ public static class CistaNasApiClientFiles
     }
 
     /// <summary>ファイルをダウンロードする（Stream 版）。</summary>
-    public static async Task<Stream> DownloadFileStreamAsync(this CistaNasApiClient client, string volumeName, string filePath)
+    public static async Task<Stream> DownloadFileStreamAsync(this CistaNasApiClient client, string volumeName, string filePath, CancellationToken ct = default)
     {
         var http = client._http;
-        var res = await http.GetAsync($"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(filePath)}", System.Net.Http.HttpCompletionOption.ResponseHeadersRead);
+        var res = await http.GetAsync($"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(filePath)}", System.Net.Http.HttpCompletionOption.ResponseHeadersRead, ct);
         res.EnsureSuccessStatusCode();
-        return await res.Content.ReadAsStreamAsync();
+        return await res.Content.ReadAsStreamAsync(ct);
     }
 
     /// <summary>ファイルを削除する。</summary>

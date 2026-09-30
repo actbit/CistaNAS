@@ -17,13 +17,14 @@ namespace CistaNAS.Tests;
 public static class TestHelper
 {
     public static (IServiceProvider sp, string dataRoot) BuildTestServices(
-        VolumeOptions? volOpts = null)
+        VolumeOptions? volOpts = null, StorageOptions? storageOpts = null)
     {
         var dataRoot = Path.Combine(Path.GetTempPath(), "cista-test-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dataRoot);
         var opt = new CistaNasOptions
         {
             DataRoot = dataRoot,
+            Storage = storageOpts ?? new StorageOptions(),
             Volume = volOpts ?? new VolumeOptions { SectorSize = 512, KdfIterations = 10_000, KdfMemoryKiB = 8192, KdfTimeCost = 1, KdfParallelism = 1 },
             Auth = new AuthOptions { Pbkdf2Iterations = 10_000, Argon2MemoryKiB = 8192, Argon2TimeCost = 1, Argon2Parallelism = 1 },
         };

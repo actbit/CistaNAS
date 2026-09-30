@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using CistaNAS.Client.Api;
 using CistaNAS.Shared.Crypto;
+using CistaNAS.Mobile.Core.Security;
 
 namespace CistaNAS.Mobile.Core.Services;
 
@@ -22,7 +23,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
     public async Task DownloadAsync(string volumeName, E2eeFileEntry entry, Stream output,
         IProgress<double>? progress = null, CancellationToken ct = default)
     {
-        int chunkSize = e2eeSession.GetChunkSize(volumeName);
+        ct.ThrowIfCancellationRequested();
 
         if (entry.KeyEpoch >= 1)
         {
@@ -33,25 +34,28 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
         byte[] masterKey = e2eeSession.GetMasterKey(volumeName);
 
         // チャンク 0 から fileSalt を取得して fileKey を導出
-        (byte[] data0, int revision0, _) = await api.DownloadChunkAsync(volumeName, entry.FileId, 0);
+        (byte[] data0, int revision0, _) = await api.DownloadChunkAsync(volumeName, entry.FileId, 0, ct);
         if (data0.Length < E2eeCrypto.SaltSize + E2eeCrypto.GcmTagSize)
             throw new InvalidOperationException("チャンク 0 が不正です。");
         byte[] fileSalt = new byte[E2eeCrypto.SaltSize];
         Buffer.BlockCopy(data0, 0, fileSalt, 0, E2eeCrypto.SaltSize);
         byte[] fileKey = E2eeCrypto.DeriveFileKey(masterKey, fileSalt);
-
-        // nonce 導出にはチャンクごとの revision が必須（Dokan 差分保存で revision >= 1 に上がる）。
-        byte[] plain0 = E2eeCrypto.DecryptChunk(data0, fileKey, 0, fileSalt, revision0);
-        await output.WriteAsync(plain0, ct);
-
-        for (int i = 1; i < entry.ChunkCount; i++)
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            (byte[] enc, int revision, _) = await api.DownloadChunkAsync(volumeName, entry.FileId, i);
-            byte[] plain = E2eeCrypto.DecryptChunk(enc, fileKey, i, fileSalt, revision);
-            await output.WriteAsync(plain, ct);
-            progress?.Report((double)(i + 1) / entry.ChunkCount * 100);
+            // nonce 導出にはチャンクごとの revision が必須（Dokan 差分保存で revision >= 1 に上がる）。
+            byte[] plain0 = E2eeCrypto.DecryptChunk(data0, fileKey, 0, fileSalt, revision0);
+            await WritePlainAsync(output, plain0, ct);
+
+            for (int i = 1; i < entry.ChunkCount; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                (byte[] enc, int revision, _) = await api.DownloadChunkAsync(volumeName, entry.FileId, i, ct);
+                byte[] plain = E2eeCrypto.DecryptChunk(enc, fileKey, i, fileSalt, revision);
+                await WritePlainAsync(output, plain, ct);
+                progress?.Report((double)(i + 1) / entry.ChunkCount * 100);
+            }
         }
+        finally { CryptographicOperations.ZeroMemory(fileKey); }
     }
 
     /// <summary>crypto format v2 のダウンロード。チャンク復号にはチャンク固有 keyEpoch（アップロード時に刻印）を使う。</summary>
@@ -69,7 +73,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
         try
         {
             // チャンク 0 の先頭 16B (fileSalt) を取得
-            (byte[] data0, int revision0, int epoch0) = await api.DownloadChunkAsync(volumeName, entry.FileId, 0);
+            (byte[] data0, int revision0, int epoch0) = await api.DownloadChunkAsync(volumeName, entry.FileId, 0, ct);
             if (data0.Length < E2eeCrypto.SaltSize + E2eeCrypto.GcmTagSize)
                 throw new InvalidOperationException("チャンク 0 が不正です。");
             byte[] fileSalt = new byte[E2eeCrypto.SaltSize];
@@ -78,16 +82,16 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
             var ctx0 = new E2eeChunkContext(volumeId, entry.FileId, 0, revision0,
                 epoch0 > 0 ? epoch0 : entry.KeyEpoch);
             byte[] plain0 = E2eeV2.DecryptChunk(data0, fileKey, ctx0, fileSalt);
-            await output.WriteAsync(plain0, ct);
+            await WritePlainAsync(output, plain0, ct);
 
             for (int i = 1; i < entry.ChunkCount; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                (byte[] enc, int revision, int chunkEpoch) = await api.DownloadChunkAsync(volumeName, entry.FileId, i);
+                (byte[] enc, int revision, int chunkEpoch) = await api.DownloadChunkAsync(volumeName, entry.FileId, i, ct);
                 var ctx = new E2eeChunkContext(volumeId, entry.FileId, i, revision,
                     chunkEpoch > 0 ? chunkEpoch : entry.KeyEpoch);
                 byte[] plain = E2eeV2.DecryptChunk(enc, fileKey, ctx, fileSalt);
-                await output.WriteAsync(plain, ct);
+                await WritePlainAsync(output, plain, ct);
                 progress?.Report((double)(i + 1) / entry.ChunkCount * 100);
             }
         }
@@ -105,9 +109,18 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
         if (plainLen > MaxInMemoryDownloadBytes)
             throw new InvalidOperationException("ファイルが大きすぎてメモリに展開できません。");
         var ms = new MemoryStream((int)plainLen);
-        await DownloadAsync(volumeName, entry, ms, progress, ct);
-        ms.Position = 0;
-        return ms;
+        try
+        {
+            await DownloadAsync(volumeName, entry, ms, progress, ct);
+            ms.Position = 0;
+            return ms;
+        }
+        catch
+        {
+            CryptographicOperations.ZeroMemory(ms.GetBuffer());
+            ms.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -118,6 +131,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
     public async Task<(string FileId, int ChunkCount)> UploadAsync(string volumeName, string fileName,
         Stream input, long plainLength, IProgress<double>? progress = null, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         if (e2eeSession.TryGetV2State(volumeName, out var v2))
         {
             return await UploadV2Async(volumeName, v2!, fileName, input, plainLength, progress, ct);
@@ -129,34 +143,43 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
         int chunkCount = E2eeCrypto.ComputeChunkCount(plainLength, chunkSize);
         long encryptedLength = E2eeCrypto.ComputeEncryptedLength(plainLength, chunkSize);
         byte[] fileSalt = E2eeCrypto.GenerateFileSalt();
-        byte[] fileKey = E2eeCrypto.DeriveFileKey(masterKey, fileSalt);
         string encryptedName = E2eeCrypto.EncryptFilename(fileName, masterKey);
-
-        (string fileId, string lease) = await api.CreateFileAsync(volumeName, encryptedName, encryptedLength, chunkCount);
+        byte[] fileKey = E2eeCrypto.DeriveFileKey(masterKey, fileSalt);
         try
         {
-            var buffer = new byte[chunkSize];
-            for (int i = 0; i < chunkCount; i++)
+            (string fileId, string lease) = await api.CreateFileAsync(volumeName, encryptedName, encryptedLength, chunkCount);
+            try
             {
-                ct.ThrowIfCancellationRequested();
-                int read = await ReadBlockAsync(input, buffer, ct);
-                // isFirstChunk: true で chunk 0 の先頭に fileSalt が平文埋め込みされる
-                byte[] enc = E2eeCrypto.EncryptChunk(buffer[..read], fileKey, i, fileSalt, isFirstChunk: i == 0);
-                await api.UploadChunkAsync(volumeName, fileId, i, enc, lease);
-                progress?.Report((double)(i + 1) / chunkCount * 100);
+                using var secureBuffer = new SecureBuffer(chunkSize);
+                var buffer = secureBuffer.Data;
+                for (int i = 0; i < chunkCount; i++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    int expected = (int)Math.Min(chunkSize, plainLength - (long)i * chunkSize);
+                    int read = await ReadBlockAsync(input, buffer.AsMemory(0, expected), ct);
+                    if (read != expected) throw new EndOfStreamException("アップロード元のファイルが途中で終了しました。");
+                    // isFirstChunk: true で chunk 0 の先頭に fileSalt が平文埋め込みされる
+                    byte[] block = buffer[..read];
+                    byte[] enc;
+                    try { enc = E2eeCrypto.EncryptChunk(block, fileKey, i, fileSalt, isFirstChunk: i == 0); }
+                    finally { CryptographicOperations.ZeroMemory(block); }
+                    await api.UploadChunkAsync(volumeName, fileId, i, enc, lease);
+                    progress?.Report((double)(i + 1) / chunkCount * 100);
+                }
+                await api.FinalizeFileAsync(volumeName, fileId, encryptedLength, lease, chunkCount);
+                return (fileId, chunkCount);
             }
-            await api.FinalizeFileAsync(volumeName, fileId, encryptedLength, lease, chunkCount);
-            return (fileId, chunkCount);
+            catch
+            {
+                await CleanupFailedUploadAsync(api, volumeName, fileId, lease);
+                throw;
+            }
+            finally
+            {
+                try { await api.ReleaseWriteLeaseAsync(volumeName, fileId, lease); } catch { /* ベストエフォート */ }
+            }
         }
-        catch
-        {
-            await CleanupFailedUploadAsync(api, volumeName, fileId, lease);
-            throw;
-        }
-        finally
-        {
-            try { await api.ReleaseWriteLeaseAsync(volumeName, fileId, lease); } catch { /* ベストエフォート */ }
-        }
+        finally { CryptographicOperations.ZeroMemory(fileKey); }
     }
 
     /// <summary>crypto format v2 のアップロード。per-file DEK を生成して現行 epoch の GroupKey でラップする。</summary>
@@ -175,13 +198,12 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
         byte[] fileSalt = E2eeV2.GenerateFileSalt();
         byte[] fileKey = E2eeV2.GenerateFileKey();
         // v2 のファイル名は GroupKey で暗号化する（v1 = masterKey）
-        string encryptedName = E2eeCrypto.EncryptFilename(fileName, groupKey);
-
-        // fileId をクライアント側で先に決定する（WrappedFileKey の AAD に fileId が bind されるため）。
-        string fileId = Guid.NewGuid().ToString("N");
-        var (nonce, ctBytes, tag) = E2eeV2.WrapFileKey(fileKey, groupKey, volumeId, fileId, keyEpoch);
         try
         {
+            string encryptedName = E2eeCrypto.EncryptFilename(fileName, groupKey);
+            // fileId をクライアント側で先に決定する（WrappedFileKey の AAD に bind するため）。
+            string fileId = Guid.NewGuid().ToString("N");
+            var (nonce, ctBytes, tag) = E2eeV2.WrapFileKey(fileKey, groupKey, volumeId, fileId, keyEpoch);
             (fileId, string lease) = await api.CreateFileAsync(volumeName, encryptedName, encryptedLength, chunkCount,
                 keyEpoch, new WrappedAeadKey
                 {
@@ -192,13 +214,19 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
                 }, fileId);
             try
             {
-                var buffer = new byte[chunkSize];
+                using var secureBuffer = new SecureBuffer(chunkSize);
+                var buffer = secureBuffer.Data;
                 for (int i = 0; i < chunkCount; i++)
                 {
                     ct.ThrowIfCancellationRequested();
-                    int read = await ReadBlockAsync(input, buffer, ct);
+                    int expected = (int)Math.Min(chunkSize, plainLength - (long)i * chunkSize);
+                    int read = await ReadBlockAsync(input, buffer.AsMemory(0, expected), ct);
+                    if (read != expected) throw new EndOfStreamException("アップロード元のファイルが途中で終了しました。");
                     var chunkCtx = new E2eeChunkContext(volumeId, fileId, i, Revision: 0, keyEpoch);
-                    byte[] enc = E2eeV2.EncryptChunk(buffer[..read], fileKey, chunkCtx, isFirstChunk: i == 0, fileSalt);
+                    byte[] block = buffer[..read];
+                    byte[] enc;
+                    try { enc = E2eeV2.EncryptChunk(block, fileKey, chunkCtx, isFirstChunk: i == 0, fileSalt); }
+                    finally { CryptographicOperations.ZeroMemory(block); }
                     await api.UploadChunkAsync(volumeName, fileId, i, enc, lease);
                     progress?.Report((double)(i + 1) / chunkCount * 100);
                 }
@@ -247,12 +275,18 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
         catch { /* ロールバック失敗は無視 (finalize 未了の孤立ファイルは finalize 前提のため自然消滅) */ }
     }
 
-    private static async Task<int> ReadBlockAsync(Stream input, byte[] buffer, CancellationToken ct)
+    private static async Task WritePlainAsync(Stream output, byte[] plain, CancellationToken ct)
+    {
+        try { await output.WriteAsync(plain, ct); }
+        finally { CryptographicOperations.ZeroMemory(plain); }
+    }
+
+    private static async Task<int> ReadBlockAsync(Stream input, Memory<byte> buffer, CancellationToken ct)
     {
         int total = 0;
         while (total < buffer.Length)
         {
-            int read = await input.ReadAsync(buffer.AsMemory(total), ct);
+            int read = await input.ReadAsync(buffer[total..], ct);
             if (read == 0) break;
             total += read;
         }

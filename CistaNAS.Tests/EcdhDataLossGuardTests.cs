@@ -324,7 +324,8 @@ public class EcdhDataLossGuardTests
         }
     }
 
-    // ---- ECIES: 他人の鍵では復号できない（クロスユーザー分離） ----    [Fact]
+    // ---- ECIES: 他人の鍵では復号できない（クロスユーザー分離） ----
+    [Fact]
     public void EcdhUnwrap_WrongRecipient_FailsClosed_BothDirections()
     {
         var (alicePub, alicePriv) = E2eeCrypto.GenerateEcdhKeyPair();

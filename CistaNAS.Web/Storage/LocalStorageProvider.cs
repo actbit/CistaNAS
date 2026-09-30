@@ -5,7 +5,17 @@ namespace CistaNAS.Web.Storage;
 /// <summary>ローカルファイルシステムを使用する IStorageProvider 実装（デフォルト）。</summary>
 public sealed class LocalStorageProvider : IStorageProvider
 {
+    // Windows の置換中に同じパスが一時的に開けなくなることを防ぐ。
+    // 同一プロセスの複数 provider 間でも共有し、ロック数は固定にする。
+    private static readonly SemaphoreSlim[] BlobGates = Enumerable.Range(0, 256)
+        .Select(_ => new SemaphoreSlim(1, 1)).ToArray();
     private readonly string _basePath;
+
+    private static SemaphoreSlim GetBlobGate(string fullPath)
+    {
+        var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        return BlobGates[(uint)comparer.GetHashCode(Path.GetFullPath(fullPath)) % (uint)BlobGates.Length];
+    }
 
     public LocalStorageProvider(string basePath)
     {
@@ -16,8 +26,20 @@ public sealed class LocalStorageProvider : IStorageProvider
     public async Task<byte[]?> ReadAsync(string blobPath, CancellationToken ct = default)
     {
         string fullPath = ToFullPath(blobPath);
-        if (!File.Exists(fullPath)) return null;
-        return await File.ReadAllBytesAsync(fullPath, ct);
+        var gate = GetBlobGate(fullPath);
+        await gate.WaitAsync(ct);
+        try
+        {
+            // 開いた版を最後まで読み、置換中の一時的な未存在を外へ返さない。
+            await using var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete, 81920, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            using var output = new MemoryStream();
+            await fs.CopyToAsync(output, ct);
+            return output.ToArray();
+        }
+        catch (FileNotFoundException) { return null; }
+        catch (DirectoryNotFoundException) { return null; }
+        finally { gate.Release(); }
     }
 
     public async Task WriteAsync(string blobPath, Stream content, CancellationToken ct = default)
@@ -34,9 +56,29 @@ public sealed class LocalStorageProvider : IStorageProvider
         Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
         // GUID を付与して同時実行時の衝突を防止（他プロバイダーとの整合性）
         string tmpPath = fullPath + ".tmp-" + Guid.NewGuid().ToString("N");
-        using (var fs = File.Create(tmpPath))
-            await content.CopyToAsync(fs, ct);
-        File.Move(tmpPath, fullPath, overwrite: true);
+        try
+        {
+            using (var fs = File.Create(tmpPath))
+            {
+                await content.CopyToAsync(fs, ct);
+                await fs.FlushAsync(ct);
+                fs.Flush(flushToDisk: true);
+            }
+            ct.ThrowIfCancellationRequested();
+            var gate = GetBlobGate(fullPath);
+            await gate.WaitAsync(ct);
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                File.Move(tmpPath, fullPath, overwrite: true);
+            }
+            finally { gate.Release(); }
+        }
+        finally
+        {
+            // 失敗した書き込みの平文メタデータを残さない。
+            if (File.Exists(tmpPath)) File.Delete(tmpPath);
+        }
     }
 
     public Task DeleteAsync(string blobPath, CancellationToken ct = default)

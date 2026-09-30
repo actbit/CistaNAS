@@ -40,18 +40,22 @@ public class FileServiceTests : IAsyncDisposable
     }
 
     [Fact]
-    public async Task Upload_OverwriteShorter_ReusesOffset()
+    public async Task Upload_OverwriteShorter_PublishesNewOffset()
     {
         string vol = await MountVol("overwrite-short");
         var fs = GetFileService();
 
         byte[] data1 = new byte[1000];
+        FileMetadata original;
         using (var ms = new MemoryStream(data1))
-            await fs.UploadAsync(vol, "file.bin", ms, data1.Length);
+            original = await fs.UploadAsync(vol, "file.bin", ms, data1.Length);
 
         byte[] data2 = new byte[500];
+        FileMetadata updated;
         using (var ms = new MemoryStream(data2))
-            await fs.UploadAsync(vol, "file.bin", ms, data2.Length);
+            updated = await fs.UploadAsync(vol, "file.bin", ms, data2.Length);
+
+        Assert.True(updated.Offset >= original.Offset + original.Length);
 
         var dl = await fs.DownloadAsync(vol, "file.bin");
         using var dlStream = dl.Stream;
@@ -85,21 +89,19 @@ public class FileServiceTests : IAsyncDisposable
     }
 
     [Fact]
-    public async Task Upload_EarlyEof_RecordsActualLength()
+    public async Task Upload_EarlyEof_RejectsIncompleteFile()
     {
         string vol = await MountVol("early-eof");
         var fs = GetFileService();
 
         byte[] data = new byte[300];
         using var ms = new MemoryStream(data);
-        var meta = await fs.UploadAsync(vol, "short.bin", ms, contentLength: 1000);
-
-        Assert.Equal(300, meta.Length);
+        await Assert.ThrowsAsync<FileServiceException>(() => fs.UploadAsync(vol, "short.bin", ms, contentLength: 1000));
+        Assert.Empty((await fs.ListAsync(vol)).Files);
     }
 
     /// <summary>
-    /// 既存ファイルより短い上書きで、残領域が旧データ残留ではなくゼロクリアされること。
-    /// カタログは短い長さを記録するが、volume.dat 上の残りバイトに旧内容が残らない。
+    /// 新しい内容の公開後に旧領域がゼロクリアされること。
     /// </summary>
     [Fact]
     public async Task Upload_OverwriteShorter_ClearsResidualData()

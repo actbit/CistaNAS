@@ -42,6 +42,7 @@ internal sealed class TempFileCacheProvider : IFileCacheProvider
         return File.OpenWrite(Path.Combine(_dir, fileName));
     }
     public string GetPath(string fileName) => Path.Combine(_dir, fileName);
+    public void Delete(string fileName) => File.Delete(GetPath(fileName));
     public void Clear()
     {
         if (Directory.Exists(_dir)) Directory.Delete(_dir, true);

@@ -184,11 +184,11 @@ public sealed class CistaNasApiClient
     /// このチャンクの暗号化時 keyEpoch（v1 では 0、旧サーバーではヘッダ欠如で 0）。
     /// v2 チャンクの nonce / AAD は (chunkIndex, revision, keyEpoch) を bind するため復号に必須。
     /// </summary>
-    public async Task<(byte[] Data, int Revision, int KeyEpoch)> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex)
+    public async Task<(byte[] Data, int Revision, int KeyEpoch)> DownloadChunkAsync(string volumeName, string fileId, int chunkIndex, CancellationToken ct = default)
     {
-        var res = await _http.GetAsync($"/api/v1/e2ee/{volumeName}/download-chunk/{fileId}/{chunkIndex}");
+        using var res = await _http.GetAsync($"/api/v1/e2ee/{volumeName}/download-chunk/{fileId}/{chunkIndex}", ct);
         res.EnsureSuccessStatusCode();
-        byte[] data = await res.Content.ReadAsByteArrayAsync();
+        byte[] data = await res.Content.ReadAsByteArrayAsync(ct);
         int revision = 0;
         if (res.Headers.TryGetValues("X-Chunk-Revision", out var vals))
         {

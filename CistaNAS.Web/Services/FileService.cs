@@ -109,112 +109,10 @@ public sealed class FileService
     }
 
     /// <summary>非チャンクモードのアップロード本体。</summary>
-    private async Task<FileMetadata> UploadInternalAsync(string volumeName, string fileName, Stream content, long contentLength, CancellationToken ct)
-    {
-        var (ioGuard, stream, _) = await _volumeService.GetMountedForIoAsync(volumeName, ct);
-        try
-        {
+    private Task<FileMetadata> UploadInternalAsync(string volumeName, string fileName, Stream content, long contentLength, CancellationToken ct)
+        => WriteLocalAsync(volumeName, fileName, 0, content, contentLength, patch: false, ct);
 
-        // ジャーナル: 書き込み前
-        string opId = await _journalService.RecordAsync(volumeName, new JournalEntry
-        {
-            Operation = JournalOp.WriteFile,
-            Path = fileName,
-            Length = checked((int)Math.Min(contentLength, int.MaxValue)),
-        }, ct);
-
-        // カタログ読み込み + ストリーム書き込み + カタログ保存をボリュームロックで保護
-        long offset;
-        long writtenBytes;
-        FileMetadata meta;
-        SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
-        await catLock.WaitAsync(ct);
-        try
-        {
-            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
-            var catalog = await LoadCatalogAsync(volumeName, ct);
-            catalog.Files.TryGetValue(fileName, out var existing);
-
-            SemaphoreSlim streamLock = _streamLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
-            await streamLock.WaitAsync(ct);
-            try
-            {
-                if (existing is not null && existing.Length >= contentLength)
-                {
-                    offset = existing.Offset;
-                }
-                else
-                {
-                    offset = stream.Length;
-                }
-
-                stream.Seek(offset, SeekOrigin.Begin);
-
-                // チャンク単位で読み取り→書き込み（メモリにファイル全体をバッファリングしない）
-                byte[] buffer = new byte[81920];
-                long remaining = contentLength;
-                writtenBytes = 0;
-                while (remaining > 0)
-                {
-                    int toRead = (int)Math.Min(buffer.Length, remaining);
-                    int read = await content.ReadAsync(buffer.AsMemory(0, toRead), ct);
-                    if (read == 0) break;
-                    await stream.WriteAsync(buffer.AsMemory(0, read), ct);
-                    writtenBytes += read;
-                    remaining -= read;
-                }
-
-                // 既存ファイル領域を再利用して短くなった場合、残領域を暗号化ゼロでクリア。
-                // カタログは writtenBytes で短縮記録されるが、volume.dat 上の残りバイトに
-                // 旧内容（暗号文）が残留するのを防ぐ。
-                if (existing is not null && existing.Length >= contentLength && existing.Length > writtenBytes)
-                {
-                    stream.Seek(offset + writtenBytes, SeekOrigin.Begin);
-                    Array.Clear(buffer, 0, buffer.Length);
-                    long zRemain = existing.Length - writtenBytes;
-                    while (zRemain > 0)
-                    {
-                        int n = (int)Math.Min(buffer.Length, zRemain);
-                        await stream.WriteAsync(buffer.AsMemory(0, n), ct);
-                        zRemain -= n;
-                    }
-                }
-
-                await stream.FlushAsync(ct);
-            }
-            finally
-            {
-                streamLock.Release();
-            }
-
-            meta = new FileMetadata
-            {
-                Name = fileName,
-                Offset = offset,
-                Length = writtenBytes,
-                CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
-                ModifiedAt = DateTimeOffset.UtcNow,
-            };
-            catalog.Files[fileName] = meta;
-            await SaveCatalogAsync(volumeName, catalog, ct);
-        }
-        finally
-        {
-            catLock.Release();
-        }
-
-        // ジャーナル: コミット
-        await _journalService.CommitAsync(volumeName, opId, ct);
-
-        return meta;
-        }
-        finally
-        {
-            ioGuard.Dispose();
-        }
-    }
-
-    /// <summary>ファイルの一部を書き込む（差分保存）。既存ファイルの offset に上書き、必要に応じて拡張。</summary>
+    /// <summary>ファイルの一部を書き込む（差分保存）。未変更の内容を保持し、必要に応じて拡張。</summary>
     public async Task<FileMetadata> PatchRangeAsync(string volumeName, string fileName, long offset, Stream content, long contentLength, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(fileName);
@@ -238,96 +136,143 @@ public sealed class FileService
         }
     }
 
-    /// <summary>非チャンクモードの部分書き込み本体。AesXtsStream のセクタ単位 RMW で安全に部分上書き。</summary>
-    private async Task<FileMetadata> PatchInternalAsync(string volumeName, string fileName, long offset, Stream content, long contentLength, CancellationToken ct)
+    /// <summary>非チャンクモードの部分書き込み本体。</summary>
+    private Task<FileMetadata> PatchInternalAsync(string volumeName, string fileName, long offset, Stream content, long contentLength, CancellationToken ct)
+        => WriteLocalAsync(volumeName, fileName, offset, content, contentLength, patch: true, ct);
+
+    /// <summary>
+    /// 新しい領域に完全な内容を構築し、フラッシュ後にカタログを切り替える。
+    /// 本文不足・キャンセル・保存失敗時にも既存領域は変更しない。
+    /// PATCH の拡張が隣接ファイルを上書きしたり、その内容を隙間として公開することも防ぐ。
+    /// </summary>
+    private async Task<FileMetadata> WriteLocalAsync(string volumeName, string fileName, long offset,
+        Stream content, long contentLength, bool patch, CancellationToken ct)
     {
         var (ioGuard, stream, _) = await _volumeService.GetMountedForIoAsync(volumeName, ct);
-        try
+        using (ioGuard)
         {
-        string opId = await _journalService.RecordAsync(volumeName, new JournalEntry
-        {
-            Operation = JournalOp.WriteFile,
-            Path = fileName,
-            Length = checked((int)Math.Min(contentLength, int.MaxValue)),
-        }, ct);
+            string opId = await _journalService.RecordAsync(volumeName, new JournalEntry
+            {
+                Operation = JournalOp.WriteFile,
+                Path = fileName,
+                Length = (int)Math.Min(contentLength, int.MaxValue),
+            }, ct);
 
-        FileMetadata meta;
-        SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
-        await catLock.WaitAsync(ct);
-        try
-        {
-            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
-            var catalog = await LoadCatalogAsync(volumeName, ct);
-            catalog.Files.TryGetValue(fileName, out var existing);
-
-            SemaphoreSlim streamLock = _streamLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
-            await streamLock.WaitAsync(ct);
+            var catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+            await catLock.WaitAsync(ct);
             try
             {
-                long baseOffset = existing?.Offset ?? stream.Length;
+                using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
+                var catalog = await LoadCatalogAsync(volumeName, ct);
+                catalog.Files.TryGetValue(fileName, out var existing);
+                if (patch && contentLength == 0 && existing is not null)
+                {
+                    await _journalService.CommitAsync(volumeName, opId, ct);
+                    return existing;
+                }
+
+                var streamLock = _streamLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+                await streamLock.WaitAsync(ct);
                 byte[] buffer = new byte[81920];
-
-                // 新規ファイルで offset > 0（sparse）: baseOffset..baseOffset+offset を暗号化ゼロで埋める。
-                // AesXtsStream は平文ゼロを暗号化ゼロとして書き込む。
-                if (existing is null && offset > 0)
+                long newOffset = stream.Length;
+                bool publicationStarted = false;
+                try
                 {
-                    stream.Seek(baseOffset, SeekOrigin.Begin);
-                    Array.Clear(buffer, 0, buffer.Length);
-                    long zRemain = offset;
-                    while (zRemain > 0)
+                    long oldLength = patch ? existing?.Length ?? 0 : 0;
+                    long newLength = contentLength == 0 ? 0 : Math.Max(oldLength, checked(offset + contentLength));
+
+                    // 同一ストリームなので読み取りと書き込みの位置を各回明示する。
+                    for (long copied = 0; copied < oldLength;)
                     {
-                        int n = (int)Math.Min(buffer.Length, zRemain);
-                        await stream.WriteAsync(buffer.AsMemory(0, n), ct);
-                        zRemain -= n;
+                        int count = (int)Math.Min(buffer.Length, oldLength - copied);
+                        stream.Position = existing!.Offset + copied;
+                        await stream.ReadExactlyAsync(buffer.AsMemory(0, count), ct);
+                        stream.Position = newOffset + copied;
+                        await stream.WriteAsync(buffer.AsMemory(0, count), ct);
+                        copied += count;
                     }
+                    if (contentLength > 0)
+                    {
+                        // sparse 拡張の穴には必ず平文ゼロを書き、旧データを露出させない。
+                        if (offset > oldLength)
+                            await ClearLocalRangeAsync(stream, newOffset + oldLength, offset - oldLength, buffer, ct);
+                        stream.Position = newOffset + offset;
+                        long remaining = contentLength;
+                        while (remaining > 0)
+                        {
+                            int count = (int)Math.Min(buffer.Length, remaining);
+                            int read = await content.ReadAsync(buffer.AsMemory(0, count), ct);
+                            if (read == 0)
+                                throw new FileServiceException("リクエスト本文がContent-Lengthより短いです。");
+                            await stream.WriteAsync(buffer.AsMemory(0, read), ct);
+                            remaining -= read;
+                        }
+                    }
+                    await stream.FlushAsync(ct);
+                    // カタログが永続化される前に、新しいデータもディスクへ確定させる。
+                    if (stream is FileStream file)
+                        file.Flush(flushToDisk: true);
+                    else if (stream is AesXtsStream xts)
+                        xts.Flush(flushToDisk: true);
+
+                    var meta = new FileMetadata
+                    {
+                        Name = fileName,
+                        Offset = newOffset,
+                        Length = newLength,
+                        CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
+                        ModifiedAt = DateTimeOffset.UtcNow,
+                    };
+                    catalog.Files[fileName] = meta;
+                    publicationStarted = true;
+                    await SaveCatalogAsync(volumeName, catalog, ct);
+
+                    // 新世代の公開後にだけ旧領域を消去する。切り替え前の消去はデータ欠損になる。
+                    if (existing is not null && existing.Length > 0)
+                    {
+                        try
+                        {
+                            await ClearLocalRangeAsync(stream, existing.Offset, existing.Length, buffer, CancellationToken.None);
+                            await stream.FlushAsync(CancellationToken.None);
+                        }
+                        catch (IOException) { /* 新世代は保存済み。旧領域の消去はベストエフォート。 */ }
+                    }
+                    await _journalService.CommitAsync(volumeName, opId, ct);
+                    return meta;
                 }
-
-                stream.Seek(baseOffset + offset, SeekOrigin.Begin);
-                long remaining = contentLength;
-                long written = 0;
-                while (remaining > 0)
+                catch
                 {
-                    int toRead = (int)Math.Min(buffer.Length, remaining);
-                    int read = await content.ReadAsync(buffer.AsMemory(0, toRead), ct);
-                    if (read == 0) break;
-                    await stream.WriteAsync(buffer.AsMemory(0, read), ct);
-                    written += read;
-                    remaining -= read;
+                    // 本文受信中の失敗で伸びた領域を回収する。
+                    // カタログ保存を開始した後は公開の成否が不明なため切り詰めない。
+                    if (!publicationStarted)
+                    {
+                        try { stream.SetLength(newOffset); stream.Flush(); }
+                        catch (IOException) { /* 元の失敗を保持する。旧領域は変更していない。 */ }
+                    }
+                    throw;
                 }
-                await stream.FlushAsync(ct);
-
-                long logicalEnd = baseOffset + offset + written;
-                long newLength = existing is not null
-                    ? Math.Max(existing.Length, logicalEnd - baseOffset)
-                    : (logicalEnd - baseOffset);
-
-                meta = new FileMetadata
+                finally
                 {
-                    Name = fileName,
-                    Offset = baseOffset,
-                    Length = newLength,
-                    CreatedAt = existing?.CreatedAt ?? DateTimeOffset.UtcNow,
-                    ModifiedAt = DateTimeOffset.UtcNow,
-                };
-                catalog.Files[fileName] = meta;
-                await SaveCatalogAsync(volumeName, catalog, ct);
+                    CryptographicOperations.ZeroMemory(buffer);
+                    streamLock.Release();
+                }
             }
             finally
             {
-                streamLock.Release();
+                catLock.Release();
             }
         }
-        finally
-        {
-            catLock.Release();
-        }
+    }
 
-        await _journalService.CommitAsync(volumeName, opId, ct);
-        return meta;
-        }
-        finally
+    private static async Task ClearLocalRangeAsync(Stream stream, long offset, long length, byte[] buffer, CancellationToken ct)
+    {
+        Array.Clear(buffer);
+        stream.Position = offset;
+        while (length > 0)
         {
-            ioGuard.Dispose();
+            int count = (int)Math.Min(buffer.Length, length);
+            await stream.WriteAsync(buffer.AsMemory(0, count), ct);
+            length -= count;
         }
     }
 
@@ -448,14 +393,14 @@ public sealed class FileService
 
                         // 新しいオブジェクトへ全チャンクをコピーしてからカタログを切り替える。
                         // 範囲外チャンクは暗号文のままコピーできる。
-                        if (!inWriteRange && oldStored is not null)
+                        int curPlainSize = (int)Math.Min(chunkSize, newLength - (long)ci * chunkSize);
+                        if (!inWriteRange && oldStored is not null && chunkSizes[ci] == curPlainSize)
                         {
                             using var copyStream = new MemoryStream(oldStored, writable: false);
                             await _chunkStore.WriteChunkAsync(volumeName, newObjectId, ci, copyStream, ct);
                             continue;
                         }
 
-                        int curPlainSize = (int)Math.Min(chunkSize, newLength - (long)ci * chunkSize);
                         if (curPlainSize <= 0) break;
 
                         byte[] plain = new byte[curPlainSize];
@@ -597,8 +542,11 @@ public sealed class FileService
                 while (remaining > 0)
                 {
                     int toRead = (int)Math.Min(buffer.Length, remaining);
-                    int read = await content.ReadAsync(buffer.AsMemory(0, toRead), ct);
-                    if (read == 0) break;
+                    // Stream.ReadAsync は EOF 以外でも短く返る。チャンク境界まで集める。
+                    int read = await content.ReadAtLeastAsync(buffer.AsMemory(0, toRead), toRead,
+                        throwOnEndOfStream: false, ct);
+                    if (read != toRead)
+                        throw new FileServiceException("リクエスト本文がContent-Lengthより短いです。");
 
                     byte[] chunkData = buffer[..read].ToArray();
 
@@ -629,7 +577,7 @@ public sealed class FileService
             {
                 Name = fileName,
                 Offset = 0, // チャンクモードでは使用しない
-                Length = contentLength - remaining, // 実際に読み取ったバイト数
+                Length = contentLength,
                 ChunkCount = chunkSizes.Count,
                 ChunkSizes = chunkSizes,
                 ChunkObjectId = objectId,
@@ -776,9 +724,9 @@ public sealed class FileService
             await _journalService.CommitAsync(volumeName, opId, ct);
         }
 
-        // 削除完了後にファイルゲートをクリーンアップ
-        if (_fileGates.TryRemove((volumeName, fileName), out var removed))
-            removed.Dispose();
+        // 削除後も、待機中のリクエストや同名ファイルの再作成がこのゲートを使う。
+        // ここで破棄すると SemaphoreSlim の待機者が永続的に停止したり、
+        // 再作成側と古いリクエストが別ゲートで動作する。回収はボリューム削除時に行う。
     }
 
     /// <summary>クラッシュ復旧：未コミットジャーナルからカタログを修復し、ジャーナルをクリアする。</summary>
@@ -807,25 +755,20 @@ public sealed class FileService
             // チャンクモード: WriteFile 未完了のファイルでチャンク欠落がある場合はカタログから削除
             if (_volumeService.IsChunkMode(volumeName))
             {
-            var brokenFiles = new List<string>();
-            foreach (var (fileName, meta) in catalog.Files)
-            {
-                if (!meta.IsChunked) continue;
-                try
+                var brokenFiles = new List<string>();
+                foreach (var (fileName, meta) in catalog.Files)
                 {
+                    if (!meta.IsChunked) continue;
+                    // 通信障害・キャンセルは欠損の証拠にならない。
+                    // 一覧取得に失敗したらカタログ・ジャーナルを保持したまま復旧を中断する。
                     var indices = await _chunkStore.ListChunksAsync(
                         volumeName, meta.ChunkObjectId ?? fileName, ct);
-                    if (indices.Count < meta.ChunkCount)
+                    var present = indices.ToHashSet();
+                    if (!Enumerable.Range(0, meta.ChunkCount).All(present.Contains))
                         brokenFiles.Add(fileName);
                 }
-                catch (Exception)
-                {
-                    // チャンク一覧の取得自体が失敗 → ファイルを broken 扱い
-                    brokenFiles.Add(fileName);
-                }
-            }
-            foreach (var broken in brokenFiles)
-                catalog.Files.Remove(broken);
+                foreach (var broken in brokenFiles)
+                    catalog.Files.Remove(broken);
             }
 
             await SaveCatalogAsync(volumeName, catalog, ct);

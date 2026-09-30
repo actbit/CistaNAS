@@ -298,7 +298,7 @@ public class DokanFileSystemTests
         // SetFileKey は上書き可能（他クライアントの上書きで salt が変わった場合に再導出が必要）
         // いずれかのキーが保持されていることを確認
         Assert.True(cache.TryGetFileKey(out var retrievedKey, out _));
-        Assert.True(retrievedKey == key1 || retrievedKey == key2,
+        Assert.True(retrievedKey!.SequenceEqual(key1) || retrievedKey.SequenceEqual(key2),
             $"キーは key1 または key2 のいずれかである必要があります。実際: {BitConverter.ToString(retrievedKey)}");
     }
 
@@ -321,6 +321,41 @@ public class DokanFileSystemTests
         // SetFileKey 前は false、後は true が混在しているはず
         Assert.Contains(true, results);
         Assert.Contains(false, results);
+    }
+
+    [Fact]
+    public void FileCache_ReplacingKeyPreservesActiveReaderAndCallerBuffers()
+    {
+        var cache = new CistaNasFileSystem.FileCache();
+        byte[] first = Enumerable.Repeat((byte)1, 32).ToArray();
+        byte[] salt = Enumerable.Repeat((byte)2, 16).ToArray();
+        cache.SetFileKey(first, salt);
+        Assert.True(cache.TryGetFileKey(out var readerKey, out var readerSalt));
+        cache.SetFileKey(Enumerable.Repeat((byte)3, 32).ToArray(), new byte[16]);
+        cache.Dispose();
+        Assert.All(first, b => Assert.Equal(1, b));
+        Assert.All(readerKey!, b => Assert.Equal(1, b));
+        Assert.All(readerSalt!, b => Assert.Equal(2, b));
+        Array.Clear(readerKey!);
+        Array.Clear(readerSalt!);
+    }
+
+    [Fact]
+    public void FileCache_UpdatingSaltWithCachedKeyPreservesKey()
+    {
+        var cache = new CistaNasFileSystem.FileCache();
+        byte[] expected = Enumerable.Repeat((byte)7, 32).ToArray();
+        cache.SetFileKey((byte[])expected.Clone(), new byte[16]);
+        Assert.True(cache.TryGetFileKey(out var key, out var salt));
+        cache.SetFileKey(key!, Enumerable.Repeat((byte)8, 16).ToArray());
+        Assert.True(cache.TryGetFileKey(out var updated, out var updatedSalt));
+        Assert.Equal(expected, updated);
+        Assert.All(updatedSalt!, b => Assert.Equal(8, b));
+        cache.Dispose();
+        Array.Clear(key!);
+        Array.Clear(salt!);
+        Array.Clear(updated!);
+        Array.Clear(updatedSalt!);
     }
 
     [Fact]
