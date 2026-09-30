@@ -10,12 +10,19 @@ public sealed class ApiSession : IDisposable
 {
     private readonly AuthHeaderHandler _authHandler;
     private readonly HttpClient _http;
-    private string? _token;
-    private Uri? _serverAddress;
+    // The destination and its credential must be observed as one state. Separate
+    // reads could send a new server's token to the old destination during a switch.
+    private sealed record AuthorizationState(Uri? Server, string? Token, long Version);
+    private AuthorizationState _authorization = new(null, null, 0);
 
     public ApiSession(HttpMessageHandler? httpHandler = null)
     {
-        _authHandler = new AuthHeaderHandler(() => _token, () => _serverAddress);
+        _authHandler = new AuthHeaderHandler(() => Volatile.Read(ref _authorization).Token,
+            () => Volatile.Read(ref _authorization).Server, () =>
+            {
+                var state = Volatile.Read(ref _authorization);
+                return (state.Server, state.Token, state.Version);
+            });
         // リダイレクト先へログイン情報やアップロード本文を転送しない。
         _authHandler.InnerHandler = httpHandler ?? new HttpClientHandler { AllowAutoRedirect = false };
         // 接続失敗後もサーバーを変更できるよう、送信時に接続先を解決する。
@@ -30,7 +37,7 @@ public sealed class ApiSession : IDisposable
     public CistaNasApiClient Api { get; }
 
     /// <summary>接続先サーバー URL (末尾スラッシュなし)。未接続時は null。</summary>
-    public Uri? BaseAddress => _serverAddress;
+    public Uri? BaseAddress => Volatile.Read(ref _authorization).Server;
 
     /// <summary>サーバー URL を設定する (例: "http://192.168.1.10:5000")。</summary>
     public void ConfigureServer(string serverUrl)
@@ -38,24 +45,31 @@ public sealed class ApiSession : IDisposable
         if (!Uri.TryCreate(serverUrl.TrimEnd('/'), UriKind.Absolute, out var uri)
             || (uri.Scheme != "http" && uri.Scheme != "https"))
             throw new ArgumentException("サーバー URL が不正です。", nameof(serverUrl));
-        if (_serverAddress != uri) ClearToken();
-        _serverAddress = uri;
+        UpdateAuthorization(state => state.Server == uri ? state : new(uri, null, state.Version + 1));
     }
 
-    public bool IsConfigured => _serverAddress is not null;
+    public bool IsConfigured => BaseAddress is not null;
 
     /// <summary>アクセストークン (JWT) を設定する。トークンはメモリのみに保持する。</summary>
     public void SetToken(string token)
     {
-        _token = token;
-        Api.SetToken(token);
+        UpdateAuthorization(state => state with { Token = token, Version = state.Version + 1 });
     }
 
     /// <summary>トークンを破棄する (ログアウト / 401 時)。</summary>
     public void ClearToken()
     {
-        _token = null;
-        Api.ClearToken();
+        UpdateAuthorization(state => state with { Token = null, Version = state.Version + 1 });
+    }
+
+    private void UpdateAuthorization(Func<AuthorizationState, AuthorizationState> update)
+    {
+        AuthorizationState previous, next;
+        do
+        {
+            previous = Volatile.Read(ref _authorization);
+            next = update(previous);
+        } while (!ReferenceEquals(Interlocked.CompareExchange(ref _authorization, next, previous), previous));
     }
 
     public event Action Unauthorized

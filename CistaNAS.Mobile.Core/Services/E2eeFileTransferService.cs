@@ -166,6 +166,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
                     await api.UploadChunkAsync(volumeName, fileId, i, enc, lease);
                     progress?.Report((double)(i + 1) / chunkCount * 100);
                 }
+                ct.ThrowIfCancellationRequested();
                 await api.FinalizeFileAsync(volumeName, fileId, encryptedLength, lease, chunkCount);
                 return (fileId, chunkCount);
             }
@@ -230,6 +231,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
                     await api.UploadChunkAsync(volumeName, fileId, i, enc, lease);
                     progress?.Report((double)(i + 1) / chunkCount * 100);
                 }
+                ct.ThrowIfCancellationRequested();
                 await api.FinalizeFileAsync(volumeName, fileId, encryptedLength, lease, chunkCount);
                 return (fileId, chunkCount);
             }

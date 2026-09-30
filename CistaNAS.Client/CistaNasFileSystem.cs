@@ -251,12 +251,17 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         private readonly List<(long Offset, byte[] Data)> _ranges = new();
         private long _maxWritten;
         private readonly long _existingLength;
+        private long _preservedLength;
+        private long _truncateVersion, _uploadTruncateVersion;
+        private long _trimDuringUpload = long.MaxValue;
+        private bool _uploadInProgress;
 
         public PlainRangeWriteState(CistaNasFileSystem fs, string plainName, string? existingFileId, long existingLength = 0)
             : base(fs, plainName, existingFileId)
         {
             _existingLength = existingLength;
             PersistedLength = existingLength;
+            _preservedLength = existingLength;
         }
 
         public IReadOnlyList<(long Offset, byte[] Data)> Ranges => _ranges;
@@ -266,6 +271,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
         /// <summary>直近の persist で確認済みのサーバー上のファイル長（Gate 保護で更新）。</summary>
         internal long PersistedLength { get; set; }
+        internal long PreservedLength => _preservedLength;
 
         public override long CurrentSize
         {
@@ -275,7 +281,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 // _maxWritten は SetDeclaredSize でクランプ済みのため、ここでの Max が
                 // 「切り詰め後の追記（write past EOF）」由来だけになる。
                 if (DeclaredSize >= 0) return Math.Max(DeclaredSize, _maxWritten);
-                return Math.Max(_maxWritten, _existingLength);
+                return Math.Max(_maxWritten, PersistedLength);
             }
         }
 
@@ -292,6 +298,13 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
         public override void SetDeclaredSize(long size)
         {
+            if (size >= 0 && size < CurrentSize)
+            {
+                _preservedLength = Math.Min(_preservedLength, size);
+                _truncateVersion++;
+                if (_uploadInProgress) _trimDuringUpload = Math.Min(_trimDuringUpload, size);
+                TrimRanges(_ranges, size);
+            }
             DeclaredSize = size;
             MarkPending();
             // grow / shrink 両方を反映する。shrink を無視すると、同一ハンドル内の
@@ -317,6 +330,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         /// </summary>
         internal List<(long Offset, byte[] Data)> TakeRangesForUpload()
         {
+            _uploadInProgress = true;
+            _uploadTruncateVersion = _truncateVersion;
+            _trimDuringUpload = long.MaxValue;
             var taken = new List<(long, byte[])>(_ranges);
             _ranges.Clear();
             TakePending();
@@ -324,17 +340,44 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         }
 
         /// <summary>Gate 保持中に呼ぶ。アップロード済みレンジの平文を解放する（ゼロクリア）。</summary>
-        internal void CompleteRangeUpload(List<(long Offset, byte[] Data)> taken)
+        internal void CompleteRangeUpload(List<(long Offset, byte[] Data)> taken, long persistedLength)
         {
             foreach (var (_, data) in taken)
                 CryptographicOperations.ZeroMemory(data);
+            _uploadInProgress = false;
+            _preservedLength = _uploadTruncateVersion == _truncateVersion
+                ? persistedLength : Math.Min(_preservedLength, persistedLength);
+            PersistedLength = persistedLength;
+            ExistingFileId = PlainName;
+            TruncatedAtOpen = false;
         }
 
         /// <summary>Gate 保持中に呼ぶ。アップロード失敗: レンジを未永続化としてバッファへ戻す。</summary>
         internal void RollbackRangeUpload(List<(long Offset, byte[] Data)> taken)
         {
+            TrimRanges(taken, _trimDuringUpload);
+            _uploadInProgress = false;
             _ranges.InsertRange(0, taken);
             RestorePending();
+        }
+
+        private static void TrimRanges(List<(long Offset, byte[] Data)> ranges, long length)
+        {
+            for (int i = ranges.Count - 1; i >= 0; i--)
+            {
+                var (offset, data) = ranges[i];
+                if (offset >= length)
+                {
+                    CryptographicOperations.ZeroMemory(data);
+                    ranges.RemoveAt(i);
+                }
+                else if (data.Length > length - offset)
+                {
+                    byte[] kept = data.AsSpan(0, checked((int)(length - offset))).ToArray();
+                    CryptographicOperations.ZeroMemory(data);
+                    ranges[i] = (offset, kept);
+                }
+            }
         }
 
         private void ZeroAndClearRanges()
@@ -354,6 +397,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         private byte[]? _existingFileKey;
         private int _existingChunkCount;
         private long _existingPlainLength;
+        private long _preservedLength;
+        private long _truncateVersion, _uploadTruncateVersion;
         // crypto format v2: 既存チャンク復号に使う鍵 epoch（0 = v1）と volumeId（AAD bind 用）
         private int _existingFileKeyEpoch;
         private string? _existingVolumeId;
@@ -373,6 +418,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
                     _existingChunkCount = cache.ChunkCount;
                     _existingPlainLength = cache.PlainLength;
+                    _preservedLength = cache.PlainLength;
                     _existingFileKeyEpoch = cache.KeyEpoch;
                     _existingVolumeId = fs.VolumeIdString;
                     if (cache.TryGetFileKey(out var key, out var salt))
@@ -445,6 +491,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         public byte[]? ExistingFileKey => _existingFileKey;
         public int ExistingChunkCount => _existingChunkCount;
         public long ExistingPlainLength => _existingPlainLength;
+        internal long PreservedLength => _preservedLength;
         /// <summary>crypto format v2: 既存チャンク復号に使う鍵 epoch（0 = v1）。RMW 用。</summary>
         public int ExistingFileKeyEpoch => _existingFileKeyEpoch;
         /// <summary>crypto format v2: volumeId（チャンク AAD bind 用）。v1 では null。</summary>
@@ -462,6 +509,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         {
             _existingChunkCount = 0;
             _existingPlainLength = 0;
+            _preservedLength = 0;
             SetDeclaredSize(0);
         }
 
@@ -552,6 +600,20 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
         public override void SetDeclaredSize(long size)
         {
+            if (size >= 0 && size < CurrentSize)
+            {
+                _preservedLength = Math.Min(_preservedLength, size);
+                _truncateVersion++;
+                foreach (var (ci, chunk) in _dirtyChunks.ToArray())
+                {
+                    int kept = (int)Math.Min(chunk.Length, Math.Max(0, size - (long)ci * Fs._chunkSize));
+                    if (kept == chunk.Length) continue;
+                    _touchedDuringUpload.Add(ci);
+                    if (kept == 0) _dirtyChunks.Remove(ci);
+                    else _dirtyChunks[ci] = chunk.AsSpan(0, kept).ToArray();
+                    CryptographicOperations.ZeroMemory(chunk);
+                }
+            }
             DeclaredSize = size;
             MarkPending();
             // grow / shrink 両方を反映する（PlainRangeWriteState と同じ規約）。
@@ -591,6 +653,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             ZeroAndClearDirtyChunks();
             _existingChunkCount = persistedChunkCount;
             _existingPlainLength = persistedPlainLength;
+            _preservedLength = persistedPlainLength;
         }
 
         /// <summary>アップロード中に書き換えられたチャンクインデックス（Gate 保護）。
@@ -601,13 +664,13 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         /// Gate 保持中に呼ぶ。ダーティチャンクをアップロードへ引き抜く。
         /// dict の各エントリを同一内容のクローンと置き換えることで、ゲート解放後のアップロード中に
         /// WriteFile がバッファへ追記しても、暗号化対象のオリジナルバッファが破壊されない。
-        /// 切り詰めで不要になったチャンク（index ≥ <paramref name="chunkCount"/>）もクローン対象に
-        /// 含める — ここで破棄するとスナップショット外になり、アップロード失敗時に
-        /// ロールバックできず書き込みデータが失われる。アップロード側は
-        /// index ≥ chunkCount をスキップし、確定時に破棄する。
+        /// 長さ確定時に不要となるチャンク（index ≥ <paramref name="chunkCount"/>）も
+        /// スナップショットに含め、確定時に解放する。切り詰め済みのバイトは
+        /// SetDeclaredSize で破棄しており、保存失敗時にも復活させない。
         /// </summary>
         internal List<(int ChunkIndex, byte[] Original)> TakeDirtyChunksForUpload(int chunkCount)
         {
+            _uploadTruncateVersion = _truncateVersion;
             var result = new List<(int, byte[])>();
             _touchedDuringUpload.Clear();
             foreach (int ci in _dirtyChunks.Keys.OrderBy(ci => ci))
@@ -640,6 +703,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             _touchedDuringUpload.Clear();
             _existingChunkCount = chunkCount;
             _existingPlainLength = plainLength;
+            _preservedLength = _uploadTruncateVersion == _truncateVersion
+                ? plainLength : Math.Min(_preservedLength, plainLength);
         }
 
         /// <summary>
@@ -666,7 +731,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
             int chunkSize = Fs._chunkSize;
             // 既存チャンク: DL + 復号（末尾保持のため RMW）
-            if (ExistingFileId is not null && ci < _existingChunkCount
+            if (ExistingFileId is not null && ci < _existingChunkCount && (long)ci * chunkSize < _preservedLength
                 && _existingFileKey is not null && _existingFileSalt is not null)
             {
                 byte[] chunk = Fs.LoadPlainChunkForWrite(ExistingFileId, ci, _existingFileKey, _existingFileSalt,
@@ -675,9 +740,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 // バッファへ取り込まない。取り込むと切り詰め後の拡張書き込み（RMW）で
                 // 切り詰め点〜書き込み位置の隙間に旧内容が復活する
                 // （truncate-then-extend のセマンティクスでは隙間はゼロ）。
-                if (DeclaredSize >= 0)
+                if (_preservedLength < _existingPlainLength)
                 {
-                    long preserved = Math.Max(0, DeclaredSize - (long)ci * chunkSize);
+                    long preserved = Math.Max(0, _preservedLength - (long)ci * chunkSize);
                     if (preserved < chunk.Length)
                         Array.Clear(chunk, (int)preserved, chunk.Length - (int)preserved);
                 }
@@ -716,7 +781,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 {
                     _dirtyChunks[ci] = new byte[desiredLength];
                 }
-                else if (oldLength != desiredLength)
+                else if (oldLength != desiredLength || _preservedLength < (long)ci * Fs._chunkSize + desiredLength)
                 {
                     byte[] existing = GetOrLoadChunk(ci);
                     _dirtyChunks[ci] = ResizeChunk(existing, desiredLength);
@@ -1038,7 +1103,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             //（round 6: SetEndOfFile が宣言を上書きし旧内容が [0,N) に復活する缺陷）。
             if (plain.ExistingFileId is not null && !plain.TruncatedAtOpen)
             {
-                long availForDownload = ws.CurrentSize - offset;
+                long availForDownload = Math.Min(ws.CurrentSize, plain.PreservedLength) - offset;
                 int downloadLen = availForDownload <= 0 ? 0
                     : (int)Math.Min((long)buffer.Length, availForDownload);
                 if (downloadLen > 0)
@@ -1110,16 +1175,16 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 {
                     chunk = dirty;
                 }
-                else if (e2ee.ExistingFileId is not null && ci < e2ee.ExistingChunkCount
+                else if (e2ee.ExistingFileId is not null && ci < e2ee.ExistingChunkCount && chunkStart < e2ee.PreservedLength
                          && e2ee.ExistingFileKey is not null && e2ee.ExistingFileSalt is not null)
                 {
                     chunk = LoadPlainChunkForWrite(e2ee.ExistingFileId, ci, e2ee.ExistingFileKey,
                         e2ee.ExistingFileSalt, e2ee.ExistingFileKeyEpoch, e2ee.ExistingVolumeId);
                     // GetOrLoadChunk（RMW 書き込み側）と同じ規約: 切り詰め宣言中は
                     // 宣言サイズ以降の旧サーバー内容をバッファへ取り込まない（round 5 H4）。
-                    if (e2ee.DeclaredSize >= 0)
+                    if (e2ee.PreservedLength < e2ee.ExistingPlainLength)
                     {
-                        long preserved = Math.Max(0, e2ee.DeclaredSize - chunkStart);
+                        long preserved = Math.Max(0, e2ee.PreservedLength - chunkStart);
                         if (preserved < chunk.Length)
                             Array.Clear(chunk, (int)preserved, chunk.Length - (int)preserved);
                     }
@@ -1822,11 +1887,13 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         List<(long Offset, byte[] Data)> taken;
         long serverLength;
         long snapshotSize;
+        long preservedLength;
         ws.Gate.Wait();
         try
         {
             serverLength = ws.PersistedLength;
             snapshotSize = ws.CurrentSize;
+            preservedLength = ws.PreservedLength;
             taken = ws.TakeRangesForUpload();
         }
         finally
@@ -1839,7 +1906,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             // CREATE_ALWAYS / TRUNCATE_EXISTING で開いたハンドル: 旧サーバー内容はすべて無効。
             // 現在の論理長（snapshotSize）をゼロ + ダーティレンジで全体 PUT する。PATCH を使うと
             // 書き込み位置以前の旧内容（切り詰め済みのはず）が残り、SetEndOfFile で拡張した場合も
-            // 旧内容が復活するため、このハンドルは常に全体 PUT で確定する（round 6 H1）。
+            // 旧内容が復活するため、最初の保存は全体 PUT で確定する（round 6 H1）。
             if (ws.TruncatedAtOpen)
             {
                 using var fullBuffer = new SecureBuffer(new byte[Math.Max(0, snapshotSize)]);
@@ -1854,8 +1921,10 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 return;
             }
 
-            // 新規ファイルで offset=0 から始まらない（sparse）または空の場合は全体アップロードで確実に作成。
-            if (isNew && (taken.Count == 0 || taken[0].Offset != 0))
+            long writtenEnd = taken.Count == 0 ? 0 : taken.Max(range => range.Offset + range.Data.Length);
+            // New sparse/empty files and declared trailing zeros need a complete
+            // upload. Ordinary writes retain PATCH to avoid a file-sized copy.
+            if (isNew && (taken.Count == 0 || taken[0].Offset != 0 || snapshotSize > writtenEnd))
             {
                 using var fullBuffer = new SecureBuffer(new byte[Math.Max(0, snapshotSize)]);
                 byte[] full = fullBuffer.Buffer;
@@ -1869,15 +1938,16 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 return;
             }
 
-            if (taken.Count == 0 && snapshotSize == serverLength)
+            if (taken.Count == 0 && snapshotSize == serverLength && preservedLength >= serverLength)
             {
                 // 既存ファイルで書き込みなし・長さ変更なし → 何もしない。
                 // 回帰: 「>= serverLength」で早期 return すると純粋な SetEndOfFile 拡張が
                 // 消費済み pending ごと捨てられ、拡張が永続化されなかった。
+                CommitPlainLength(ws, serverLength, taken);
                 return;
             }
 
-            if (snapshotSize < serverLength || (taken.Count == 0 && snapshotSize > serverLength))
+            if (preservedLength < serverLength || snapshotSize < serverLength || snapshotSize > Math.Max(serverLength, writtenEnd))
             {
                 // 切り詰め、または書き込みなしの純粋な拡張: PATCH では長さを変更できないため、
                 // サーバー内容 + ダーティ + 指定長で全体 PUT する。
@@ -1891,9 +1961,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                     // 回帰: サーバー内容の取得に失敗して全ゼロで PUT すると既存内容を破壊するため、
                     // 例外は握りつぶさず persist 全体を失敗させロールバックする。
                     // 切り詰め宣言（DeclaredSize）以降・サーバー長以降はゼロで埋める。
-                    long preserve = full.Length;
-                    if (ws.DeclaredSize >= 0)
-                        preserve = Math.Min(preserve, Math.Max(0, ws.DeclaredSize));
+                    long preserve = Math.Min(full.Length, preservedLength);
                     preserve = Math.Min(preserve, serverLength);
                     if (preserve > 0)
                     {
@@ -1938,8 +2006,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
         ws.Gate.Wait();
         try
         {
-            ws.CompleteRangeUpload(taken);
-            ws.PersistedLength = persistedLength;
+            ws.CompleteRangeUpload(taken, persistedLength);
         }
         finally
         {

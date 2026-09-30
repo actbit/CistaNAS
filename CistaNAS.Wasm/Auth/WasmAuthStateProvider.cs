@@ -14,6 +14,7 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
     private ClaimsPrincipal? _user;
     private string? _token;
     private DateTimeOffset? _expiresAt;
+    private long _authenticationVersion;
 
     public event Action? StateChanged;
 
@@ -24,6 +25,10 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
 
     /// <summary>現在の JWT トークン。</summary>
     public string? Token => _token;
+
+    // A repeated login can receive the same JWT within a second. Its responses
+    // still belong to a different authentication session.
+    public long AuthenticationVersion => _authenticationVersion;
 
     /// <summary>ログイン済みか。</summary>
     public bool IsLoggedIn =>
@@ -45,6 +50,7 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
     /// <summary>ログイン成功時に呼ぶ。JWT を解析して ClaimsPrincipal を構築。</summary>
     public async Task SetTokenAsync(string token, DateTimeOffset expiresAt)
     {
+        _authenticationVersion++;
         _token = token;
         _expiresAt = expiresAt;
 
@@ -66,6 +72,7 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
     /// <summary>ログアウト。</summary>
     public async Task LogoutAsync()
     {
+        _authenticationVersion++;
         _user = null;
         _token = null;
         _expiresAt = null;
@@ -98,6 +105,7 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
                 return;
             }
 
+            _authenticationVersion++;
             _token = token;
             _expiresAt = expires;
             _user = ParseJwtClaims(token);

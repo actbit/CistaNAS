@@ -1,4 +1,5 @@
 using CistaNAS.Shared.Crypto;
+using System.Security.Cryptography;
 using CistaNAS.Wasm.Models;
 using Microsoft.JSInterop;
 
@@ -43,24 +44,20 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
                 ct.ThrowIfCancellationRequested();
                 int readLen = (int)Math.Min(chunkSize, bytesRemaining);
                 byte[] buffer = new byte[readLen];
-                int read = 0;
-                while (read < readLen)
+                try
                 {
-                    int n = await content.ReadAsync(buffer, read, readLen - read, ct);
-                    if (n == 0) break;
-                    read += n;
+                    await content.ReadExactlyAsync(buffer, ct);
+                    string encB64 = await e2ee.EncryptChunk(buffer, masterKeyHandle, i, fileSaltB64, isFirstChunk: i == 0);
+                    byte[] encBytes = Convert.FromBase64String(encB64);
+                    await api.UploadChunkAsync(volumeName, entry.FileId, i, encBytes, writeLease);
                 }
-                if (read < buffer.Length) buffer = buffer[..read];
-
-                string encB64 = await e2ee.EncryptChunk(buffer, masterKeyHandle, i, fileSaltB64, isFirstChunk: i == 0);
-                byte[] encBytes = Convert.FromBase64String(encB64);
-
-                await api.UploadChunkAsync(volumeName, entry.FileId, i, encBytes, writeLease);
-                bytesRemaining -= read;
+                finally { CryptographicOperations.ZeroMemory(buffer); }
+                bytesRemaining -= readLen;
                 progress?.Report((double)(i + 1) / totalChunks * 100);
             }
 
             // chunkCount も確定させる（Mobile.Core と同じプロトコル。縮小確定に必要）。
+            ct.ThrowIfCancellationRequested();
             await api.FinalizeFileAsync(volumeName, entry.FileId,
                 E2eeCrypto.ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease, totalChunks);
         }
@@ -163,26 +160,22 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
                 ct.ThrowIfCancellationRequested();
                 int readLen = (int)Math.Min(chunkSize, bytesRemaining);
                 byte[] buffer = new byte[readLen];
-                int read = 0;
-                while (read < readLen)
+                try
                 {
-                    int n = await content.ReadAsync(buffer, read, readLen - read, ct);
-                    if (n == 0) break;
-                    read += n;
+                    await content.ReadExactlyAsync(buffer, ct);
+                    string encB64 = await e2ee.EncryptChunkV2(buffer, fileKeyB64, i,
+                        revision: 0, keyContext.KeyEpoch, keyContext.VolumeId, entry.FileId,
+                        fileSaltB64, isFirstChunk: i == 0);
+                    byte[] encBytes = Convert.FromBase64String(encB64);
+                    await api.UploadChunkAsync(volumeName, entry.FileId, i, encBytes, writeLease);
                 }
-                if (read < buffer.Length) buffer = buffer[..read];
-
-                string encB64 = await e2ee.EncryptChunkV2(buffer, fileKeyB64, i,
-                    revision: 0, keyContext.KeyEpoch, keyContext.VolumeId, entry.FileId,
-                    fileSaltB64, isFirstChunk: i == 0);
-                byte[] encBytes = Convert.FromBase64String(encB64);
-
-                await api.UploadChunkAsync(volumeName, entry.FileId, i, encBytes, writeLease);
-                bytesRemaining -= read;
+                finally { CryptographicOperations.ZeroMemory(buffer); }
+                bytesRemaining -= readLen;
                 progress?.Report((double)(i + 1) / totalChunks * 100);
             }
 
             // chunkCount も確定させる（Mobile.Core と同じプロトコル。縮小確定に必要）。
+            ct.ThrowIfCancellationRequested();
             await api.FinalizeFileAsync(volumeName, entry.FileId,
                 E2eeCrypto.ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease, totalChunks);
             return entry;

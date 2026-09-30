@@ -15,6 +15,24 @@ namespace CistaNAS.Tests;
 /// </summary>
 public class E2eeTransferServiceTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CancellationAfterLastChunk_DoesNotFinalizeUpload(bool v2)
+    {
+        var (service, server) = CreateService(1024, v2);
+        using var stop = new CancellationTokenSource();
+        using var input = new MemoryStream(new byte[3]);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => service.UploadAsync(Volume, "file.bin", input, 3,
+            new CancelProgress(stop), stop.Token));
+        Assert.Equal(0, server.FinalizedCount);
+        Assert.Equal(1, server.DeletedCount);
+        Assert.Equal(1, server.ReleasedCount);
+    }
+
+    private sealed class CancelProgress(CancellationTokenSource stop) : IProgress<double>
+    { public void Report(double value) { if (value == 100) stop.Cancel(); } }
+
     private const string Volume = "vol";
     private static readonly byte[] MasterKey = E2eeCrypto.GenerateMasterKey();
 

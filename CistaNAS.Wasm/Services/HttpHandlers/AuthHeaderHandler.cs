@@ -25,19 +25,21 @@ public sealed class AuthHeaderHandler : DelegatingHandler
     protected override async Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        if (_auth.IsLoggedIn && !string.IsNullOrEmpty(_auth.Token))
-        {
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _auth.Token);
-        }
+        string? sentToken = _auth.IsLoggedIn ? _auth.Token : null;
+        long sentVersion = _auth.AuthenticationVersion;
+        request.Headers.Authorization = string.IsNullOrEmpty(sentToken) ? null
+            : new AuthenticationHeaderValue("Bearer", sentToken);
 
         var response = await base.SendAsync(request, cancellationToken);
 
         // 認証済みユーザーへの 401 = JWT 期限切れ等 → ログアウトしてログイン画面へ。
         // 未認証時の 401（auth/setup, auth/login, auth/has-users 等の初回フロー）は無視する。
-        if (response.StatusCode == HttpStatusCode.Unauthorized && _auth.IsLoggedIn)
+        if (response.StatusCode == HttpStatusCode.Unauthorized && _auth.IsLoggedIn &&
+            !string.IsNullOrEmpty(sentToken) && sentToken == _auth.Token &&
+            sentVersion == _auth.AuthenticationVersion)
         {
             await _auth.LogoutAsync();
-            _nav.NavigateTo("/login", forceLoad: true);
+            if (!_auth.IsLoggedIn) _nav.NavigateTo("/login", forceLoad: true);
         }
 
         return response;

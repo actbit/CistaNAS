@@ -14,6 +14,69 @@ namespace CistaNAS.Tests;
 /// </summary>
 public class DokanUploadWriteStateTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ShrinkDuringSave_PreservesLaterWritesButCannotRestoreEarlierTruncatedWrites(bool fail)
+    {
+        using var storage = new StatefulPlainFileHandler(Enumerable.Repeat((byte)9, 100).ToArray());
+        using var paused = new PauseSaveHandler(storage, fail);
+        using var http = new HttpClient(paused) { BaseAddress = new Uri("http://test/") };
+        using var fs = new CistaNasFileSystem(new CistaNasApiClient(http), "vol");
+        var state = new CistaNasFileSystem.PlainRangeWriteState(fs, "file.txt", "file.txt", 100);
+        Task save = Task.CompletedTask;
+        try
+        {
+            state.Write([2, 2, 2], 0, 3, 80);
+            save = Task.Run(() => fs.UploadWriteState(state));
+            await paused.Reached.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            state.Gate.Wait();
+            try
+            {
+                state.SetDeclaredSize(50);
+                state.SetDeclaredSize(100);
+                state.Write([7], 0, 1, 70);
+            }
+            finally { state.Gate.Release(); }
+            paused.Release.TrySetResult();
+            if (fail) await Assert.ThrowsAsync<HttpRequestException>(() => save);
+            else await save.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(state.HasPending);
+            fs.UploadWriteState(state);
+            byte[] expected = new byte[100];
+            Array.Fill(expected, (byte)9, 0, 50);
+            expected[70] = 7;
+            Assert.Equal(expected, storage.Content);
+        }
+        finally
+        {
+            paused.Release.TrySetResult();
+            try { await save.WaitAsync(TimeSpan.FromSeconds(5)); } catch { }
+            state.Dispose();
+        }
+    }
+
+    private sealed class PauseSaveHandler(HttpMessageHandler inner, bool fail) : HttpMessageHandler
+    {
+        private readonly HttpMessageInvoker _inner = new(inner, disposeHandler: false);
+        private bool _paused;
+        public TaskCompletionSource Reached { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            var response = await _inner.SendAsync(request, ct);
+            if (!_paused && request.Method == HttpMethod.Patch)
+            {
+                _paused = true;
+                Reached.TrySetResult();
+                await Release.Task.WaitAsync(ct);
+                if (fail) { response.Dispose(); return new HttpResponseMessage(HttpStatusCode.InternalServerError); }
+            }
+            return response;
+        }
+        protected override void Dispose(bool disposing) { if (disposing) _inner.Dispose(); base.Dispose(disposing); }
+    }
+
     /// <summary>全リクエストを記録し 200 OK を返すモック。PATCH は FileMetadata JSON を返す。</summary>
     private sealed class RecordingHandler : HttpMessageHandler
     {
@@ -46,6 +109,12 @@ public class DokanUploadWriteStateTests
             }
             if (request.Method == HttpMethod.Patch)
             {
+                int offset = int.Parse(request.RequestUri!.Query.Replace("?offset=", ""));
+                byte[] data = request.Content!.ReadAsByteArrayAsync(cancellationToken).GetAwaiter().GetResult();
+                byte[] updated = new byte[Math.Max(Content.Length, offset + data.Length)];
+                Content.CopyTo(updated, 0);
+                data.CopyTo(updated, offset);
+                Content = updated;
                 PatchCount++;
                 return Metadata();
             }
@@ -72,6 +141,65 @@ public class DokanUploadWriteStateTests
                 $"{{\"name\":\"file.txt\",\"length\":{Content.Length},\"createdAt\":\"2026-01-01T00:00:00Z\",\"modifiedAt\":\"2026-01-01T00:00:00Z\"}}",
                 Encoding.UTF8, "application/json"),
         });
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PlainSecondSave_PreservesEarlierSavedBytes(bool truncateAtOpen)
+    {
+        using var handler = new StatefulPlainFileHandler(truncateAtOpen ? new byte[100] : []);
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("http://test/") };
+        using var fs = new CistaNasFileSystem(new CistaNasApiClient(http), "vol");
+        var state = new CistaNasFileSystem.PlainRangeWriteState(fs, "file.txt", truncateAtOpen ? "file.txt" : null,
+            truncateAtOpen ? 100 : 0) { TruncatedAtOpen = truncateAtOpen };
+        try
+        {
+            if (truncateAtOpen) state.SetDeclaredSize(0);
+            state.Write([1, 2, 3], 0, 3, 0);
+            fs.UploadWriteState(state);
+            state.Write([4, 5, 6], 0, 3, 3);
+            fs.UploadWriteState(state);
+            Assert.Equal(new byte[] { 1, 2, 3, 4, 5, 6 }, handler.Content);
+        }
+        finally { state.Dispose(); }
+    }
+
+    [Fact]
+    public void PlainNewFile_DeclaredTrailingZeroExtentIsPersisted()
+    {
+        using var handler = new StatefulPlainFileHandler([]);
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("http://test/") };
+        using var fs = new CistaNasFileSystem(new CistaNasApiClient(http), "vol");
+        var state = new CistaNasFileSystem.PlainRangeWriteState(fs, "file.txt", null);
+        try
+        {
+            state.SetDeclaredSize(6);
+            state.Write([1, 2, 3], 0, 3, 0);
+            fs.UploadWriteState(state);
+            Assert.Equal(new byte[] { 1, 2, 3, 0, 0, 0 }, handler.Content);
+        }
+        finally { state.Dispose(); }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PlainShrinkThenGrow_DoesNotRestoreTruncatedServerOrDirtyBytes(bool dirty)
+    {
+        using var handler = new StatefulPlainFileHandler(Enumerable.Repeat((byte)9, 100).ToArray());
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("http://test/") };
+        using var fs = new CistaNasFileSystem(new CistaNasApiClient(http), "vol");
+        var state = new CistaNasFileSystem.PlainRangeWriteState(fs, "file.txt", "file.txt", 100);
+        try
+        {
+            if (dirty) state.Write([7, 7, 7], 0, 3, 80);
+            state.SetDeclaredSize(50);
+            state.SetDeclaredSize(100);
+            fs.UploadWriteState(state);
+            Assert.Equal(Enumerable.Repeat((byte)9, 50).Concat(new byte[50]), handler.Content);
+        }
+        finally { state.Dispose(); }
     }
 
     /// <summary>create-file は fileId 応答、upload-chunk は 500 で失敗を注入するモック。</summary>

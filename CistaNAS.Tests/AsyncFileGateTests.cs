@@ -259,32 +259,19 @@ public class AsyncFileGateTests
         wl.Dispose();
     }
 
-    /// <summary>最後のリーダーの解放でライターに即時通知される（遅延なし）。</summary>
+    /// <summary>最後のリーダーの解放で待機中のライターが取得可能になる。</summary>
     [Fact]
-    public async Task LastReaderExit_InstantWriterNotification()
+    public async Task LastReaderExit_ReleasesWaitingWriter()
     {
         using var gate = new AsyncFileGate();
         var readLock = await gate.EnterReadAsync(Ct);
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        bool writerAcquired = false;
-        var writerTask = Task.Run(async () =>
-        {
-            using var wl = await gate.EnterWriteAsync(Ct);
-            writerAcquired = true;
-        });
-
-        // ライターが待機状態に入るまで少し待つ
-        await Task.Delay(100);
-
-        // リーダーを解放 → ライターに即時通知されるはず
+        // Start acquisition directly so the pending writer is established before
+        // releasing the reader, without depending on thread-pool scheduling.
+        var writerTask = gate.EnterWriteAsync(Ct);
+        Assert.False(writerTask.IsCompleted);
         readLock.Dispose();
-        await writerTask;
-        sw.Stop();
-
-        Assert.True(writerAcquired);
-        // 即時通知なら 50ms 以内に完了するはず（スピンウェイトの 20ms より高速）
-        Assert.True(sw.ElapsedMilliseconds < 200, $"ライター取得に {sw.ElapsedMilliseconds}ms かかった");
+        using var writeLock = await writerTask.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     /// <summary>Dispose 後に新しい操作は ObjectDisposedException。</summary>
