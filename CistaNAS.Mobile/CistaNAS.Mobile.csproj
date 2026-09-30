@@ -28,6 +28,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CistaNAS.Mobile.Core\CistaNAS.Mobile.Core.csproj" />
+    <Compile Include="..\CistaNAS.Client\Services\ImagePreviewDecoder.cs" Link="Views\ImagePreviewDecoder.cs" />
   </ItemGroup>
 
   <!-- Native test entry points are absent from ordinary and release APKs. -->

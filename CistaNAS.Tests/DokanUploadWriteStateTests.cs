@@ -50,7 +50,19 @@ public class DokanUploadWriteStateTests
                 return Metadata();
             }
             if (request.Method == HttpMethod.Get)
+            {
+                if (request.Headers.Range is { } range)
+                {
+                    var part = range.Ranges.Single();
+                    int start = (int)part.From!.Value;
+                    int end = (int)Math.Min(part.To!.Value, Content.Length - 1);
+                    var response = new HttpResponseMessage(HttpStatusCode.PartialContent)
+                    { Content = new ByteArrayContent(Content[start..(end + 1)]) };
+                    response.Content.Headers.ContentRange = new System.Net.Http.Headers.ContentRangeHeaderValue(start, end, Content.Length);
+                    return Task.FromResult(response);
+                }
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Content) });
+            }
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
         }
 

@@ -103,7 +103,10 @@ public static class CistaNasApiClientFiles
         request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(offset, offset + count - 1);
         using var res = await http.SendAsync(request, System.Net.Http.HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         if (res.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
+        {
+            if (requireExactRange) throw new EndOfStreamException("要求した読み取り範囲が存在しません。");
             return Array.Empty<byte>();
+        }
         res.EnsureSuccessStatusCode();
         // Existing Dokan write paths also handle servers returning full content.
         if (!requireExactRange) return await res.Content.ReadAsByteArrayAsync(ct).ConfigureAwait(false);
@@ -111,7 +114,13 @@ public static class CistaNasApiClientFiles
         if (res.StatusCode != System.Net.HttpStatusCode.PartialContent || range is null ||
             range.From != offset || range.To != offset + count - 1)
             throw new InvalidDataException("サーバーが要求した読み取り範囲を返しませんでした。");
-        return await BoundedResponseReader.ReadAsync(res.Content, count, ct).ConfigureAwait(false);
+        byte[] bytes = await BoundedResponseReader.ReadAsync(res.Content, count, ct).ConfigureAwait(false);
+        if (bytes.Length != count)
+        {
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(bytes);
+            throw new EndOfStreamException("サーバーが読み取り範囲の全データを返しませんでした。");
+        }
+        return bytes;
     }
 
     /// <summary>ファイルの一部を書き込む（差分保存）。PATCH /files/{volume}/{path}?offset=N。</summary>

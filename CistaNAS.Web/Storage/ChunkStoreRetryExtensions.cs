@@ -13,11 +13,13 @@ internal static class ChunkStoreRetryExtensions
         const int maxRetries = 3;
         for (int i = 0; i < maxRetries; i++)
         {
+            ct.ThrowIfCancellationRequested();
             try
             {
                 await store.DeleteChunksAsync(volumeName, objectId, ct);
                 return; // 成功時は即時リターン
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception)
             {
                 if (i < maxRetries - 1)

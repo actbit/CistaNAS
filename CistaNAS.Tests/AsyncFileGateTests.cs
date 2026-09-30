@@ -8,6 +8,26 @@ namespace CistaNAS.Tests;
 /// </summary>
 public class AsyncFileGateTests
 {
+    [Fact]
+    public async Task OverlappingReaderEntryAndExit_LeavesNoPhantomReadersOrPrematureWriter()
+    {
+        using var gate = new AsyncFileGate();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => Task.Run(async () =>
+        {
+            for (int i = 0; i < 5000; i++)
+            {
+                using var reader = await gate.EnterReadAsync(stop.Token);
+                if (i % 100 == 0) await Task.Yield();
+            }
+        })));
+        using var held = await gate.EnterReadAsync(stop.Token);
+        Task<IDisposable> writer = gate.EnterWriteAsync(stop.Token);
+        Assert.False(writer.IsCompleted);
+        held.Dispose();
+        using var acquired = await writer.WaitAsync(TimeSpan.FromSeconds(2));
+    }
+
     private static CancellationToken Ct => CancellationToken.None;
 
     /// <summary>複数の並行リーダーが同時に読み取りロックを取得できる。</summary>

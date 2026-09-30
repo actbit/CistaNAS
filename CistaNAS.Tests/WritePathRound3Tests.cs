@@ -253,6 +253,17 @@ public class WritePathRound3Tests
                     return Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError));
                 }
                 byte[] content = Files.TryGetValue(name, out var existing) ? existing : Array.Empty<byte>();
+                if (request.Headers.Range?.Ranges.SingleOrDefault() is { } range)
+                {
+                    int from = (int)(range.From ?? 0);
+                    if (from >= content.Length)
+                        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.RequestedRangeNotSatisfiable));
+                    int to = (int)Math.Min(range.To ?? content.Length - 1, content.Length - 1);
+                    var response = new HttpResponseMessage(HttpStatusCode.PartialContent)
+                    { Content = new ByteArrayContent(content[from..(to + 1)]) };
+                    response.Content.Headers.ContentRange = new System.Net.Http.Headers.ContentRangeHeaderValue(from, to, content.Length);
+                    return Task.FromResult(response);
+                }
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(content) });
             }
 

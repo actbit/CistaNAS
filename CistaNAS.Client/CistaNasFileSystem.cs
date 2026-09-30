@@ -1842,7 +1842,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             // 旧内容が復活するため、このハンドルは常に全体 PUT で確定する（round 6 H1）。
             if (ws.TruncatedAtOpen)
             {
-                byte[] full = new byte[Math.Max(0, snapshotSize)];
+                using var fullBuffer = new SecureBuffer(new byte[Math.Max(0, snapshotSize)]);
+                byte[] full = fullBuffer.Buffer;
                 foreach (var (off, data) in taken)
                 {
                     if (off >= 0 && off + data.Length <= full.Length)
@@ -1856,7 +1857,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             // 新規ファイルで offset=0 から始まらない（sparse）または空の場合は全体アップロードで確実に作成。
             if (isNew && (taken.Count == 0 || taken[0].Offset != 0))
             {
-                byte[] full = new byte[Math.Max(0, snapshotSize)];
+                using var fullBuffer = new SecureBuffer(new byte[Math.Max(0, snapshotSize)]);
+                byte[] full = fullBuffer.Buffer;
                 foreach (var (off, data) in taken)
                 {
                     if (off >= 0 && off + data.Length <= full.Length)
@@ -1879,7 +1881,8 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             {
                 // 切り詰め、または書き込みなしの純粋な拡張: PATCH では長さを変更できないため、
                 // サーバー内容 + ダーティ + 指定長で全体 PUT する。
-                byte[] full = new byte[Math.Max(0, snapshotSize)];
+                using var fullBuffer = new SecureBuffer(new byte[Math.Max(0, snapshotSize)]);
+                byte[] full = fullBuffer.Buffer;
                 if (!isNew)
                 {
                     // 切り詰め後も保持する先頭部分だけ Range 取得する。丸ごと DownloadFileAsync
@@ -1894,8 +1897,10 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                     preserve = Math.Min(preserve, serverLength);
                     if (preserve > 0)
                     {
-                        byte[] existing = CistaNasApiClientFiles.DownloadFileRangeAsync(_api, _volumeName, ws.PlainName, 0, (int)preserve).GetAwaiter().GetResult();
-                        Buffer.BlockCopy(existing, 0, full, 0, (int)Math.Min(existing.Length, preserve));
+                        byte[] existing = CistaNasApiClientFiles.DownloadFileRangeAsync(_api, _volumeName, ws.PlainName, 0,
+                            (int)preserve, requireExactRange: true).GetAwaiter().GetResult();
+                        try { Buffer.BlockCopy(existing, 0, full, 0, (int)preserve); }
+                        finally { CryptographicOperations.ZeroMemory(existing); }
                     }
                 }
                 foreach (var (off, data) in taken)

@@ -43,13 +43,14 @@ public sealed class StreamingSmokeActivity : Activity
             }
             string cache = Application.Context.CacheDir!.AbsolutePath;
             var before = Directory.GetFiles(cache, "*", SearchOption.AllDirectories).ToHashSet();
+            await TestImageLifecycleAsync();
             await TestMediaAsync("tone.wav", MakeWave());
             await TestMediaAsync("clip.mp4", await LoadVideoAsync());
             await TestPdfAsync();
             await TestViewerLifecycleAsync();
             var added = Directory.GetFiles(cache, "*", SearchOption.AllDirectories).Where(path => !before.Contains(path)).ToArray();
             if (added.Length != 0) throw new InvalidOperationException("Viewer created cache files: " + string.Join(",", added));
-            Log.Info("CistaNASSmoke", "PASS audio, video, seek, PDF, cancellation, viewer lifecycle, no cache files");
+            Log.Info("CistaNASSmoke", "PASS image, audio, video, seek, PDF, cancellation, viewer lifecycle, no cache files");
             status.Text = "PASS native streaming";
         }
         catch (Exception ex) { Log.Error("CistaNASSmoke", "FAIL " + ex); status.Text = "FAIL " + ex.Message; }
@@ -71,6 +72,60 @@ public sealed class StreamingSmokeActivity : Activity
     {
         _viewerFixture?.Dispose();
         base.OnDestroy();
+    }
+
+    private async Task TestImageLifecycleAsync()
+    {
+        using var source = new SkiaSharp.SKBitmap(100, 8000);
+        source.Erase(SkiaSharp.SKColors.Blue);
+        using var encoded = source.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100);
+        byte[] png = encoded.ToArray();
+        var main = App.Services ?? throw new InvalidOperationException("Avalonia app is not initialized");
+        using var app = new AppServices(main.KeyStore, main.Settings, new AndroidFileViewerLauncher(), new ImageHandler(png));
+        app.Session.ConfigureServer("http://test/");
+        var browser = new Core.ViewModels.FileBrowserViewModel(app, new VolumeListItem { Name = "vol", EncryptionMode = "server" });
+        using var vm = new Core.ViewModels.ImageViewerViewModel(app, browser, new Core.ViewModels.FileItem
+        {
+            Name = "portrait.png", FullPath = "portrait.png", IsFolder = false,
+            ServerMeta = new FileMetadata { Name = "portrait.png", Length = png.Length }
+        });
+        var view = new Views.ImageViewerView { DataContext = vm };
+        var field = typeof(Views.ImageViewerView).GetField("_bitmap", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        try
+        {
+            foreach (bool logout in new[] { false, true })
+            {
+                vm.OnNavigatedTo();
+                await WaitUntilAsync(() => !vm.IsBusy);
+                if (vm.Error is not null) throw new IOException(vm.Error);
+                byte[] heldBytes = vm.ImageData ?? throw new IOException("Missing image bytes");
+                var held = (Avalonia.Media.Imaging.Bitmap?)field.GetValue(view) ?? throw new IOException("Missing image bitmap");
+                if (held.PixelSize.Width != 20 || held.PixelSize.Height != 1600) throw new IOException("Image dimensions are unbounded");
+                if (logout) app.ClearSession(); else vm.OnNavigatedFrom();
+                if (vm.ImageData is not null || heldBytes.Any(b => b != 0) || field.GetValue(view) is not null)
+                    throw new IOException("Closed image retained plaintext or bitmap");
+                bool disposed = false;
+                using var output = new MemoryStream();
+                try { held.Save(output); } catch (Exception) { disposed = true; }
+                if (!disposed) throw new IOException("Closed image bitmap was not disposed");
+            }
+        }
+        finally { view.DataContext = null; CryptographicOperations.ZeroMemory(png); }
+        Log.Info("CistaNASSmoke", "PASS portrait image bounds, back/logout wipes bytes and disposes bitmap");
+    }
+
+    private sealed class ImageHandler(byte[] bytes) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+            var range = request.Headers.Range!.Ranges.Single();
+            long from = range.From!.Value, to = range.To!.Value;
+            var response = new HttpResponseMessage(HttpStatusCode.PartialContent)
+            { Content = new ByteArrayContent(bytes[(int)from..((int)to + 1)]) };
+            response.Content.Headers.ContentRange = new System.Net.Http.Headers.ContentRangeHeaderValue(from, to, bytes.Length);
+            return Task.FromResult(response);
+        }
     }
 
     private async Task TestMediaAsync(string name, byte[] bytes)

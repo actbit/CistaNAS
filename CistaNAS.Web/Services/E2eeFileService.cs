@@ -34,7 +34,7 @@ public sealed class E2eeFileService
     private readonly string _volumeDataPath;
 
     /// <summary>ファイル単位の読み書きゲート。ダウンロード中の上書き・削除を防止。</summary>
-    private static readonly ConcurrentDictionary<string, AsyncFileGate> _fileGates = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<(string Volume, string FileId), AsyncFileGate> _fileGates = new();
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _volumeGates = new(StringComparer.Ordinal);
     private static readonly ConcurrentDictionary<string, ConcurrentBag<string>> _volumeFileIds = new(StringComparer.Ordinal);
 
@@ -149,7 +149,7 @@ public sealed class E2eeFileService
             catalog.Files[fileId] = entry;
             await SaveCatalogAsync(volumeName, catalog, ct);
 
-            _fileGates.TryAdd(fileId, new AsyncFileGate());
+            _fileGates.GetOrAdd((volumeName, fileId), _ => new AsyncFileGate());
             _volumeFileIds.GetOrAdd(volumeName, _ => new ConcurrentBag<string>()).Add(fileId);
             return entry;
         }
@@ -172,7 +172,7 @@ public sealed class E2eeFileService
         try
         {
             using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
-            var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
+            var gate = _fileGates.GetOrAdd((volumeName, fileId), _ => new AsyncFileGate());
             using (await gate.EnterWriteAsync(ct))
             {
                 var catalog = await LoadCatalogAsync(volumeName, ct);
@@ -385,7 +385,7 @@ public sealed class E2eeFileService
     {
         GetE2eeHeader(volumeName);
 
-        var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
+        var gate = _fileGates.GetOrAdd((volumeName, fileId), _ => new AsyncFileGate());
         var readLock = await gate.EnterReadAsync(ct);
 
         try
@@ -485,7 +485,7 @@ public sealed class E2eeFileService
         try
         {
             using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
-            var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
+            var gate = _fileGates.GetOrAdd((volumeName, fileId), _ => new AsyncFileGate());
             using (await gate.EnterWriteAsync(ct))
             {
                 var catalog = await LoadCatalogAsync(volumeName, ct);
@@ -676,7 +676,7 @@ public sealed class E2eeFileService
             foreach (string fileId in ownFileIds)
             {
                 if (!catalog.Files.ContainsKey(fileId)
-                    && _fileGates.TryRemove(fileId, out var fileGate))
+                    && _fileGates.TryRemove((volumeName, fileId), out var fileGate))
                 {
                     fileGate.Dispose();
                 }
@@ -705,7 +705,7 @@ public sealed class E2eeFileService
         try
         {
             using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
-            var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
+            var gate = _fileGates.GetOrAdd((volumeName, fileId), _ => new AsyncFileGate());
             using (await gate.EnterWriteAsync(ct))
             {
                 var catalog = await LoadCatalogAsync(volumeName, ct);
@@ -726,7 +726,7 @@ public sealed class E2eeFileService
         }
 
         // ファイル削除後に対応するゲートを破棄
-        if (_fileGates.TryRemove(fileId, out var g))
+        if (_fileGates.TryRemove((volumeName, fileId), out var g))
             g.Dispose();
     }
 
@@ -737,7 +737,7 @@ public sealed class E2eeFileService
         {
             foreach (var fileId in fileIds)
             {
-                if (_fileGates.TryRemove(fileId, out var fileGate))
+                if (_fileGates.TryRemove((volumeName, fileId), out var fileGate))
                     fileGate.Dispose();
             }
         }
