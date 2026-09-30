@@ -317,10 +317,14 @@ public static class ApiEndpoints
         })
             .WithName("ListGroups");
 
-        groups.MapPost("/", async (CreateGroupRequest req, HttpContext ctx, GroupService gs) =>
+        groups.MapPost("/", async (CreateGroupRequest req, HttpContext ctx, GroupService gs,
+            ISharingPolicy sharingPolicy) =>
         {
             string? username = ctx.User.Identity?.Name;
             if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+            // グループは共有の単位。共有無効ユーザーによる新規作成は拒否（既存グループは影響なし）。
+            if (!await sharingPolicy.IsAllowedAsync(SharingAction.Send, username))
+                return Results.Json(new { error = "Sharing is disabled for this account." }, statusCode: 403);
             try
             {
                 await gs.CreateGroupAsync(req.GroupName, username);
@@ -344,10 +348,16 @@ public static class ApiEndpoints
         .WithName("DeleteGroup");
 
         groups.MapPost("/{groupName}/members", async (string groupName, AddGroupMemberRequest req,
-            HttpContext ctx, GroupService gs) =>
+            HttpContext ctx, GroupService gs, ISharingPolicy sharingPolicy) =>
         {
             string? username = ctx.User.Identity?.Name;
             if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+            // メンバー追加は共有構成操作: sender（グループオーナー）と recipient の双方が共有可能であること。
+            // grant-group（ボリュームへのグループ付与）の recipient 側フィルタはここで担保される。
+            if (!await sharingPolicy.IsAllowedAsync(SharingAction.Send, username))
+                return Results.Json(new { error = "Sharing is disabled for this account." }, statusCode: 403);
+            if (!await sharingPolicy.IsAllowedAsync(SharingAction.Receive, req.Username))
+                return Results.Json(new { error = "The target user does not accept shares." }, statusCode: 409);
             try
             {
                 await gs.AddMemberAsync(groupName, username, req.Username);
@@ -373,12 +383,17 @@ public static class ApiEndpoints
 
         // ---- ボリューム グループアクセス ----
         volumes.MapPost("/{name}/grant-group", async (string name, GrantGroupAccessRequest req,
-            HttpContext ctx, VolumeService vs) =>
+            HttpContext ctx, VolumeService vs, ISharingPolicy sharingPolicy) =>
         {
             try
             {
                 string? granter = ctx.User.Identity?.Name;
                 if (string.IsNullOrEmpty(granter)) return Results.Unauthorized();
+                // grant-group も共有操作。sender（オーナー）の共有可否をチェックする。
+                // recipient 側はグループ単位のため AddGroupMember 時の Receive チェックで担保、
+                // 既存アクセスは SharingEnabled 切替で破壊しない方針。
+                if (!await sharingPolicy.IsAllowedAsync(SharingAction.Send, granter))
+                    return Results.Json(new { error = "Sharing is disabled for this account." }, statusCode: 403);
                 await vs.GrantGroupAccessAsync(name, granter, req.GroupName);
                 return Results.Ok();
             }

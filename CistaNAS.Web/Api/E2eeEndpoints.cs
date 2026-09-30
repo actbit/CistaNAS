@@ -177,7 +177,8 @@ public static class E2eeEndpoints
 
         try
         {
-            // 共有無効 remaining member 宛ての wrap は skip される（revoke 自体は常に許可）
+            // wrap 対象は検証済み remaining members のみ。SharingEnabled=false の member 宛ても
+            // アクセス継続のため wrap を登録する（revoke は共有ポリシーで拒否しない）
             var skipped = await vs.RotateGroupKeyAsync(volumeName, username, req);
             return Results.Ok(new { keyEpoch = req.NewEpoch, skippedUsers = skipped });
         }
@@ -554,13 +555,16 @@ public static class E2eeEndpoints
     }
 
     private static async Task<IResult> AddWrappedKeysBatch(string volumeName, AddE2eeWrappedKeysBatchRequest req,
-        VolumeService vs, HttpContext ctx)
+        VolumeService vs, ISharingPolicy sharingPolicy, HttpContext ctx)
     {
         string username = ctx.User.Identity?.Name ?? "";
         if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
+        // sender（オーナー）も共有ポリシーの対象（単独 add-wrapped-key と同等の強制）
+        if (!await sharingPolicy.IsAllowedAsync(SharingAction.Send, username))
+            return Results.Json(new { error = "Sharing is disabled for this account." }, statusCode: 403);
         try
         {
-            // SharingEnabled=false の受取先は skip され、呼び出し元へ返される（silent skip はしない）
+            // SharingEnabled=false（または global 無効）の受取先は skip され、呼び出し元へ返される（silent skip はしない）
             var skipped = await vs.AddE2eeWrappedKeysBatchAsync(volumeName, username, req.WrappedKeys);
             return Results.Ok(new { skippedUsers = skipped });
         }

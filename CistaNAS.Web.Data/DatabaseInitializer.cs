@@ -28,7 +28,10 @@ public static class DatabaseInitializer
     {
         string providerName = db.Database.ProviderName
             ?? throw new InvalidOperationException("データベース プロバイダーが構成されていません。");
-        if (providerName is not ("Microsoft.EntityFrameworkCore.Sqlite" or "Microsoft.EntityFrameworkCore.Npgsql"))
+        // Npgsql パッケージの実際の ProviderName は "Npgsql.EntityFrameworkCore.PostgreSQL"
+        // （"Microsoft.EntityFrameworkCore.Npgsql" ではない。誤名だと PostgreSQL 構成の
+        //  起動時初期化が必ず失敗する）
+        if (providerName is not ("Microsoft.EntityFrameworkCore.Sqlite" or "Npgsql.EntityFrameworkCore.PostgreSQL"))
             throw new InvalidOperationException(
                 $"未対応のデータベース プロバイダー: {providerName}. 対応: sqlite, postgresql");
 
@@ -57,7 +60,7 @@ public static class DatabaseInitializer
         {
             "Microsoft.EntityFrameworkCore.Sqlite" =>
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'Users'",
-            "Microsoft.EntityFrameworkCore.Npgsql" =>
+            "Npgsql.EntityFrameworkCore.PostgreSQL" =>
                 "SELECT COUNT(*) FROM information_schema.tables " +
                 "WHERE table_schema = current_schema() AND table_name = 'Users'",
             _ => throw new InvalidOperationException($"未対応のデータベース プロバイダー: {providerName}"),

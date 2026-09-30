@@ -61,6 +61,92 @@ public class EcdhDerivationBrowserTests(PlaywrightWebAppFixture fixture)
         Assert.Equal(DeriveCsharpPublicKey("pbkdf2-sha256"), jsResult.GetProperty("legacy").GetString());
     }
 
+    /// <summary>
+    /// ECDH identity 導出後もブラウザストレージ（localStorage / sessionStorage）に
+    /// 秘密鍵が一切永続化されないこと（項目 6 の WASM 分）。
+    /// 旧バージョンの残留キー名 (e2ee_privkey_* / ecdh_priv*) に加え、導出した秘密鍵の
+    /// 生バイトが値として書き出されないことも合わせて検証する。
+    /// 公開鍵 pin は IndexedDB に fingerprint (SHA-256) のみを保存するため秘密鍵に該当しない。
+    /// </summary>
+    [Fact]
+    public async Task IdentityDerivation_NeverPersistsPrivateKeyToBrowserStorage()
+    {
+        await using var context = await fixture.CreateAnonymousContextAsync();
+        var page = await context.NewPageAsync();
+
+        // モジュール import（e2ee.js）のためアプリを開く
+        await page.GotoAsync(fixture.BaseUrl);
+
+        var jsResult = await page.EvaluateAsync<JsonElement>(@"(async (args) => {
+            const m = await import('./js/e2ee.js');
+            const kp = await m.deriveIdentityKeyPair('alice', 's3cret-pass', args.salt,
+                { algorithm: 'pbkdf2-sha256', iterations: 10000, memoryKiB: 0, timeCost: 0, parallelism: 0 });
+            try {
+                // 導出直後の状態でストレージをスキャンする（クリーンアップ前に採取）
+                const scanKeys = (storage) => {
+                    const hits = [];
+                    for (let i = 0; i < storage.length; i++) {
+                        const k = storage.key(i);
+                        if (k && /priv|secret|ecdh/i.test(k)) hits.push(k);
+                    }
+                    return hits;
+                };
+                const scanValues = (storage) => {
+                    // 値にも秘密鍵の生バイト（base64 断片）が書き出されていないこと
+                    const hits = [];
+                    for (let i = 0; i < storage.length; i++) {
+                        const k = storage.key(i);
+                        if (!k) continue;
+                        const v = storage.getItem(k) ?? '';
+                        if (v.includes(args.privSample)) hits.push(k);
+                    }
+                    return hits;
+                };
+                return {
+                    localKeys: scanKeys(localStorage),
+                    sessionKeys: scanKeys(sessionStorage),
+                    localValues: scanValues(localStorage),
+                    sessionValues: scanValues(sessionStorage),
+                    pubB64: kp.publicKeyBase64,
+                };
+            } finally {
+                m.clearKey(kp.privateKeyHandle);
+                m.clearKey(kp.publicKeyHandle);
+            }
+        })", new
+        {
+            salt = SaltB64,
+            // C# 側で実導出した秘密鍵の生バイト断片（base64 部分一致サンプル）。
+            // 導出結果が正しい前提で、そのバイト列がストレージの値に書き出されていないことを検証する
+            privSample = SamplePrivateKeyB64(),
+        });
+
+        Assert.Empty(jsResult.GetProperty("localKeys").EnumerateArray());
+        Assert.Empty(jsResult.GetProperty("sessionKeys").EnumerateArray());
+        Assert.Empty(jsResult.GetProperty("localValues").EnumerateArray());
+        Assert.Empty(jsResult.GetProperty("sessionValues").EnumerateArray());
+
+        // 導出自体は C# と一致していること（このテストが有効な導出であることの保証）
+        Assert.Equal(DeriveCsharpPublicKey("pbkdf2-sha256"), jsResult.GetProperty("pubB64").GetString());
+    }
+
+    /// <summary>実導出した秘密鍵の一部（base64 断片）を取得する（値スキャン用サンプル）。</summary>
+    private static string SamplePrivateKeyB64()
+    {
+        byte[] salt = Enumerable.Range(0, 32).Select(i => (byte)i).ToArray();
+        var (_, priv) = EcdhIdentityKey.DeriveKeyPair(
+            Username, Password, salt, new KdfSpec("pbkdf2-sha256", 10000, 0, 0, 0));
+        try
+        {
+            // 秘密鍵 32 バイトの先頭 16 バイト分の base64 断片（連続一致する部分列）
+            return Convert.ToBase64String(priv, 0, 15)[..^2]; // padding 除去で部分一致可能に
+        }
+        finally
+        {
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(priv);
+        }
+    }
+
     /// <summary>導出した identity 秘密鍵で ECIES アンラップができること（C# ラップ ↔ JS アンラップ）。</summary>
     [Fact]
     public async Task DerivedKey_EciesInterop_CsharpWrapJsUnwrap()

@@ -43,6 +43,13 @@ public sealed class E2eeKeyResolverService(E2eeInterop e2ee, VolumeApiClient vol
             throw new Exception("E2EE 共有パスワードを入力してください。");
         var setup = await _e2eeApi.GetIdentitySetupAsync()
             ?? throw new Exception("このアカウントでは E2EE 共有機能が無効です。");
+        // 未対応の DerivationVersion では導出してはならない:
+        // 導出仕様が変わったサーバーに対して旧仕様で導出すると、誤った鍵で公開鍵を
+        // 登録・更新し、既存 identity を破壊する（データ欠損）。導出前に拒否する
+        // （Desktop / Mobile の EcdhIdentityKey.CurrentDerivationVersion と同一の契約）。
+        if (setup.DerivationVersion != CistaNAS.Shared.Crypto.EcdhIdentityKey.CurrentDerivationVersion)
+            throw new Exception(
+                $"サーバーの ECDH identity 導出バージョン (v{setup.DerivationVersion}) はこのクライアント (v{CistaNAS.Shared.Crypto.EcdhIdentityKey.CurrentDerivationVersion}) が未対応です。ページを最新のクライアントで読み込み直してください。");
         var kdf = new E2eeKdfOptions(setup.Kdf.Algorithm, setup.Kdf.Iterations,
             setup.Kdf.MemoryKiB, setup.Kdf.TimeCost, setup.Kdf.Parallelism);
         var derived = await _e2ee.DeriveIdentityKeyPair(

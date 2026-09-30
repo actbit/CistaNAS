@@ -280,7 +280,9 @@ public class E2eeDataNoLossTests : IAsyncDisposable
     }
 
     /// <summary>チャンク差し替え（replace=true、revision 進行）の後、再マウントしても
-    /// 常に「最新の内容」が復号されること（旧 revision が読まれる退行の防止）。</summary>
+    /// 常に「最新の内容」が復号されること（旧 revision が読まれる退行の防止）。
+    /// ファイル単位の可視化（staged visibility）: 確定（FinalizeFileAsync）前の読み取りは
+    /// 完全な旧版 v1 のみを返し、確定後に完全な新版 v2 が一括で見えることも検証する。</summary>
     [Fact]
     public async Task ReplaceChunk_Remount_LatestContentDecrypts()
     {
@@ -292,7 +294,7 @@ public class E2eeDataNoLossTests : IAsyncDisposable
         string fileId = await WritePlainFileAsync(e2eeFs, vol, _masterKey, "single.bin", v1);
 
         // 保存済み先頭チャンクから fileSalt を取得し、同サイズの内容 v2 に差し替え（revision=1）
-        var (firstStream, firstLen, _, _) = await e2eeFs.DownloadChunkAsync(vol, fileId, 0);
+        var (firstStream, firstLen, firstRev, _) = await e2eeFs.DownloadChunkAsync(vol, fileId, 0);
         byte[] firstEnc = new byte[firstLen];
         using (firstStream)
             await firstStream.ReadExactlyAsync(firstEnc);
@@ -305,6 +307,14 @@ public class E2eeDataNoLossTests : IAsyncDisposable
             await e2eeFs.UploadChunkAsync(vol, fileId, 0, ms, encV2.Length, replace: true);
         var (_, rev) = await e2eeFs.GetChunkHashAsync(vol, fileId, 0);
         Assert.Equal(1, rev);
+
+        // 確定前の読み取りは完全な旧版 v1 のみ（新旧混在・半分差し替えを観測できない）
+        Assert.Equal(0, firstRev);
+        Assert.Equal(v1, await ReadPlainFileAsync(e2eeFs, vol, _masterKey, fileId));
+
+        // FinalizeFileAsync で一括昇格 → 以降の読み取りは完全な新版 v2
+        await e2eeFs.FinalizeFileAsync(vol, fileId, new E2eeFinalizeFileRequest(encV2.Length, 1));
+        Assert.Equal(v2, await ReadPlainFileAsync(e2eeFs, vol, _masterKey, fileId));
 
         await _vs.LockAsync(vol, Owner);
         await _vs.MountE2eeAsync(vol, Owner);

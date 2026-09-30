@@ -32,6 +32,8 @@ public sealed class EcdhKeyManager
     /// 公開鍵が未登録（初回セットアップ）の場合は照合をスキップする。
     /// 戻り値の秘密鍵 (SEC1) は秘密情報であり、呼び出し側は使用後に Array.Clear 等で破棄すること。
     /// </summary>
+    /// <exception cref="NotSupportedException">サーバーの identity 導出バージョンがこのクライアント未対応
+    /// （将来の KDF 変更で導出結果が変わる可能性があるため、推測での導出・登録を行わず fail closed する）。</exception>
     /// <exception cref="InvalidOperationException">E2EE Key Password が誤っている、または共有機能が無効。</exception>
     public async Task<(byte[] PublicKey, byte[] PrivateKeySec1)> DeriveVerifiedAsync(
         CistaNasApiClient api, string username, string e2eePassword)
@@ -41,6 +43,12 @@ public sealed class EcdhKeyManager
         var setup = await api.GetIdentitySetupAsync()
             ?? throw new InvalidOperationException(
                 "このアカウントでは共有機能が無効です。E2EE 共有のセットアップはできません。");
+        // 未対応の DerivationVersion では導出してはならない:
+        // 導出仕様が変わったサーバーに対して旧仕様で導出すると、誤った鍵で公開鍵を
+        // 登録・更新し、既存 identity を破壊する（データ欠損）。導出前に拒否する。
+        if (setup.DerivationVersion != EcdhIdentityKey.CurrentDerivationVersion)
+            throw new NotSupportedException(
+                $"サーバーの ECDH identity 導出バージョン (v{setup.DerivationVersion}) はこのクライアント (v{EcdhIdentityKey.CurrentDerivationVersion}) が未対応です。アプリを更新してください。");
         var (publicKey, privateKeySec1) = EcdhIdentityKey.DeriveKeyPair(
             username, e2eePassword, setup.IdentitySalt, ToKdfSpec(setup.Kdf));
         try

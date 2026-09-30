@@ -80,6 +80,16 @@ public sealed class E2eeFileEntry
     public List<string> ChunkObjectIds { get; set; } = [];
 
     /// <summary>
+    /// ファイル単位の可視化（staged visibility）用の未確定チャンク。チャンクモードの差分上書き
+    /// （replace=true）で書き込まれた新世代チャンクをここに退避し、FinalizeFileAsync の一括昇格で
+    /// 初めて可視チャンク（ChunkObjectIds 等）に反映する。複数チャンクの差し替え中でも読み手は
+    /// 常に完全な旧バージョンを見る（チャンク単位の断片公開 = 新旧混在読み取りを排除）。
+    /// null = 未確定チャンクなし。WASM / Dokan / Mobile クライアントは未知フィールドを無視するため
+    /// API レスポンスに含まれても影響しない。
+    /// </summary>
+    public Dictionary<int, E2eePendingChunk>? PendingChunks { get; set; }
+
+    /// <summary>
     /// このファイルの鍵 epoch。0 = v1 形式（masterKey 派生 fileKey、単独 E2EE）。
     /// ≥1 = crypto format v2（per-file DEK、強化 AAD）。共有 E2EE で新規作成されるファイルは
     /// ボリュームの現行 KeyEpoch で作成される。
@@ -102,6 +112,19 @@ public sealed class E2eeFileEntry
     /// <summary>作成APIの応答でのみ返す初期書き込みリース。カタログには保存しない。</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? WriteLeaseToken { get; set; }
+}
+
+/// <summary>未確定（staged）チャンク 1 件分のメタデータ。FinalizeFileAsync の昇格時に
+/// 可視フィールド（ChunkObjectIds / ChunkSizes / ChunkHashes / ChunkRevisions / ChunkKeyEpochs）へ移される。</summary>
+public sealed class E2eePendingChunk
+{
+    public required string ObjectId { get; set; }
+    public required int Size { get; set; }
+    public required string Hash { get; set; }
+    public required int Revision { get; set; }
+
+    /// <summary>チャンクを暗号化した keyEpoch（entry.KeyEpoch を刻む）。</summary>
+    public required int KeyEpoch { get; set; }
 }
 
 public sealed record E2eeCreateFileRequest(
