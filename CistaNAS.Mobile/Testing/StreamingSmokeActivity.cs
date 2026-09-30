@@ -1,4 +1,6 @@
 using System.Net;
+using Stopwatch = System.Diagnostics.Stopwatch;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using Android.App;
@@ -44,9 +46,10 @@ public sealed class StreamingSmokeActivity : Activity
             await TestMediaAsync("tone.wav", MakeWave());
             await TestMediaAsync("clip.mp4", await LoadVideoAsync());
             await TestPdfAsync();
+            await TestViewerLifecycleAsync();
             var added = Directory.GetFiles(cache, "*", SearchOption.AllDirectories).Where(path => !before.Contains(path)).ToArray();
             if (added.Length != 0) throw new InvalidOperationException("Viewer created cache files: " + string.Join(",", added));
-            Log.Info("CistaNASSmoke", "PASS audio, video, seek, PDF, cancellation, no cache files");
+            Log.Info("CistaNASSmoke", "PASS audio, video, seek, PDF, cancellation, viewer lifecycle, no cache files");
             status.Text = "PASS native streaming";
         }
         catch (Exception ex) { Log.Error("CistaNASSmoke", "FAIL " + ex); status.Text = "FAIL " + ex.Message; }
@@ -149,11 +152,106 @@ public sealed class StreamingSmokeActivity : Activity
         Log.Info("CistaNASSmoke", $"PASS PDF reverse page render, encrypted chunk requests={fixture.Requests}");
     }
 
-    private static byte[] MakeWave()
+    private async Task TestViewerLifecycleAsync()
+    {
+        using var observer = new ViewerObserver(Application!);
+        using (var fixture = await Fixture.CreateAsync("connection-error.wav", MakeWave(60)))
+        {
+            var viewer = await observer.OpenAsync(fixture.Content);
+            await WaitUntilAsync(() => Field<bool>(viewer, "_prepared"));
+            // Fail a later encrypted chunk after native preparation, then seek past
+            // MediaPlayer's prefetched data to exercise its real Error callback.
+            fixture.FailRequests = true;
+            var player = Field<MediaPlayer>(viewer, "_player");
+            player.SeekTo(player.Duration - 1000);
+            await WaitUntilAsync(() => Field<bool>(viewer, "_mediaFailed"));
+            await Task.Delay(1000); // Let the old position timer fire if still armed.
+            if (Field<bool>(viewer, "_prepared") || Field<Button>(viewer, "_play").Enabled ||
+                Field<SeekBar>(viewer, "_seek").Enabled)
+                throw new IOException("Failed media retained active controls");
+            viewer.Finish();
+            await observer.Destroyed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Log.Info("CistaNASSmoke", "PASS native read failure after preparation disables controls without crashing");
+        }
+
+        using (var fixture = await Fixture.CreateAsync("lifecycle.pdf", MakePdf()))
+        {
+            var viewer = await observer.OpenAsync(fixture.Content);
+            await WaitUntilAsync(() => Field<int>(viewer, "_pageCount") == 2 && !Field<bool>(viewer, "_pdfRendering"));
+            var previous = Field<Button>(viewer, "_previousPage");
+            var next = Field<Button>(viewer, "_nextPage");
+            if (previous.Enabled || !next.Enabled) throw new IOException("PDF first-page controls");
+            next.PerformClick();
+            next.PerformClick(); // Disabled while rendering; no second job may queue.
+            await WaitUntilAsync(() => Field<int>(viewer, "_page") == 1 && !Field<bool>(viewer, "_pdfRendering"));
+            if (!previous.Enabled || next.Enabled || !Field<TextView>(viewer, "_status").Text!.EndsWith("2 / 2"))
+                throw new IOException("PDF page controls or status out of order");
+
+            // Hold the native-render lock as an uncancellable render would. This
+            // makes the close test deterministic without an expensive hostile PDF.
+            var gate = Field<SemaphoreSlim>(viewer, "_pdfGate");
+            if (!gate.Wait(0)) throw new IOException("PDF still rendering");
+            var elapsed = Stopwatch.StartNew();
+            try
+            {
+                previous.PerformClick();
+                viewer.Finish();
+                // A timeout continuation must run off-thread so it can release
+                // the gate even if the old OnDestroy blocks Android's UI thread.
+                await observer.Destroyed.Task.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+                if (elapsed.Elapsed > TimeSpan.FromSeconds(2) || !fixture.Content.Cancellation.IsCancellationRequested)
+                    throw new IOException("PDF close blocked or retained the content source");
+            }
+            finally { gate.Release(); }
+            Log.Info("CistaNASSmoke", "PASS PDF navigation and close while render lock is held");
+        }
+    }
+
+    private static T Field<T>(StreamingViewerActivity viewer, string name) =>
+        (T)typeof(StreamingViewerActivity).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(viewer)!;
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var elapsed = Stopwatch.StartNew();
+        while (!condition())
+        {
+            if (elapsed.Elapsed > TimeSpan.FromSeconds(20)) throw new TimeoutException("Viewer state transition");
+            await Task.Delay(50);
+        }
+    }
+
+    private sealed class ViewerObserver : Java.Lang.Object, Application.IActivityLifecycleCallbacks
+    {
+        private readonly Application _application;
+        private TaskCompletionSource<StreamingViewerActivity> _ready = null!;
+        public TaskCompletionSource Destroyed { get; private set; } = null!;
+        public ViewerObserver(Application application)
+        { _application = application; application.RegisterActivityLifecycleCallbacks(this); }
+        public async Task<StreamingViewerActivity> OpenAsync(ReadOnlyFileContent content)
+        {
+            _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            Destroyed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            await new AndroidFileViewerLauncher().LaunchAsync(content);
+            return await _ready.Task.WaitAsync(TimeSpan.FromSeconds(20));
+        }
+        public void OnActivityResumed(Activity activity)
+        { if (activity is StreamingViewerActivity viewer) _ready.TrySetResult(viewer); }
+        public void OnActivityDestroyed(Activity activity)
+        { if (activity is StreamingViewerActivity) Destroyed.TrySetResult(); }
+        public void OnActivityCreated(Activity activity, Bundle? state) { }
+        public void OnActivityStarted(Activity activity) { }
+        public void OnActivityPaused(Activity activity) { }
+        public void OnActivityStopped(Activity activity) { }
+        public void OnActivitySaveInstanceState(Activity activity, Bundle state) { }
+        protected override void Dispose(bool disposing)
+        { if (disposing) _application.UnregisterActivityLifecycleCallbacks(this); base.Dispose(disposing); }
+    }
+
+    private static byte[] MakeWave(int seconds = 2)
     {
         using var stream = new MemoryStream();
         using var writer = new BinaryWriter(stream, Encoding.ASCII, leaveOpen: true);
-        int samples = 16000 * 2;
+        int samples = 16000 * seconds;
         writer.Write(Encoding.ASCII.GetBytes("RIFF")); writer.Write(36 + samples * 2);
         writer.Write(Encoding.ASCII.GetBytes("WAVEfmt ")); writer.Write(16);
         writer.Write((short)1); writer.Write((short)1); writer.Write(16000); writer.Write(32000);
@@ -189,6 +287,7 @@ public sealed class StreamingSmokeActivity : Activity
         private E2eeSession _session = null!;
         public ReadOnlyFileContent Content { get; private set; } = null!;
         public int Requests { get; private set; }
+        public volatile bool FailRequests;
         public static async Task<Fixture> CreateAsync(string name, byte[] plain)
         {
             var fixture = new Fixture();
@@ -213,6 +312,7 @@ public sealed class StreamingSmokeActivity : Activity
         {
             ct.ThrowIfCancellationRequested();
             Requests++;
+            if (FailRequests) return Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable));
             int index = int.Parse(request.RequestUri!.Segments[^1]);
             var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(_chunks[index]) };
             response.Headers.Add("X-Chunk-Revision", "0");

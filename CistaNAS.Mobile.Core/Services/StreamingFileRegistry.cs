@@ -4,13 +4,28 @@ namespace CistaNAS.Mobile.Core.Services;
 public sealed class StreamingFileRegistry
 {
     private readonly object _gate = new();
-    private readonly Dictionary<string, ReadOnlyFileContent> _files = [];
+    private readonly Dictionary<string, Entry> _files = [];
 
     public string Add(ReadOnlyFileContent content)
     {
-        content.Cancellation.ThrowIfCancellationRequested();
         string id = Guid.NewGuid().ToString("N");
-        lock (_gate) _files.Add(id, content);
+        var entry = new Entry(content);
+        lock (_gate)
+        {
+            content.Cancellation.ThrowIfCancellationRequested();
+            _files.Add(id, entry);
+        }
+        // Navigation can cancel before Android creates the Activity, or Android can
+        // refuse a background launch. The Activity must not be required for cleanup.
+        var registration = content.Cancellation.Register(() => Remove(id));
+        bool retained;
+        lock (_gate)
+        {
+            retained = _files.TryGetValue(id, out var current) && ReferenceEquals(current, entry);
+            if (retained) entry.Registration = registration;
+        }
+        if (!retained) registration.Dispose();
+        content.Cancellation.ThrowIfCancellationRequested();
         return id;
     }
 
@@ -18,27 +33,34 @@ public sealed class StreamingFileRegistry
     {
         lock (_gate)
         {
-            if (!_files.TryGetValue(id, out var content)) throw new FileNotFoundException("表示が終了しました。");
-            content.Cancellation.ThrowIfCancellationRequested();
-            return content;
+            if (!_files.TryGetValue(id, out var entry)) throw new FileNotFoundException("表示が終了しました。");
+            entry.Content.Cancellation.ThrowIfCancellationRequested();
+            return entry.Content;
         }
     }
 
     public void Remove(string id)
     {
-        ReadOnlyFileContent? content;
-        lock (_gate) _files.Remove(id, out content);
-        content?.Dispose();
+        Entry? entry;
+        lock (_gate) _files.Remove(id, out entry);
+        entry?.Dispose();
     }
 
     public void Clear()
     {
-        ReadOnlyFileContent[] contents;
+        Entry[] contents;
         lock (_gate)
         {
             contents = [.. _files.Values];
             _files.Clear();
         }
         foreach (var content in contents) content.Dispose();
+    }
+
+    private sealed class Entry(ReadOnlyFileContent content) : IDisposable
+    {
+        public ReadOnlyFileContent Content { get; } = content;
+        public CancellationTokenRegistration Registration { get; set; }
+        public void Dispose() { Registration.Dispose(); Content.Dispose(); }
     }
 }

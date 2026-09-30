@@ -22,6 +22,8 @@ public sealed class StreamingViewerActivity : Activity
     private StreamingMediaDataSource? _media;
     private bool _prepared;
     private bool _resumed;
+    private bool _mediaFailed;
+    private SurfaceView? _videoSurface;
     private SurfaceCallbacks? _surfaceCallbacks;
     private PdfRenderer? _pdf;
     private StreamingPdfDescriptor? _pdfDescriptor;
@@ -29,6 +31,10 @@ public sealed class StreamingViewerActivity : Activity
     private Bitmap? _pageBitmap;
     private ImageView? _pageImage;
     private int _page;
+    private int _pageCount;
+    private bool _pdfRendering;
+    private Button? _previousPage;
+    private Button? _nextPage;
     private bool _destroyed;
     private TextView _status = null!;
     private Button _play = null!;
@@ -63,44 +69,56 @@ public sealed class StreamingViewerActivity : Activity
     private void OpenMedia(LinearLayout layout)
     {
         _player = new MediaPlayer();
-        _media = new StreamingMediaDataSource(_content!);
+        _media = new StreamingMediaDataSource(_content!, () => RunOnUiThread(() =>
+            MediaFailed(new IOException("ファイルを読み取れませんでした。接続を確認してください。"))));
         _player.SetDataSource(_media);
         _play = new Button(this) { Text = "再生", Enabled = false };
         _play.Click += (_, _) =>
         {
             if (!_prepared || _player is null) return;
-            if (_player.IsPlaying) _player.Pause(); else _player.Start();
-            _play.Text = _player.IsPlaying ? "一時停止" : "再生";
+            RunMediaAction(() =>
+            {
+                if (_player.IsPlaying) _player.Pause(); else _player.Start();
+                _play.Text = _player.IsPlaying ? "一時停止" : "再生";
+            });
         };
         _seek = new SeekBar(this) { Max = 1000, Enabled = false };
         _seek.StartTrackingTouch += (_, _) => _seeking = true;
         _seek.StopTrackingTouch += (_, _) =>
         {
             _seeking = false;
-            if (_prepared && _player is not null) _player.SeekTo((int)((long)_player.Duration * _seek.Progress / 1000));
+            if (_prepared && _player is not null) RunMediaAction(() =>
+            {
+                int duration = _player.Duration;
+                if (duration > 0) _player.SeekTo((int)((long)duration * _seek.Progress / 1000));
+            });
         };
         _player.Prepared += (_, _) =>
         {
-            if (_destroyed) return;
+            if (_destroyed || _mediaFailed) return;
             _prepared = true;
-            _play.Enabled = _seek.Enabled = true;
+            _play.Enabled = true;
             _status.Text = _content!.Name;
-            if (_resumed) { _player.Start(); _play.Text = "一時停止"; }
-            _positionHandler = new Handler(Looper.MainLooper!);
-            UpdatePosition();
+            RunMediaAction(() =>
+            {
+                _seek.Enabled = _player.Duration > 0;
+                if (_resumed) { _player.Start(); _play.Text = "一時停止"; }
+                _positionHandler = new Handler(Looper.MainLooper!);
+                UpdatePosition();
+            });
         };
         _player.Completion += (_, _) => { if (!_destroyed) _play.Text = "再生"; };
         _player.Error += (_, e) =>
         {
             e.Handled = true;
-            ShowError(new IOException("この動画・音声を再生できませんでした。形式と接続を確認してください。"));
+            MediaFailed(new IOException("この動画・音声を再生できませんでした。形式と接続を確認してください。"));
         };
         if (_content!.MimeType.StartsWith("video/", StringComparison.Ordinal))
         {
-            var surface = new SurfaceView(this);
+            _videoSurface = new SurfaceView(this);
             _surfaceCallbacks = new SurfaceCallbacks(this);
-            surface.Holder!.AddCallback(_surfaceCallbacks);
-            layout.AddView(surface, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, 0, 1));
+            _videoSurface.Holder!.AddCallback(_surfaceCallbacks);
+            layout.AddView(_videoSurface, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, 0, 1));
         }
         else _player.PrepareAsync();
         layout.AddView(_seek);
@@ -109,9 +127,35 @@ public sealed class StreamingViewerActivity : Activity
 
     private void UpdatePosition()
     {
-        if (_destroyed || !_prepared || _player is null) return;
-        if (!_seeking && _player.Duration > 0) _seek.Progress = (int)((long)_player.CurrentPosition * 1000 / _player.Duration);
-        _positionHandler?.PostDelayed(UpdatePosition, 500);
+        if (_destroyed || !_prepared || _mediaFailed || _player is null) return;
+        RunMediaAction(() =>
+        {
+            int duration = _player.Duration;
+            if (!_seeking && duration > 0) _seek.Progress = (int)((long)_player.CurrentPosition * 1000 / duration);
+        });
+        if (_prepared && !_mediaFailed) _positionHandler?.PostDelayed(UpdatePosition, 500);
+    }
+
+    private void RunMediaAction(Action action)
+    {
+        if (_destroyed || _mediaFailed) return;
+        try { action(); }
+        catch (Exception ex) { MediaFailed(ex); }
+    }
+
+    private void MediaFailed(Exception error)
+    {
+        if (_destroyed || _mediaFailed) return;
+        _mediaFailed = true;
+        _prepared = false;
+        _positionHandler?.RemoveCallbacksAndMessages(null);
+        if (_play is not null) _play.Enabled = false;
+        if (_seek is not null) _seek.Enabled = false;
+        // Reset is valid even in MediaPlayer's Error state and stops buffered
+        // playback after a read failure that the decoder reported only as EOF.
+        try { _player?.Reset(); }
+        catch (Exception) { }
+        ShowError(error);
     }
 
     private void OpenPdf(LinearLayout layout)
@@ -122,22 +166,24 @@ public sealed class StreamingViewerActivity : Activity
         _pageImage.SetScaleType(ImageView.ScaleType.FitCenter);
         layout.AddView(_pageImage, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MatchParent, 0, 1));
         var controls = new LinearLayout(this) { Orientation = Orientation.Horizontal };
-        var previous = new Button(this) { Text = "前のページ" };
-        var next = new Button(this) { Text = "次のページ" };
-        previous.Click += async (_, _) => await RenderPdfAsync(-1);
-        next.Click += async (_, _) => await RenderPdfAsync(1);
-        controls.AddView(previous);
-        controls.AddView(next);
+        _previousPage = new Button(this) { Text = "前のページ", Enabled = false };
+        _nextPage = new Button(this) { Text = "次のページ", Enabled = false };
+        _previousPage.Click += async (_, _) => await RenderPdfAsync(-1);
+        _nextPage.Click += async (_, _) => await RenderPdfAsync(1);
+        controls.AddView(_previousPage);
+        controls.AddView(_nextPage);
         layout.AddView(controls);
         _ = RenderPdfAsync(0);
     }
 
     private async Task RenderPdfAsync(int direction)
     {
-        if (!OperatingSystem.IsAndroidVersionAtLeast(26)) return;
+        if (!OperatingSystem.IsAndroidVersionAtLeast(26) || _destroyed || _pdfRendering) return;
+        _pdfRendering = true;
+        _previousPage!.Enabled = _nextPage!.Enabled = false;
         try
         {
-            var bitmap = await Task.Run(async () =>
+            var result = await Task.Run(async () =>
             {
                 if (!OperatingSystem.IsAndroidVersionAtLeast(26)) throw new PlatformNotSupportedException();
                 await _pdfGate.WaitAsync(_content!.Cancellation).ConfigureAwait(false);
@@ -157,20 +203,30 @@ public sealed class StreamingViewerActivity : Activity
                     {
                         image.EraseColor(Color.White);
                         page.Render(image, null, null, PdfRenderMode.ForDisplay);
-                        return image;
+                        return (Bitmap: image, Page: _page, Count: _pdf.PageCount);
                     }
                     catch { image.Recycle(); image.Dispose(); throw; }
                 }
                 finally { _pdfGate.Release(); }
             });
-            if (_destroyed) { bitmap.Recycle(); bitmap.Dispose(); return; }
-            _pageImage!.SetImageBitmap(bitmap);
+            if (_destroyed) { result.Bitmap.Recycle(); result.Bitmap.Dispose(); return; }
+            _pageImage!.SetImageBitmap(result.Bitmap);
             _pageBitmap?.Recycle();
             _pageBitmap?.Dispose();
-            _pageBitmap = bitmap;
-            _status.Text = $"{_content!.Name} — {_page + 1} / {_pdf!.PageCount}";
+            _pageBitmap = result.Bitmap;
+            _pageCount = result.Count;
+            _status.Text = $"{_content!.Name} — {result.Page + 1} / {result.Count}";
         }
         catch (Exception ex) { ShowError(ex); }
+        finally
+        {
+            _pdfRendering = false;
+            if (!_destroyed)
+            {
+                _previousPage.Enabled = _page > 0;
+                _nextPage.Enabled = _page + 1 < _pageCount;
+            }
+        }
     }
 
     private void ShowError(Exception ex)
@@ -181,7 +237,10 @@ public sealed class StreamingViewerActivity : Activity
     protected override void OnPause()
     {
         _resumed = false;
-        if (_prepared && _player?.IsPlaying == true) { _player.Pause(); _play.Text = "再生"; }
+        if (_prepared && _player is not null) RunMediaAction(() =>
+        {
+            if (_player.IsPlaying) { _player.Pause(); _play.Text = "再生"; }
+        });
         base.OnPause();
     }
 
@@ -197,25 +256,43 @@ public sealed class StreamingViewerActivity : Activity
         _positionHandler?.RemoveCallbacksAndMessages(null);
         _closedRegistration.Dispose();
         if (_id is not null) AndroidFileViewerLauncher.Files.Remove(_id);
+        if (_surfaceCallbacks is not null) _videoSurface?.Holder?.RemoveCallback(_surfaceCallbacks);
         _player?.Release();
         _player?.Dispose();
         _media?.Dispose();
-        _pdfGate.Wait();
+        _pageImage?.SetImageBitmap(null);
+        _pageBitmap?.Recycle();
+        _pageBitmap?.Dispose();
+        _pageBitmap = null;
+        // Native PDF rendering is not cancellable. Waiting for it on the main
+        // thread would freeze closing/navigation; release resources off-thread.
+        _ = Task.Run(DisposePdfAsync);
+        _surfaceCallbacks?.Dispose();
+        _positionHandler?.Dispose();
+        base.OnDestroy();
+    }
+
+    private async Task DisposePdfAsync()
+    {
+        await _pdfGate.WaitAsync().ConfigureAwait(false);
         try
         {
             if (OperatingSystem.IsAndroidVersionAtLeast(26))
             {
-                _pdf?.Close();
-                _pdf?.Dispose();
-                _pdfDescriptor?.Dispose();
+                try { _pdf?.Close(); }
+                finally
+                {
+                    try { _pdf?.Dispose(); }
+                    finally
+                    {
+                        try { _pdfDescriptor?.Dispose(); }
+                        finally { _pdf = null; _pdfDescriptor = null; }
+                    }
+                }
             }
-            _pageBitmap?.Recycle();
-            _pageBitmap?.Dispose();
         }
+        catch (Exception) { Android.Util.Log.Warn("CistaNAS", "PDF resource cleanup failed."); }
         finally { _pdfGate.Release(); }
-        _surfaceCallbacks?.Dispose();
-        _positionHandler?.Dispose();
-        base.OnDestroy();
     }
 
     private sealed class SurfaceCallbacks(StreamingViewerActivity activity) : Java.Lang.Object, ISurfaceHolderCallback
@@ -223,14 +300,20 @@ public sealed class StreamingViewerActivity : Activity
         private bool _preparing;
         public void SurfaceCreated(ISurfaceHolder holder)
         {
-            activity._player?.SetDisplay(holder);
-            if (!_preparing) { _preparing = true; activity._player?.PrepareAsync(); }
+            activity.RunMediaAction(() =>
+            {
+                activity._player?.SetDisplay(holder);
+                if (!_preparing) { _preparing = true; activity._player?.PrepareAsync(); }
+            });
         }
         public void SurfaceChanged(ISurfaceHolder holder, Android.Graphics.Format format, int width, int height) { }
         public void SurfaceDestroyed(ISurfaceHolder holder)
         {
-            if (activity._prepared && activity._player?.IsPlaying == true) activity._player.Pause();
-            activity._player?.SetDisplay(null);
+            activity.RunMediaAction(() =>
+            {
+                if (activity._prepared && activity._player?.IsPlaying == true) activity._player.Pause();
+                activity._player?.SetDisplay(null);
+            });
         }
     }
 }
