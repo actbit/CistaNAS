@@ -22,6 +22,10 @@ the generator persists only AES-GCM ciphertext under ignored TestResults. These 
 as encrypted E2EE chunks to the production StreamingFileService, MediaDataSource and proxy PDF descriptor.
 The test checks actual Android preparation, seek, playback completion, reverse page rendering,
 read rejection after close and unchanged application cache files.
+It also starts the production viewer, fails an encrypted audio read after preparation,
+checks that failed playback disables controls, exercises PDF page-button ordering,
+and closes the PDF viewer while holding its render lock to verify the UI does not wait.
+The render-lock simulation uses reflection only in this opt-in Debug test Activity.
 
 After testing, rebuild without EnableAndroidSmokeTests and reinstall the ordinary APK. Verify that
 the smoke Activity is absent, and start the resolved launcher Activity three times in succession.

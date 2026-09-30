@@ -7,9 +7,11 @@ using CommunityToolkit.Mvvm.Input;
 
 namespace CistaNAS.Client.ViewModels;
 
-public sealed partial class FilePreviewViewModel(MountedFilePreviewService files) : ObservableObject, IDisposable
+public sealed partial class FilePreviewViewModel(IMountedFilePreviewService files) : ObservableObject, IDisposable
 {
     private CancellationTokenSource? _read;
+    private CancellationTokenSource? _listing;
+    private long _listingVersion;
     private string _folder = "";
     private bool _disposed;
     [ObservableProperty] private ObservableCollection<PreviewEntry> _items = [];
@@ -21,16 +23,26 @@ public sealed partial class FilePreviewViewModel(MountedFilePreviewService files
 
     public async Task RefreshAsync()
     {
+        if (_disposed) return;
+        long version = ++_listingVersion;
+        string folder = _folder;
+        _listing?.Cancel();
+        _listing?.Dispose();
+        _listing = new CancellationTokenSource();
+        var ct = _listing.Token;
         ClearPreview();
+        SelectedItem = null;
+        Items.Clear();
         Status = "画像・テキストを選択してください。";
         try
         {
-            var entries = await Task.Run(() => files.List(_folder));
-            if (_disposed) return;
+            var entries = await files.ListAsync(folder, ct);
+            if (_disposed || ct.IsCancellationRequested || version != _listingVersion) return;
             Items = new(entries);
-            Location = "/" + _folder;
+            Location = "/" + folder;
         }
-        catch (Exception ex) { if (!_disposed) Status = ex.Message; }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { if (!_disposed && !ct.IsCancellationRequested && version == _listingVersion) Status = ex.Message; }
     }
 
     [RelayCommand] private async Task UpAsync()
@@ -60,7 +72,12 @@ public sealed partial class FilePreviewViewModel(MountedFilePreviewService files
                     using var stream = new MemoryStream(bytes.Buffer, writable: false);
                     image = Bitmap.DecodeToWidth(stream, 1600);
                 }
-                else text = Encoding.UTF8.GetString(bytes.Buffer);
+                else
+                {
+                    using var stream = new MemoryStream(bytes.Buffer, writable: false);
+                    using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+                    text = reader.ReadToEnd();
+                }
             }, ct);
             if (ct.IsCancellationRequested || _disposed) { image?.Dispose(); return; }
             Image = image;
@@ -80,5 +97,13 @@ public sealed partial class FilePreviewViewModel(MountedFilePreviewService files
         Image = null;
         Text = "";
     }
-    public void Dispose() { _disposed = true; ClearPreview(); Items.Clear(); }
+    public void Dispose()
+    {
+        _disposed = true;
+        _listing?.Cancel();
+        _listing?.Dispose();
+        _listing = null;
+        ClearPreview();
+        Items.Clear();
+    }
 }

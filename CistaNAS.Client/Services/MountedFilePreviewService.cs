@@ -2,8 +2,14 @@ using CistaNAS.Client.Security;
 
 namespace CistaNAS.Client.Services;
 
+public interface IMountedFilePreviewService
+{
+    Task<PreviewEntry[]> ListAsync(string relative, CancellationToken ct);
+    Task<SecureBuffer> ReadAsync(string relative, CancellationToken ct);
+}
+
 /// <summary>Mounted Dokan content is read into owned RAM buffers, without local copies.</summary>
-public sealed class MountedFilePreviewService
+public sealed class MountedFilePreviewService : IMountedFilePreviewService
 {
     public const int ImageLimit = 32 * 1024 * 1024;
     public const int TextLimit = 2 * 1024 * 1024;
@@ -36,11 +42,19 @@ public sealed class MountedFilePreviewService
     public static bool IsText(string name) => Path.GetExtension(name).ToLowerInvariant() is
         ".txt" or ".md" or ".json" or ".csv" or ".log" or ".xml" or ".yaml" or ".yml" or ".cs";
 
-    public PreviewEntry[] List(string relative) => Directory.EnumerateFileSystemEntries(Resolve(relative))
-        .Select(path => new PreviewEntry(Path.GetFileName(path), Path.GetRelativePath(_root, path), Directory.Exists(path)))
-        .OrderByDescending(item => item.IsFolder).ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+    public Task<PreviewEntry[]> ListAsync(string relative, CancellationToken ct) => Task.Run(() =>
+    {
+        var entries = new List<PreviewEntry>();
+        foreach (string path in Directory.EnumerateFileSystemEntries(Resolve(relative)))
+        {
+            ct.ThrowIfCancellationRequested();
+            entries.Add(new(Path.GetFileName(path), Path.GetRelativePath(_root, path), Directory.Exists(path)));
+        }
+        return entries.OrderByDescending(item => item.IsFolder)
+            .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+    }, ct);
 
-    public async Task<SecureBuffer> ReadAsync(string relative, CancellationToken ct)
+    public Task<SecureBuffer> ReadAsync(string relative, CancellationToken ct) => Task.Run(async () =>
     {
         int limit = IsImage(relative) ? ImageLimit : IsText(relative) ? TextLimit
             : throw new NotSupportedException("組み込みViewerは画像・テキストに対応しています。");
@@ -55,7 +69,7 @@ public sealed class MountedFilePreviewService
             return buffer;
         }
         catch { buffer.Dispose(); throw; }
-    }
+    }, ct);
 }
 
 public sealed record PreviewEntry(string Name, string RelativePath, bool IsFolder)
