@@ -338,14 +338,15 @@ public class E2eeBrowserTests(PlaywrightWebAppFixture fixture)
         // C# 側 recipient 鍵ペア（JS wrap → C# unwrap 方向の受信者）
         var (recipientPub, recipientPriv) = E2eeCrypto.GenerateEcdhKeyPair();
 
-        // フェーズ 1: JS 側 recipient 鍵ペアを生成してページに保持し、公開鍵 (raw 65B) を受け取る。
+        // フェーズ 1: JS 側で決定論的 identity 鍵を導出してページに保持し、公開鍵 (raw 65B) を受け取る。
         // C# → JS 方向はこの公開鍵宛に wrap しないと秘密鍵が一致せず復号できない。
         string jsPubB64 = await page.EvaluateAsync<string>(@"async (args) => {
             const mod = await import(args.moduleUrl);
-            const kp = await mod.generateKeyPair();
+            const kp = await mod.deriveIdentityKeyPair('pw-bob', 'pw-v2-test-pass', args.saltB64,
+                { algorithm: 'pbkdf2-sha256', iterations: 10000, memoryKiB: 0, timeCost: 0, parallelism: 0 });
             window.__v2kp = kp;
             return await mod.exportPublicKey(kp.publicKeyHandle);
-        }", new { moduleUrl = $"{fixture.BaseUrl}/js/e2ee.js" });
+        }", new { moduleUrl = $"{fixture.BaseUrl}/js/e2ee.js", saltB64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" });
 
         // C# → JS: JS 側 recipient 公開鍵宛に GroupKey を wrap（JS がアンラップする）
         var (csEph, csNonce, csCt, csTag) = E2eeV2.EcdhWrapGroupKey(

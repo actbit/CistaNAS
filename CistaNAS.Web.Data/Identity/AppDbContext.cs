@@ -19,6 +19,7 @@ public sealed class AppDbContext : IdentityDbContext<ApplicationUser, Applicatio
         {
             e.ToTable("Users");
             e.Property(u => u.PublicKey).HasMaxLength(256);
+            e.Property(u => u.EcdhIdentitySalt).HasMaxLength(64);
         });
         builder.Entity<ApplicationRole>(e => e.ToTable("Roles"));
         builder.Entity<IdentityUserRole<string>>(e => e.ToTable("UserRoles"));

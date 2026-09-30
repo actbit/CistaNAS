@@ -63,6 +63,13 @@ namespace CistaNAS.Web.Migrations.Sqlite.Migrations
                         .IsRequired()
                         .HasColumnType("TEXT");
 
+                    b.Property<int>("EcdhDerivationVersion")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<byte[]>("EcdhIdentitySalt")
+                        .HasMaxLength(64)
+                        .HasColumnType("BLOB");
+
                     b.Property<string>("Email")
                         .HasMaxLength(256)
                         .HasColumnType("TEXT");
@@ -99,6 +106,9 @@ namespace CistaNAS.Web.Migrations.Sqlite.Migrations
 
                     b.Property<string>("SecurityStamp")
                         .HasColumnType("TEXT");
+
+                    b.Property<bool>("SharingEnabled")
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("TwoFactorEnabled")
                         .HasColumnType("INTEGER");

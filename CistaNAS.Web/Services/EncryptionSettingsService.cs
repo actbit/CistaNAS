@@ -37,6 +37,30 @@ public sealed class EncryptionSettingsService
     /// <summary>現在の認証設定（メモリ上の CistaNasOptions）を返す。</summary>
     public AuthOptions CurrentAuthOptions() => _options.Auth;
 
+    /// <summary>現在の共有設定（メモリ上の CistaNasOptions）を返す。</summary>
+    public SharingOptions CurrentSharingOptions() => _options.Sharing;
+
+    /// <summary>
+    /// サーバー全体の共有有効フラグを cista-settings.json に保存する。
+    /// false でも revoke 等のセキュリティ操作は許可される（SharingPolicy 参照）。
+    /// </summary>
+    public void SaveSharingOptions(bool enabled)
+    {
+        try
+        {
+            Directory.CreateDirectory(_options.DataRoot);
+            var persisted = LoadOrInitPersisted();
+            persisted.Sharing = new PersistedSharing { Enabled = enabled };
+            WriteAtomicSettings(SettingsPath, JsonSerializer.Serialize(persisted, JsonOptions));
+            _options.Sharing.Enabled = enabled;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "共有設定の保存に失敗しました。");
+            throw;
+        }
+    }
+
     /// <summary>
     /// DataRoot/cista-settings.json から VolumeOptions を読み込み、メモリ上の
     /// CistaNasOptions.Volume を更新する。ファイルが無ければ何もしない。
@@ -66,6 +90,10 @@ public sealed class EncryptionSettingsService
                 _options.Auth.DefaultAdminUser = persisted.Auth.DefaultAdminUser;
                 _options.Auth.Pbkdf2Iterations = persisted.Auth.Pbkdf2Iterations;
                 _options.Auth.WebDavPbkdf2Iterations = persisted.Auth.WebDavPbkdf2Iterations;
+            }
+            if (persisted?.Sharing is not null)
+            {
+                _options.Sharing.Enabled = persisted.Sharing.Enabled;
             }
         }
         catch (Exception ex)
@@ -212,6 +240,7 @@ public sealed class EncryptionSettingsService
     {
         public PersistedVolume? Volume { get; set; }
         public PersistedAuth? Auth { get; set; }
+        public PersistedSharing? Sharing { get; set; }
     }
 
     private sealed class PersistedVolume
@@ -233,5 +262,10 @@ public sealed class EncryptionSettingsService
         public string DefaultAdminUser { get; set; } = "admin";
         public int Pbkdf2Iterations { get; set; }
         public int WebDavPbkdf2Iterations { get; set; }
+    }
+
+    private sealed class PersistedSharing
+    {
+        public bool Enabled { get; set; } = true;
     }
 }

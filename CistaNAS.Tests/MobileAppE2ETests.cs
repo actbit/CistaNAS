@@ -28,6 +28,8 @@ internal sealed class MemorySecureKeyStore : ISecureKeyStore
     public void Save(string name, byte[] plaintext) => _store[name] = plaintext;
     public void Delete(string name) => _store.TryRemove(name, out _);
     public bool Exists(string name) => _store.ContainsKey(name);
+    /// <summary>保存済みキー名の一覧（秘密鍵非永続化テスト用）。</summary>
+    public IReadOnlyCollection<string> Keys => [.. _store.Keys];
 }
 
 /// <summary>テスト用一時ディレクトリの IFileCacheProvider。</summary>

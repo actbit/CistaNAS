@@ -6,7 +6,9 @@
 @inject AuthApiClient AuthApi
 @inject AccountApiClient AccountApi
 @inject GroupApiClient GroupApi
+@inject E2eeApiClient E2eeApi
 @inject E2eeInterop E2ee
+@inject E2eeKeyResolverService KeyResolver
 @inject EncryptionSettingsClient EncSettingsApi
 @inject IJSRuntime JS
 @inject NavigationManager Nav
@@ -72,6 +74,7 @@ else
                                 <tr>
                                     <th>ユーザー名</th>
                                     <th>ロール</th>
+                                    <th>共有</th>
                                     <th>操作</th>
                                 </tr>
                             </thead>
@@ -82,6 +85,11 @@ else
                                         <td>@user.UserName</td>
                                         <td>
                                             <span class="badge bg-primary">@(user.Roles.FirstOrDefault() ?? "user")</span>
+                                        </td>
+                                        <td>
+                                            <input type="checkbox" class="form-check-input" title="共有を許可"
+                                                   checked="@user.SharingEnabled"
+                                                   @onchange="args => HandleToggleUserSharing(user.UserName, args.Value is true)" />
                                         </td>
                                         <td>
                                             @if (user.UserName != Auth.CurrentUsername)
@@ -131,6 +139,22 @@ else
                         <button class="btn btn-success" @onclick="HandleAddUser">追加</button>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <!-- 共有設定 (admin) -->
+        <div class="card mb-4">
+            <div class="card-header">共有設定（サーバー全体）</div>
+            <div class="card-body">
+                <div class="form-check form-switch">
+                    <input class="form-check-input" type="checkbox" role="switch" id="globalSharingSwitch"
+                           checked="@_globalSharingEnabled" @onchange="HandleGlobalSharingChanged" />
+                    <label class="form-check-label" for="globalSharingSwitch">共有機能を有効にする</label>
+                </div>
+                <p class="form-text">
+                    無効にすると全ユーザーの共有・招待・ECDH identity セットアップが禁止されます
+                    （revoke は常に可能。私用 E2EE ボリュームには影響しません）。
+                </p>
             </div>
         </div>
     }
@@ -308,15 +332,22 @@ else
         </div>
     </div>
 
-    <!-- E2EE 鍵ペア管理 -->
+    <!-- E2EE 共有鍵（identity）管理 -->
     <div class="card mb-4">
-        <div class="card-header">E2EE 鍵ペア管理</div>
+        <div class="card-header">E2EE 共有鍵（identity）管理</div>
         <div class="card-body">
             <p class="form-text">
-                E2EE グループ共有で使用する ECDH 鍵ペアを管理します。
-                秘密鍵はパスワードで暗号化してブラウザに保存します。
+                E2EE グループ共有で使用する ECDH identity 鍵を管理します。
+                秘密鍵はブラウザにもサーバーにも保存されません。E2EE Key Password から必要時に
+                決定論的に導出します（Argon2id KDF を実行するため導出に時間がかかることがあります）。
             </p>
-            @if (_keyHasPublicKey)
+            @if (_keySetup is null)
+            {
+                <div class="alert alert-secondary">
+                    このアカウントでは共有機能が無効です（セットアップ不要。私用 E2EE ボリュームは共有無効でも利用できます）。
+                </div>
+            }
+            else if (_keyHasPublicKey)
             {
                 <div class="alert alert-success">
                     公開鍵登録済み。E2EE グループ共有を利用できます。
@@ -325,7 +356,15 @@ else
             else
             {
                 <div class="alert alert-warning">
-                    公開鍵が未登録です。鍵ペアを生成してください。
+                    公開鍵が未登録です。E2EE Key Password を入力して identity 鍵を導出・登録してください。
+                </div>
+            }
+            @if (_hasLegacyPrivKey)
+            {
+                <div class="alert alert-warning">
+                    旧バージョンがブラウザに保存した E2EE 秘密鍵（e2ee_privkey_*）が残留しています。
+                    新方式では秘密鍵をブラウザに保存しないため削除できます。
+                    <button class="btn btn-sm btn-outline-danger ms-2" @onclick="HandleRemoveLegacyKey">削除</button>
                 </div>
             }
             @if (_keyError is not null)
@@ -337,12 +376,15 @@ else
                 <div class="alert alert-success">@_keySuccess</div>
             }
             <div class="mb-3">
-                <label class="form-label">パスワード（秘密鍵の暗号化用）</label>
+                <label class="form-label">E2EE Key Password（identity 鍵の導出用）</label>
                 <input type="password" class="form-control input-narrow" @bind="_keyPassword" />
             </div>
-            <button class="btn btn-primary" disabled="@_keyLoading" @onclick="HandleGenerateKeyPair">
-                @(_keyLoading ? "生成中..." : "鍵ペアを生成・登録")
-            </button>
+            @if (_keySetup is not null)
+            {
+                <button class="btn btn-primary" disabled="@_keyLoading" @onclick="HandleSetupIdentityKey">
+                    @(_keyLoading ? "導出中..." : (_keyHasPublicKey ? "鍵を再導出して検証" : "identity 鍵を導出・登録"))
+                </button>
+            }
         </div>
     </div>
 }
@@ -369,6 +411,9 @@ else
     private string? _userError;
     private bool _userSuccess;
 
+    // 共有設定
+    private bool _globalSharingEnabled = true;
+
     // グループ管理
     private IReadOnlyList<GroupEntity> _groups = [];
     private string _newGroupName = "";
@@ -381,9 +426,11 @@ else
     private bool _encSaveSuccess;
     private string? _encError;
 
-    // E2EE 鍵ペア管理
+    // E2EE 共有鍵（identity）管理
+    private E2eeApiClient.E2eeIdentitySetupInfo? _keySetup;
     private bool _keyHasPublicKey;
     private bool _keyLoading;
+    private bool _hasLegacyPrivKey;
     private string _keyPassword = "";
     private string? _keyError;
     private string? _keySuccess;
@@ -401,6 +448,7 @@ else
         if (Auth.IsAdmin)
         {
             try { _users = await AccountApi.ListWithRolesAsync(); } catch { }
+            try { _globalSharingEnabled = await EncSettingsApi.GetSharingEnabledAsync(); } catch { }
         }
 
         try { _groups = await GroupApi.ListGroupsAsync(); } catch { }
@@ -412,7 +460,13 @@ else
         }
         catch { }
 
-        try { _keyHasPublicKey = await AccountApi.GetPublicKeyAsync(Auth.CurrentUsername) is not null; } catch { }
+        try
+        {
+            _keySetup = await E2eeApi.GetIdentitySetupAsync();
+            _keyHasPublicKey = _keySetup?.PublicKey is not null;
+        }
+        catch { }
+        try { _hasLegacyPrivKey = await KeyResolver.HasLegacyPrivateKeyAsync(Auth.CurrentUsername); } catch { }
     }
 
     // ---- パスワード変更 ----
@@ -468,6 +522,36 @@ else
             await RefreshData();
         }
         catch (Exception ex) { _userError = ex.Message; }
+    }
+
+    // ---- 共有設定 ----
+
+    private async Task HandleToggleUserSharing(string username, bool enabled)
+    {
+        _userError = null;
+        try
+        {
+            await AccountApi.SetUserSharingAsync(username, enabled);
+            _users = _users
+                .Select(u => u.UserName == username ? u with { SharingEnabled = enabled } : u)
+                .ToList();
+        }
+        catch (Exception ex) { _userError = $"共有設定の変更に失敗しました: {ex.Message}"; }
+    }
+
+    private async Task HandleGlobalSharingChanged(ChangeEventArgs e)
+    {
+        bool enabled = e.Value is true;
+        try
+        {
+            await EncSettingsApi.SetSharingEnabledAsync(enabled);
+            _globalSharingEnabled = enabled;
+        }
+        catch (Exception ex)
+        {
+            _userError = $"共有設定の保存に失敗しました: {ex.Message}";
+            StateHasChanged();
+        }
     }
 
     // ---- グループ管理 ----
@@ -548,59 +632,79 @@ else
         catch (Exception ex) { _encError = $"保存エラー: {ex.Message}"; }
     }
 
-    // ---- E2EE 鍵ペア管理 ----
+    // ---- E2EE 共有鍵（identity）管理 ----
 
-    private async Task HandleGenerateKeyPair()
+    private async Task HandleSetupIdentityKey()
     {
+        if (_keyLoading) return; // 再入防止（二重クリック等で同一処理を走らせない）
         _keyLoading = true; _keyError = null; _keySuccess = null;
         try
         {
+            var setup = _keySetup;
+            if (setup is null)
+            {
+                _keyError = "このアカウントでは共有機能が無効です。";
+                return;
+            }
             if (string.IsNullOrWhiteSpace(_keyPassword))
             {
-                _keyError = "パスワードを入力してください。";
+                _keyError = "E2EE Key Password を入力してください。";
                 return;
             }
 
-            // ECDH 鍵ペア生成
-            var (pubHandle, privHandle) = await E2ee.GenerateKeyPair();
-
-            // 公開鍵をエクスポート
-            string pubKeyB64 = await E2ee.ExportPublicKey(pubHandle);
-
-            // 秘密鍵をパスワードで暗号化（Argon2id+PBKDF2 合成 KDF、サーバー設定のパラメータを使用）
-            var encSettings = await EncSettingsApi.GetAsync();
-            var privKdf = E2eeKdfOptions.NewArgon2id(
-                encSettings.KdfIterations, encSettings.KdfMemoryKiB, encSettings.KdfTimeCost, encSettings.KdfParallelism);
-            byte[] salt = System.Security.Cryptography.RandomNumberGenerator.GetBytes(16);
-            string saltB64 = Convert.ToBase64String(salt);
-            var (nonceB64, wrappedB64) = await E2ee.EncryptPrivateKey(privHandle, _keyPassword, saltB64, privKdf);
-
-            // サーバーに公開鍵を登録
-            await AccountApi.UpdatePublicKeyAsync(pubKeyB64);
-
-            // 暗号化済み秘密鍵を localStorage に保存（KDF パラメータも記録。旧スキーマはレガシー PBKDF2 として復号）
-            string key = $"e2ee_privkey_{Auth.CurrentUsername}";
-            string json = System.Text.Json.JsonSerializer.Serialize(new
+            var kdf = new E2eeKdfOptions(setup.Kdf.Algorithm, setup.Kdf.Iterations,
+                setup.Kdf.MemoryKiB, setup.Kdf.TimeCost, setup.Kdf.Parallelism);
+            var (pubHandle, privHandle, pubKeyB64) = await E2ee.DeriveIdentityKeyPair(
+                Auth.CurrentUsername, _keyPassword, Convert.ToBase64String(setup.IdentitySalt), kdf);
+            try
             {
-                wrapped = wrappedB64,
-                nonce = nonceB64,
-                salt = saltB64,
-                iterations = privKdf.Iterations,
-                algorithm = privKdf.Algorithm,
-                memoryKiB = privKdf.MemoryKiB,
-                timeCost = privKdf.TimeCost,
-                parallelism = privKdf.Parallelism,
-            });
-            await JS.InvokeVoidAsync("localStorage.setItem", key, json);
-
-            await E2ee.ClearKey(pubHandle);
-            await E2ee.ClearKey(privHandle);
-
-            _keyHasPublicKey = true;
-            _keySuccess = "鍵ペアを生成し、公開鍵を登録しました。";
+                if (!string.IsNullOrEmpty(setup.PublicKey)
+                    && !string.Equals(setup.PublicKey, pubKeyB64, StringComparison.Ordinal))
+                {
+                    // パスワード誤り: 登録済み公開鍵は決して上書きしない（rotation は別途明示操作のみ）
+                    _keyError = "E2EE Key Password が既存の identity と一致しません。" +
+                                "セットアップ時に設定したパスワードを入力してください（公開鍵は変更されていません）。";
+                    return;
+                }
+                if (string.IsNullOrEmpty(setup.PublicKey))
+                {
+                    await E2eeApi.SetMyPublicKeyAsync(pubKeyB64);
+                    // 登録後は _keySetup も更新する。stale な PublicKey=null のままだと
+                    // 次の「鍵を再導出して検証」が比較経路ではなく登録経路（PUT）に進み、
+                    // 誤パスワード時にサーバー側 400 の汎用エラーになってしまう
+                    _keySetup = setup with { PublicKey = pubKeyB64 };
+                    _keyHasPublicKey = true;
+                    _keySuccess = "identity 鍵を導出し、公開鍵を登録しました。秘密鍵はブラウザに保存されません。";
+                }
+                else
+                {
+                    _keySuccess = "導出した identity 鍵は登録済み公開鍵と一致しました（E2EE Key Password は正しいです）。";
+                }
+            }
+            finally
+            {
+                try { await E2ee.ClearKey(pubHandle); } catch { }
+                try { await E2ee.ClearKey(privHandle); } catch { }
+            }
         }
         catch (Exception ex) { _keyError = $"エラー: {ex.Message}"; }
-        finally { _keyLoading = false; }
+        finally
+        {
+            _keyPassword = "";
+            _keyLoading = false;
+        }
+    }
+
+    private async Task HandleRemoveLegacyKey()
+    {
+        _keyError = null; _keySuccess = null;
+        try
+        {
+            bool removed = await KeyResolver.RemoveLegacyPrivateKeyAsync(Auth.CurrentUsername);
+            _hasLegacyPrivKey = await KeyResolver.HasLegacyPrivateKeyAsync(Auth.CurrentUsername);
+            if (removed) _keySuccess = "旧 E2EE 秘密鍵をブラウザから削除しました。";
+        }
+        catch (Exception ex) { _keyError = $"エラー: {ex.Message}"; }
     }
 
     private async void OnAuthStateChanged()

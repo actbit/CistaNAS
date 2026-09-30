@@ -116,6 +116,10 @@ public sealed partial class VolumeService
                 {
                     var header = await LoadHeaderIfExistsAsync(name);
                     if (header is null || !header.HasUserAccess(username)) continue;
+                    // ECDH wrap は identity 公開鍵でラップされており login パスワードと無関係。
+                    // サーバーでは再ラップできないため対象外（BeginRewrapUser 参照）。
+                    if (!string.Equals(header.UserKeys[username].WrapType, "password", StringComparison.Ordinal))
+                        continue;
 
                     oldEntries[name] = header.UserKeys[username];
                     header.BeginRewrapUser(username, oldPassword, newPassword, VolOpts.ToKdfSpec());

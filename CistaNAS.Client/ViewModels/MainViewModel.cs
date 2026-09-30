@@ -107,9 +107,18 @@ public partial class MainViewModel : ObservableObject
             EncKdfAlgorithm = alg; // OnEncKdfAlgorithmChanged で index が再同期される（収束）
     }
 
-    // ---- 設定: E2EE鍵ペア ----
+    // ---- 設定: E2EE 鍵ペア ----
     [ObservableProperty] private bool _hasPublicKey;
     [ObservableProperty] private string _keyPairPassword = "";
+
+    /// <summary>E2EE 共有パスワード（ECDH identity 導出用。ログインパスワードとは別概念）。
+    /// RAM 上のみで保持し、ログアウト時に破棄する。永続化ストレージへは書き込まない。</summary>
+    [ObservableProperty] private string _e2eePassword = "";
+
+    /// <summary>旧バージョンが残した ECDH 秘密鍵ファイル（DPAPI 保護）の検出状況。
+    /// 新方式では秘密鍵を永続化しないため、検出時に警告を表示し cleanup を促す。</summary>
+    [ObservableProperty] private bool _hasLegacyKeyFiles;
+    [ObservableProperty] private int _legacyKeyFileCount;
 
     // ---- 招待 ----
     [ObservableProperty] private string _inviteTargetUsername = "";
@@ -250,6 +259,10 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand]
     private void Logout()
     {
+        // E2EE セッション破棄: E2EE 共有パスワードは RAM 上のみで保持しており、
+        // ログアウト時に破棄する（永続化ストレージには一切書き込まない）。
+        E2eePassword = "";
+        KeyPairPassword = "";
         IsLoggedIn = false;
         IsAdmin = false;
         _api = null;
@@ -407,7 +420,7 @@ public partial class MainViewModel : ObservableObject
         {
             if (SelectedVolume.IsE2ee)
             {
-                await _mountService.MountE2eeAsync(SelectedVolume.Name, SelectedDriveLetter, _api, Username, VolumePassword);
+                await _mountService.MountE2eeAsync(SelectedVolume.Name, SelectedDriveLetter, _api, Username, VolumePassword, E2eePassword);
             }
             else if (SelectedVolume.EncryptionMode == "server")
             {
@@ -540,12 +553,11 @@ public partial class MainViewModel : ObservableObject
         int newEpoch = currentEpoch + 1;
         string volumeId = gki.VolumeId;
 
-        // 現行 epoch の GroupKey を自分の ECDH 秘密鍵でアンラップ（旧 per-file DEK の再ラップ用）
+        // 現行 epoch の GroupKey を ECDH identity 秘密鍵（E2EE 共有パスワードから導出）で
+        // アンラップ（旧 per-file DEK の再ラップ用）。秘密鍵は RAM 上のみ。
         var myWrap = gki.MyGroupKeys.FirstOrDefault(k => k.Epoch == currentEpoch)
             ?? throw new InvalidOperationException("自分宛ての現行 epoch GroupKey がありません。");
-        byte[]? privateKey = EcdhKeyStore.LoadPrivateKey(Username!);
-        if (privateKey is null)
-            throw new InvalidOperationException("ローカルに ECDH 秘密鍵が見つかりません。先に設定で鍵ペアを生成してください。");
+        byte[] privateKey = await DeriveEcdhPrivateKeyAsync();
         try
         {
             using var oldGroupKeyBuf = new SecureBuffer(E2eeV2.EcdhUnwrapGroupKey(
@@ -676,9 +688,7 @@ public partial class MainViewModel : ObservableObject
             {
                 var myWrap = gki.MyGroupKeys.FirstOrDefault(k => k.Epoch == gki.KeyEpoch)
                     ?? throw new InvalidOperationException("自分宛ての現行 epoch GroupKey がありません。");
-                byte[]? privateKey = EcdhKeyStore.LoadPrivateKey(Username!);
-                if (privateKey is null)
-                    throw new InvalidOperationException("ローカルに ECDH 秘密鍵が見つかりません。先に設定で鍵ペアを生成してください。");
+                byte[] privateKey = await DeriveEcdhPrivateKeyAsync();
                 try
                 {
                     using var groupKeyBuf = new SecureBuffer(E2eeV2.EcdhUnwrapGroupKey(
@@ -969,27 +979,82 @@ public partial class MainViewModel : ObservableObject
         IsBusy = true;
         try
         {
-            // ECDH P-256 鍵ペア生成（公開鍵は raw 非圧縮点 65B、秘密鍵は SEC1）
-            var (publicKey, privateKey) = E2eeCrypto.GenerateEcdhKeyPair();
-            try
+            // identity salt / KDF スペックをサーバーから取得（salt は非秘密）。
+            // 共有機能が無効なアカウントでは ECDH セットアップ自体が不要。
+            var setup = await _api.GetIdentitySetupAsync();
+            if (setup is null)
             {
-                // 公開鍵をサーバーに登録（raw 65B を Base64 で送信。WASM と同一形式）
-                await CistaNasApiClientE2eeExtensions.SetMyPublicKeyAsync(_api, publicKey);
-
-                // 秘密鍵を DPAPI (CurrentUser) で保護してローカルに永続化。
-                // マウント時にパスワード入力不要で ECDH アンラップ可能。
-                EcdhKeyStore.SavePrivateKey(Username!, privateKey);
+                StatusMessage = "このアカウントでは共有機能が無効です。E2EE 共有のセットアップは不要です。";
+                HasPublicKey = false;
+                return;
             }
-            finally
+
+            // E2EE 共有パスワードから決定論的に ECDH identity 鍵ペアを導出。
+            // 秘密鍵は永続化ストレージへ保存せず、RAM 上で使用後に破棄する。
+            if (string.IsNullOrEmpty(E2eePassword))
             {
-                CryptographicOperations.ZeroMemory(privateKey);
+                StatusMessage = "E2EE 共有パスワードを入力してください。";
+                return;
+            }
+            var (publicKey, privateKey) = EcdhIdentityUnlock.DeriveVerified(Username!, E2eePassword, setup);
+            CryptographicOperations.ZeroMemory(privateKey);
+
+            if (setup.PublicKey is null)
+            {
+                // 初回セットアップ: 公開鍵のみサーバーに登録（private key は送らない）
+                await CistaNasApiClientE2eeExtensions.SetMyPublicKeyAsync(_api, publicKey);
+                StatusMessage = "E2EE 共有をセットアップしました。";
+            }
+            else
+            {
+                // DeriveVerified が既存公開鍵との一致を確認済み → 同一 identity が復元できている
+                StatusMessage = "E2EE 共有パスワードを確認しました。同一 identity を再導出できています。";
             }
 
             HasPublicKey = true;
-            StatusMessage = "E2EE 鍵ペアを生成・登録しました。";
+            CheckLegacyKeyFiles();
         }
-        catch (Exception ex) { StatusMessage = $"鍵ペア生成失敗: {ex.Message}"; }
+        catch (Exception ex) { StatusMessage = $"E2EE 共有セットアップ失敗: {ex.Message}"; }
         finally { IsBusy = false; }
+    }
+
+    /// <summary>旧バージョンが残した ECDH 秘密鍵ファイル（DPAPI 保護）を検出して警告を立てる。</summary>
+    private void CheckLegacyKeyFiles()
+    {
+        var files = LegacyEcdhKeyCleanup.DetectLegacyKeyFiles();
+        LegacyKeyFileCount = files.Length;
+        HasLegacyKeyFiles = files.Length > 0;
+        if (HasLegacyKeyFiles)
+        {
+            StatusMessage =
+                "E2EE 共有鍵の保存方式が変更されました。旧バージョンの秘密鍵ファイルが残っています。「旧鍵ファイルを削除」で cleanup してください。";
+        }
+    }
+
+    [RelayCommand]
+    private void CleanupLegacyKeys()
+    {
+        int deleted = LegacyEcdhKeyCleanup.DeleteLegacyKeyFiles();
+        CheckLegacyKeyFiles();
+        StatusMessage = deleted > 0
+            ? $"旧 ECDH 秘密鍵ファイルを {deleted} 件削除しました。"
+            : "削除対象の旧 ECDH 秘密鍵ファイルはありません。";
+    }
+
+    /// <summary>
+    /// E2EE 共有パスワードから決定論的に ECDH identity 秘密鍵（SEC1）を導出する。
+    /// サーバー登録済み公開鍵と照合し、不一致（パスワード誤り）時は例外で中止する。
+    /// 戻り値は秘密情報のため、呼び出し側は使用後に zeroize すること（永続化しない）。
+    /// </summary>
+    private async Task<byte[]> DeriveEcdhPrivateKeyAsync()
+    {
+        if (_api is null) throw new InvalidOperationException("ログインしてください。");
+        if (string.IsNullOrEmpty(E2eePassword))
+            throw new InvalidOperationException("E2EE 共有パスワードを入力してください（設定タブで入力できます）。");
+        var setup = await _api.GetIdentitySetupAsync()
+            ?? throw new InvalidOperationException("このアカウントでは共有機能が無効です。");
+        var (_, privateKey) = EcdhIdentityUnlock.DeriveVerified(Username!, E2eePassword, setup);
+        return privateKey;
     }
 
     [RelayCommand]

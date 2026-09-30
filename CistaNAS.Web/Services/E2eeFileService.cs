@@ -190,25 +190,42 @@ public sealed class E2eeFileService
                 long storedSoFar = 0;
                 for (int i = 0; i < entry.ChunkSizes.Count; i++)
                     storedSoFar = checked(storedSoFar + entry.ChunkSizes[i]);
+                // 未確定チャンク（staged visibility の退避分）もストレージを占有するため合算する
+                // （二重カウント気味になるが、DoS 防護としては過大評価側に倒すのが安全）。
+                if (entry.PendingChunks is not null)
+                {
+                    foreach (var pending in entry.PendingChunks.Values)
+                        storedSoFar = checked(storedSoFar + pending.Size);
+                }
                 long oldChunkLen = chunkIndex < entry.ChunkSizes.Count ? entry.ChunkSizes[chunkIndex] : 0;
                 long projectedStored = Math.Max(0, checked(storedSoFar - oldChunkLen + dataLength));
-                int projectedChunkCount = Math.Max(entry.ChunkCount, replace ? chunkIndex + 1 : entry.ChunkCount);
+
+                // 差分上書き（replace）か新規順次アップロードかで範囲チェックを切替。
+                // replace=true: 既存チャンクの上書き、または末尾追記（可視 + 未確定の effective 数まで）を許可。
+                //   既存チャンク上書きは nonce の revision を +1 して AES-GCM の nonce 再利用を防ぐ。
+                // replace=false: 従来の順次アップロード強制（新規ファイル作成用）。
+                //
+                // ファイル単位の可視化（staged visibility）: チャンクモードの replace は
+                // PendingChunks に退避され、FinalizeFileAsync の一括昇格で初めて読み取り側に見える。
+                // 排他の単位をチャンクでなくファイルにするため（昇格はカタログ R-M-W 1 回で完了し、
+                // 複数チャンク差し替え中の読み手が新旧混在のファイルを読めない）。
+                // 範囲チェックは可視 ChunkCount と未確定最大インデックスの effective 数に対して行う。
+                int effectiveChunkCount = entry.ChunkCount;
+                if (entry.PendingChunks is not null)
+                {
+                    foreach (int pendingIndex in entry.PendingChunks.Keys)
+                        effectiveChunkCount = Math.Max(effectiveChunkCount, pendingIndex + 1);
+                }
+                int projectedChunkCount = Math.Max(effectiveChunkCount, replace ? chunkIndex + 1 : effectiveChunkCount);
                 long projectedPlain = ComputePlainSize(projectedStored, projectedChunkCount);
                 if (projectedPlain > _volumeService.MaxFileSizeBytes)
                     throw new FileServiceException(
                         $"ファイルサイズが上限 ({_volumeService.MaxFileSizeBytes:N0} バイト) を超えています。");
 
-                // 差分上書き（replace）か新規順次アップロードかで範囲チェックを切替。
-                // replace=true: 既存チャンク（chunkIndex < ChunkCount）の上書き、または末尾追記（== ChunkCount）を許可。
-                //   既存チャンク上書きは nonce の revision を +1 して AES-GCM の nonce 再利用を防ぐ。
-                // replace=false: 従来の順次アップロード強制（新規ファイル作成用）。
-                int prevChunkCount = entry.ChunkCount;
                 if (replace)
                 {
-                    if (chunkIndex > entry.ChunkCount)
-                        throw new FileServiceException($"チャンク {chunkIndex} は範囲外です（差分上書きは 0-{entry.ChunkCount}）。");
-                    if (chunkIndex == entry.ChunkCount)
-                        entry.ChunkCount = chunkIndex + 1; // 末尾追記: チャンクを拡張
+                    if (chunkIndex > effectiveChunkCount)
+                        throw new FileServiceException($"チャンク {chunkIndex} は範囲外です（差分上書きは 0-{effectiveChunkCount}）。");
                 }
                 else
                 {
@@ -244,11 +261,9 @@ public sealed class E2eeFileService
                     System.Security.Cryptography.SHA256.HashData(chunkData));
 
                 string? newChunkObjectId = null;
-                string? oldChunkObjectId = null;
 
                 if (_volumeService.IsChunkMode(volumeName))
                 {
-                    oldChunkObjectId = GetChunkObjectId(entry, chunkIndex);
                     newChunkObjectId = $"{fileId}/versions/{Guid.NewGuid():N}";
                     using var chunkStream = new MemoryStream(chunkData, writable: false);
                     await _chunkStore.WriteChunkAsync(volumeName, newChunkObjectId, chunkIndex, chunkStream, ct);
@@ -266,36 +281,80 @@ public sealed class E2eeFileService
                     await fs.FlushAsync(ct);
                 }
 
-                while (entry.ChunkSizes.Count <= chunkIndex)
-                    entry.ChunkSizes.Add(0);
-                entry.ChunkSizes[chunkIndex] = chunkData.Length;
-
-                // ハッシュをカタログに保存
-                while (entry.ChunkHashes.Count <= chunkIndex)
-                    entry.ChunkHashes.Add("");
-                entry.ChunkHashes[chunkIndex] = hashHex;
-
-                // revision: 既存チャンクの差分上書き（replace && chunkIndex < prevChunkCount）は
-                // nonce を一意にするため +1。新規/追記チャンクは初回 revision=0。
-                while (entry.ChunkRevisions.Count <= chunkIndex)
-                    entry.ChunkRevisions.Add(0);
-                entry.ChunkRevisions[chunkIndex] = (replace && chunkIndex < prevChunkCount)
-                    ? entry.ChunkRevisions[chunkIndex] + 1
-                    : 0;
-
-                // crypto format v2: チャンクを暗号化したときの keyEpoch を記録する。
-                // クライアントは entry.KeyEpoch（カタログ取得時点の値）を ctx に使って暗号化するため
-                // サーバーも同じ値を刻む。rotation 後の rewrap（entry.KeyEpoch のみ更新）でも
-                // 旧チャンクはここに記録された epoch で復号できる。
-                while (entry.ChunkKeyEpochs.Count <= chunkIndex)
-                    entry.ChunkKeyEpochs.Add(entry.KeyEpoch);
-                entry.ChunkKeyEpochs[chunkIndex] = entry.KeyEpoch;
-
-                if (newChunkObjectId is not null)
+                // revision: 「実際にアップロード済みのチャンク」の差分上書きは nonce を一意にする
+                // ため +1。未アップロード（宣言のみ・hash 未記録）のチャンクへの初回書き込みは
+                // revision=0 のまま — クライアントは GetChunkHash の hash が null のとき
+                // revision=0 で暗号化するため、サーバーの記録と一致させる（旧実装は
+                // 「chunkIndex < ChunkCount」で判定していたため、sparse 書き込みで宣言済み
+                // 未アップロード・チャンクに replace=true した場合にサーバーだけ +1 して
+                // 復号不能になる潜在バグがあった）。同一未確定チャンクの再上書きでも
+                // pending 側の revision から連続して増えるため nonce 再利用は起こらない。
+                bool previouslyUploaded = (entry.PendingChunks is not null && entry.PendingChunks.ContainsKey(chunkIndex))
+                    || (chunkIndex < entry.ChunkHashes.Count && !string.IsNullOrEmpty(entry.ChunkHashes[chunkIndex]));
+                int newRevision;
+                if (replace && previouslyUploaded)
                 {
-                    while (entry.ChunkObjectIds.Count <= chunkIndex)
-                        entry.ChunkObjectIds.Add("");
-                    entry.ChunkObjectIds[chunkIndex] = newChunkObjectId;
+                    int baseRevision = entry.PendingChunks is not null && entry.PendingChunks.TryGetValue(chunkIndex, out var existingPending)
+                        ? existingPending.Revision
+                        : chunkIndex < entry.ChunkRevisions.Count ? entry.ChunkRevisions[chunkIndex] : 0;
+                    newRevision = baseRevision + 1;
+                }
+                else
+                {
+                    newRevision = 0; // 新規 / 末尾追記 / 未アップロード・チャンクへの初回書き込み
+                }
+
+                if (replace && newChunkObjectId is not null)
+                {
+                    // チャンクモードの差分上書き: ファイル単位の可視化（staged visibility）。
+                    // 未確定チャンクとして PendingChunks に退避し、可視カタログ
+                    // （ChunkObjectIds / Sizes / Hashes / Revisions / KeyEpochs / ChunkCount）は
+                    // 一切更新しない。FinalizeFileAsync の一括昇格で初めて読み取り側に見えるため、
+                    // 複数チャンクの差し替え中でも読み手は常に完全な旧バージョンを見る。
+                    // 旧チャンクオブジェクトも昇格まで保持する（中途半端な状態で公開しない）。
+                    // 新規順次アップロード（replace=false）は従来通り即時反映する
+                    //（半完成の新ファイルは確定まで読めない方が自然だが、既存クライアントの
+                    // アップロード途中リスト取得・レジューム動作を変えないため）。
+                    entry.PendingChunks ??= [];
+                    entry.PendingChunks[chunkIndex] = new E2eePendingChunk
+                    {
+                        ObjectId = newChunkObjectId,
+                        Size = chunkData.Length,
+                        Hash = hashHex,
+                        Revision = newRevision,
+                        KeyEpoch = entry.KeyEpoch,
+                    };
+                }
+                else
+                {
+                    // 非チャンクモード（レガシー・共有 volume.dat への in-place 書き込み）と
+                    // 新規順次アップロードは staging できない / しないため、従来通り即時反映する。
+                    // 書き込みセッション間の排他は E2eeWriteLeaseService のファイル単位リースで
+                    // 保証される。crypto format v2: チャンクを暗号化したときの keyEpoch を記録する。
+                    if (chunkIndex == entry.ChunkCount)
+                        entry.ChunkCount = chunkIndex + 1; // 末尾追記: チャンクを拡張
+                    while (entry.ChunkSizes.Count <= chunkIndex)
+                        entry.ChunkSizes.Add(0);
+                    entry.ChunkSizes[chunkIndex] = chunkData.Length;
+
+                    while (entry.ChunkHashes.Count <= chunkIndex)
+                        entry.ChunkHashes.Add("");
+                    entry.ChunkHashes[chunkIndex] = hashHex;
+
+                    while (entry.ChunkRevisions.Count <= chunkIndex)
+                        entry.ChunkRevisions.Add(0);
+                    entry.ChunkRevisions[chunkIndex] = newRevision;
+
+                    while (entry.ChunkKeyEpochs.Count <= chunkIndex)
+                        entry.ChunkKeyEpochs.Add(entry.KeyEpoch);
+                    entry.ChunkKeyEpochs[chunkIndex] = entry.KeyEpoch;
+
+                    if (newChunkObjectId is not null)
+                    {
+                        while (entry.ChunkObjectIds.Count <= chunkIndex)
+                            entry.ChunkObjectIds.Add("");
+                        entry.ChunkObjectIds[chunkIndex] = newChunkObjectId;
+                    }
                 }
 
                 try
@@ -304,21 +363,14 @@ public sealed class E2eeFileService
                 }
                 catch
                 {
+                    // カタログ保存失敗時は未確定チャンクの新オブジェクトを撤去（ゴミを残さない）。
+                    // 可視カタログは更新していないため、既存データは無傷のまま。
                     if (newChunkObjectId is not null)
                     {
                         try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, newChunkObjectId, CancellationToken.None); }
                         catch { }
                     }
                     throw;
-                }
-
-                // 旧形式は全チャンクが FileId 配下にあるため、個別移行時には削除しない。
-                if (oldChunkObjectId is not null
-                    && oldChunkObjectId != fileId
-                    && oldChunkObjectId != newChunkObjectId)
-                {
-                    try { await _chunkStore.DeleteChunksAsync(volumeName, oldChunkObjectId, ct); }
-                    catch { /* 新世代は公開済み。旧世代の削除はベストエフォート。 */ }
                 }
             }
         }
@@ -401,7 +453,16 @@ public sealed class E2eeFileService
             if (!catalog.Files.TryGetValue(fileId, out var entry))
                 return (null, 0);
 
-            if (chunkIndex < 0 || chunkIndex >= entry.ChunkHashes.Count)
+            if (chunkIndex < 0)
+                return (null, 0);
+
+            // 未確定チャンク（staged visibility の退避分）は確定前の検証（GetChunkHash → 暗号化 →
+            // UploadChunk → Finalize）で参照されるため、effective ビュー（pending 優先）で返す。
+            // DownloadChunkAsync は可視チャンクのみを返すため、確定前のデータが読めることはない。
+            if (entry.PendingChunks is not null && entry.PendingChunks.TryGetValue(chunkIndex, out var pending))
+                return (pending.Hash, pending.Revision);
+
+            if (chunkIndex >= entry.ChunkHashes.Count)
                 return (null, 0);
 
             string hash = entry.ChunkHashes[chunkIndex];
@@ -430,6 +491,38 @@ public sealed class E2eeFileService
                 var catalog = await LoadCatalogAsync(volumeName, ct);
                 if (!catalog.Files.TryGetValue(fileId, out var entry))
                     throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+
+                // ファイル単位の可視化: 未確定チャンク（replace 分）をここで一括昇格する。
+                // 昇格はカタログ R-M-W 1 回で完了するため、読み手は常に完全な旧版か完全な新版の
+                // どちらかを見る（チャンク単位の断片公開がない）。昇格前の可視 ObjectId は
+                // 検証成功後（SaveCatalogAsync 後）にベストエフォートで削除する。検証失敗時は
+                // 保存しないため未確定チャンクと旧データは無傷 — クライアントは再確定または
+                // ファイル削除で回復できる。
+                List<string> removedObjectIds = [];
+                if (entry.PendingChunks is { Count: > 0 })
+                {
+                    foreach (var (pendingIndex, pending) in entry.PendingChunks)
+                    {
+                        string? oldObjectId = pendingIndex < entry.ChunkObjectIds.Count ? entry.ChunkObjectIds[pendingIndex] : null;
+                        while (entry.ChunkObjectIds.Count <= pendingIndex) entry.ChunkObjectIds.Add("");
+                        while (entry.ChunkSizes.Count <= pendingIndex) entry.ChunkSizes.Add(0);
+                        while (entry.ChunkHashes.Count <= pendingIndex) entry.ChunkHashes.Add("");
+                        while (entry.ChunkRevisions.Count <= pendingIndex) entry.ChunkRevisions.Add(0);
+                        while (entry.ChunkKeyEpochs.Count <= pendingIndex) entry.ChunkKeyEpochs.Add(pending.KeyEpoch);
+
+                        if (!string.IsNullOrWhiteSpace(oldObjectId) && oldObjectId != fileId && oldObjectId != pending.ObjectId)
+                            removedObjectIds.Add(oldObjectId);
+
+                        entry.ChunkObjectIds[pendingIndex] = pending.ObjectId;
+                        entry.ChunkSizes[pendingIndex] = pending.Size;
+                        entry.ChunkHashes[pendingIndex] = pending.Hash;
+                        entry.ChunkRevisions[pendingIndex] = pending.Revision;
+                        entry.ChunkKeyEpochs[pendingIndex] = pending.KeyEpoch;
+                    }
+                    entry.ChunkCount = Math.Max(entry.ChunkCount, entry.PendingChunks.Keys.Max() + 1);
+                    entry.PendingChunks = null;
+                }
+
                 int requestedChunkCount = request.ChunkCount ?? entry.ChunkCount;
                 if (requestedChunkCount <= 0 || requestedChunkCount > entry.ChunkCount
                     || entry.ChunkSizes.Count < requestedChunkCount)
@@ -446,7 +539,6 @@ public sealed class E2eeFileService
                     actualStoredLength, requestedChunkCount, ct);
                 entry.EncryptedLength = actualStoredLength;
                 entry.ModifiedAt = DateTimeOffset.UtcNow;
-                List<string> removedObjectIds = [];
 
                 // ファイル長変更（縮小）時のチャンク数調整（論理切り詰め）。
                 // チャンクモードの物理チャンク削除はベストエフォート（カタログ整合性を優先）。
@@ -573,12 +665,21 @@ public sealed class E2eeFileService
         GetE2eeHeader(volumeName);
         var catalog = await LoadCatalogAsync(volumeName, ct);
 
-        foreach (var kvp in _fileGates)
+        // ゴミゲート（カタログから消えたファイルのもの）を破棄する。
+        // _fileGates は全ボリュームで共有される static 辞書のため、自ボリュームに
+        // 紐づく fileId（_volumeFileIds）だけを対象にすること。他ボリュームの gate を
+        // 破棄すると、並行動作中のそのボリュームの UploadChunkAsync / DownloadChunkAsync が
+        // 使用中の SemaphoreSlim を破壊され（ObjectDisposedException）、
+        // アップロード中のデータが失われる。
+        if (_volumeFileIds.TryGetValue(volumeName, out var ownFileIds))
         {
-            if (!catalog.Files.ContainsKey(kvp.Key))
+            foreach (string fileId in ownFileIds)
             {
-                if (_fileGates.TryRemove(kvp.Key, out var fileGate))
+                if (!catalog.Files.ContainsKey(fileId)
+                    && _fileGates.TryRemove(fileId, out var fileGate))
+                {
                     fileGate.Dispose();
+                }
             }
         }
 

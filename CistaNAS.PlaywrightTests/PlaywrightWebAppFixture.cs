@@ -34,7 +34,11 @@ public sealed class PlaywrightWebAppFixture : IAsyncLifetime
             .OfType<ProjectResource>()
             .First(r => r.Name == "webfrontend");
         builder.CreateResourceBuilder(proj)
-            .WithEnvironment("CistaNas__DataRoot", _tempDataRoot);
+            .WithEnvironment("CistaNas__DataRoot", _tempDataRoot)
+            // ブラウザ E2E は 1 アプリ・1 IP から UI ログイン＋API を連打するためレート制限を緩和
+            // （本番既定は auth 10 / api 100 req/min のまま）
+            .WithEnvironment("CistaNas__Auth__AuthRateLimitPerMinute", "100000")
+            .WithEnvironment("CistaNas__Auth__ApiRateLimitPerMinute", "100000");
 
         _app = await builder.BuildAsync();
         await _app.StartAsync();

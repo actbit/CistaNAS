@@ -87,7 +87,10 @@ public class E2eeFileTests : IAsyncDisposable
         Assert.Equal(plain1, dec1);
     }
 
-    /// <summary>replace モードで同じ chunkIndex を上書きするたびに revision が +1 される（nonce 再利用回避）。</summary>
+    /// <summary>replace モードで同じ chunkIndex を上書きするたびに revision が +1 される（nonce 再利用回避）。
+    /// チャンクモードの replace はファイル単位の可視化（staged visibility）で、確定前は可視カタログが
+    /// 不変（旧世代のObjectId のまま）であり、FinalizeFileAsync の一括昇格で初めて ObjectId が
+    /// 入れ替わり旧世代が削除されることを検証する。</summary>
     [Fact]
     public async Task UploadChunk_ReplaceMode_IncrementsRevision()
     {
@@ -108,23 +111,41 @@ public class E2eeFileTests : IAsyncDisposable
         var (_, rev0) = await e2eeFs.GetChunkHashAsync(vol, entry.FileId, 0);
         Assert.Equal(0, rev0);
 
-        // 差分上書き（replace=true）→ revision=1
+        // 差分上書き（replace=true）→ revision=1（未確定 = pending に退避）
         byte[] enc1 = E2eeCrypto.EncryptChunk(plain, fileKey, 0, fileSalt, isFirstChunk: true, revision: 1);
         using (var ms1 = new MemoryStream(enc1))
             await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0, ms1, enc1.Length, replace: true);
         var (hash1, rev1) = await e2eeFs.GetChunkHashAsync(vol, entry.FileId, 0);
         Assert.Equal(1, rev1);
         Assert.NotNull(hash1);
+
+        // 確定前は可視カタログが不変 — 読み手は revision=0 の旧世代を見続ける
+        string stagedObjectId = Assert.Single((await e2eeFs.ListFilesAsync(vol)).Files).ChunkObjectIds[0];
+        Assert.Equal(firstObjectId, stagedObjectId);
+        // 注意: DownloadChunkAsync は read lock を保持した GateReadStream を返すため、
+        // 破棄せずに FinalizeFileAsync（write lock 取得）へ進むと永久ブロックする
+        var (visibleStream, _, visibleRev, _) = await e2eeFs.DownloadChunkAsync(vol, entry.FileId, 0);
+        using (visibleStream) { }
+        Assert.Equal(0, visibleRev);
+
+        // FinalizeFileAsync で一括昇格 → ObjectId が入れ替わり、旧世代は削除される
+        await e2eeFs.FinalizeFileAsync(vol, entry.FileId, new E2eeFinalizeFileRequest(enc0.Length, 1));
         string secondObjectId = Assert.Single((await e2eeFs.ListFilesAsync(vol)).Files).ChunkObjectIds[0];
         Assert.NotEqual(firstObjectId, secondObjectId);
         Assert.Empty(await _sp.GetRequiredService<IChunkStore>().ListChunksAsync(vol, firstObjectId));
+        var (promotedStream, _, promotedRev, _) = await e2eeFs.DownloadChunkAsync(vol, entry.FileId, 0);
+        using (promotedStream) { }
+        Assert.Equal(1, promotedRev);
 
-        // さらに上書き（replace=true）→ revision=2
+        // さらに上書き（replace=true）→ revision=2（同様に昇格で反映）
         byte[] enc2 = E2eeCrypto.EncryptChunk(plain, fileKey, 0, fileSalt, isFirstChunk: true, revision: 2);
         using (var ms2 = new MemoryStream(enc2))
             await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0, ms2, enc2.Length, replace: true);
         var (_, rev2) = await e2eeFs.GetChunkHashAsync(vol, entry.FileId, 0);
         Assert.Equal(2, rev2);
+        await e2eeFs.FinalizeFileAsync(vol, entry.FileId, new E2eeFinalizeFileRequest(enc0.Length, 1));
+        string thirdObjectId = Assert.Single((await e2eeFs.ListFilesAsync(vol)).Files).ChunkObjectIds[0];
+        Assert.NotEqual(secondObjectId, thirdObjectId);
     }
 
     [Fact]

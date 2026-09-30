@@ -276,20 +276,28 @@
                                 </StackPanel>
                             </Border>
 
-                            <!-- E2EE 鍵ペア管理 -->
+                            <!-- E2EE 共有鍵（identity）管理 -->
                             <Border BorderBrush="{DynamicResource SystemControlForegroundBaseMediumLowBrush}"
                                     BorderThickness="1" CornerRadius="4" Padding="12">
                                 <StackPanel Spacing="8">
-                                    <TextBlock Text="E2EE 鍵ペア管理" FontWeight="SemiBold" FontSize="14"/>
+                                    <TextBlock Text="E2EE 共有鍵（identity）管理" FontWeight="SemiBold" FontSize="14"/>
+                                    <TextBlock Text="秘密鍵は保存されません。E2EE Key Password から必要時に決定論的に導出します。" FontSize="12" Foreground="Gray"/>
                                     <TextBlock Text="公開鍵登録済み" Foreground="Green" FontSize="12"
                                                IsVisible="{Binding HasPublicKey}" />
                                     <TextBlock Text="公開鍵未登録" Foreground="Orange" FontSize="12"
                                                IsVisible="{Binding !HasPublicKey}" />
                                     <StackPanel Orientation="Horizontal" Spacing="8">
                                         <TextBox Text="{Binding KeyPairPassword}" PasswordChar="*"
-                                                 PlaceholderText="パスワード（秘密鍵暗号化用）" Width="250" />
-                                        <Button Content="鍵ペア生成・登録" Command="{Binding GenerateKeyPairCommand}"
+                                                 PlaceholderText="E2EE Key Password（identity 鍵導出用）" Width="250" />
+                                        <Button Content="identity 鍵導出・登録" Command="{Binding GenerateKeyPairCommand}"
                                                 IsEnabled="{Binding !IsBusy}" />
+                                    </StackPanel>
+                                    <StackPanel Orientation="Horizontal" Spacing="8"
+                                                IsVisible="{Binding HasLegacyKeyFiles}">
+                                        <TextBlock VerticalAlignment="Center" FontSize="12" Foreground="Orange">
+                                            <Run Text="旧 ECDH 秘密鍵ファイルが "/><Run Text="{Binding LegacyKeyFileCount}"/><Run Text=" 件残留しています。"/>
+                                        </TextBlock>
+                                        <Button Content="削除" Command="{Binding CleanupLegacyKeysCommand}" />
                                     </StackPanel>
                                 </StackPanel>
                             </Border>
@@ -328,6 +336,8 @@
                     <StackPanel IsVisible="{Binding SelectedVolume.Encrypted}">
                         <TextBlock Text="パスワード" FontSize="12" />
                         <TextBox Text="{Binding VolumePassword}" PasswordChar="*" />
+                        <TextBlock Text="E2EE Key Password（共有 v2 / ECDH 共有ボリューム用。未設定なら空欄）" FontSize="12" Margin="0,8,0,0" />
+                        <TextBox Text="{Binding E2eePassword}" PasswordChar="*" />
                     </StackPanel>
 
                     <StackPanel Orientation="Horizontal" Spacing="8">

@@ -1,3 +1,4 @@
+using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Identity;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Volume;
@@ -51,10 +52,16 @@ public sealed class AccountService(
     /// <summary>
     /// ユーザー一覧を DTO で返す。includeRoles=false のとき Roles を空にし、
     /// 一般ユーザーへのロール（誰が admin か）の漏洩を防ぐ。admin のみ includeRoles=true で呼ぶこと。
+    /// sharingOnly=true のとき SharingEnabled=false のユーザーを除外する
+    /// （共有先候補 picker 用。管理者用の一覧では false を渡すこと）。
     /// </summary>
-    public async Task<List<UserDto>> ListUserDtosAsync(bool includeRoles = false)
+    public async Task<List<UserDto>> ListUserDtosAsync(bool includeRoles = false, bool sharingOnly = false)
         => (await ListWithRolesAsync())
-            .Select(u => new UserDto(u.User.UserName ?? "", includeRoles ? u.Roles : Array.Empty<string>()))
+            .Where(u => !sharingOnly || u.User.SharingEnabled)
+            .Select(u => new UserDto(
+                u.User.UserName ?? "",
+                includeRoles ? u.Roles : Array.Empty<string>(),
+                u.User.SharingEnabled))
             .ToList();
 
     public async Task CreateUserAsync(string username, string password, string role = "user")
@@ -172,10 +179,68 @@ public sealed class AccountService(
         return user?.PublicKey;
     }
 
-    public async Task UpdatePublicKeyAsync(string username, string publicKeyBase64)
+    /// <summary>ユーザー単位の共有有効フラグ。ユーザー不在時は false。</summary>
+    public async Task<bool> IsSharingEnabledAsync(string username)
+    {
+        var user = await userManager.FindByNameAsync(username);
+        return user?.SharingEnabled ?? false;
+    }
+
+    /// <summary>ユーザー単位の共有有効フラグを管理者が変更する。既存共有は自動 revoke しない。</summary>
+    public async Task SetSharingEnabledAsync(string username, bool enabled)
     {
         var user = await userManager.FindByNameAsync(username)
             ?? throw new InvalidOperationException($"ユーザー '{username}' が見つかりません。");
+        if (user.SharingEnabled == enabled) return;
+        user.SharingEnabled = enabled;
+        var result = await userManager.UpdateAsync(user);
+        if (!result.Succeeded)
+            throw new InvalidOperationException(string.Join(", ", result.Errors.Select(e => e.Description)));
+    }
+
+    /// <summary>ECDH identity の状態（salt / 導出バージョン / 登録済み公開鍵）。</summary>
+    public sealed record EcdhIdentityInfo(byte[] IdentitySalt, int DerivationVersion, string? PublicKey);
+
+    /// <summary>
+    /// ECDH identity salt を取得する。未発行なら CSPRNG 32B で発行して保存する。
+    /// salt は非秘密（サーバー DB 保存可）。秘密鍵はクライアント側でのみ導出され、サーバーに送られない。
+    /// </summary>
+    public async Task<EcdhIdentityInfo> GetOrCreateEcdhIdentityAsync(string username)
+    {
+        var user = await userManager.FindByNameAsync(username)
+            ?? throw new InvalidOperationException($"ユーザー '{username}' が見つかりません。");
+
+        if (user.EcdhIdentitySalt is not null && user.EcdhIdentitySalt.Length > 0
+            && user.EcdhDerivationVersion > 0)
+        {
+            return new EcdhIdentityInfo(user.EcdhIdentitySalt, user.EcdhDerivationVersion, user.PublicKey);
+        }
+
+        user.EcdhIdentitySalt = EcdhIdentityKey.GenerateIdentitySalt();
+        user.EcdhDerivationVersion = EcdhIdentityKey.CurrentDerivationVersion;
+        var result = await userManager.UpdateAsync(user);
+        if (!result.Succeeded)
+            throw new InvalidOperationException(string.Join(", ", result.Errors.Select(e => e.Description)));
+        return new EcdhIdentityInfo(user.EcdhIdentitySalt, user.EcdhDerivationVersion, user.PublicKey);
+    }
+
+    /// <summary>
+    /// ECDH 公開鍵を登録する。決定論的導出のため、同一 identity（password / salt）からは常に
+    /// 同一公開鍵が得られる。既存登録があり且つ allowRotation=false の場合は登録済み鍵の
+    /// 上書きを拒否する（誤ったパスワードからの導出結果で既存 identity を潰さないため）。
+    /// 鍵の更新は明示的な rotation 操作のみ。
+    /// </summary>
+    public async Task UpdatePublicKeyAsync(string username, string publicKeyBase64, bool allowRotation = false)
+    {
+        var user = await userManager.FindByNameAsync(username)
+            ?? throw new InvalidOperationException($"ユーザー '{username}' が見つかりません。");
+        if (user.PublicKey is not null && !allowRotation)
+        {
+            if (!string.Equals(user.PublicKey, publicKeyBase64, StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    "公開鍵は既に登録されています。鍵の更新は明示的な rotation 操作でのみ可能です。");
+            return; // 同一鍵の再登録は冪等に成功扱い
+        }
         user.PublicKey = publicKeyBase64;
         var result = await userManager.UpdateAsync(user);
         if (!result.Succeeded)

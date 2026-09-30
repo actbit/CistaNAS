@@ -147,6 +147,31 @@ public sealed class E2eeApiClient
         return result?.InvitationId ?? "";
     }
 
+    /// <summary>
+    /// 決定論的 ECDH identity のセットアップ情報を取得する（identity salt は非秘密）。
+    /// 秘密鍵はクライアント側で E2EE パスワードから導出し、サーバーへは送らない。
+    /// 共有機能が無効なアカウントでは 403 → null。
+    /// </summary>
+    public async Task<E2eeIdentitySetupInfo?> GetIdentitySetupAsync()
+    {
+        var response = await _http.GetAsync("/api/v1/e2ee/identity-setup");
+        if (!response.IsSuccessStatusCode) return null;
+        return await response.Content.ReadFromJsonAsync<E2eeIdentitySetupInfo>();
+    }
+
+    /// <summary>自分の公開鍵を登録する。既存鍵の更新（rotation）は rotate=true を必須とする
+    /// （誤った E2EE パスワードからの導出結果で既存 identity を上書きしないため）。</summary>
+    public async Task SetMyPublicKeyAsync(string publicKey, bool rotate = false)
+    {
+        var response = await _http.PutAsJsonAsync(
+            $"/api/v1/e2ee/my-public-key{(rotate ? "?rotate=true" : "")}",
+            new { PublicKey = publicKey });
+        response.EnsureSuccessStatusCode();
+    }
+
+    public sealed record E2eeIdentitySetupInfo(
+        byte[] IdentitySalt, int DerivationVersion, string? PublicKey, E2eeKdfOptions Kdf);
+
     private sealed record HashResponse(string Hash);
     private sealed record InvitationIdResponse(string InvitationId);
     private sealed record WriteLeaseResponse(string Token, DateTimeOffset ExpiresAt);

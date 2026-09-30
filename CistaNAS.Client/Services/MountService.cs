@@ -13,13 +13,14 @@ public sealed class MountService
 
     /// <summary>
     /// E2EE ボリュームをマウントする。サーバー側マウント + クライアント側で鍵復号。
-    /// 共有 v2 ボリューム（KeyEpoch ≥ 1）では全 epoch の GroupKey を自分の ECDH 秘密鍵で
-    /// アンラップして v2 状態として登録する。オーナー（password wrap）のみ残置 v1 ファイルの
-    /// 読み取り用に masterKey も復元する（v2 メンバーの wrapped-key は GroupKey wrap と同型のため
-    /// masterKey としては扱わない）。
+    /// 共有 v2 ボリューム（KeyEpoch ≥ 1）では全 epoch の GroupKey を ECDH identity 秘密鍵で
+    /// アンラップして v2 状態として登録する。秘密鍵は E2EE 共有パスワードから
+    /// 決定論的に導出し（永続化ストレージには存在しない）、アンラップ後に破棄する。
+    /// オーナー（password wrap）のみ残置 v1 ファイルの読み取り用に masterKey も復元する
+    /// （v2 メンバーの wrapped-key は GroupKey wrap と同型のため masterKey としては扱わない）。
     /// </summary>
     public async Task MountE2eeAsync(string volumeName, string driveLetter, CistaNasApiClient api,
-        string username, string password)
+        string username, string password, string e2eePassword)
     {
         if (_mounted.ContainsKey(volumeName))
             throw new InvalidOperationException($"ボリューム '{volumeName}' は既にマウントされています。");
@@ -31,7 +32,7 @@ public sealed class MountService
         var gki = await api.GetGroupKeyInfoAsync(volumeName);
         if (gki is not null && gki.KeyEpoch >= 1)
         {
-            E2eeV2VolumeState? v2 = await UnwrapGroupKeysV2Async(gki, username);
+            E2eeV2VolumeState? v2 = await UnwrapGroupKeysV2Async(api, gki, username, e2eePassword);
             try
             {
                 // オーナー + password wrap の場合のみ masterKey も復元（残置 v1 ファイルの読み取り用）
@@ -69,11 +70,9 @@ public sealed class MountService
         byte[] masterKeyV1;
         if (string.Equals(wkV1.WrapType, "ecdh", StringComparison.OrdinalIgnoreCase))
         {
-            // ECDH ラップキー: 自分の秘密鍵（DPAPI 永続化）で ECIES アンラップ。password 不要。
-            byte[]? privateKey = EcdhKeyStore.LoadPrivateKey(username);
-            if (privateKey is null)
-                throw new InvalidOperationException(
-                    "ローカルに ECDH 秘密鍵が見つかりません。先に設定で鍵ペアを生成してください。");
+            // ECDH ラップキー: E2EE 共有パスワードから決定論的に導出した ECDH 秘密鍵で
+            // ECIES アンラップする（秘密鍵は RAM 上のみ。使用後すぐ破棄）。
+            byte[] privateKey = await DeriveEcdhPrivateKeyAsync(api, username, e2eePassword);
             if (wkV1.EphemeralPublicKey is null)
                 throw new InvalidOperationException("ECDH ラップキーに一時公開鍵が含まれていません。");
             try
@@ -97,13 +96,12 @@ public sealed class MountService
         await MountDokanAsync(volumeName, driveLetter, fsV1);
     }
 
-    /// <summary>共有 v2: 自分宛ての全 epoch GroupKey wraps を ECDH 秘密鍵でアンラップする。</summary>
-    private static async Task<E2eeV2VolumeState> UnwrapGroupKeysV2Async(E2eeGroupKeyInfo gki, string username)
+    /// <summary>共有 v2: 自分宛ての全 epoch GroupKey wraps を ECDH identity 秘密鍵でアンラップする。
+    /// 秘密鍵は E2EE 共有パスワードから決定論的に導出し、アンラップ後に破棄する（永続化なし）。</summary>
+    private static async Task<E2eeV2VolumeState> UnwrapGroupKeysV2Async(
+        CistaNasApiClient api, E2eeGroupKeyInfo gki, string username, string e2eePassword)
     {
-        byte[]? privateKey = EcdhKeyStore.LoadPrivateKey(username);
-        if (privateKey is null)
-            throw new InvalidOperationException(
-                "ローカルに ECDH 秘密鍵が見つかりません。先に設定で鍵ペアを生成してください。");
+        byte[] privateKey = await DeriveEcdhPrivateKeyAsync(api, username, e2eePassword);
         try
         {
             var groupKeys = new Dictionary<int, byte[]>();
@@ -129,6 +127,22 @@ public sealed class MountService
         {
             CryptographicOperations.ZeroMemory(privateKey);
         }
+    }
+
+    /// <summary>
+    /// E2EE 共有パスワードから決定論的に ECDH identity 秘密鍵（SEC1）を導出する。
+    /// 導出結果はサーバー登録済み公開鍵と照合され、不一致（パスワード誤り）時は例外で中止する。
+    /// 戻り値は秘密情報のため、呼び出し側は使用後に zeroize すること。
+    /// </summary>
+    private static async Task<byte[]> DeriveEcdhPrivateKeyAsync(CistaNasApiClient api, string username, string e2eePassword)
+    {
+        if (string.IsNullOrEmpty(e2eePassword))
+            throw new InvalidOperationException("E2EE 共有パスワードを入力してください（設定タブで入力できます）。");
+        var setup = await EcdhIdentityUnlock.GetSetupAsync(api)
+            ?? throw new InvalidOperationException(
+                "このアカウントでは共有機能が無効です。E2EE 共有のセットアップはできません。");
+        var (_, privateKey) = EcdhIdentityUnlock.DeriveVerified(username, e2eePassword, setup);
+        return privateKey;
     }
 
     /// <summary>password ラップキーをヘッダの KDF スペック（Argon2id 合成 / レガシー PBKDF2）でアンラップする。</summary>

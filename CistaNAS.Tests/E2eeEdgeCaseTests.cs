@@ -135,7 +135,9 @@ public class E2eeEdgeCaseTests(AspireFixture fixture)
     // ---- 差分更新 (replace) ----
 
     /// <summary>replace=false で revision=0、replace=true で revision が +1 される（AES-GCM nonce 再利用回避）。
-    /// 上書き後の暗号文を revision=1 で正しく復元できることも検証する。</summary>
+    /// 上書き後の暗号文を revision=1 で正しく復元できることも検証する。
+    /// チャンクモードの replace は未確定チャンクに staging されるため、確定（finalize）後に
+    /// 初めて新リビジョンがダウンロード可能になることも併せて検証する。</summary>
     [Fact]
     public async Task UploadChunk_ReplaceMode_IncrementsRevision()
     {
@@ -173,6 +175,19 @@ public class E2eeEdgeCaseTests(AspireFixture fixture)
         }
         var (hash1, rev1) = await GetChunkHashAsync(c, vol, fileId, 0);
         Assert.Equal(1, rev1);
+
+        // 確定前のダウンロードは旧リビジョン（revision=0）のまま（ファイル単位の可視化）
+        var dl0 = await c.GetAsync($"/api/v1/e2ee/{vol}/download-chunk/{fileId}/0");
+        Assert.True(dl0.IsSuccessStatusCode);
+        byte[] downloaded0 = await dl0.Content.ReadAsByteArrayAsync();
+        Assert.Equal(plain, E2eeCrypto.DecryptChunk(downloaded0, fileKey, 0, fileSalt, revision: 0));
+
+        // finalize で一括昇格 → 以降は revision=1 の暗号文が返る
+        using var finalizeContent = JsonContent.Create(new { actualEncryptedLength = enc0.Length, chunkCount = 1 });
+        using var finalizeRequest = WithWriteLease(HttpMethod.Patch,
+            $"/api/v1/e2ee/{vol}/finalize-file/{fileId}", writeLease, finalizeContent);
+        var finalizeResp = await c.SendAsync(finalizeRequest);
+        Assert.True(finalizeResp.IsSuccessStatusCode, $"finalize failed: {finalizeResp.StatusCode}");
 
         // ダウンロードして revision=1 の暗号文を正しく復号できること
         var dl = await c.GetAsync($"/api/v1/e2ee/{vol}/download-chunk/{fileId}/0");

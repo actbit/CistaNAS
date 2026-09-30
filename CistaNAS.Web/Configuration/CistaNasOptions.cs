@@ -18,6 +18,7 @@ public sealed class CistaNasOptions
     public JwtOptions Jwt { get; set; } = new();
     public AuthOptions Auth { get; set; } = new();
     public VolumeOptions Volume { get; set; } = new();
+    public SharingOptions Sharing { get; set; } = new();
 
     /// <summary>CORS で許可するオリジンリスト。空なら CORS ポリシーは適用されない（same-origin のみ）。</summary>
     public List<string> CorsAllowedOrigins { get; set; } = [];
@@ -145,6 +146,14 @@ public sealed class AuthOptions
     public int WebDavRequestsPerMinute { get; set; } = 600;
 
     /// <summary>
+    /// 一般 REST API（"api" ポリシー、/api/v1 volumes・e2ee 等）のレート制限
+    /// （1 IP あたりの req/min）。統合テスト（Aspire）では 1 アプリ・1 IP に全テストクラスが
+    /// 直列に大量リクエストを送るため緩和できる。0 で無効化は不可（DoS 対策のため下限 10）。
+    /// </summary>
+    [Range(10, 100000)]
+    public int ApiRateLimitPerMinute { get; set; } = 100;
+
+    /// <summary>
     /// WebDAV Basic 認証の失敗スロットル（1 IP あたり 1 分間の失敗許容回数）。
     /// 超過した IP は Argon2id 検証（1 回あたり 64 MiB 相当のメモリ）を実行せず即座に 401 を返す。
     /// webdav ポリシー（600 req/min）は正常操作用であり、認証失敗への絞りが無いと
@@ -160,6 +169,24 @@ public sealed class AuthOptions
     /// </summary>
     [Range(0, 86400)]
     public int JwtSecurityStampCacheSeconds { get; set; } = 300;
+
+    /// <summary>
+    /// 認証エンドポイント（ログイン等）のレート制限（1 IP あたり 1 分間の許容リクエスト数）。
+    /// "auth" ポリシーの PermitLimit。統合テスト（Aspire）では多数のユーザーを連続作成するため
+    /// 緩和できる。0 で無効化は不可（総当たり対策のため下限 10）。
+    /// </summary>
+    [Range(10, 100000)]
+    public int AuthRateLimitPerMinute { get; set; } = 10;
+}
+
+/// <summary>サーバー全体の共有機能設定。</summary>
+public sealed class SharingOptions
+{
+    /// <summary>
+    /// サーバー全体で共有機能（E2EE 共有・招待・グループ共有・ECDH identity セットアップ）を有効化するか。
+    /// false でも revoke 等のセキュリティ操作は常に許可され、private E2EE は影響を受けない。
+    /// </summary>
+    public bool Enabled { get; set; } = true;
 }
 
 public sealed class VolumeOptions

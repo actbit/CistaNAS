@@ -12,4 +12,6 @@ public sealed record MemberDto(string Username);
 /// <summary>ユーザー一覧 API 用 DTO。</summary>
 public sealed record UserDto(
     string UserName,
-    IList<string> Roles);
+    IList<string> Roles,
+    /// <summary>このユーザーが共有機能を利用可能か（共有先候補のフィルタに使う）。</summary>
+    bool SharingEnabled = true);

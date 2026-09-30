@@ -54,6 +54,15 @@ public sealed class AccountApiClient
         response.EnsureSuccessStatusCode();
     }
 
-    public sealed record UserWithRoles(string UserName, IList<string> Roles);
+    /// <summary>ユーザーの共有可否（SharingEnabled）を設定する（admin）。</summary>
+    public async Task SetUserSharingAsync(string username, bool enabled)
+    {
+        var response = await _http.PutAsJsonAsync(
+            $"/api/v1/account/users/{Uri.EscapeDataString(username)}/sharing",
+            new { SharingEnabled = enabled });
+        response.EnsureSuccessStatusCode();
+    }
+
+    public sealed record UserWithRoles(string UserName, IList<string> Roles, bool SharingEnabled = true);
     private sealed record PublicKeyResponse(string PublicKey);
 }

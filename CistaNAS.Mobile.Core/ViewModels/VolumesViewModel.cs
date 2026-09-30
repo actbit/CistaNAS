@@ -21,11 +21,47 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
     [ObservableProperty]
     private string _mountPassword = "";
 
+    /// <summary>E2EE Key Password（共有 v2 / ECDH 共有ボリュームの identity 鍵導出用。ボリュームパスワードとは別）。</summary>
+    [ObservableProperty]
+    private string _mountE2eePassword = "";
+
+    /// <summary>保留中のマウントが E2EE ボリュームか（E2EE Key Password 入力欄の表示制御）。</summary>
+    [ObservableProperty]
+    private bool _isE2eeMount;
+
     public override string Title => "ボリューム";
 
     public bool HasVolumes => Volumes.Count > 0;
 
-    public override async void OnNavigatedTo() => await RunBusyAsync(() => LoadCoreAsync(CancellationToken.None));
+    /// <summary>旧バージョンが secure store に保存した ECDH 秘密鍵の残留警告。</summary>
+    [ObservableProperty]
+    private string? _legacyKeyWarning;
+
+    public override async void OnNavigatedTo()
+    {
+        CheckLegacySecureStoreKey();
+        await RunBusyAsync(() => LoadCoreAsync(CancellationToken.None));
+    }
+
+    /// <summary>旧方式の秘密鍵残留を検出したらユーザーに警告する（無言削除はしない）。</summary>
+    private void CheckLegacySecureStoreKey()
+    {
+        string? username = app.Settings.Username;
+        LegacyKeyWarning = username is not null
+            && EcdhKeyManager.HasLegacySecureStoreKey(app.KeyStore, username)
+                ? "旧バージョンが保存した ECDH 秘密鍵が端末に残留しています。新方式では秘密鍵を保存しないため削除できます。"
+                : null;
+    }
+
+    /// <summary>旧 secure store の ECDH 秘密鍵を削除する（警告表示後の明示操作）。</summary>
+    [RelayCommand]
+    private void CleanupLegacyKey()
+    {
+        string? username = app.Settings.Username;
+        if (username is null) return;
+        EcdhKeyManager.DeleteLegacySecureStoreKey(app.KeyStore, username);
+        CheckLegacySecureStoreKey();
+    }
 
     [RelayCommand]
     private Task RefreshAsync(CancellationToken ct) => RunBusyAsync(() => LoadCoreAsync(ct));
@@ -49,6 +85,8 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
         {
             _pendingMount = volume;
             MountPassword = "";
+            MountE2eePassword = "";
+            IsE2eeMount = IsE2ee(volume);
             IsMountPromptVisible = true;
             return;
         }
@@ -68,7 +106,7 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
             return;
         }
         if (IsE2ee(volume))
-            await MountE2eeAsync(volume, MountPassword, ct);
+            await MountE2eeAsync(volume, MountPassword, MountE2eePassword, ct);
         else
             await MountServerAsync(volume, MountPassword, ct);
         IsMountPromptVisible = false;
@@ -84,13 +122,14 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
     /// <summary>
     /// E2EE ボリュームのマウント: wrapped-key を取得してローカルでアンラップし、
     /// masterKey をセッションに登録する (サーバーに鍵は送らない)。
-    /// 共有 v2 ボリューム (KeyEpoch ≥ 1) では全 epoch の GroupKey を自分の ECDH 秘密鍵で
-    /// アンラップして v2 状態として登録する。オーナー (password wrap) のみ残置 v1 ファイルの
-    /// 読み取り用に masterKey も復元する (v2 メンバーの wrapped-key は GroupKey wrap と同型のため
-    /// masterKey としては扱わない)。
+    /// 共有 v2 ボリューム (KeyEpoch ≥ 1) では全 epoch の GroupKey を E2EE Key Password から
+    /// 決定論的に導出した ECDH identity 秘密鍵でアンラップして v2 状態として登録する
+    /// （秘密鍵は RAM 上のみ。アンラップ後に破棄する）。オーナー (password wrap) のみ残置 v1
+    /// ファイルの読み取り用に masterKey も復元する (v2 メンバーの wrapped-key は GroupKey wrap と
+    /// 同型のため masterKey としては扱わない)。
     /// サーバー側は作成時に自動マウント済みのことがあるため、未マウント時のみ解除を依頼する。
     /// </summary>
-    private async Task MountE2eeAsync(VolumeListItem volume, string password, CancellationToken ct)
+    private async Task MountE2eeAsync(VolumeListItem volume, string password, string e2eePassword, CancellationToken ct)
     {
         string username = app.Settings.Username ?? throw new InvalidOperationException("未ログインです。");
 
@@ -98,7 +137,7 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
         var gki = await app.Session.Api.GetGroupKeyInfoAsync(volume.Name);
         if (gki is not null && gki.KeyEpoch >= 1)
         {
-            byte[] privateKey = await app.EcdhKeys.GetOrCreatePrivateKeyAsync(app.Session.Api, username);
+            byte[] privateKey = (await app.EcdhKeys.DeriveVerifiedAsync(app.Session.Api, username, e2eePassword)).PrivateKeySec1;
             try
             {
                 var groupKeys = new Dictionary<int, byte[]>();
@@ -145,7 +184,9 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
         byte[] masterKeyV1;
         if (string.Equals(wkV1.WrapType, "ecdh", StringComparison.Ordinal))
         {
-            byte[] privateKey = await app.EcdhKeys.GetOrCreatePrivateKeyAsync(app.Session.Api, username);
+            // ECDH ラップキー: E2EE Key Password から決定論的に導出した identity 秘密鍵で
+            // アンラップする（秘密鍵は RAM 上のみ。使用後すぐ破棄）。
+            byte[] privateKey = (await app.EcdhKeys.DeriveVerifiedAsync(app.Session.Api, username, e2eePassword)).PrivateKeySec1;
             try
             {
                 masterKeyV1 = app.E2ee.UnwrapMasterKey(username, null, wkV1, privateKey);
