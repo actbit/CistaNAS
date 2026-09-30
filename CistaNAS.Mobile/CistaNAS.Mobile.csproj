@@ -14,6 +14,10 @@
     <!-- 開発中は apk。配布時は aab に変更する。 -->
     <AndroidPackageFormat>apk</AndroidPackageFormat>
     <RuntimeIdentifier Condition="'$(Configuration)' == 'Debug'">android-arm64</RuntimeIdentifier>
+    <!-- Android packaging can reuse removed assets from a previous incremental
+         APK. Keep opt-in test assemblies and assets in independent outputs. -->
+    <IntermediateOutputPath Condition="'$(EnableAndroidSmokeTests)' == 'true'">obj\$(Configuration)\smoke\</IntermediateOutputPath>
+    <OutputPath Condition="'$(EnableAndroidSmokeTests)' == 'true'">bin\$(Configuration)\smoke\</OutputPath>
   </PropertyGroup>
 
   <ItemGroup>
