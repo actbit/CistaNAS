@@ -9,6 +9,9 @@ public interface IFileCacheProvider
     /// <summary>キャッシュ済みファイルのフルパスを取得する (外部委譲用)。</summary>
     string GetPath(string fileName);
 
+    /// <summary>失敗した転送の一時ファイルを削除する。</summary>
+    void Delete(string fileName);
+
     /// <summary>キャッシュディレクトリを掃除する。</summary>
     void Clear();
 }

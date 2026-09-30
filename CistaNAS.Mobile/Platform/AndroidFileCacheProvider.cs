@@ -1,28 +1,26 @@
 using Android.Content;
 using CistaNAS.Mobile.Core.Abstractions;
+using CistaNAS.Mobile.Core.Services;
 
 namespace CistaNAS.Mobile.Platform;
 
 /// <summary>外部アプリ委譲用の一時ファイルキャッシュ (CacheDir/externalviewer)。</summary>
 public sealed class AndroidFileCacheProvider : IFileCacheProvider
 {
-    private static readonly string CacheDir =
-        Path.Combine(Application.Context.CacheDir!.Path!, "externalviewer");
+    private readonly DiskFileCacheProvider _cache = new(
+        Path.Combine(Application.Context.CacheDir!.Path!, "externalviewer"));
 
     public Stream OpenWrite(string fileName)
     {
-        Directory.CreateDirectory(CacheDir);
-        return File.Create(GetPath(fileName));
+        return _cache.OpenWrite(fileName);
     }
 
-    public string GetPath(string fileName) => Path.Combine(CacheDir, fileName);
+    public string GetPath(string fileName) => _cache.GetPath(fileName);
+
+    public void Delete(string fileName) => _cache.Delete(fileName);
 
     public void Clear()
     {
-        if (!Directory.Exists(CacheDir)) return;
-        foreach (string file in Directory.EnumerateFiles(CacheDir))
-        {
-            try { File.Delete(file); } catch (IOException) { /* 使用中は無視 */ }
-        }
+        _cache.Clear();
     }
 }

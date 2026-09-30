@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using System.Text.Json;
 using CistaNAS.Client.Api;
 using CistaNAS.Mobile.Core.Services;
 using CistaNAS.Shared.Crypto;
@@ -17,12 +18,14 @@ public class E2eeTransferServiceTests
     private const string Volume = "vol";
     private static readonly byte[] MasterKey = E2eeCrypto.GenerateMasterKey();
 
-    private static (E2eeFileTransferService Svc, FakeE2eeServer Server) CreateService(int chunkSize = 64 * 1024)
+    private static (E2eeFileTransferService Svc, FakeE2eeServer Server) CreateService(int chunkSize = 64 * 1024, bool v2 = false)
     {
         var server = new FakeE2eeServer();
         var http = new HttpClient(server) { BaseAddress = new Uri("http://test/") };
         var session = new E2eeSession();
         session.StoreKey(Volume, MasterKey, chunkSize);
+        if (v2) session.StoreV2State(Volume, Guid.NewGuid().ToString("N"),
+            new Dictionary<int, byte[]> { [1] = E2eeV2.GenerateGroupKey() });
         return (new E2eeFileTransferService(new CistaNasApiClient(http), session), server);
     }
 
@@ -133,6 +136,58 @@ public class E2eeTransferServiceTests
         byte[] expected = [.. plain0, .. plain1];
         Assert.Equal(expected, output.ToArray());
     }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task IncompleteUpload_IsNotFinalizedAndRollsBack(bool v2)
+    {
+        (var svc, var server) = CreateService(1024, v2);
+        using var input = new MemoryStream(new byte[1024]);
+        await Assert.ThrowsAsync<EndOfStreamException>(() => svc.UploadAsync(Volume, "partial.bin", input, 1025));
+        Assert.Equal(0, server.FinalizedCount);
+        Assert.Equal(1, server.DeletedCount);
+        Assert.Equal(1, server.ReleasedCount);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DeclaredLength_LeavesTrailingInputUnreadAndRoundTrips(bool v2)
+    {
+        (var svc, var server) = CreateService(1024, v2);
+        byte[] inputBytes = Enumerable.Range(0, 2500).Select(i => (byte)i).ToArray();
+        using var input = new MemoryStream(inputBytes);
+        await svc.UploadAsync(Volume, "bounded.bin", input, 1500);
+        Assert.Equal(1500, input.Position);
+        using var output = await svc.OpenDecryptedAsync(Volume, server.LastCreated!);
+        Assert.Equal(inputBytes[..1500], output.ToArray());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DecryptedChunk_IsErasedWhenOutputWriteFails(bool v2)
+    {
+        (var svc, var server) = CreateService(1024, v2);
+        using var input = new MemoryStream(new byte[] { 1, 2, 3 });
+        await svc.UploadAsync(Volume, "secret.bin", input, 3);
+        using var output = new FailingOutput();
+        await Assert.ThrowsAsync<IOException>(() => svc.DownloadAsync(Volume, server.LastCreated!, output));
+        Assert.NotNull(output.WrittenBuffer);
+        Assert.All(output.WrittenBuffer!, b => Assert.Equal(0, b));
+    }
+
+    private sealed class FailingOutput : MemoryStream
+    {
+        public byte[]? WrittenBuffer { get; private set; }
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+        {
+            Assert.True(System.Runtime.InteropServices.MemoryMarshal.TryGetArray(buffer, out var segment));
+            WrittenBuffer = segment.Array;
+            return ValueTask.FromException(new IOException("Output failure"));
+        }
+    }
 }
 
 /// <summary>E2EE チャンク転送エンドポイントのインメモリFake。</summary>
@@ -142,6 +197,10 @@ internal sealed class FakeE2eeServer : HttpMessageHandler
     private readonly Dictionary<(string FileId, int Index), int> _revisions = new();
     private readonly Dictionary<(string FileId, int Index), string> _leaseHeaders = new();
     private int _nextFileId = 1;
+    public E2eeFileEntry? LastCreated { get; private set; }
+    public int FinalizedCount { get; private set; }
+    public int DeletedCount { get; private set; }
+    public int ReleasedCount { get; private set; }
 
     public Dictionary<(string FileId, int Index), string> ChunkLeaseHeaders => _leaseHeaders;
 
@@ -170,7 +229,23 @@ internal sealed class FakeE2eeServer : HttpMessageHandler
             string op = segments[4];
 
             if (op == "create-file" && request.Method == HttpMethod.Post)
-                return Task.FromResult(Json(HttpStatusCode.Created, $$"""{"fileId":"f{{_nextFileId++}}","writeLeaseToken":"lease-1"}"""));
+            {
+                using var body = System.Text.Json.JsonDocument.Parse(request.Content!.ReadAsStringAsync(ct).GetAwaiter().GetResult());
+                var root = body.RootElement;
+                string fileId = root.TryGetProperty("fileId", out var id) && id.ValueKind == System.Text.Json.JsonValueKind.String
+                    ? id.GetString()! : $"f{_nextFileId++}";
+                LastCreated = new E2eeFileEntry
+                {
+                    FileId = fileId,
+                    EncryptedName = root.GetProperty("encryptedName").GetString()!,
+                    EncryptedLength = root.GetProperty("encryptedLength").GetInt64(),
+                    ChunkCount = root.GetProperty("chunkCount").GetInt32(),
+                    KeyEpoch = root.GetProperty("keyEpoch").GetInt32(),
+                    WrappedFileKey = root.GetProperty("wrappedFileKey").Deserialize<WrappedAeadKey>(
+                        new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true }),
+                };
+                return Task.FromResult(Json(HttpStatusCode.Created, $$"""{"fileId":"{{fileId}}","writeLeaseToken":"lease-1"}"""));
+            }
 
             if (op == "upload-chunk" && request.Method == HttpMethod.Post)
             {
@@ -197,10 +272,17 @@ internal sealed class FakeE2eeServer : HttpMessageHandler
             }
 
             if (op == "finalize-file" && request.Method == HttpMethod.Patch)
+            {
+                FinalizedCount++;
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+            }
 
             if (op == "files" && request.Method == HttpMethod.Delete)
+            {
+                if (segments.Length > 6 && segments[6] == "write-lease") ReleasedCount++;
+                else DeletedCount++;
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
+            }
 
             if (op == "write-lease" && request.Method == HttpMethod.Delete)
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));

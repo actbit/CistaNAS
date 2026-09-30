@@ -138,9 +138,9 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
         if (gki is not null && gki.KeyEpoch >= 1)
         {
             byte[] privateKey = (await app.EcdhKeys.DeriveVerifiedAsync(app.Session.Api, username, e2eePassword)).PrivateKeySec1;
+            var groupKeys = new Dictionary<int, byte[]>();
             try
             {
-                var groupKeys = new Dictionary<int, byte[]>();
                 foreach (var wrap in gki.MyGroupKeys)
                 {
                     if (wrap.EphemeralPublicKey is null) continue;
@@ -161,6 +161,7 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
             }
             finally
             {
+                foreach (byte[] groupKey in groupKeys.Values) Array.Clear(groupKey);
                 Array.Clear(privateKey);
             }
 
@@ -170,7 +171,8 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
             if (passwordWrap && string.Equals(volume.OwnerUser, username, StringComparison.OrdinalIgnoreCase))
             {
                 byte[] masterKey = app.E2ee.UnwrapMasterKey(username, password, wk, null);
-                app.E2ee.StoreKey(volume.Name, masterKey, wk.ChunkSize);
+                try { app.E2ee.StoreKey(volume.Name, masterKey, wk.ChunkSize); }
+                finally { Array.Clear(masterKey); }
             }
 
             if (!volume.IsMounted)
@@ -201,9 +203,13 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
             masterKeyV1 = app.E2ee.UnwrapMasterKey(username, password, wkV1, null);
         }
 
-        if (!volume.IsMounted)
-            await app.Session.Api.MountAsync(volume.Name);
-        app.E2ee.StoreKey(volume.Name, masterKeyV1, wkV1.ChunkSize);
+        try
+        {
+            if (!volume.IsMounted)
+                await app.Session.Api.MountAsync(volume.Name);
+            app.E2ee.StoreKey(volume.Name, masterKeyV1, wkV1.ChunkSize);
+        }
+        finally { Array.Clear(masterKeyV1); }
     }
 
     [RelayCommand]
@@ -213,8 +219,7 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
     [RelayCommand]
     private void Logout()
     {
-        app.Session.ClearToken();
-        app.E2ee.ClearKeys();
+        app.ClearSession();
         app.Navigation.NavigateToRoot(new LoginViewModel(app));
     }
 

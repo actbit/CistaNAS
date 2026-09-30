@@ -34,8 +34,6 @@ public class App : Avalonia.Application
             // 401 検知 → ログイン画面へ戻す
             Services.SessionExpired += () =>
             {
-                Services.Session.ClearToken();
-                Services.E2ee.ClearKeys();
                 Services.Navigation.NavigateToRoot(new LoginViewModel(Services));
             };
 

@@ -120,5 +120,6 @@ public class MinIOFixture : IAsyncLifetime
 /// MinIO テストコレクション定義。MinIOFixture を1回だけ生成し、
 /// コレクション内の全テストクラスで共有する。
 /// </summary>
-[CollectionDefinition("MinIO")]
+// 複数の Aspire AppHost を並行起動すると DCP のプロキシが切断される場合がある。
+[CollectionDefinition("MinIO", DisableParallelization = true)]
 public class MinIOTestCollection : ICollectionFixture<MinIOFixture>;

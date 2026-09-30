@@ -356,6 +356,15 @@ public sealed class AesXtsStream : Stream
 
     public override void Flush() => _base.Flush();
 
+    /// <summary>ファイルに保存している場合は OS のディスクキャッシュもフラッシュする。</summary>
+    public void Flush(bool flushToDisk)
+    {
+        if (_base is FileStream file)
+            file.Flush(flushToDisk);
+        else
+            _base.Flush();
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (_disposed) return;

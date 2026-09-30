@@ -11,6 +11,8 @@ namespace CistaNAS.Mobile.Core.ViewModels;
 /// </summary>
 public sealed partial class ExternalViewerViewModel(AppServices app, FileBrowserViewModel browser, FileItem item) : BusyViewModelBase
 {
+    private CancellationTokenSource? _transferCancellation;
+
     [ObservableProperty]
     private double _progressPercent;
 
@@ -29,39 +31,57 @@ public sealed partial class ExternalViewerViewModel(AppServices app, FileBrowser
     [RelayCommand]
     private Task RetryAsync(CancellationToken ct) => RunBusyAsync(TransferAndLaunchAsync);
 
+    public override void OnNavigatedFrom() => _transferCancellation?.Cancel();
+
     private async Task TransferAndLaunchAsync()
     {
         ProgressPercent = 0;
         Status = "ダウンロード中...";
         var progress = new Progress<double>(p => ProgressPercent = p);
 
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(app.SessionCancellation);
+        _transferCancellation = cancellation;
+        CancellationToken ct = cancellation.Token;
         string cacheName = MakeSafeCacheName();
-        await using (Stream output = app.FileCache.OpenWrite(cacheName))
+        bool keepCache = false;
+        try
         {
-            if (browser.IsE2ee && item.E2eeEntry is not null)
+            ct.ThrowIfCancellationRequested();
+            await using (Stream output = app.FileCache.OpenWrite(cacheName))
             {
-                await app.Transfer.DownloadAsync(browser.VolumeName, item.E2eeEntry, output, progress);
+                if (browser.IsE2ee && item.E2eeEntry is not null)
+                {
+                    await app.Transfer.DownloadAsync(browser.VolumeName, item.E2eeEntry, output, progress, ct);
+                }
+                else
+                {
+                    await using Stream source = await app.Session.Api.DownloadFileStreamAsync(browser.VolumeName, item.FullPath, ct);
+                    await source.CopyToAsync(output, ct);
+                }
             }
-            else
-            {
-                await using Stream source = await app.Session.Api.DownloadFileStreamAsync(browser.VolumeName, item.FullPath);
-                await source.CopyToAsync(output);
-            }
-        }
 
-        Status = "アプリを起動中...";
-        bool launched = await app.ExternalViewer.LaunchAsync(
-            app.FileCache.GetPath(cacheName),
-            FileCategoryService.GetMimeType(FileName));
-        Status = launched ? "外部アプリで表示しました。" : "このファイルを開けるアプリが見つかりません。";
+            ct.ThrowIfCancellationRequested();
+            Status = "アプリを起動中...";
+            bool launched = await app.ExternalViewer.LaunchAsync(
+                app.FileCache.GetPath(cacheName),
+                FileCategoryService.GetMimeType(FileName));
+            ct.ThrowIfCancellationRequested();
+            keepCache = launched;
+            Status = launched ? "外部アプリで表示しました。" : "このファイルを開けるアプリが見つかりません。";
+        }
+        finally
+        {
+            _transferCancellation = null;
+            if (!keepCache) app.FileCache.Delete(cacheName);
+        }
     }
 
-    /// <summary>キャッシュファイル名の衝突を避けるためボリューム名とパスを含める。</summary>
+    /// <summary>既に外部アプリへ渡した URI を別ファイルの内容に使い回さない。</summary>
     private string MakeSafeCacheName()
     {
-        string raw = $"{browser.VolumeName}_{browser.CurrentPath}_{FileName}";
-        foreach (char c in Path.GetInvalidFileNameChars())
-            raw = raw.Replace(c, '_');
-        return raw;
+        string extension = Path.GetExtension(FileName);
+        if (extension.Length > 20 || extension.Any(c => c != '.' && !char.IsAsciiLetterOrDigit(c)))
+            extension = "";
+        return Guid.NewGuid().ToString("N") + extension;
     }
 }

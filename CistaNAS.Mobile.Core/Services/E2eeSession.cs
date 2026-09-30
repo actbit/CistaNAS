@@ -97,14 +97,20 @@ public sealed class E2eeSession : IDisposable
     /// <summary>アンラップ済み masterKey をセッションに登録する。</summary>
     public void StoreKey(string volumeName, byte[] masterKey, int chunkSize)
     {
-        _keys[volumeName] = (new SecureBuffer(masterKey), chunkSize);
+        var replacement = new SecureBuffer(masterKey);
+        if (_keys.TryGetValue(volumeName, out var previous)) previous.Buffer.Dispose();
+        _keys[volumeName] = (replacement, chunkSize);
     }
 
     /// <summary>
     /// 共有 v2 の GroupKey 状態を登録する。masterKey を持たないメンバーはこれだけで読み書きできる。
     /// </summary>
     public void StoreV2State(string volumeName, string volumeId, IReadOnlyDictionary<int, byte[]> groupKeysByEpoch)
-        => _v2States[volumeName] = new E2eeV2VolumeState(volumeId, groupKeysByEpoch);
+    {
+        var replacement = new E2eeV2VolumeState(volumeId, groupKeysByEpoch);
+        if (_v2States.TryGetValue(volumeName, out var previous)) previous.Dispose();
+        _v2States[volumeName] = replacement;
+    }
 
     public bool HasKey(string volumeName) => _keys.ContainsKey(volumeName);
 
