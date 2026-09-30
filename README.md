@@ -14,7 +14,8 @@ Volume-level encryption (server-side AES-XTS / E2EE AES-256-GCM), multi-user key
 - **Multi-user key management** — Each user wraps the master key with an independent Argon2id+PBKDF2 → KEK. Password changes re-wrap only the target user's entry
 - **Shared volumes** — Owners can grant/revoke access to other users, with group-level access control
 - **Media streaming** — Video playback and photo preview in the browser. Regular volumes support HTTP Range seeking; E2EE volumes use chunk-wise Blob URL previews
-- **3 client types** — Browser (Blazor + Web Crypto API), Windows (Dokan.NET virtual filesystem), WebDAV (rclone / RCX)
+- **Clients** — Browser (Blazor + Web Crypto API), Windows (Dokan.NET virtual filesystem), Android, WebDAV (rclone / RCX)
+- **Built-in viewers** — Windows previews mounted images and text in RAM. Android displays images, text, video, audio and PDF (Android 8+ for PDF), reading encrypted chunks or HTTP ranges on demand without decrypted file caches or external app sharing
 - **Journaling** — Crash recovery for write operations
 - **WebDAV** — Direct access from external clients
 - **REST API** — `/api/v1` provides volume, file, auth, E2EE, and streaming endpoints
@@ -28,6 +29,8 @@ Volume-level encryption (server-side AES-XTS / E2EE AES-256-GCM), multi-user key
 | `CistaNAS.AppHost` | .NET Aspire orchestration |
 | `CistaNAS.Web` | Blazor WebUI + REST API + WebDAV (single process) |
 | `CistaNAS.Client` | Dokan.NET Windows virtual filesystem client |
+| `CistaNAS.Mobile.Core` | Platform-independent Android logic and streaming readers |
+| `CistaNAS.Mobile` | Android client with built-in viewers |
 | `CistaNAS.ServiceDefaults` | Aspire shared settings (telemetry, health checks) |
 | `CistaNAS.Tests` | xUnit tests |
 

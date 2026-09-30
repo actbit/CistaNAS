@@ -1,7 +1,6 @@
-using CistaNAS.Client.Api;
-using CistaNAS.Mobile.Core.Abstractions;
 using CistaNAS.Mobile.Core.Services;
 using CistaNAS.Mobile.Core.ViewModels;
+using CistaNAS.Client.Api;
 using CistaNAS.Shared.Crypto;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -9,16 +8,8 @@ using Microsoft.AspNetCore.Http;
 
 namespace CistaNAS.Tests;
 
-public sealed class MobileSecurityRegressionTests : IDisposable
+public sealed class MobileSecurityRegressionTests
 {
-    private readonly string _directory = Path.Combine(Path.GetTempPath(), $"cista-mobile-security-{Guid.NewGuid():N}");
-    private DiskFileCacheProvider Cache => new(_directory);
-
-    public void Dispose()
-    {
-        if (Directory.Exists(_directory)) Directory.Delete(_directory, true);
-    }
-
     [Fact]
     public async Task DefaultHttpHandler_CanLoginOverRealHttp()
     {
@@ -52,24 +43,15 @@ public sealed class MobileSecurityRegressionTests : IDisposable
         Assert.Equal(0, forwarded);
     }
 
-    [Theory]
-    [InlineData("../outside")]
-    [InlineData("..\\outside")]
-    [InlineData("/absolute")]
-    [InlineData("C:\\absolute")]
-    [InlineData(".")]
-    [InlineData("data:stream")]
-    public void CacheRejectsPathsOutsideItsDirectory(string name) =>
-        Assert.Throws<ArgumentException>(() => Cache.OpenWrite(name));
-
     [Fact]
     public async Task ChangingServerAfterRequest_DoesNotSendPreviousToken()
     {
         var destinations = new List<Uri>();
-        var handler = new Handler(request =>
+        var handler = new Handler((request, _) =>
         {
             destinations.Add(request.RequestUri!);
-            return new StringContent("{\"accessToken\":\"token\"}", System.Text.Encoding.UTF8, "application/json");
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            { Content = new StringContent("{\"accessToken\":\"token\"}", System.Text.Encoding.UTF8, "application/json") });
         });
         using var session = new ApiSession(handler);
         session.ConfigureServer("http://first/");
@@ -83,92 +65,72 @@ public sealed class MobileSecurityRegressionTests : IDisposable
     }
 
     [Fact]
-    public async Task ReopeningSameFile_DoesNotReplacePreviouslyGrantedViewerPath()
+    public async Task OpeningServerVideo_DoesNotDownloadUntilViewerRequestsRange()
     {
-        var launcher = new Viewer();
-        using var app = CreateApp(new Handler(_ => new ByteArrayContent([1, 2, 3])), launcher);
-        var viewer = CreateViewer(app);
-        await viewer.RetryCommand.ExecuteAsync(null);
-        await viewer.RetryCommand.ExecuteAsync(null);
-        Assert.Null(viewer.Error);
-        Assert.Equal(2, launcher.Paths.Count);
-        Assert.NotEqual(launcher.Paths[0], launcher.Paths[1]);
-        Assert.All(launcher.Paths, path => Assert.Equal(".mp4", Path.GetExtension(path)));
-        Assert.Equal(new byte[] { 1, 2, 3 }, await File.ReadAllBytesAsync(launcher.Paths[0]));
-    }
-
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task FailedTransferOrMissingViewer_RemovesDecryptedCache(bool failedTransfer)
-    {
-        var launcher = new Viewer { CanLaunch = false };
-        using var app = CreateApp(new Handler(_ => failedTransfer
-            ? new StreamContent(new InterruptedStream()) : new ByteArrayContent([1, 2, 3])), launcher);
-        var viewer = CreateViewer(app);
-        await viewer.RetryCommand.ExecuteAsync(null);
-        Assert.Empty(Directory.GetFiles(_directory));
-        if (failedTransfer)
+        int requests = 0;
+        using var app = CreateApp(new Handler((request, _) =>
         {
-            Assert.NotNull(viewer.Error);
-            Assert.Empty(launcher.Paths);
-        }
-        else Assert.Null(viewer.Error);
-    }
-
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task LogoutOrNavigationDuringTransfer_CancelsAndNeverLaunches(bool logout)
-    {
-        var stream = new PendingStream();
-        var launcher = new Viewer();
-        using var app = CreateApp(new Handler(_ => new StreamContent(stream)), launcher);
-        var viewer = CreateViewer(app);
-        Task transfer = viewer.RetryCommand.ExecuteAsync(null);
-        await stream.Waiting.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        if (logout) new VolumesViewModel(app).LogoutCommand.Execute(null);
-        else viewer.OnNavigatedFrom();
-        await transfer.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.Empty(launcher.Paths);
-        Assert.Empty(Directory.GetFiles(_directory));
-    }
-
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task LogoutOrUnauthorized_ClearsTokenKeysAndCache(bool unauthorized)
-    {
-        var handler = new Handler(_ => new ByteArrayContent([])) { Status = HttpStatusCode.Unauthorized };
-        using var app = CreateApp(handler, new Viewer());
-        app.Session.SetToken("secret-token");
-        app.E2ee.StoreKey("vol", E2eeCrypto.GenerateMasterKey(), 1024);
-        byte[] storedKey = app.E2ee.GetMasterKey("vol");
-        using (var output = Cache.OpenWrite("secret.txt")) output.Write([1, 2, 3]);
-        bool expired = false;
-        app.SessionExpired += () => expired = true;
-        if (unauthorized)
-        {
-            await Assert.ThrowsAsync<HttpRequestException>(() => app.Session.Api.ListVolumesAsync());
-            Assert.True(expired);
-        }
-        else new VolumesViewModel(app).LogoutCommand.Execute(null);
-        Assert.False(app.E2ee.HasKey("vol"));
-        Assert.All(storedKey, b => Assert.Equal(0, b));
-        Assert.Empty(Directory.GetFiles(_directory));
-        await Assert.ThrowsAsync<HttpRequestException>(() => app.Session.Api.ListVolumesAsync());
-        Assert.Null(handler.LastAuthorization);
+            requests++;
+            Assert.Equal("bytes=1-2", request.Headers.Range!.ToString());
+            var response = new HttpResponseMessage(HttpStatusCode.PartialContent) { Content = new ByteArrayContent([2, 3]) };
+            response.Content.Headers.ContentRange = new System.Net.Http.Headers.ContentRangeHeaderValue(1, 2, 3);
+            return Task.FromResult(response);
+        }));
+        using var vm = CreateViewer(app);
+        await vm.RetryCommand.ExecuteAsync(null);
+        Assert.Null(vm.Error);
+        Assert.Equal(0, requests);
+        var content = Assert.Single(((RecordingFileViewer)app.Viewer).Launched);
+        var buffer = new byte[2];
+        Assert.Equal(2, await content.ReadAsync(1, buffer));
+        Assert.Equal(new byte[] { 2, 3 }, buffer);
     }
 
     [Fact]
-    public void StartupAndDispose_RemovePreviousPlaintextCache()
+    public async Task ReopeningAndNavigation_CancelPreviousReaders()
     {
-        using (var output = Cache.OpenWrite("old.txt")) output.WriteByte(42);
-        var app = CreateApp(new Handler(_ => new ByteArrayContent([])), new Viewer());
-        Assert.Empty(Directory.GetFiles(_directory));
-        using (var output = Cache.OpenWrite("new.txt")) output.WriteByte(42);
-        app.Dispose();
-        Assert.Empty(Directory.GetFiles(_directory));
+        using var app = CreateApp(new Handler((_, _) => throw new InvalidOperationException("No eager download")));
+        using var vm = CreateViewer(app);
+        await vm.RetryCommand.ExecuteAsync(null);
+        var first = Assert.Single(((RecordingFileViewer)app.Viewer).Launched);
+        await vm.RetryCommand.ExecuteAsync(null);
+        Assert.True(first.Cancellation.IsCancellationRequested);
+        var second = ((RecordingFileViewer)app.Viewer).Launched[1];
+        vm.OnNavigatedFrom();
+        Assert.True(second.Cancellation.IsCancellationRequested);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => second.ReadAsync(0, new byte[3]).AsTask());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LogoutOrUnauthorized_DuringRead_CancelsWithoutDeadlock(bool unauthorized)
+    {
+        var waiting = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var app = CreateApp(new Handler(async (_, ct) =>
+        {
+            waiting.TrySetResult();
+            if (unauthorized) return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+            await Task.Delay(Timeout.Infinite, ct);
+            throw new InvalidOperationException();
+        }));
+        app.Session.SetToken("secret-token");
+        app.E2ee.StoreKey("vol", E2eeCrypto.GenerateMasterKey(), 1024);
+        byte[] storedKey = app.E2ee.GetMasterKey("vol");
+        using var vm = CreateViewer(app);
+        await vm.RetryCommand.ExecuteAsync(null);
+        var content = Assert.Single(((RecordingFileViewer)app.Viewer).Launched);
+        Task read = content.ReadAsync(0, new byte[3]).AsTask();
+        await waiting.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        if (!unauthorized) app.ClearSession();
+        var error = await Record.ExceptionAsync(() => read.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.NotNull(error);
+        Assert.IsNotType<TimeoutException>(error);
+        Assert.True(read.IsCompleted);
+        Assert.True(content.Cancellation.IsCancellationRequested);
+        Assert.False(app.E2ee.HasKey("vol"));
+        Assert.All(storedKey, b => Assert.Equal(0, b));
+        Assert.Empty(((RecordingFileViewer)app.Viewer).Launched);
     }
 
     [Fact]
@@ -193,56 +155,24 @@ public sealed class MobileSecurityRegressionTests : IDisposable
         return builder.Build();
     }
 
-    private AppServices CreateApp(HttpMessageHandler handler, Viewer viewer)
+    private static AppServices CreateApp(HttpMessageHandler handler)
     {
-        var app = new AppServices(new MemorySecureKeyStore(), new MemoryAppSettings(), Cache, viewer, handler);
+        var app = new AppServices(new MemorySecureKeyStore(), new MemoryAppSettings(), new RecordingFileViewer(), handler);
         app.Session.ConfigureServer("http://test/");
         return app;
     }
 
-    private static ExternalViewerViewModel CreateViewer(AppServices app) => new(app,
+    private static StreamingViewerViewModel CreateViewer(AppServices app) => new(app,
         new FileBrowserViewModel(app, new VolumeListItem { Name = "vol", EncryptionMode = "server" }),
-        new FileItem { Name = "clip.mp4", FullPath = "clip.mp4", IsFolder = false });
+        new FileItem { Name = "clip.mp4", FullPath = "clip.mp4", IsFolder = false, ServerMeta = new FileMetadata { Name = "clip.mp4", Length = 3 } });
 
-    private sealed class Viewer : IExternalViewerLauncher
+    private sealed class Handler(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> send) : HttpMessageHandler
     {
-        public bool CanLaunch { get; init; } = true;
-        public List<string> Paths { get; } = [];
-        public Task<bool> LaunchAsync(string filePath, string mimeType)
-        {
-            Paths.Add(filePath);
-            return Task.FromResult(CanLaunch);
-        }
-    }
-
-    private sealed class Handler(Func<HttpRequestMessage, HttpContent> content) : HttpMessageHandler
-    {
-        public HttpStatusCode Status { get; init; } = HttpStatusCode.OK;
         public string? LastAuthorization { get; private set; }
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             LastAuthorization = request.Headers.Authorization?.ToString();
-            return Task.FromResult(new HttpResponseMessage(Status) { Content = content(request) });
-        }
-    }
-
-    private sealed class InterruptedStream : MemoryStream
-    {
-        public override async Task CopyToAsync(Stream destination, int bufferSize, CancellationToken ct)
-        {
-            await destination.WriteAsync(new byte[] { 42 }, ct);
-            throw new IOException("Interrupted download");
-        }
-    }
-
-    private sealed class PendingStream : MemoryStream
-    {
-        public TaskCompletionSource Waiting { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public override async Task CopyToAsync(Stream destination, int bufferSize, CancellationToken ct)
-        {
-            await destination.WriteAsync(new byte[] { 42 }, ct);
-            Waiting.TrySetResult();
-            await Task.Delay(Timeout.Infinite, ct);
+            return send(request, ct);
         }
     }
 }

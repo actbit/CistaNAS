@@ -13,6 +13,7 @@ namespace CistaNAS.Client.ViewModels;
 
 public partial class MainViewModel : ObservableObject
 {
+    public event Action<string?>? ViewerClosing;
     // ---- ログイン ----
     [ObservableProperty] private string _serverUrl = "https://localhost:5001";
     [ObservableProperty] private string _username = "";
@@ -259,6 +260,7 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand]
     private void Logout()
     {
+        ViewerClosing?.Invoke(null);
         // E2EE セッション破棄: E2EE 共有パスワードは RAM 上のみで保持しており、
         // ログアウト時に破棄する（永続化ストレージには一切書き込まない）。
         E2eePassword = "";
@@ -443,6 +445,7 @@ public partial class MainViewModel : ObservableObject
     private async Task UnmountAsync()
     {
         if (SelectedVolume is null) return;
+        ViewerClosing?.Invoke(SelectedVolume.Name);
         IsBusy = true;
         StatusMessage = "アンマウント中...";
         try

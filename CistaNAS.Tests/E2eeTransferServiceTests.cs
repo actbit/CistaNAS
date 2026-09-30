@@ -198,6 +198,8 @@ internal sealed class FakeE2eeServer : HttpMessageHandler
     private readonly Dictionary<(string FileId, int Index), string> _leaseHeaders = new();
     private int _nextFileId = 1;
     public E2eeFileEntry? LastCreated { get; private set; }
+    public List<int> DownloadRequests { get; } = [];
+    public void CorruptChunk(string fileId, int index) => _chunks[(fileId, index)][^1] ^= 1;
     public int FinalizedCount { get; private set; }
     public int DeletedCount { get; private set; }
     public int ReleasedCount { get; private set; }
@@ -264,6 +266,7 @@ internal sealed class FakeE2eeServer : HttpMessageHandler
             {
                 string fileId = segments[5];
                 int index = int.Parse(segments[6]);
+                DownloadRequests.Add(index);
                 if (!_chunks.TryGetValue((fileId, index), out var data))
                     return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
                 var res = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(data) };

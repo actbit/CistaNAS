@@ -13,7 +13,7 @@
 | `CistaNAS.Client` | Windows 用 Dokan マウントクライアント（Avalonia + DokanNet） |
 | `CistaNAS.Api.Client` | REST クライアント一式（`CistaNAS.Client` から抽出。Client / Mobile で共有。namespace は `CistaNAS.Client.Api` のまま） |
 | `CistaNAS.Mobile.Core` | Android モバイルアプリのロジック層（ViewModel・E2EE セッション・転送。UI 非依存で `CistaNAS.Tests` でテスト可） |
-| `CistaNAS.Mobile` | Android 用 Avalonia モバイルアプリ（`net10.0-android`。ボリューム一覧・ファイル閲覧・画像/テキストビューア。動画等は Intent で外部アプリ委譲） |
+| `CistaNAS.Mobile` | Android 用 Avalonia モバイルアプリ（`net10.0-android`。画像・テキスト・動画・音声・PDFの組み込みViewer。復号ファイルを保存しない） |
 | `CistaNAS.Shared` | 暗号化プリミティブ（Web / Client / Wasm / Mobile で共有） |
 | `CistaNAS.Tests` | xUnit 単体・統合テスト |
 | `CistaNAS.PlaywrightTests` | Playwright によるブラウザ E2E テスト（CSP 検出・UI 回帰・実 JS 暗号化検証） |
@@ -94,8 +94,10 @@ Crypto / Volume / Journal
 ## CistaNAS.Mobile の役割
 
 `CistaNAS.Mobile` は Avalonia 12 + `net10.0-android` の **Android 用モバイルクライアント**。
-ボリューム一覧・フォルダ閲覧・画像 / テキストのアプリ内表示に対応。PDF・動画等は
-FileProvider + ACTION_VIEW Intent で外部アプリに委譲。E2EE モード / サーバー側暗号化モード両対応。
+ボリューム一覧・フォルダ閲覧・画像 / テキスト / 動画 / 音声 / PDFのアプリ内表示に対応。
+動画・音声はMediaDataSource、PDFは仮想ファイルディスクリプターで必要範囲をRAMから供給する。
+復号データのファイルキャッシュや外部アプリへのURI共有は禁止。PDFはAndroid 8以降。
+E2EE モード / サーバー側暗号化モード両対応。WindowsにはDokanを読み取る画像・テキストViewerを備える。
 
 - 起動モデルは Avalonia 12 方式: `MainActivity : AvaloniaMainActivity`（非ジェネリック）+ `CistanasApplication : AvaloniaAndroidApplication<App>`（`CustomizeAppBuilder` で構成）。`UseAndroid()` は廃止済み API
 - ロジックはすべて `CistaNAS.Mobile.Core`（UI 非依存）に置き、Android head は View + プラットフォーム実装のみ

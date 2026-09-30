@@ -1,0 +1,22 @@
+<Window xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:CistaNAS.Client.ViewModels" x:Class="CistaNAS.Client.Views.FilePreviewWindow"
+        x:DataType="vm:FilePreviewViewModel" Title="CistaNAS Viewer" Width="960" Height="700">
+  <Grid Margin="16" RowDefinitions="Auto,*,Auto" ColumnDefinitions="260,*">
+    <StackPanel Grid.ColumnSpan="2" Orientation="Horizontal" Spacing="12" Margin="0,0,0,12">
+      <Button Content="上のフォルダ" Command="{Binding UpCommand}" />
+      <TextBlock Text="{Binding Location}" VerticalAlignment="Center" />
+    </StackPanel>
+    <DockPanel Grid.Row="1" Margin="0,0,12,0">
+      <Button DockPanel.Dock="Bottom" Content="開く" Command="{Binding OpenCommand}" />
+      <ListBox ItemsSource="{Binding Items}" SelectedItem="{Binding SelectedItem}" DoubleTapped="OpenItem">
+        <ListBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate></ListBox.ItemTemplate>
+      </ListBox>
+    </DockPanel>
+    <Grid Grid.Row="1" Grid.Column="1">
+      <Image Source="{Binding Image}" Stretch="Uniform" />
+      <TextBox Text="{Binding Text, Mode=OneWay}" IsReadOnly="True" AcceptsReturn="True"
+               IsVisible="{Binding Text, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+    </Grid>
+    <TextBlock Grid.Row="2" Grid.ColumnSpan="2" Text="{Binding Status}" TextWrapping="Wrap" Margin="0,12,0,0" />
+  </Grid>
+</Window>

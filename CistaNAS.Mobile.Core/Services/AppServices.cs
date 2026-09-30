@@ -12,17 +12,17 @@ public sealed class AppServices : IDisposable
     private CancellationTokenSource _sessionCancellation = new();
 
     public AppServices(ISecureKeyStore keyStore, IAppSettings settings,
-        IFileCacheProvider fileCache, IExternalViewerLauncher externalViewer,
+        IFileViewerLauncher viewer,
         HttpMessageHandler? httpHandler = null)
     {
         KeyStore = keyStore;
         Settings = settings;
-        FileCache = fileCache;
-        FileCache.Clear(); // 前回プロセスが終了した際の復号キャッシュも破棄する。
-        ExternalViewer = externalViewer;
+        Viewer = viewer;
+        Viewer.Clear();
         EcdhKeys = new EcdhKeyManager();
         Session = new ApiSession(httpHandler);
         Transfer = new E2eeFileTransferService(Session.Api, E2ee);
+        StreamingFiles = new StreamingFileService(Session.Api, E2ee);
         Session.Unauthorized += () =>
         {
             ClearSession();
@@ -32,12 +32,12 @@ public sealed class AppServices : IDisposable
 
     public ISecureKeyStore KeyStore { get; }
     public IAppSettings Settings { get; }
-    public IFileCacheProvider FileCache { get; }
-    public IExternalViewerLauncher ExternalViewer { get; }
+    public IFileViewerLauncher Viewer { get; }
     public ApiSession Session { get; }
     public E2eeSession E2ee { get; } = new();
     public EcdhKeyManager EcdhKeys { get; }
     public E2eeFileTransferService Transfer { get; }
+    public StreamingFileService StreamingFiles { get; }
     public NavigationService Navigation { get; } = new();
 
     /// <summary>JWT 失効 (401) を検知したときに発火。UI はログイン画面へ戻す。</summary>
@@ -48,7 +48,7 @@ public sealed class AppServices : IDisposable
         get { lock (_sessionLock) return _sessionCancellation.Token; }
     }
 
-    /// <summary>転送を中止し、トークン・鍵・復号キャッシュをまとめて破棄する。</summary>
+    /// <summary>転送を中止し、表示画面のRAM上の内容・トークン・鍵を破棄する。</summary>
     public void ClearSession()
     {
         CancellationTokenSource previous;
@@ -59,9 +59,9 @@ public sealed class AppServices : IDisposable
         }
         previous.Cancel();
         previous.Dispose();
+        Viewer.Clear();
         Session.ClearToken();
         E2ee.ClearKeys();
-        FileCache.Clear();
     }
 
     public void Dispose()

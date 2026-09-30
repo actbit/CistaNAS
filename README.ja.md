@@ -14,7 +14,8 @@
 - **マルチユーザー鍵管理** — ユーザーごとに独立した Argon2id+PBKDF2 → KEK でマスターキーをラップ。パスワード変更時は対象ユーザーのエントリのみ再ラップ
 - **共有ボリューム** — オーナーが他ユーザーにアクセス権を付与・取り消し可能。グループ単位のアクセス制御にも対応
 - **メディアストリーミング** — ブラウザでの動画再生・写真プレビュー。通常ボリュームは HTTP Range 要求でシーク対応、E2EE ボリュームはチャンク単位の Blob URL プレビュー
-- **3 クライアント対応** — ブラウザ (Blazor + Web Crypto API)、Windows (Dokan.NET 仮想ファイルシステム)、WebDAV (rclone / RCX)
+- **クライアント対応** — ブラウザ (Blazor + Web Crypto API)、Windows (Dokan.NET 仮想ファイルシステム)、Android、WebDAV (rclone / RCX)
+- **組み込みViewer** — Windowsはマウント済みボリュームの画像・テキストをRAMで表示。Androidは画像・テキスト・動画・音声・PDF（PDFはAndroid 8以降）に対応し、暗号化チャンクまたはHTTP Rangeを必要な範囲だけ読み込む。復号ファイルのキャッシュや外部アプリへの共有は行わない
 - **ジャーナリング** — 書き込み操作のクラッシュリカバリ
 - **WebDAV** — 外部クライアントから直接アクセス可能
 - **REST API** — `/api/v1` にボリューム・ファイル・認証・E2EE・ストリーミングエンドポイントを提供
@@ -28,6 +29,8 @@
 | `CistaNAS.AppHost` | .NET Aspire オーケストレーション |
 | `CistaNAS.Web` | Blazor WebUI + REST API + WebDAV（単一プロセス） |
 | `CistaNAS.Client` | Dokan.NET Windows 仮想ファイルシステムクライアント |
+| `CistaNAS.Mobile.Core` | Androidのロジック・ストリーミング読み取り（UI非依存） |
+| `CistaNAS.Mobile` | 組み込みViewerを備えるAndroidクライアント |
 | `CistaNAS.ServiceDefaults` | Aspire 共通設定（テレメトリ・ヘルスチェック） |
 | `CistaNAS.Tests` | xUnit テスト (181 tests) |
 

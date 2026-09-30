@@ -407,6 +407,9 @@ public class DokanIntegrationTests
 
             // 検証: 末尾保持（revision 差分上書きで chunk0 だけ更新、chunk1/2 は維持）
             byte[] result = File.ReadAllBytes(mountPoint + "secret.txt");
+            using (var preview = await new CistaNAS.Client.Services.MountedFilePreviewService(mountPoint)
+                .ReadAsync("secret.txt", default))
+                Assert.Equal(result, preview.Buffer);
             Assert.Equal(initial.Length, result.Length);
             Assert.Equal((byte)0xFF, result[0]);
             for (int i = 1; i < initial.Length; i++)

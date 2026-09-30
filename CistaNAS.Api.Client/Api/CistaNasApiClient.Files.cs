@@ -93,17 +93,25 @@ public static class CistaNasApiClientFiles
     }
 
     /// <summary>ファイルの一部をダウンロードする（Range リクエスト対応）。</summary>
-    public static async Task<byte[]> DownloadFileRangeAsync(this CistaNasApiClient client, string volumeName, string filePath, long offset, int count)
+    public static async Task<byte[]> DownloadFileRangeAsync(this CistaNasApiClient client, string volumeName, string filePath, long offset, int count, CancellationToken ct = default, bool requireExactRange = false)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(count);
         var http = client._http;
         using var request = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Get,
             $"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(filePath)}");
         request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(offset, offset + count - 1);
-        var res = await http.SendAsync(request, System.Net.Http.HttpCompletionOption.ResponseContentRead);
+        using var res = await http.SendAsync(request, System.Net.Http.HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         if (res.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
             return Array.Empty<byte>();
         res.EnsureSuccessStatusCode();
-        return await res.Content.ReadAsByteArrayAsync();
+        // Existing Dokan write paths also handle servers returning full content.
+        if (!requireExactRange) return await res.Content.ReadAsByteArrayAsync(ct).ConfigureAwait(false);
+        var range = res.Content.Headers.ContentRange;
+        if (res.StatusCode != System.Net.HttpStatusCode.PartialContent || range is null ||
+            range.From != offset || range.To != offset + count - 1)
+            throw new InvalidDataException("サーバーが要求した読み取り範囲を返しませんでした。");
+        return await BoundedResponseReader.ReadAsync(res.Content, count, ct).ConfigureAwait(false);
     }
 
     /// <summary>ファイルの一部を書き込む（差分保存）。PATCH /files/{volume}/{path}?offset=N。</summary>

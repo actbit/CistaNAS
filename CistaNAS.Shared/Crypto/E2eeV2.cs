@@ -247,7 +247,7 @@ public static class E2eeV2
     public static byte[] DecryptChunk(
         byte[] encData, byte[] fileKey, in E2eeChunkContext ctx, byte[] fileSalt)
     {
-        int offset = ctx.ChunkIndex == 0 && encData.Length > SaltSize + TagSize ? SaltSize : 0;
+        int offset = ctx.ChunkIndex == 0 && encData.Length >= SaltSize + TagSize ? SaltSize : 0;
         if (encData.Length < offset + TagSize)
             throw new CryptographicException("暗号化データが短すぎます。");
         int ctLen = encData.Length - offset - TagSize;

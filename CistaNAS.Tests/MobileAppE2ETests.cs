@@ -32,32 +32,16 @@ internal sealed class MemorySecureKeyStore : ISecureKeyStore
     public IReadOnlyCollection<string> Keys => [.. _store.Keys];
 }
 
-/// <summary>テスト用一時ディレクトリの IFileCacheProvider。</summary>
-internal sealed class TempFileCacheProvider : IFileCacheProvider
+/// <summary>同一プロセス内の読み取り元を受け取るViewer。</summary>
+internal sealed class RecordingFileViewer : IFileViewerLauncher
 {
-    private readonly string _dir = Path.Combine(Path.GetTempPath(), $"cista-mobile-cache-{Guid.NewGuid():N}");
-    public Stream OpenWrite(string fileName)
+    public List<ReadOnlyFileContent> Launched { get; } = [];
+    public Task<bool> LaunchAsync(ReadOnlyFileContent content)
     {
-        Directory.CreateDirectory(_dir);
-        return File.OpenWrite(Path.Combine(_dir, fileName));
-    }
-    public string GetPath(string fileName) => Path.Combine(_dir, fileName);
-    public void Delete(string fileName) => File.Delete(GetPath(fileName));
-    public void Clear()
-    {
-        if (Directory.Exists(_dir)) Directory.Delete(_dir, true);
-    }
-}
-
-/// <summary>起動記録を残す IExternalViewerLauncher (実際には起動しない)。</summary>
-internal sealed class RecordingExternalViewer : IExternalViewerLauncher
-{
-    public List<(string FilePath, string MimeType)> Launched { get; } = [];
-    public Task<bool> LaunchAsync(string filePath, string mimeType)
-    {
-        Launched.Add((filePath, mimeType));
+        Launched.Add(content);
         return Task.FromResult(true);
     }
+    public void Clear() { foreach (var content in Launched) content.Dispose(); Launched.Clear(); }
 }
 
 #endregion
@@ -82,7 +66,7 @@ public class MobileAppE2ETests(AspireFixture fixture)
         };
         var app = new AppServices(
             new MemorySecureKeyStore(), new MemoryAppSettings(),
-            new TempFileCacheProvider(), new RecordingExternalViewer(), handler);
+            new RecordingFileViewer(), handler);
         app.Session.ConfigureServer(fixture.Http.BaseAddress!.ToString());
         return app;
     }
@@ -203,7 +187,7 @@ public class MobileAppE2ETests(AspireFixture fixture)
         await WaitIdleAsync(textViewer, "テキストの復号");
         Assert.Equal(textContent, textViewer.Content);
 
-        // --- 動画は外部アプリ委譲 (キャッシュ復号 + ランチャー起動) ---
+        // --- 動画は必要範囲だけをRAM上で復号する組み込みViewer ---
         byte[] videoBytes = RandomNumberGenerator.GetBytes(200_000);
         using (var ms = new MemoryStream(videoBytes))
             await app.Transfer.UploadAsync(volName, "clip.mp4", ms, videoBytes.Length);
@@ -213,12 +197,15 @@ public class MobileAppE2ETests(AspireFixture fixture)
         await WaitIdleAsync(browser, "一覧の再読込");
         FileItem videoItem = Assert.Single(browser.Items, i => i.Name == "clip.mp4");
         browser.OpenItemCommand.Execute(videoItem);
-        var external = Assert.IsAssignableFrom<ExternalViewerViewModel>(app.Navigation.Current);
-        await WaitIdleAsync(external, "動画の復号と委譲");
-        var launched = Assert.Single(((RecordingExternalViewer)app.ExternalViewer).Launched);
+        var streamingViewer = Assert.IsAssignableFrom<StreamingViewerViewModel>(app.Navigation.Current);
+        await WaitIdleAsync(streamingViewer, "動画のストリーミング準備");
+        var launched = Assert.Single(((RecordingFileViewer)app.Viewer).Launched);
         Assert.Equal("video/mp4", launched.MimeType);
-        Assert.True(File.Exists(launched.FilePath), "外部委譲先のキャッシュファイルが存在する");
-        Assert.Equal(videoBytes, await File.ReadAllBytesAsync(launched.FilePath));
+        byte[] actual = new byte[videoBytes.Length];
+        int position = 0;
+        while (position < actual.Length)
+            position += await launched.ReadAsync(position, actual.AsMemory(position));
+        Assert.Equal(videoBytes, actual);
     }
 
     [Fact]
@@ -288,6 +275,17 @@ public class MobileAppE2ETests(AspireFixture fixture)
         var viewer = Assert.IsAssignableFrom<ImageViewerViewModel>(app.Navigation.Current);
         await WaitIdleAsync(viewer, "画像のダウンロード");
         Assert.Equal(pngBytes, viewer.ImageData);
+
+        // Real HTTP Range responses must support random-access without a full download.
+        byte[] video = RandomNumberGenerator.GetBytes(200000);
+        FileMetadata metadata = await app.Session.Api.UploadFileAsync(volName, "clip.mp4", video);
+        using var content = app.StreamingFiles.OpenServerFile(volName, "clip.mp4", metadata, app.SessionCancellation);
+        foreach (long offset in new long[] { 150000, 100, video.Length - 5 })
+        {
+            byte[] buffer = new byte[1000];
+            int count = await content.ReadAsync(offset, buffer);
+            Assert.Equal(video.Skip((int)offset).Take(count), buffer.Take(count));
+        }
     }
 
     [Fact]
