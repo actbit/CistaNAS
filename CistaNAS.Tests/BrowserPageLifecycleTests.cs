@@ -8,6 +8,36 @@ namespace CistaNAS.Tests;
 
 public sealed class BrowserPageLifecycleTests
 {
+    [Fact]
+    public async Task LeavingFilesDuringDownload_CannotOpenTheAbandonedDownload()
+    {
+        var pending = new TaskCompletionSource<HttpResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var http = new HttpClient(new Handler(_ => pending.Task)) { BaseAddress = new Uri("http://test/") };
+        var js = new RecordingJs();
+        using var auth = new WasmAuthStateProvider(js);
+        await auth.SetTokenAsync("header.eyJzdWIiOiJhbGljZSJ9.signature", DateTimeOffset.UtcNow.AddMinutes(5));
+        await using var crypto = new E2eeInterop(js);
+        using var mounts = new ClientVolumeMountService(auth, crypto);
+        var page = new CistaNAS.Wasm.Pages.Files { VolumeName = "volume" };
+        Inject(page, "Auth", auth);
+        Inject(page, "VolumeMountService", mounts);
+        Inject(page, "FileApi", new FileApiClient(http));
+        Inject(page, "JS", js);
+        Task download = InvokeTask(page, "DownloadFile", new CistaNAS.Wasm.Models.FileMetadata { Name = "secret.txt", Length = 3 });
+        Assert.False(download.IsCompleted);
+        await page.DisposeAsync();
+        pending.SetResult(Json(new { token = "abandoned-download-token" }));
+        await download.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(0, js.Downloads);
+    }
+
+    private sealed class RecordingJs : IJSRuntime
+    {
+        public int Downloads;
+        public ValueTask<T> InvokeAsync<T>(string identifier, object?[]? args)
+        { if (identifier == "cista.openUrl") Downloads++; return ValueTask.FromResult(default(T)!); }
+        public ValueTask<T> InvokeAsync<T>(string identifier, CancellationToken ct, object?[]? args) => InvokeAsync<T>(identifier, args);
+    }
     [Theory]
     [InlineData("close")]
     [InlineData("replace")]

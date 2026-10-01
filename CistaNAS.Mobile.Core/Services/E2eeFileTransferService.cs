@@ -24,6 +24,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
         IProgress<double>? progress = null, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
+        long remaining = ValidatePlainLength(entry);
 
         if (entry.KeyEpoch >= 1)
         {
@@ -44,16 +45,19 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
         {
             // nonce 導出にはチャンクごとの revision が必須（Dokan 差分保存で revision >= 1 に上がる）。
             byte[] plain0 = E2eeCrypto.DecryptChunk(data0, fileKey, 0, fileSalt, revision0);
-            await WritePlainAsync(output, plain0, ct);
+            remaining = await WritePlainAsync(output, plain0, remaining, ct);
+            progress?.Report(100.0 / entry.ChunkCount);
 
             for (int i = 1; i < entry.ChunkCount; i++)
             {
                 ct.ThrowIfCancellationRequested();
                 (byte[] enc, int revision, _) = await api.DownloadChunkAsync(volumeName, entry.FileId, i, ct);
                 byte[] plain = E2eeCrypto.DecryptChunk(enc, fileKey, i, fileSalt, revision);
-                await WritePlainAsync(output, plain, ct);
+                remaining = await WritePlainAsync(output, plain, remaining, ct);
                 progress?.Report((double)(i + 1) / entry.ChunkCount * 100);
             }
+            ct.ThrowIfCancellationRequested();
+            if (remaining != 0) throw new InvalidDataException("復号後のサイズがファイル情報と一致しません。");
         }
         finally { CryptographicOperations.ZeroMemory(fileKey); }
     }
@@ -62,6 +66,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
     private async Task DownloadV2Async(string volumeName, E2eeFileEntry entry, Stream output,
         IProgress<double>? progress, CancellationToken ct)
     {
+        long remaining = ValidatePlainLength(entry);
         var v2 = e2eeSession.GetV2State(volumeName);
         string volumeId = v2.VolumeIdString;
         byte[] groupKey = v2.GetGroupKey(entry.KeyEpoch);
@@ -82,7 +87,8 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
             var ctx0 = new E2eeChunkContext(volumeId, entry.FileId, 0, revision0,
                 epoch0 > 0 ? epoch0 : entry.KeyEpoch);
             byte[] plain0 = E2eeV2.DecryptChunk(data0, fileKey, ctx0, fileSalt);
-            await WritePlainAsync(output, plain0, ct);
+            remaining = await WritePlainAsync(output, plain0, remaining, ct);
+            progress?.Report(100.0 / entry.ChunkCount);
 
             for (int i = 1; i < entry.ChunkCount; i++)
             {
@@ -91,9 +97,11 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
                 var ctx = new E2eeChunkContext(volumeId, entry.FileId, i, revision,
                     chunkEpoch > 0 ? chunkEpoch : entry.KeyEpoch);
                 byte[] plain = E2eeV2.DecryptChunk(enc, fileKey, ctx, fileSalt);
-                await WritePlainAsync(output, plain, ct);
+                remaining = await WritePlainAsync(output, plain, remaining, ct);
                 progress?.Report((double)(i + 1) / entry.ChunkCount * 100);
             }
+            ct.ThrowIfCancellationRequested();
+            if (remaining != 0) throw new InvalidDataException("復号後のサイズがファイル情報と一致しません。");
         }
         finally
         {
@@ -105,13 +113,14 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
     public async Task<MemoryStream> OpenDecryptedAsync(string volumeName, E2eeFileEntry entry,
         IProgress<double>? progress = null, CancellationToken ct = default)
     {
-        long plainLen = ComputePlainLength(entry);
+        long plainLen = ValidatePlainLength(entry);
         if (plainLen > MaxInMemoryDownloadBytes)
             throw new InvalidOperationException("ファイルが大きすぎてメモリに展開できません。");
         var ms = new MemoryStream((int)plainLen);
         try
         {
             await DownloadAsync(volumeName, entry, ms, progress, ct);
+            ct.ThrowIfCancellationRequested();
             ms.Position = 0;
             return ms;
         }
@@ -277,9 +286,24 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
         catch { /* ロールバック失敗は無視 (finalize 未了の孤立ファイルは finalize 前提のため自然消滅) */ }
     }
 
-    private static async Task WritePlainAsync(Stream output, byte[] plain, CancellationToken ct)
+    private static long ValidatePlainLength(E2eeFileEntry entry)
     {
-        try { await output.WriteAsync(plain, ct); }
+        if (entry.ChunkCount is <= 0 or > 100000
+            || entry.EncryptedLength < E2eeCrypto.SaltSize + (long)entry.ChunkCount * E2eeCrypto.GcmTagSize)
+            throw new InvalidDataException("ファイルのサイズまたはチャンク数が不正です。");
+        return ComputePlainLength(entry);
+    }
+
+    private static async Task<long> WritePlainAsync(Stream output, byte[] plain, long remaining, CancellationToken ct)
+    {
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+            if (plain.LongLength > remaining) throw new InvalidDataException("復号後のサイズがファイル情報を超えています。");
+            await output.WriteAsync(plain, ct);
+            ct.ThrowIfCancellationRequested();
+            return remaining - plain.Length;
+        }
         finally { CryptographicOperations.ZeroMemory(plain); }
     }
 

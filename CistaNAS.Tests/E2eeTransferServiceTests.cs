@@ -16,6 +16,38 @@ namespace CistaNAS.Tests;
 public class E2eeTransferServiceTests
 {
     [Theory]
+    [InlineData(false, -1)]
+    [InlineData(false, 1)]
+    [InlineData(true, -1)]
+    [InlineData(true, 1)]
+    public async Task DecryptedDownload_RejectsMismatchWithDeclaredFileLength(bool v2, int difference)
+    {
+        var (service, server) = CreateService(1024, v2);
+        using var input = new MemoryStream(new byte[1500]);
+        await service.UploadAsync(Volume, "changed.bin", input, 1500);
+        server.LastCreated!.EncryptedLength += difference;
+        await Assert.ThrowsAsync<InvalidDataException>(async () =>
+        {
+            using var output = await service.OpenDecryptedAsync(Volume, server.LastCreated);
+        });
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CancellationAfterFinalDownloadChunk_CannotReturnPlaintext(bool v2)
+    {
+        var (service, server) = CreateService(1024, v2);
+        using var input = new MemoryStream(new byte[1500]);
+        await service.UploadAsync(Volume, "cancelled.bin", input, 1500);
+        using var stop = new CancellationTokenSource();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            using var output = await service.OpenDecryptedAsync(Volume, server.LastCreated!, new CancelProgress(stop), stop.Token);
+        });
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task CancellationAfterLastChunk_DoesNotFinalizeUpload(bool v2)

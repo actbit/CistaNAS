@@ -8,6 +8,54 @@ namespace CistaNAS.Tests;
 public sealed class WasmUploadIntegrityTests
 {
     [Theory]
+    [InlineData(false, -1)]
+    [InlineData(false, 1)]
+    [InlineData(true, -1)]
+    [InlineData(true, 1)]
+    public async Task DownloadRejectsContentThatDiffersFromDeclaredLength(bool v2, int difference)
+    {
+        using var server = new DownloadServer();
+        using var http = new HttpClient(server) { BaseAddress = new Uri("http://test/") };
+        await using var crypto = new E2eeInterop(new FakeCrypto());
+        var transfer = new CistaNAS.Wasm.Services.E2eeFileTransferService(new E2eeApiClient(http), crypto);
+        var entry = new CistaNAS.Wasm.Models.E2eeFileEntry
+        {
+            FileId = "file", EncryptedName = "name", ChunkCount = 1, EncryptedLength = 35 + difference, KeyEpoch = v2 ? 1 : 0,
+            WrappedFileKey = new CistaNAS.Wasm.Models.WrappedAeadKeyParams
+            { Nonce = new byte[12], Ciphertext = new byte[32], Tag = new byte[16] }
+        };
+        await Assert.ThrowsAsync<InvalidDataException>(() => v2
+            ? transfer.DownloadAsync("vol", entry, "volume", new Dictionary<int, string> { [1] = "group" })
+            : transfer.DownloadAsync("vol", entry, "master"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CancellationAfterLastDownloadChunk_CannotReturnPlaintext(bool v2)
+    {
+        using var server = new DownloadServer();
+        using var http = new HttpClient(server) { BaseAddress = new Uri("http://test/") };
+        await using var crypto = new E2eeInterop(new FakeCrypto());
+        var transfer = new CistaNAS.Wasm.Services.E2eeFileTransferService(new E2eeApiClient(http), crypto);
+        using var stop = new CancellationTokenSource();
+        var entry = new CistaNAS.Wasm.Models.E2eeFileEntry
+        {
+            FileId = "file", EncryptedName = "name", ChunkCount = 1, EncryptedLength = 35, KeyEpoch = 1,
+            WrappedFileKey = new CistaNAS.Wasm.Models.WrappedAeadKeyParams
+            { Nonce = new byte[12], Ciphertext = new byte[32], Tag = new byte[16] }
+        };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => v2
+            ? transfer.DownloadAsync("vol", entry, "volume", new Dictionary<int, string> { [1] = "group" }, new CancelProgress(stop), stop.Token)
+            : transfer.DownloadAsync("vol", "file", 1, "master", new CancelProgress(stop), stop.Token));
+    }
+
+    private sealed class DownloadServer : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+            => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(new byte[35]) });
+    }
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task CancellationAfterLastChunk_DoesNotFinalizeUpload(bool v2)
@@ -107,6 +155,8 @@ public sealed class WasmUploadIntegrityTests
                 "encryptFilename" or "importKeyHandleFromB64" => "key",
                 "generateFileSalt" => Convert.ToBase64String(new byte[16]),
                 "generateFileKeyV2" => Convert.ToBase64String(new byte[32]),
+                "unwrapFileKey" => Convert.ToBase64String(new byte[32]),
+                "decryptChunk" or "decryptChunkV2" => Convert.ToBase64String(new byte[] { 7, 8, 9 }),
                 "wrapFileKey" => JsonSerializer.SerializeToElement(new
                 { nonce = Convert.ToBase64String(new byte[12]), ciphertext = Convert.ToBase64String(new byte[32]), tag = Convert.ToBase64String(new byte[16]) }),
                 "encryptChunk" or "encryptChunkV2" => Convert.ToBase64String(new byte[Convert.FromBase64String((string)args![0]!).Length + E2eeCrypto.GcmTagSize]),

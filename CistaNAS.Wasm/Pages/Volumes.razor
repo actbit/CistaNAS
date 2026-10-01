@@ -644,6 +644,8 @@ else
 
     private void ShowMountDialog(string name, bool encrypted, string encryptionMode)
     {
+        CloseMountDialog();
+        _mountCancellation = new CancellationTokenSource();
         _mountTarget = name;
         _mountNeedsPassword = encrypted;
         _mountIsE2ee = encryptionMode == "e2ee" || encryptionMode == "group-e2ee";
@@ -654,34 +656,54 @@ else
 
     private void CloseMountDialog()
     {
+        _mountGeneration++;
+        _mountCancellation?.Cancel();
+        _mountCancellation?.Dispose();
+        _mountCancellation = null;
         _mountTarget = null;
         _mountError = null;
+        _mountPassword = "";
+        _isMounting = false;
     }
+
+    private long _mountGeneration;
+    private CancellationTokenSource? _mountCancellation;
 
     private async Task HandleMount()
     {
+        if (_isMounting || _mountTarget is null) return;
         _isMounting = true;
         _mountError = null;
         long version = Auth.AuthenticationVersion;
+        long generation = _mountGeneration;
+        var cancellation = _mountCancellation?.Token ?? CancellationToken.None;
+        bool e2ee = _mountIsE2ee, needsPassword = _mountNeedsPassword;
         string target = _mountTarget!, username = Auth.CurrentUsername, password = _mountPassword;
+
+        void EnsureCurrentMount()
+        {
+            EnsureActiveSession(version);
+            cancellation.ThrowIfCancellationRequested();
+            if (generation != _mountGeneration || target != _mountTarget) throw new OperationCanceledException();
+        }
 
         try
         {
-            EnsureActiveSession(version);
-            if (_mountIsE2ee)
+            EnsureCurrentMount();
+            if (e2ee)
             {
                 // E2EE: サーバー側マウント（アクセス権チェック）+ クライアント側で鍵復号
-                var volInfo = await VolumeApi.MountE2eeAsync(target, username);
-                EnsureActiveSession(version);
+                var volInfo = await VolumeApi.MountE2eeAsync(target, username, cancellation);
+                EnsureCurrentMount();
 
                 // 共有 v2: 自分宛ての全 epoch GroupKey をアンラップして保持
                 // （v2 形式ファイル/ファイル名の読取には GroupKey、v1 形式残置ファイルの読取には masterKey を使う）
-                var (groupKeys, volumeId) = await KeyResolver.LoadGroupKeysAsync(target, username, password);
-                EnsureActiveSession(version);
+                var (groupKeys, volumeId) = await KeyResolver.LoadGroupKeysAsync(target, username, password, cancellation);
+                EnsureCurrentMount();
 
                 // wrapped key を取得してアンラップ
-                var wrappedKeyResp = await VolumeApi.GetWrappedKeyAsync(target, username);
-                EnsureActiveSession(version);
+                var wrappedKeyResp = await VolumeApi.GetWrappedKeyAsync(target, username, cancellation);
+                EnsureCurrentMount();
                 if (wrappedKeyResp is null)
                 {
                     _mountError = "ラップ済み鍵が見つかりません。";
@@ -694,17 +716,17 @@ else
                     if (volumeId is null)
                     {
                         // v1 形式: wrapped key は masterKey
-                        mkHandle = await KeyResolver.UnwrapMyMasterKeyAsync(wrappedKeyResp, username, password);
+                        mkHandle = await KeyResolver.UnwrapMyMasterKeyAsync(wrappedKeyResp, username, password, cancellation);
                     }
                     else if (volInfo.OwnerUser == username
                         && string.Equals(wrappedKeyResp.WrapType, "password", StringComparison.OrdinalIgnoreCase))
                     {
                         // 共有 v2 オーナー: 残置 v1 ファイルの読取用に masterKey もアンラップ
-                        mkHandle = await KeyResolver.UnwrapMyMasterKeyAsync(wrappedKeyResp, username, password);
+                        mkHandle = await KeyResolver.UnwrapMyMasterKeyAsync(wrappedKeyResp, username, password, cancellation);
                     }
                     // 共有 v2 メンバーは GroupKey のみで v2 ファイルを読む（masterKey は持たない）
 
-                    EnsureActiveSession(version);
+                    EnsureCurrentMount();
                     // クライアント側マウント状態に登録
                     MountService.MountE2ee(target, mkHandle, wrappedKeyResp.ChunkSize,
                         volInfo.EncryptionMode, volumeId, groupKeys, version);
@@ -718,16 +740,16 @@ else
             }
             else
             {
-                await VolumeApi.MountAsync(target, username, _mountNeedsPassword ? password : null);
+                await VolumeApi.MountAsync(target, username, needsPassword ? password : null, cancellation);
             }
 
-            EnsureActiveSession(version);
+            EnsureCurrentMount();
             CloseMountDialog();
             await LoadVolumesAsync();
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { if (version == Auth.AuthenticationVersion) _mountError = ex.Message; }
-        finally { if (version == Auth.AuthenticationVersion) _isMounting = false; }
+        catch (Exception ex) { if (!_disposed && generation == _mountGeneration && version == Auth.AuthenticationVersion) _mountError = ex.Message; }
+        finally { if (generation == _mountGeneration && version == Auth.AuthenticationVersion) _isMounting = false; }
     }
 
     // ---- ロック ----
