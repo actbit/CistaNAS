@@ -20,6 +20,54 @@ namespace CistaNAS.Tests;
 /// </summary>
 public class WritePathRound3Tests
 {
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void NewFileFlush_CommitsBeforeCloseAndReportsUploadFailure(bool e2ee, bool fail)
+    {
+        var (encryptedFs, encrypted, _, _, _) = CreateExistingE2eeFile(0);
+        using var plain = new PlainServer { FailNextWrites = fail ? 1 : 0 };
+        using var http = new HttpClient(plain) { BaseAddress = new Uri("http://test/") };
+        using var plainFs = new CistaNasFileSystem(new CistaNasApiClient(http), Volume);
+        using (encryptedFs)
+        {
+            encrypted.FailNextCreateFiles = fail ? 1 : 0;
+            var fs = e2ee ? encryptedFs : plainFs;
+            CistaNasFileSystem.WriteState state = e2ee
+                ? new CistaNasFileSystem.E2eeChunkWriteState(fs, "new.txt", null)
+                : new CistaNasFileSystem.PlainRangeWriteState(fs, "new.txt", null);
+            try
+            {
+                var info = new StubFileInfo(state);
+                Assert.Equal(DokanResult.Success, fs.WriteFile("\\new.txt", [1, 2, 3], out int written, 0, info));
+                Assert.Equal(3, written);
+                var status = fs.FlushFileBuffers("\\new.txt", info);
+                Assert.Equal(fail ? DokanResult.InternalError : DokanResult.Success, status);
+                if (fail)
+                {
+                    Assert.True(state.HasPending);
+                    Assert.Equal(DokanResult.Success, fs.FlushFileBuffers("\\new.txt", info));
+                }
+                Assert.False(state.HasPending);
+                Assert.NotNull(state.ExistingFileId);
+                if (e2ee)
+                {
+                    Assert.Single(encrypted.FinalizeRequests);
+                    var saved = Assert.IsType<CistaNasFileSystem.E2eeChunkWriteState>(state);
+                    var chunk = encrypted.Chunks[0];
+                    byte[] committed = E2eeCrypto.DecryptChunk(chunk.Cipher, saved.ExistingFileKey!, 0,
+                        saved.ExistingFileSalt!, chunk.Revision);
+                    try { Assert.Equal(new byte[] { 1, 2, 3 }, committed); }
+                    finally { CryptographicOperations.ZeroMemory(committed); }
+                }
+                else Assert.Equal(new byte[] { 1, 2, 3 }, plain.Files["new.txt"]);
+            }
+            finally { state.Dispose(); }
+        }
+    }
+
     [Fact]
     public async Task E2eeShrinkDuringSave_IsNotLostWhenOlderSnapshotCommits()
     {
@@ -265,6 +313,7 @@ public class WritePathRound3Tests
         public int PutCount { get; private set; }
         public int PatchCount { get; private set; }
         public int FailNextGets { get; set; }
+        public int FailNextWrites { get; set; }
 
         /// <summary>このリストにあるファイルへの PUT/PATCH を BlockRelease までブロックする。</summary>
         public HashSet<string> BlockNames { get; } = new();
@@ -278,6 +327,12 @@ public class WritePathRound3Tests
             var segments = request.RequestUri!.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
             // /api/v1/files/{vol}/{name}
             string name = segments[^1];
+
+            if ((request.Method == HttpMethod.Post || request.Method == HttpMethod.Patch) && FailNextWrites > 0)
+            {
+                FailNextWrites--;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError));
+            }
 
             if (request.Method == HttpMethod.Post)
             {

@@ -14,6 +14,7 @@ public sealed class ApiSession : IDisposable
     // reads could send a new server's token to the old destination during a switch.
     private sealed record AuthorizationState(Uri? Server, string? Token, long Version);
     private AuthorizationState _authorization = new(null, null, 0);
+    private readonly AsyncLocal<long?> _requestVersion = new();
 
     public ApiSession(HttpMessageHandler? httpHandler = null)
     {
@@ -22,7 +23,7 @@ public sealed class ApiSession : IDisposable
             {
                 var state = Volatile.Read(ref _authorization);
                 return (state.Server, state.Token, state.Version);
-            });
+            }, () => _requestVersion.Value);
         // リダイレクト先へログイン情報やアップロード本文を転送しない。
         _authHandler.InnerHandler = httpHandler ?? new HttpClientHandler { AllowAutoRedirect = false };
         // 接続失敗後もサーバーを変更できるよう、送信時に接続先を解決する。
@@ -38,6 +39,7 @@ public sealed class ApiSession : IDisposable
 
     /// <summary>接続先サーバー URL (末尾スラッシュなし)。未接続時は null。</summary>
     public Uri? BaseAddress => Volatile.Read(ref _authorization).Server;
+    public long AuthenticationVersion => Volatile.Read(ref _authorization).Version;
 
     /// <summary>サーバー URL を設定する (例: "http://192.168.1.10:5000")。</summary>
     public void ConfigureServer(string serverUrl)
@@ -60,6 +62,27 @@ public sealed class ApiSession : IDisposable
     public void ClearToken()
     {
         UpdateAuthorization(state => state with { Token = null, Version = state.Version + 1 });
+    }
+
+    internal bool TrySetToken(string token, long expectedVersion)
+    {
+        var previous = Volatile.Read(ref _authorization);
+        if (previous.Version != expectedVersion) return false;
+        var next = previous with { Token = token, Version = previous.Version + 1 };
+        return ReferenceEquals(Interlocked.CompareExchange(ref _authorization, next, previous), previous);
+    }
+
+    internal IDisposable BindRequests(long version)
+    {
+        long? previous = _requestVersion.Value;
+        _requestVersion.Value = version;
+        return new RequestBinding(() => _requestVersion.Value = previous);
+    }
+
+    private sealed class RequestBinding(Action release) : IDisposable
+    {
+        private Action? _release = release;
+        public void Dispose() => Interlocked.Exchange(ref _release, null)?.Invoke();
     }
 
     private void UpdateAuthorization(Func<AuthorizationState, AuthorizationState> update)

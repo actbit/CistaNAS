@@ -7,6 +7,18 @@ namespace CistaNAS.Tests;
 
 public sealed class AuthResponseRaceTests
 {
+    [Fact]
+    public async Task StaleBoundRequest_IsRejectedBeforeItsCredentialsReachTransport()
+    {
+        int sent = 0;
+        using var handler = new AuthHeaderHandler(() => "new-token", () => new Uri("http://second/"),
+            () => (new Uri("http://second/"), "new-token", 2), () => 1)
+        { InnerHandler = new Handler((_, _) => { sent++; return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)); }) };
+        using var http = new HttpClient(handler);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => http.PostAsync("http://first/login", new StringContent("old-password")));
+        Assert.Equal(0, sent);
+    }
+
     [Theory]
     [InlineData(false, true, false)]
     [InlineData(true, true, false)]

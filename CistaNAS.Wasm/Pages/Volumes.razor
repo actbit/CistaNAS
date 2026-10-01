@@ -455,6 +455,7 @@ else
     private string _ecdhUsername = "";
 
     private string? _lockError;
+    private bool _disposed;
 
     // 公開鍵 pinning（TOFU trust anchor。pin は IndexedDB に origin ローカル保存）
     private PinMismatchInfo? _pinMismatch;
@@ -479,6 +480,7 @@ else
     protected override async Task OnInitializedAsync()
     {
         Auth.StateChanged += OnAuthStateChanged;
+        Auth.SessionInvalidated += ClearSessionState;
         try { _sharingEnabled = await EncSettingsApi.GetSharingEnabledAsync(); } catch { }
         await LoadVolumesAsync();
     }
@@ -487,27 +489,34 @@ else
     {
         if (!Auth.IsLoggedIn) { _isLoading = false; return; }
         _isLoading = true;
+        long version = Auth.AuthenticationVersion;
 
         try
         {
-            _volumes = await VolumeApi.ListAsync();
+            var volumes = await VolumeApi.ListAsync();
+            EnsureActiveSession(version);
             // E2EE ボリュームの使用量を取得
-            _volumeStats.Clear();
-            foreach (var v in _volumes)
+            var volumeStats = new Dictionary<string, E2eeVolumeStats>();
+            foreach (var v in volumes)
             {
                 if (v.EncryptionMode == "e2ee" || v.EncryptionMode == "group-e2ee")
                 {
                     try
                     {
                         var stats = await E2eeApi.GetStatsAsync(v.Name);
-                        _volumeStats[v.Name] = stats;
+                        EnsureActiveSession(version);
+                        volumeStats[v.Name] = stats;
                     }
                     catch { /* 使用量取得失敗は無視 */ }
                 }
+                EnsureActiveSession(version);
             }
+            _volumes = volumes;
+            _volumeStats = volumeStats;
         }
-        catch (Exception ex) { _error = $"エラー: {ex.Message}"; }
-        finally { _isLoading = false; }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { if (version == Auth.AuthenticationVersion) _error = $"エラー: {ex.Message}"; }
+        finally { if (version == Auth.AuthenticationVersion) _isLoading = false; }
     }
 
     // ---- ボリューム作成 ----
@@ -653,20 +662,26 @@ else
     {
         _isMounting = true;
         _mountError = null;
+        long version = Auth.AuthenticationVersion;
+        string target = _mountTarget!, username = Auth.CurrentUsername, password = _mountPassword;
 
         try
         {
+            EnsureActiveSession(version);
             if (_mountIsE2ee)
             {
                 // E2EE: サーバー側マウント（アクセス権チェック）+ クライアント側で鍵復号
-                var volInfo = await VolumeApi.MountE2eeAsync(_mountTarget!, Auth.CurrentUsername);
+                var volInfo = await VolumeApi.MountE2eeAsync(target, username);
+                EnsureActiveSession(version);
 
                 // 共有 v2: 自分宛ての全 epoch GroupKey をアンラップして保持
                 // （v2 形式ファイル/ファイル名の読取には GroupKey、v1 形式残置ファイルの読取には masterKey を使う）
-                var (groupKeys, volumeId) = await LoadGroupKeysForMountAsync(_mountPassword);
+                var (groupKeys, volumeId) = await KeyResolver.LoadGroupKeysAsync(target, username, password);
+                EnsureActiveSession(version);
 
                 // wrapped key を取得してアンラップ
-                var wrappedKeyResp = await VolumeApi.GetWrappedKeyAsync(_mountTarget!, Auth.CurrentUsername);
+                var wrappedKeyResp = await VolumeApi.GetWrappedKeyAsync(target, username);
+                EnsureActiveSession(version);
                 if (wrappedKeyResp is null)
                 {
                     _mountError = "ラップ済み鍵が見つかりません。";
@@ -679,19 +694,20 @@ else
                     if (volumeId is null)
                     {
                         // v1 形式: wrapped key は masterKey
-                        mkHandle = await UnwrapMyMasterKeyAsync(wrappedKeyResp, _mountPassword);
+                        mkHandle = await KeyResolver.UnwrapMyMasterKeyAsync(wrappedKeyResp, username, password);
                     }
-                    else if (volInfo.OwnerUser == Auth.CurrentUsername
+                    else if (volInfo.OwnerUser == username
                         && string.Equals(wrappedKeyResp.WrapType, "password", StringComparison.OrdinalIgnoreCase))
                     {
                         // 共有 v2 オーナー: 残置 v1 ファイルの読取用に masterKey もアンラップ
-                        mkHandle = await UnwrapMyMasterKeyAsync(wrappedKeyResp, _mountPassword);
+                        mkHandle = await KeyResolver.UnwrapMyMasterKeyAsync(wrappedKeyResp, username, password);
                     }
                     // 共有 v2 メンバーは GroupKey のみで v2 ファイルを読む（masterKey は持たない）
 
+                    EnsureActiveSession(version);
                     // クライアント側マウント状態に登録
-                    MountService.MountE2ee(_mountTarget!, mkHandle, wrappedKeyResp.ChunkSize,
-                        volInfo.EncryptionMode, volumeId, groupKeys);
+                    MountService.MountE2ee(target, mkHandle, wrappedKeyResp.ChunkSize,
+                        volInfo.EncryptionMode, volumeId, groupKeys, version);
                 }
                 catch
                 {
@@ -702,15 +718,16 @@ else
             }
             else
             {
-                await VolumeApi.MountAsync(_mountTarget!, Auth.CurrentUsername,
-                    _mountNeedsPassword ? _mountPassword : null);
+                await VolumeApi.MountAsync(target, username, _mountNeedsPassword ? password : null);
             }
 
+            EnsureActiveSession(version);
             CloseMountDialog();
             await LoadVolumesAsync();
         }
-        catch (Exception ex) { _mountError = ex.Message; }
-        finally { _isMounting = false; }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { if (version == Auth.AuthenticationVersion) _mountError = ex.Message; }
+        finally { if (version == Auth.AuthenticationVersion) _isMounting = false; }
     }
 
     // ---- ロック ----
@@ -720,18 +737,9 @@ else
         _lockError = null;
         try
         {
-            // E2EE ボリュームの場合、JS 側の鍵ハンドルをクリア
-            var (mounted, isE2ee) = MountService.GetMountStatus(name);
-            if (mounted && isE2ee)
-            {
-                var handle = MountService.GetE2eeKeyHandle(name);
-                if (handle is not null)
-                {
-                    try { await E2ee.ClearKey(handle); } catch { }
-                }
-            }
-            await VolumeApi.LockAsync(name);
+            // Local plaintext keys are discarded even if the server is offline.
             MountService.Lock(name);
+            await VolumeApi.LockAsync(name);
             await LoadVolumesAsync();
         }
         catch (Exception ex) { _lockError = ex.Message; }
@@ -1085,6 +1093,7 @@ else
 
     private async void OnAuthStateChanged()
     {
+        if (_disposed) return;
         StateHasChanged();
         if (Auth.IsLoggedIn && _volumes is null) await LoadVolumesAsync();
     }
@@ -1097,5 +1106,28 @@ else
         return $"{bytes / (1024.0 * 1024.0 * 1024.0):F1} GB";
     }
 
-    public void Dispose() => Auth.StateChanged -= OnAuthStateChanged;
+    private void ClearSessionState()
+    {
+        _volumes = null;
+        _volumeStats.Clear();
+        CloseMountDialog();
+        _mountPassword = "";
+        _isMounting = false;
+        _isLoading = false;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        Auth.StateChanged -= OnAuthStateChanged;
+        Auth.SessionInvalidated -= ClearSessionState;
+        ClearSessionState();
+    }
+
+    private void EnsureActiveSession(long version)
+    {
+        if (_disposed) throw new OperationCanceledException();
+        MountService.EnsureCurrentSession(version);
+    }
 }

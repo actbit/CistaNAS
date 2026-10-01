@@ -62,6 +62,12 @@ public sealed class AppServices : IDisposable
         }
     }
 
+    internal ClientSessionOperation BeginOperation(CancellationToken command, CancellationToken navigation)
+    {
+        lock (_sessionLock)
+            return new(this, _sessionCancellation.Token, Session.AuthenticationVersion, command, navigation);
+    }
+
     /// <summary>転送を中止し、表示画面のRAM上の内容・トークン・鍵を破棄する。</summary>
     public void ClearSession()
     {

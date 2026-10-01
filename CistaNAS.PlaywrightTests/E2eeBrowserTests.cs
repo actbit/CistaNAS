@@ -14,7 +14,7 @@ namespace CistaNAS.PlaywrightTests;
 /// パスワード ロック解除 → ファイルアップロード（JS 暗号化）→ 一覧表示（JS 復号）を検証。
 /// </summary>
 [Collection("Playwright")]
-public class E2eeBrowserTests(PlaywrightWebAppFixture fixture)
+public partial class E2eeBrowserTests(PlaywrightWebAppFixture fixture)
 {
     /// <summary>API で E2EE ボリュームを作成し、ボリューム名を返す（ロック解除パスワードは管理者パスワードと同一）。</summary>
     private async Task<string> CreateE2eeVolumeAsync()

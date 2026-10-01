@@ -1496,8 +1496,9 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
 
     public NtStatus FlushFileBuffers(string fileName, IDokanFileInfo info)
     {
-        // 新規ファイル（ExistingFileId == null）は Cleanup で永続化するため、ここでは何もしない。
-        if (info.Context is not WriteState ws || ws.ExistingFileId is null)
+        // Flush must persist new files too: returning success before Cleanup
+        // falsely acknowledges durability while all contents remain in RAM.
+        if (info.Context is not WriteState ws)
             return DokanResult.Success;
 
         try

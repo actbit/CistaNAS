@@ -236,10 +236,12 @@ else
     // メディアプレビュー
     private string? _selectedFile;
     private string _previewElementId = "";
+    private bool _disposed;
 
     protected override async Task OnInitializedAsync()
     {
         Auth.StateChanged += OnAuthStateChanged;
+        Auth.SessionInvalidated += ClearSessionState;
         await InitializeAsync();
     }
 
@@ -249,10 +251,12 @@ else
 
         _isLoading = true;
         _errorMessage = null;
+        long version = VolumeMountService.CaptureSession();
 
         try
         {
             var volumes = await VolumeApi.ListAsync();
+            EnsureActiveSession(version);
             var volInfo = volumes.FirstOrDefault(v => v.Name == VolumeName);
             _volumeOwner = volInfo?.OwnerUser;
             _isE2ee = volInfo?.EncryptionMode == "e2ee" || volInfo?.EncryptionMode == "group-e2ee";
@@ -286,28 +290,37 @@ else
             {
                 // 通常ボリューム
                 var response = await FileApi.ListAsync(VolumeName);
+                EnsureActiveSession(version);
                 _files = response.Files.ToList();
             }
         }
-        catch (Exception ex) { _errorMessage = $"エラー: {ex.Message}"; }
-        finally { _isLoading = false; }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { if (version == Auth.AuthenticationVersion) _errorMessage = $"エラー: {ex.Message}"; }
+        finally { if (!_disposed && version == Auth.AuthenticationVersion) _isLoading = false; }
     }
 
     // ---- E2EE ロック解除 ----
 
     private async Task HandleE2eeUnlock()
     {
+        if (_e2eeUnlocking) return;
         _e2eeUnlocking = true;
         _e2eeError = null;
+        long version = Auth.AuthenticationVersion;
+        string username = Auth.CurrentUsername, password = _e2eePassword, volume = VolumeName;
+        string? pendingHandle = null;
 
         try
         {
             // 共有 v2: 自分宛ての全 epoch GroupKey をアンラップ（v2 未移行ボリュームでは空 / volumeId null）
-            var (groupKeys, volumeId) = await KeyResolver.LoadGroupKeysAsync(VolumeName, Auth.CurrentUsername, _e2eePassword);
+            EnsureActiveSession(version);
+            var (groupKeys, volumeId) = await KeyResolver.LoadGroupKeysAsync(volume, username, password);
+            EnsureActiveSession(version);
 
             // wrapped key を取得。v1 では masterKey、v2 owner（password wrap）では残置 v1 ファイル用の
             // masterKey、v2 メンバーでは現行 epoch GroupKey の wrap が返る
-            var wrappedKeyResp = await VolumeApi.GetWrappedKeyAsync(VolumeName, Auth.CurrentUsername);
+            var wrappedKeyResp = await VolumeApi.GetWrappedKeyAsync(volume, username);
+            EnsureActiveSession(version);
             if (wrappedKeyResp is null)
             {
                 _e2eeError = "このユーザーの鍵情報が見つかりません。";
@@ -319,11 +332,12 @@ else
             string? mkHandle = null;
             bool isV2 = volumeId is not null;
             if (!isV2
-                || (_volumeOwner == Auth.CurrentUsername
+                || (_volumeOwner == username
                     && string.Equals(wrappedKeyResp.WrapType, "password", StringComparison.OrdinalIgnoreCase)))
             {
                 // v1: UserKeys wrap は masterKey。v2 owner: 残置 v1 ファイル読取用に masterKey もアンラップ
-                mkHandle = await KeyResolver.UnwrapMyMasterKeyAsync(wrappedKeyResp, Auth.CurrentUsername, _e2eePassword);
+                pendingHandle = mkHandle = await KeyResolver.UnwrapMyMasterKeyAsync(wrappedKeyResp, username, password);
+                EnsureActiveSession(version);
             }
             // v2 メンバーは GroupKey のみでマウント（UserKeys の wrap は GroupKey wrap と同一のため復号しない）
 
@@ -333,29 +347,25 @@ else
                 return;
             }
 
+            VolumeMountService.MountE2ee(volume, mkHandle, _e2eeChunkSize, "e2ee", volumeId, groupKeys, version);
+            pendingHandle = null; // The mount service owns the accepted handle.
             _masterKeyHandle = mkHandle;
             _volumeId = volumeId;
             _groupKeysByEpoch = new Dictionary<int, string>(groupKeys);
             _e2eeUnlocked = true;
             _e2eePassword = "";
 
-            // ClientVolumeMountService にも登録（v2 は GroupKey 辞書 + VolumeId を保持）
-            VolumeMountService.MountE2ee(VolumeName, mkHandle, _e2eeChunkSize, "e2ee", volumeId, groupKeys);
-
             await RefreshE2eeList();
         }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            _e2eeError = $"ロック解除失敗: {ex.Message}";
-            if (_masterKeyHandle is not null)
-            {
-                try { await E2ee.ClearKey(_masterKeyHandle); } catch { }
-                _masterKeyHandle = null;
-            }
+            if (version == Auth.AuthenticationVersion) _e2eeError = $"ロック解除失敗: {ex.Message}";
         }
         finally
         {
-            _e2eeUnlocking = false;
+            if (pendingHandle is not null) { try { await E2ee.ClearKey(pendingHandle); } catch { } }
+            if (version == Auth.AuthenticationVersion) _e2eeUnlocking = false;
         }
     }
 
@@ -363,10 +373,12 @@ else
 
     private async Task RefreshE2eeList()
     {
+        long version = Auth.AuthenticationVersion;
         try
         {
             var response = await E2eeApi.ListFilesAsync(VolumeName);
-            _e2eeFiles = [];
+            EnsureActiveSession(version);
+            var files = new List<E2eeFileViewItem>();
             foreach (var entry in response.Files)
             {
                 string plainName;
@@ -384,10 +396,12 @@ else
                     }
                 }
                 catch { plainName = $"<{entry.FileId[..Math.Min(8, entry.FileId.Length)]}...>"; }
-                _e2eeFiles.Add(new() { Entry = entry, PlainName = plainName });
+                EnsureActiveSession(version);
+                files.Add(new() { Entry = entry, PlainName = plainName });
             }
+            _e2eeFiles = files;
         }
-        catch { _e2eeFiles = []; }
+        catch { if (version == Auth.AuthenticationVersion) _e2eeFiles = []; }
     }
 
     // ---- E2EE アップロード ----
@@ -613,17 +627,37 @@ else
         public bool Downloading { get; set; }
     }
 
-    private async void OnAuthStateChanged() => StateHasChanged();
+    private void OnAuthStateChanged() { if (!_disposed) StateHasChanged(); }
 
-    public async ValueTask DisposeAsync()
+    private void EnsureActiveSession(long version)
     {
-        // プレビューの Blob URL を revoke
-        // （必要に応じて実装）
-        await ValueTask.CompletedTask;
+        if (_disposed) throw new OperationCanceledException();
+        VolumeMountService.EnsureCurrentSession(version);
+    }
+
+    private void ClearSessionState()
+    {
+        _files = null;
+        _e2eeFiles.Clear();
+        _groupKeysByEpoch.Clear();
+        _masterKeyHandle = _volumeId = null;
+        _e2eePassword = "";
+        _e2eeUnlocked = _e2eeUnlocking = false;
+        _selectedFile = null;
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        Dispose();
+        return ValueTask.CompletedTask;
     }
 
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
         Auth.StateChanged -= OnAuthStateChanged;
+        Auth.SessionInvalidated -= ClearSessionState;
+        ClearSessionState();
     }
 }

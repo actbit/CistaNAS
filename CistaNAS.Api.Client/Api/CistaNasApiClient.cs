@@ -30,11 +30,11 @@ public sealed class CistaNasApiClient
 
     // ---- 認証 ----
 
-    public async Task<string> LoginAsync(string username, string password)
+    public async Task<string> LoginAsync(string username, string password, CancellationToken ct = default)
     {
-        var res = await _http.PostAsJsonAsync("/api/v1/auth/login", new { username, password }, JsonOpts);
+        using var res = await _http.PostAsJsonAsync("/api/v1/auth/login", new { username, password }, JsonOpts, ct);
         res.EnsureSuccessStatusCode();
-        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>(ct);
         return json.GetProperty("accessToken").GetString()!;
     }
 

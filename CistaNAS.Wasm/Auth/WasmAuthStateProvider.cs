@@ -17,6 +17,8 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
     private long _authenticationVersion;
 
     public event Action? StateChanged;
+    /// <summary>Await を挟む前に、前の認証に属する鍵・表示内容を破棄する。</summary>
+    public event Action? SessionInvalidated;
 
     public WasmAuthStateProvider(IJSRuntime js)
     {
@@ -56,6 +58,7 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
 
         // JWT の payload をデコードして ClaimsPrincipal を構築
         _user = ParseJwtClaims(token);
+        SessionInvalidated?.Invoke();
 
         // sessionStorage に保存
         try
@@ -76,6 +79,7 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
         _user = null;
         _token = null;
         _expiresAt = null;
+        SessionInvalidated?.Invoke();
 
         try
         {
@@ -109,6 +113,7 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
             _token = token;
             _expiresAt = expires;
             _user = ParseJwtClaims(token);
+            SessionInvalidated?.Invoke();
 
             NotifyAuthenticationStateChanged(GetAuthenticationStateAsync());
             StateChanged?.Invoke();
@@ -176,5 +181,5 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
         }
     }
 
-    public void Dispose() => StateChanged = null;
+    public void Dispose() { StateChanged = null; SessionInvalidated = null; }
 }
