@@ -91,7 +91,7 @@ public static class ServiceCollectionExtensions
                     var sync = sp.GetRequiredService<CloudSqliteSync>();
                     o.UseSqlite($"Data Source={sync.LocalDbPath};Mode=ReadWriteCreate;Cache=Shared",
                         b => b.MigrationsAssembly(SqliteMigrationsAssembly));
-                    o.AddInterceptors(new CloudSqliteSaveChangesInterceptor(sync));
+                    o.AddInterceptors(new CloudSqliteSaveChangesInterceptor(sync), new CloudSqliteTransactionInterceptor(sync));
                 });
                 break;
             }

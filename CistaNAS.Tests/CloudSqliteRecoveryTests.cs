@@ -1,11 +1,49 @@
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Storage;
 using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 
 namespace CistaNAS.Tests;
 
 public sealed class CloudSqliteRecoveryTests
 {
+    [Fact]
+    public async Task ExplicitTransaction_CommitAfterSnapshot_IsSyncedWithoutAnotherSave()
+    {
+        using var fixture = new Fixture();
+        using var sync = fixture.CreateSync();
+        var options = new DbContextOptionsBuilder<RecoveryContext>()
+            .UseSqlite(new SqliteConnectionStringBuilder { DataSource = sync.LocalDbPath, Pooling = false }.ToString())
+            .AddInterceptors(new CloudSqliteSaveChangesInterceptor(sync), new CloudSqliteTransactionInterceptor(sync)).Options;
+        await using var db = new RecoveryContext(options);
+        await db.Database.EnsureCreatedAsync();
+        await db.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
+        var initial = new RecoveryValue { Value = "initial" };
+        db.Values.Add(initial);
+        await db.SaveChangesAsync();
+        await sync.UploadIfDirtyAsync();
+        await using var transaction = await db.Database.BeginTransactionAsync();
+        db.Values.Remove(initial);
+        db.Values.Add(new RecoveryValue { Value = "committed-later" });
+        await db.SaveChangesAsync();
+        await sync.UploadIfDirtyAsync();
+        Assert.Equal("initial", await fixture.CloudValueAsync());
+        await transaction.CommitAsync();
+        await sync.UploadIfDirtyAsync();
+        Assert.Equal("committed-later", await fixture.CloudValueAsync());
+    }
+
+    private sealed class RecoveryValue { public string Value { get; set; } = ""; }
+    private sealed class RecoveryContext(DbContextOptions<RecoveryContext> options) : DbContext(options)
+    {
+        public DbSet<RecoveryValue> Values => Set<RecoveryValue>();
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<RecoveryValue>().ToTable("recovery").HasKey(x => x.Value);
+            modelBuilder.Entity<RecoveryValue>().Property(x => x.Value).HasColumnName("value");
+        }
+    }
+
     [Fact]
     public async Task FailedSync_RestartWithoutAnotherWrite_ResendsLocalDatabase()
     {

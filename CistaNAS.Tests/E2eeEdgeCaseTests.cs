@@ -22,7 +22,7 @@ public class E2eeEdgeCaseTests(AspireFixture fixture)
     /// <summary>JWT を自動付与する HttpClient を作成。</summary>
     private HttpClient CreateAuthClient()
     {
-        var c = new HttpClient { BaseAddress = Http.BaseAddress };
+        var c = CistaNAS.Testing.LocalTestHttpClient.Create(Http.BaseAddress!);
         c.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", Token);
         return c;
     }
@@ -87,7 +87,7 @@ public class E2eeEdgeCaseTests(AspireFixture fixture)
     [Fact]
     public async Task NoAuthToken_Returns401()
     {
-        using var anon = new HttpClient { BaseAddress = Http.BaseAddress };
+        using var anon = CistaNAS.Testing.LocalTestHttpClient.Create(Http.BaseAddress!);
         var resp = await anon.GetAsync("/api/v1/e2ee/any-vol/files");
         Assert.Equal(HttpStatusCode.Unauthorized, resp.StatusCode);
     }

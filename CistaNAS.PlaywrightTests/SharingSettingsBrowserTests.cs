@@ -38,11 +38,8 @@ public class SharingSettingsBrowserTests(PlaywrightWebAppFixture fixture)
 
     private HttpClient AdminHttp()
     {
-        var c = new HttpClient
-        {
-            BaseAddress = fixture.Http.BaseAddress,
-            DefaultRequestHeaders = { Authorization = new AuthenticationHeaderValue("Bearer", fixture.Token) },
-        };
+        var c = CistaNAS.Testing.LocalTestHttpClient.Create(fixture.Http.BaseAddress!);
+        c.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", fixture.Token);
         return c;
     }
 
@@ -280,11 +277,8 @@ public class SharingSettingsBrowserTests(PlaywrightWebAppFixture fixture)
         var token = (await login.Content.ReadFromJsonAsync<JsonElement>())
             .GetProperty("accessToken").GetString()!;
 
-        using var client = new HttpClient
-        {
-            BaseAddress = fixture.Http.BaseAddress,
-            DefaultRequestHeaders = { Authorization = new AuthenticationHeaderValue("Bearer", token) },
-        };
+        using var client = CistaNAS.Testing.LocalTestHttpClient.Create(fixture.Http.BaseAddress!);
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
         var setup = await (await client.GetAsync("/api/v1/e2ee/identity-setup"))
             .Content.ReadFromJsonAsync<JsonElement>();
         string saltB64 = setup.GetProperty("identitySalt").GetString()!;

@@ -74,8 +74,7 @@ jobs:
           global-json-file: global.json
       - run: docker info
       - run: >-
-          dotnet test CistaNAS.Tests/CistaNAS.Tests.csproj -p:EnableWindowsTargeting=true
-          --filter "FullyQualifiedName~MinIOStorageE2ETests|FullyQualifiedName~PostgreSqlMigrationTests"
+          dotnet test CistaNAS.StorageTests/CistaNAS.StorageTests.csproj
           --logger "trx;LogFileName=storage.trx" --results-directory artifacts/test-results
       - name: Require container tests to execute
         if: success()

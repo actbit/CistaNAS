@@ -22,7 +22,7 @@ public class SharingEnforcementApiTests(AspireFixture fixture)
     /// <summary>JWT を付与する HttpClient を作成。</summary>
     private HttpClient AuthClient(string token)
     {
-        var c = new HttpClient { BaseAddress = Http.BaseAddress };
+        var c = CistaNAS.Testing.LocalTestHttpClient.Create(Http.BaseAddress!);
         c.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
         return c;
     }
@@ -62,7 +62,7 @@ public class SharingEnforcementApiTests(AspireFixture fixture)
     {
         public void Dispose()
         {
-            using var admin = new HttpClient { BaseAddress = baseAddress };
+            using var admin = CistaNAS.Testing.LocalTestHttpClient.Create(baseAddress);
             admin.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
             admin.PutAsJsonAsync("/api/v1/settings/sharing", new { enabled = true }).Wait();
         }

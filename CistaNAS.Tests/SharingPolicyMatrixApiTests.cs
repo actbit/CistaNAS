@@ -37,7 +37,7 @@ public class SharingPolicyMatrixApiTests(AspireFixture fixture)
 
     private HttpClient AuthClient(string token)
     {
-        var c = new HttpClient { BaseAddress = Http.BaseAddress };
+        var c = CistaNAS.Testing.LocalTestHttpClient.Create(Http.BaseAddress!);
         c.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
         return c;
     }

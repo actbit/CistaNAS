@@ -1,4 +1,5 @@
 using CistaNAS.Web.Configuration;
+using System.Data.Common;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Hosting;
@@ -182,6 +183,20 @@ public sealed class CloudSqliteSync : BackgroundService
         if (lastError is not null)
             _logger.LogError(lastError, "シャットダウン時の SQLite 同期に失敗しました。次回起動でローカル DB を再送します。");
         // Dispose / キャンセル後もローカル DB と WAL を削除しない。
+    }
+}
+
+/// <summary>明示的トランザクションは SaveChanges 後に確定するため、コミット時も再送対象にする。</summary>
+public sealed class CloudSqliteTransactionInterceptor(CloudSqliteSync sync) : DbTransactionInterceptor
+{
+    public override void TransactionCommitted(DbTransaction transaction, TransactionEndEventData eventData)
+        => sync.MarkDirty();
+
+    public override Task TransactionCommittedAsync(DbTransaction transaction, TransactionEndEventData eventData,
+        CancellationToken cancellationToken = default)
+    {
+        sync.MarkDirty();
+        return Task.CompletedTask;
     }
 }
 

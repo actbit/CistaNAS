@@ -23,7 +23,7 @@ public class EcdhShareRoundtripTests(AspireFixture fixture)
 
     private HttpClient AuthClient(string token)
     {
-        var c = new HttpClient { BaseAddress = fixture.Http.BaseAddress };
+        var c = CistaNAS.Testing.LocalTestHttpClient.Create(fixture.Http.BaseAddress!);
         c.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
         return c;
     }
