@@ -420,6 +420,16 @@ POST   /api/v1/groups/{name}/members                  Add member
 DELETE /api/v1/groups/{name}/members/{username}       Remove member
 ```
 
+E2EE `upload-chunk` requests include `X-CistaNAS-Write-Lease` and the
+`X-Chunk-KeyEpoch` used to encrypt that chunk. The epoch header is required for
+v2 uploads; v1 clients may omit it (epoch 0). The server records this encryption
+epoch independently of the file's current DEK wrap epoch, so a concurrent key
+rewrap cannot make the uploaded ciphertext unreadable. Update v2 clients along
+with the server; uploads without the epoch header are rejected before storing
+data. New files must use the volume's current epoch. Existing v1 files remain
+readable and editable, but converting them to v2 requires re-encrypting their
+contents; `rewrap-file-keys` accepts existing v2 files only.
+
 ## WebDAV Access
 
 WebDAV clients access `https://<host>/dav/<volume-name>/`.

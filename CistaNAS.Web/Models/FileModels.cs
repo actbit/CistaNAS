@@ -123,7 +123,7 @@ public sealed class E2eePendingChunk
     public required string Hash { get; set; }
     public required int Revision { get; set; }
 
-    /// <summary>チャンクを暗号化した keyEpoch（entry.KeyEpoch を刻む）。</summary>
+    /// <summary>チャンクを暗号化した keyEpoch（再ラップ後の entry.KeyEpoch とは独立）。</summary>
     public required int KeyEpoch { get; set; }
 }
 
@@ -131,7 +131,7 @@ public sealed record E2eeCreateFileRequest(
     [Required] string EncryptedName,
     [Range(0, long.MaxValue)] long EncryptedLength,
     [Range(1, 100000)] int ChunkCount,
-    /// <summary>crypto format v2: このファイルの鍵 epoch（0 = v1 形式）。ボリュームの現行 epoch 以下であること。</summary>
+    /// <summary>この新規ファイルの鍵 epoch（0 = v1）。ボリュームの現行 epoch と一致すること。</summary>
     int KeyEpoch = 0,
     /// <summary>crypto format v2: per-file DEK を GroupKey[KeyEpoch] でラップしたもの。KeyEpoch ≥ 1 で必須。</summary>
     VolumeHeader.WrappedKey? WrappedFileKey = null,

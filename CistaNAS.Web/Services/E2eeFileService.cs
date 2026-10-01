@@ -65,8 +65,8 @@ public sealed class E2eeFileService
         // crypto format v2: KeyEpoch ≥ 1 は共有 v2 形式。ラップ済み DEK が必須で、
         // epoch はボリュームの現行 epoch と一致する（旧 epoch の GroupKey で新規ファイルを作成させない）。
         // KeyEpoch == 0 は v1 形式（単独 E2EE、masterKey 派生 fileKey）。
-        if (request.KeyEpoch < 0 || request.KeyEpoch > header.KeyEpoch)
-            throw new FileServiceException($"KeyEpoch {request.KeyEpoch} は不正です（0-{header.KeyEpoch}）。");
+        if (request.KeyEpoch != header.KeyEpoch)
+            throw new FileServiceException($"新規ファイルには現行の KeyEpoch {header.KeyEpoch} が必要です。鍵を再取得してください。");
         if (request.KeyEpoch >= 1)
         {
             if (request.WrappedFileKey is null)
@@ -158,7 +158,8 @@ public sealed class E2eeFileService
     }
 
     /// <summary>チャンクをアップロードして volume.dat またはチャンクストアに書き込む。</summary>
-    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, Stream data, long dataLength, bool replace = false, CancellationToken ct = default)
+    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, Stream data, long dataLength,
+        bool replace = false, CancellationToken ct = default, int? encryptionKeyEpoch = null)
     {
         var header = GetE2eeHeader(volumeName);
 
@@ -177,6 +178,13 @@ public sealed class E2eeFileService
 
                 if (!catalog.Files.TryGetValue(fileId, out var entry))
                     throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+
+                // Rewrapping changes the DEK's wrap epoch, but an in-flight
+                // ciphertext still binds the epoch used when it was encrypted.
+                int chunkKeyEpoch = encryptionKeyEpoch ?? entry.KeyEpoch;
+                if (entry.KeyEpoch == 0 ? chunkKeyEpoch != 0
+                    : chunkKeyEpoch <= 0 || chunkKeyEpoch > header.KeyEpoch || header.GetGroupEpoch(chunkKeyEpoch) is null)
+                    throw new FileServiceException("チャンクの暗号化 KeyEpoch が不正です。v2 アップロードには X-Chunk-KeyEpoch が必要です。");
 
                 if (chunkIndex < 0)
                     throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です。");
@@ -320,7 +328,7 @@ public sealed class E2eeFileService
                         Size = chunkData.Length,
                         Hash = hashHex,
                         Revision = newRevision,
-                        KeyEpoch = entry.KeyEpoch,
+                        KeyEpoch = chunkKeyEpoch,
                     };
                 }
                 else
@@ -345,7 +353,7 @@ public sealed class E2eeFileService
 
                     while (entry.ChunkKeyEpochs.Count <= chunkIndex)
                         entry.ChunkKeyEpochs.Add(entry.KeyEpoch);
-                    entry.ChunkKeyEpochs[chunkIndex] = entry.KeyEpoch;
+                    entry.ChunkKeyEpochs[chunkIndex] = chunkKeyEpoch;
 
                     if (newChunkObjectId is not null)
                     {
@@ -593,6 +601,8 @@ public sealed class E2eeFileService
             {
                 if (!catalog.Files.TryGetValue(rewrap.FileId, out var entry))
                     throw new FileServiceException($"ファイル '{rewrap.FileId}' が見つかりません。");
+                if (entry.KeyEpoch == 0)
+                    throw new FileServiceException("v1 ファイルは鍵の再ラップだけでは v2 形式に変換できません。");
                 // 再ラップ先 epoch は現行 epoch のみ（旧 epoch への巻き戻しを防止）。
                 if (rewrap.KeyEpoch != header.KeyEpoch || header.GetGroupEpoch(rewrap.KeyEpoch) is null)
                     throw new FileServiceException($"KeyEpoch {rewrap.KeyEpoch} は不正です（現行: {header.KeyEpoch}）。");
@@ -600,6 +610,10 @@ public sealed class E2eeFileService
                     throw new FileServiceException($"ファイル '{rewrap.FileId}' の KeyEpoch を巻き戻せません。");
                 ValidateWrappedFileKeyShape(rewrap.WrappedFileKey);
 
+                // Older catalogs infer missing chunk epochs from the file's
+                // wrap epoch. Materialize that value before changing the wrap.
+                while (entry.ChunkKeyEpochs.Count < entry.ChunkCount)
+                    entry.ChunkKeyEpochs.Add(entry.KeyEpoch);
                 entry.KeyEpoch = rewrap.KeyEpoch;
                 entry.WrappedFileKey = rewrap.WrappedFileKey;
             }

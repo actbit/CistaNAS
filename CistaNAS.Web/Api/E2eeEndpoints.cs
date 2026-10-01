@@ -269,11 +269,17 @@ public static class E2eeEndpoints
     {
         if (request.ContentLength is not long len || len < 0)
             return Results.StatusCode(StatusCodes.Status411LengthRequired);
+        var epochHeader = request.Headers["X-Chunk-KeyEpoch"];
+        int epoch = 0; // Existing v1 clients may omit the header.
+        if (epochHeader.Count > 0 && (epochHeader.Count != 1
+            || !int.TryParse(epochHeader[0], System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out epoch)))
+            return Results.BadRequest(new { error = "X-Chunk-KeyEpoch が不正です。" });
         try
         {
             await leases.RunWithLeaseAsync(volumeName, fileId,
                 request.Headers[E2eeWriteLeaseService.HeaderName],
-                ct => e2eeFs.UploadChunkAsync(volumeName, fileId, chunkIndex, request.Body, len, replace, ct),
+                ct => e2eeFs.UploadChunkAsync(volumeName, fileId, chunkIndex, request.Body, len, replace, ct, epoch),
                 request.HttpContext.RequestAborted);
             return Results.Ok();
         }

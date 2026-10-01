@@ -2100,7 +2100,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                             new E2eeChunkContext(_v2!.VolumeIdString, fileId!, i, Revision: 0, keyEpoch),
                             isFirstChunk: i == 0, fileSalt)
                         : E2eeCrypto.EncryptChunk(chunk, fileKey, i, fileSalt, isFirstChunk: i == 0);
-                    _api.UploadChunkAsync(_volumeName, fileId!, i, encChunk, writeLease).GetAwaiter().GetResult();
+                    _api.UploadChunkAsync(_volumeName, fileId!, i, encChunk, writeLease, keyEpoch: keyEpoch).GetAwaiter().GetResult();
                 }
                 // FinalizeFile で長さ確定。新規ファイルでも切り詰め宣言（SetEndOfFile）が
                 // ある場合は ChunkCount を渡してサーバー側も確実に論理切り詰めさせる。
@@ -2239,7 +2239,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                         isFirstChunk: ci == 0, fileSalt)
                     : E2eeCrypto.EncryptChunk(toEncrypt, fileKey, ci, fileSalt,
                         isFirstChunk: ci == 0, revision: nextRevision);
-                _api.UploadChunkAsync(_volumeName, fileId, ci, encChunk, writeLease, replace: true).GetAwaiter().GetResult();
+                _api.UploadChunkAsync(_volumeName, fileId, ci, encChunk, writeLease, replace: true, keyEpoch: keyEpoch).GetAwaiter().GetResult();
 
                 // チャンクプールのキャッシュを更新（新しい暗号文ハッシュで）
                 PutChunkToPool(fileId, ci, toEncrypt, ComputeHashHex(encChunk));

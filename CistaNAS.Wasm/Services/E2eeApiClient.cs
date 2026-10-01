@@ -46,13 +46,15 @@ public sealed class E2eeApiClient
     }
 
     /// <summary>チャンクアップロード。</summary>
-    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, byte[] data, string writeLeaseToken, CancellationToken ct = default)
+    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, byte[] data, string writeLeaseToken,
+        CancellationToken ct = default, int keyEpoch = 0)
     {
         using var content = new ByteArrayContent(data);
         using var request = new HttpRequestMessage(HttpMethod.Post,
             $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/upload-chunk/{Uri.EscapeDataString(fileId)}/{chunkIndex}")
         { Content = content };
         request.Headers.Add("X-CistaNAS-Write-Lease", writeLeaseToken);
+        request.Headers.Add("X-Chunk-KeyEpoch", keyEpoch.ToString(System.Globalization.CultureInfo.InvariantCulture));
         using var response = await _http.SendAsync(request, ct);
         response.EnsureSuccessStatusCode();
     }

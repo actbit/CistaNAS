@@ -16,6 +16,17 @@ namespace CistaNAS.Tests;
 public class E2eeTransferServiceTests
 {
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UploadReportsTheEncryptionEpochOfEachChunk(bool v2)
+    {
+        var (service, server) = CreateService(1024, v2);
+        using var source = new MemoryStream(new byte[1025]);
+        await service.UploadAsync(Volume, "epoch.bin", source, 1025);
+        Assert.Equal(2, server.UploadEpochHeaders.Count);
+        Assert.All(server.UploadEpochHeaders, value => Assert.Equal(v2 ? "1" : "0", value));
+    }
+    [Theory]
     [InlineData(false, -1)]
     [InlineData(false, 1)]
     [InlineData(true, -1)]
@@ -243,6 +254,7 @@ public class E2eeTransferServiceTests
 /// <summary>E2EE チャンク転送エンドポイントのインメモリFake。</summary>
 internal sealed class FakeE2eeServer : HttpMessageHandler
 {
+    public List<string?> UploadEpochHeaders { get; } = [];
     private readonly Dictionary<(string FileId, int Index), byte[]> _chunks = new();
     private readonly Dictionary<(string FileId, int Index), int> _revisions = new();
     private readonly Dictionary<(string FileId, int Index), string> _leaseHeaders = new();
@@ -301,6 +313,7 @@ internal sealed class FakeE2eeServer : HttpMessageHandler
 
             if (op == "upload-chunk" && request.Method == HttpMethod.Post)
             {
+                UploadEpochHeaders.Add(request.Headers.TryGetValues("X-Chunk-KeyEpoch", out var epochs) ? epochs.Single() : null);
                 string lease = request.Headers.TryGetValues("X-CistaNAS-Write-Lease", out var vals) ? vals.First() : "";
                 if (string.IsNullOrEmpty(lease))
                     return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest));

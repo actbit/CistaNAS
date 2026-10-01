@@ -167,7 +167,8 @@ public sealed class CistaNasApiClient
         res.EnsureSuccessStatusCode();
     }
 
-    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, byte[] data, string writeLeaseToken, bool replace = false)
+    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, byte[] data, string writeLeaseToken,
+        bool replace = false, int keyEpoch = 0)
     {
         var content = new ByteArrayContent(data);
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
@@ -175,6 +176,7 @@ public sealed class CistaNasApiClient
         using var request = new HttpRequestMessage(HttpMethod.Post,
             $"/api/v1/e2ee/{volumeName}/upload-chunk/{fileId}/{chunkIndex}{query}") { Content = content };
         request.Headers.Add("X-CistaNAS-Write-Lease", writeLeaseToken);
+        request.Headers.Add("X-Chunk-KeyEpoch", keyEpoch.ToString(System.Globalization.CultureInfo.InvariantCulture));
         var res = await _http.SendAsync(request);
         res.EnsureSuccessStatusCode();
     }

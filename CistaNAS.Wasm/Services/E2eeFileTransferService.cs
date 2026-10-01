@@ -151,7 +151,7 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
                         revision: 0, keyContext.KeyEpoch, keyContext.VolumeId, entry.FileId,
                         fileSaltB64, isFirstChunk: i == 0);
                     byte[] encBytes = Convert.FromBase64String(encB64);
-                    await api.UploadChunkAsync(volumeName, entry.FileId, i, encBytes, writeLease, ct);
+                    await api.UploadChunkAsync(volumeName, entry.FileId, i, encBytes, writeLease, ct, keyContext.KeyEpoch);
                 }
                 finally { CryptographicOperations.ZeroMemory(buffer); }
                 bytesRemaining -= readLen;

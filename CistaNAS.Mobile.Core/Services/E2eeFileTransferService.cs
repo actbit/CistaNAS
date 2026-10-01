@@ -237,7 +237,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
                     byte[] enc;
                     try { enc = E2eeV2.EncryptChunk(block, fileKey, chunkCtx, isFirstChunk: i == 0, fileSalt); }
                     finally { CryptographicOperations.ZeroMemory(block); }
-                    await api.UploadChunkAsync(volumeName, fileId, i, enc, lease);
+                    await api.UploadChunkAsync(volumeName, fileId, i, enc, lease, keyEpoch: keyEpoch);
                     progress?.Report((double)(i + 1) / chunkCount * 100);
                 }
                 ct.ThrowIfCancellationRequested();

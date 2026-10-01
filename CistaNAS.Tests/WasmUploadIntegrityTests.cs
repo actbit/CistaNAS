@@ -8,6 +8,22 @@ namespace CistaNAS.Tests;
 public sealed class WasmUploadIntegrityTests
 {
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UploadSendsTheEpochUsedToEncryptEachChunk(bool v2)
+    {
+        using var server = new UploadServer();
+        using var http = new HttpClient(server) { BaseAddress = new Uri("http://test/") };
+        await using var crypto = new E2eeInterop(new FakeCrypto());
+        var transfer = new CistaNAS.Wasm.Services.E2eeFileTransferService(new E2eeApiClient(http), crypto);
+        using var source = new MemoryStream(new byte[1025]);
+        if (v2) await transfer.UploadV2Async("vol", "epoch.bin", source, 1025, 1024,
+            new E2eeV2KeyContext("volume", 1, Convert.ToBase64String(new byte[32])));
+        else await transfer.UploadAsync("vol", "epoch.bin", source, 1025, 1024, "master");
+        Assert.Equal(2, server.UploadEpochHeaders.Count);
+        Assert.All(server.UploadEpochHeaders, value => Assert.Equal(v2 ? "1" : "0", value));
+    }
+    [Theory]
     [InlineData(false, -1)]
     [InlineData(false, 1)]
     [InlineData(true, -1)]
@@ -130,10 +146,13 @@ public sealed class WasmUploadIntegrityTests
 
     private sealed class UploadServer : HttpMessageHandler
     {
+        public List<string?> UploadEpochHeaders { get; } = [];
         public int Finalized, Deleted, Released;
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             string path = request.RequestUri!.AbsolutePath;
+            if (path.Contains("upload-chunk"))
+                UploadEpochHeaders.Add(request.Headers.TryGetValues("X-Chunk-KeyEpoch", out var epochs) ? epochs.Single() : null);
             if (path.EndsWith("create-file"))
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Created)
                 { Content = new StringContent("{\"fileId\":\"file\",\"encryptedName\":\"name\",\"writeLeaseToken\":\"lease\"}", System.Text.Encoding.UTF8, "application/json") });
