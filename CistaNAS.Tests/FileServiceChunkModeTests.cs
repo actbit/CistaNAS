@@ -405,7 +405,7 @@ public class FileServiceChunkModeTests : IAsyncDisposable
         }
         Assert.Single(await storage.ListAsync($"{volume}/chunks/"));
         Assert.Equal(2, chunks.DeleteAttempts);
-        if (cancelAfterSave) await service.RecoverJournalAsync(volume);
+        if (cancelAfterSave) await service.RecoverAsync(volume);
         var download = await service.DownloadAsync(volume, "test.bin");
         using (download.Stream)
         {
