@@ -482,12 +482,14 @@ public sealed class FileService
                 await SaveCatalogAsync(volumeName, catalog, ct);
                 catalogPublished = true;
 
-                await _journalService.CommitAsync(volumeName, opId, ct);
-
-                if (existing is not null)
+                try { await _journalService.CommitAsync(volumeName, opId, ct); }
+                finally
                 {
-                    try { await _chunkStore.DeleteChunksAsync(volumeName, oldObjectId, ct); }
-                    catch { /* カタログは新オブジェクトを参照済み。旧世代の削除はベストエフォート。 */ }
+                    if (existing is not null)
+                    {
+                        try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, oldObjectId, CancellationToken.None); }
+                        catch { /* カタログは新オブジェクトを参照済み。旧世代の削除はベストエフォート。 */ }
+                    }
                 }
                 return meta;
             }
@@ -615,13 +617,15 @@ public sealed class FileService
             await SaveCatalogAsync(volumeName, catalog, ct);
             catalogPublished = true;
 
-            await _journalService.CommitAsync(volumeName, opId, ct);
-
-            if (existing is not null)
+            try { await _journalService.CommitAsync(volumeName, opId, ct); }
+            finally
             {
-                string oldObjectId = existing.ChunkObjectId ?? fileName;
-                try { await _chunkStore.DeleteChunksAsync(volumeName, oldObjectId, ct); }
-                catch (Exception) { /* ベストエフォート */ }
+                if (existing is not null)
+                {
+                    string oldObjectId = existing.ChunkObjectId ?? fileName;
+                    try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, oldObjectId, CancellationToken.None); }
+                    catch (Exception) { /* ベストエフォート */ }
+                }
             }
             return meta;
         }

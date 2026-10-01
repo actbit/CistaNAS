@@ -1,5 +1,8 @@
 using CistaNAS.Web.Configuration;
 using System.Data.Common;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Hosting;
@@ -34,28 +37,37 @@ public sealed class CloudSqliteSync : BackgroundService
         _interval = TimeSpan.FromSeconds(Math.Max(1, dbOpts.SyncIntervalSeconds));
         _logger = logger ?? NullLogger<CloudSqliteSync>.Instance;
 
-        // VolumeDataPath が設定されていれば永続パスに保存（ボリュームマウント対応）。
-        // 未設定時はテンポラリファイルにフォールバック。
-        var volDataPath = storageOpts.VolumeDataPath;
-        if (!string.IsNullOrEmpty(volDataPath))
-        {
-            Directory.CreateDirectory(volDataPath);
-            _localPath = Path.Combine(volDataPath, _blobKey);
-        }
-        else
-        {
-            // テンポラリでも固定パス（プロセス再起動で同じファイルを再利用）。
-            // シャットダウン時のアップロード失敗から次回起動で復旧できるよう、
-            // 毎回新しい空ファイルを作らずパスごとのファイルを維持する。
-            _localPath = Path.Combine(Path.GetTempPath(), _blobKey);
-        }
-
+        // 同じ DB オブジェクト名でも保存先が異なれば復旧元を共有しない。
+        // BlobKey はクラウドの名前であり、ローカルファイルパスとして解釈しない。
+        string root = Path.GetFullPath(string.IsNullOrEmpty(storageOpts.VolumeDataPath)
+            ? Path.GetTempPath() : storageOpts.VolumeDataPath);
+        string scope = JsonSerializer.Serialize(new[] { storage.RecoveryIdentity, _blobKey });
+        string identifier = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(scope))).ToLowerInvariant();
+        _localPath = Path.Combine(root, ".cistanas-sqlite", identifier, "database.sqlite");
+        string? legacy = GetLegacyPath(root, _blobKey);
+        if (!File.Exists(_localPath) && legacy is not null &&
+            (File.Exists(legacy) || File.Exists(legacy + "-wal") || File.Exists(legacy + "-shm")))
+            throw new InvalidOperationException($"Unbound SQLite recovery database found at '{legacy}'. " +
+                "Stop the server and confirm that it belongs to this storage destination before moving the DB, WAL and SHM " +
+                $"to '{_localPath}' and its matching sidecar names. The original files have been retained.");
         Directory.CreateDirectory(Path.GetDirectoryName(_localPath)!);
         // Dirty のメモリ状態は再起動で失われる。既存のローカル DB は必ず再送する。
         _dirty = File.Exists(_localPath) ? 1 : 0;
     }
 
     public string LocalDbPath => _localPath;
+
+    internal static string? GetLegacyPath(string root, string key)
+    {
+        try
+        {
+            // Match the old path calculation, including rooted or parent-relative keys.
+            // This is read-only detection; new recovery files always use the scoped path.
+            return Path.GetFullPath(Path.Combine(root, key));
+        }
+        catch (ArgumentException) { return null; }
+        catch (NotSupportedException) { return null; }
+    }
 
     /// <summary>起動時にオブジェクトストレージから DB ファイルをダウンロードする。</summary>
     /// <remarks>

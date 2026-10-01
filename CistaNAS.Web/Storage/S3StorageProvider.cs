@@ -14,9 +14,14 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
     private readonly IAmazonS3 _client;
     private readonly string _bucket;
     private readonly string _prefix;
+    public string RecoveryIdentity { get; }
     private static readonly TimeSpan LockLease = TimeSpan.FromMinutes(5);
 
     public S3StorageProvider(string bucket, string region, string? endpointOverride, string? pathPrefix)
+        : this(bucket, region, endpointOverride, pathPrefix, null) { }
+
+    internal S3StorageProvider(string bucket, string region, string? endpointOverride, string? pathPrefix,
+        IAmazonS3? client)
     {
         _bucket = bucket;
         _prefix = NormalizePrefix(pathPrefix);
@@ -31,7 +36,13 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
         if (!string.IsNullOrEmpty(endpointOverride))
             config.ServiceURL = endpointOverride;
 
-        _client = new AmazonS3Client(config);
+        string destination = string.IsNullOrEmpty(endpointOverride)
+            ? "aws:" + config.RegionEndpoint.SystemName
+            : new Uri(endpointOverride).GetComponents(UriComponents.SchemeAndServer | UriComponents.Path,
+                UriFormat.UriEscaped).TrimEnd('/');
+        RecoveryIdentity = System.Text.Json.JsonSerializer.Serialize(new[] { "s3", destination, _bucket, _prefix });
+
+        _client = client ?? new AmazonS3Client(config);
     }
 
     private string FullPath(string blobPath) => _prefix + blobPath;
@@ -110,7 +121,7 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
         var request = new ListObjectsV2Request
         {
             BucketName = _bucket,
-            Prefix = string.IsNullOrEmpty(prefix) ? null : FullPath(prefix),
+            Prefix = string.IsNullOrEmpty(prefix) ? _prefix : FullPath(prefix),
         };
 
         var result = new List<string>();
@@ -118,7 +129,7 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
         do
         {
             response = await _client.ListObjectsV2Async(request, ct);
-            foreach (var obj in response.S3Objects)
+            foreach (var obj in response.S3Objects ?? [])
             {
                 string key = obj.Key;
                 if (key.StartsWith(_prefix))

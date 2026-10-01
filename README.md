@@ -121,6 +121,12 @@ dotnet run --project CistaNAS.AppHost -- --ENABLE_MINIO true
 
 Open the MinIO console endpoint shown in the Aspire dashboard (credentials: `minioadmin` / `minioadmin`).
 
+Normal AppHost launches retain the `minio-data` Docker volume. Integration tests remove this mount
+and use a disposable container layer, checking that their bucket starts empty. Historical test data
+already in `minio-data` is retained; upgrading does not delete that volume or its objects.
+Each fixture labels its own containers with a random identifier and removes those containers and
+their anonymous volumes on teardown, including when Aspire leaves a session container running.
+
 ### Standalone launch (without Aspire)
 
 ```bash
@@ -537,6 +543,21 @@ Cloud SQLite is a **single-instance** configuration. Its local DB and WAL must b
 WAL data) every `Database:SyncIntervalSeconds` (default 30), retries failures, serializes uploads,
 and resends an existing local DB after restart even without a further application write.
 Downloaded DBs are installed atomically. Shutdown and disposal retain the local recovery copy.
+
+Recovery files live at `<VolumeDataPath>/.cistanas-sqlite/<SHA-256 of destination and BlobKey>/database.sqlite`.
+The temporary fallback uses the same isolation scheme. The actual provider, endpoint, bucket/container,
+and prefix identify the destination; credentials are excluded, so rotating Azure keys or SAS credentials
+alone does not change its recovery location. Cloud object names are not interpreted as local paths.
+
+An existing legacy `<VolumeDataPath>/<BlobKey>` or DB/WAL/SHM directly under the temporary directory
+has no destination binding. Legacy absolute or parent-relative BlobKey paths are also checked without
+modifying their files. Startup stops with both old and new paths and retains the original files.
+Before migration, stop the server, make a backup, and confirm that the old DB belongs to the current
+destination. Move the DB and any `-wal`/`-shm` files to the indicated `database.sqlite`,
+`database.sqlite-wal`, and `database.sqlite-shm` paths. Copying only a running DB can lose uncheckpointed
+changes. Restart and verify the content and synchronization. Retain and check the previous recovery
+copy when changing a destination or BlobKey as well.
+
 The temporary-directory fallback cannot survive container/host replacement: losing the local
 volume before a successful sync can still lose recent changes. Object storage is an asynchronous
 replica, not a transactional database or an independent backup. Use PostgreSQL and separate backups
@@ -551,6 +572,11 @@ clearing remain proportional to full file size, so a one-byte PATCH has full-fil
 `FileServiceIntegrityTests.LargeLocalPartialUpdates_ReportCost_AndKeepStorageBounded` records elapsed
 time and physical size for repeated 16 MiB updates without imposing hardware-dependent timing limits.
 General online compaction and proportional-I/O local patches are not implemented.
+
+In object-storage mode, replacing a pending E2EE chunk removes its superseded generation only
+after the new catalog is saved. Published updates retry old-generation deletion independently of
+request cancellation. Persistent deletion failures or a process crash can still leave orphan objects;
+automatic background collection of historical orphans is not implemented.
 
 ## Tests
 

@@ -14,13 +14,21 @@ public sealed class AzureBlobStorageProvider : IStorageProvider
 {
     private readonly BlobContainerClient _container;
     private readonly string _prefix;
+    public string RecoveryIdentity => System.Text.Json.JsonSerializer.Serialize(new[]
+    {
+        "azureblob", _container.Uri.GetComponents(UriComponents.SchemeAndServer | UriComponents.Path,
+            UriFormat.UriEscaped).TrimEnd('/'), _prefix,
+    });
     /// <summary>コンテナの初期化タスク（遅延実行）。</summary>
     private readonly Task _init;
 
     public AzureBlobStorageProvider(string connectionString, string containerName, string? pathPrefix)
+        : this(new BlobContainerClient(connectionString, containerName), pathPrefix) { }
+
+    internal AzureBlobStorageProvider(BlobContainerClient container, string? pathPrefix)
     {
         _prefix = NormalizePrefix(pathPrefix);
-        _container = new BlobContainerClient(connectionString, containerName);
+        _container = container;
         _init = _container.CreateIfNotExistsAsync();
     }
 

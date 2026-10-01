@@ -1,5 +1,6 @@
 using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
+using System.Text.Json;
 
 namespace CistaNAS.Tests;
 
@@ -64,27 +65,39 @@ public sealed class E2eeWriteLeaseServiceTests
     }
 
     [Fact]
-    public async Task RunWithLeaseAsync_LongOperation_KeepsLeaseOwned()
+    public async Task RunWithLeaseAsync_HeartbeatRenewsLeaseAndKeepsOwnership()
     {
         string dataRoot = Path.Combine(Path.GetTempPath(), "cista-write-lease-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dataRoot);
         try
         {
-            var storage = new LocalStorageProvider(dataRoot);
+            var storage = new ObservedLeaseStorage(new LocalStorageProvider(dataRoot));
             var leases = new E2eeWriteLeaseService(storage,
-                leaseDuration: TimeSpan.FromMilliseconds(300),
+                leaseDuration: TimeSpan.FromMinutes(2),
                 renewalInterval: TimeSpan.FromMilliseconds(50));
             string fileId = Guid.NewGuid().ToString("N");
             var lease = await leases.AcquireAsync("test-volume", fileId);
 
+            var operationMayFinish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             Task operation = leases.RunWithLeaseAsync("test-volume", fileId, lease.Token,
-                ct => Task.Delay(700, ct));
-            await Task.Delay(450);
-
-            var conflict = await Assert.ThrowsAsync<E2eeWriteLeaseException>(
-                () => leases.AcquireAsync("test-volume", fileId));
-            Assert.Equal(LockedStatusCode, conflict.StatusCode);
-            await operation;
+                ct => operationMayFinish.Task.WaitAsync(ct));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            try
+            {
+                // Wait for a persisted heartbeat rather than assuming that a
+                // loaded CI runner executes a timer within a 300 ms lease.
+                WriteLease renewed = await storage.HeartbeatCommitted.Task.WaitAsync(timeout.Token);
+                Assert.Equal(lease.Token, renewed.Token);
+                Assert.True(renewed.ExpiresAt > lease.ExpiresAt);
+                var conflict = await Assert.ThrowsAsync<E2eeWriteLeaseException>(
+                    () => leases.AcquireAsync("test-volume", fileId));
+                Assert.Equal(LockedStatusCode, conflict.StatusCode);
+            }
+            finally
+            {
+                operationMayFinish.TrySetResult();
+                await operation.WaitAsync(timeout.Token);
+            }
         }
         finally
         {
@@ -120,9 +133,9 @@ public sealed class E2eeWriteLeaseServiceTests
         Directory.CreateDirectory(dataRoot);
         try
         {
-            var storage = new FailLeaseRenewalStorage(new LocalStorageProvider(dataRoot));
+            var storage = new ObservedLeaseStorage(new LocalStorageProvider(dataRoot));
             var leases = new E2eeWriteLeaseService(storage,
-                leaseDuration: TimeSpan.FromMilliseconds(500),
+                leaseDuration: TimeSpan.FromMinutes(2),
                 renewalInterval: TimeSpan.FromMilliseconds(50));
             string fileId = Guid.NewGuid().ToString("N");
             var lease = await leases.AcquireAsync("test-volume", fileId);
@@ -134,11 +147,14 @@ public sealed class E2eeWriteLeaseServiceTests
                     await operationMayStop.Task;
                 });
 
-            await Task.Delay(150);
-            Assert.False(run.IsCompleted);
-
-            operationMayStop.SetResult();
-            await Assert.ThrowsAsync<IOException>(() => run);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            try
+            {
+                await storage.RenewalFailed.Task.WaitAsync(timeout.Token);
+                Assert.False(run.IsCompleted);
+            }
+            finally { operationMayStop.TrySetResult(); }
+            await Assert.ThrowsAsync<IOException>(() => run.WaitAsync(timeout.Token));
         }
         finally
         {
@@ -147,16 +163,32 @@ public sealed class E2eeWriteLeaseServiceTests
         }
     }
 
-    private sealed class FailLeaseRenewalStorage(IStorageProvider inner) : IStorageProvider
+    private sealed class ObservedLeaseStorage(IStorageProvider inner) : IStorageProvider
     {
+        private int _leaseWrites;
         public bool FailLeaseWrites { get; set; }
+        public TaskCompletionSource<WriteLease> HeartbeatCommitted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource RenewalFailed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Task<byte[]?> ReadAsync(string path, CancellationToken ct = default) => inner.ReadAsync(path, ct);
         public Task WriteAsync(string path, Stream data, CancellationToken ct = default) => inner.WriteAsync(path, data, ct);
-        public Task WriteAtomicAsync(string path, Stream data, CancellationToken ct = default)
-            => FailLeaseWrites && path.StartsWith(".write-leases/", StringComparison.Ordinal)
-                ? Task.FromException(new IOException("simulated lease renewal failure"))
-                : inner.WriteAtomicAsync(path, data, ct);
+        public async Task WriteAtomicAsync(string path, Stream data, CancellationToken ct = default)
+        {
+            bool leaseWrite = path.StartsWith(".write-leases/", StringComparison.Ordinal);
+            if (FailLeaseWrites && leaseWrite)
+            {
+                RenewalFailed.TrySetResult();
+                throw new IOException("simulated lease renewal failure");
+            }
+            await inner.WriteAtomicAsync(path, data, ct);
+            // Acquire, initial validation, then the asynchronous heartbeat.
+            if (leaseWrite && Interlocked.Increment(ref _leaseWrites) >= 3)
+            {
+                var persisted = await inner.ReadAsync(path, ct);
+                HeartbeatCommitted.TrySetResult(JsonSerializer.Deserialize<WriteLease>(persisted!,
+                    new JsonSerializerOptions(JsonSerializerDefaults.Web))!);
+            }
+        }
         public Task DeleteAsync(string path, CancellationToken ct = default) => inner.DeleteAsync(path, ct);
         public Task<bool> ExistsAsync(string path, CancellationToken ct = default) => inner.ExistsAsync(path, ct);
         public Task<IReadOnlyList<string>> ListAsync(string? prefix = null, CancellationToken ct = default) => inner.ListAsync(prefix, ct);

@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="CistaNAS.Tests" />
+    <InternalsVisibleTo Include="CistaNAS.StorageTests" />
   </ItemGroup>
 
   <ItemGroup>

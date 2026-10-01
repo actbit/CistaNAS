@@ -18,7 +18,13 @@
     <Compile Include="..\CistaNAS.Tests\MinIOFixture.cs" Link="MinIOFixture.cs" />
     <Compile Include="..\CistaNAS.Tests\LocalTestHttpClient.cs" Link="LocalTestHttpClient.cs" />
     <Compile Include="..\CistaNAS.Tests\MinIOStorageE2ETests.cs" Link="MinIOStorageE2ETests.cs" />
+    <Compile Include="..\CistaNAS.Tests\MinIOCleanupE2ETests.cs" Link="MinIOCleanupE2ETests.cs" />
     <Compile Include="..\CistaNAS.Tests\PostgreSqlMigrationTests.cs" Link="PostgreSqlMigrationTests.cs" />
+    <Compile Include="..\CistaNAS.Tests\CloudSqliteRecoveryTests.cs" Link="CloudSqliteRecoveryTests.cs" />
+    <Compile Include="..\CistaNAS.Tests\CloudSqliteSyncTests.cs" Link="CloudSqliteSyncTests.cs" />
+    <Compile Include="..\CistaNAS.Tests\CloudSqliteIsolationTests.cs" Link="CloudSqliteIsolationTests.cs" />
+    <Compile Include="..\CistaNAS.Tests\StorageRecoveryIdentityTests.cs" Link="StorageRecoveryIdentityTests.cs" />
+    <Compile Include="..\CistaNAS.Tests\GcsStorageProviderTests.cs" Link="GcsStorageProviderTests.cs" />
     <Using Include="System.Net" />
     <Using Include="Microsoft.Extensions.DependencyInjection" />
     <Using Include="Aspire.Hosting.ApplicationModel" />

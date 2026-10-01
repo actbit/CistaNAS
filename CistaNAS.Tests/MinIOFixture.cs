@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Diagnostics;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Aspire.Hosting.ApplicationModel;
@@ -17,6 +18,7 @@ public class MinIOFixture : IAsyncLifetime
 {
     private DistributedApplication? _app;
     private string _tempDataRoot = "";
+    private readonly string _containerLabel = "cistanas.test-fixture=" + Guid.NewGuid().ToString("N");
 
     public HttpClient Http { get; private set; } = null!;
     public CistaNasApiClient Api { get; private set; } = null!;
@@ -35,6 +37,13 @@ public class MinIOFixture : IAsyncLifetime
         // ENABLE_MINIO=true を渡して AppHost を起動 → AppHost 側で MinIO コンテナが立ち上がる
         var builder = await DistributedApplicationTestingBuilder
             .CreateAsync<Projects.CistaNAS_AppHost>(args: ["--ENABLE_MINIO", "true"]);
+        // Development keeps minio-data across launches. Integration tests must
+        // use the disposable container layer instead of sharing that volume.
+        var minio = builder.Resources.OfType<ContainerResource>().Single(r => r.Name == "minio");
+        foreach (var mount in minio.Annotations.OfType<ContainerMountAnnotation>()
+            .Where(m => m.Target == "/data").ToArray())
+            minio.Annotations.Remove(mount);
+        builder.CreateResourceBuilder(minio).WithContainerRuntimeArgs("--label", _containerLabel);
         builder.Services.AddLogging(logging => logging.AddConsole().SetMinimumLevel(LogLevel.Information));
 
         // webfrontend の DataRoot とバケット名をテスト用に上書き
@@ -44,6 +53,7 @@ public class MinIOFixture : IAsyncLifetime
         builder.CreateResourceBuilder(proj)
             .WithEnvironment("CistaNas__DataRoot", _tempDataRoot)
             .WithEnvironment("CistaNas__Storage__BucketOrContainer", Bucket)
+            .WithEnvironment("CistaNas__Volume__ChunkStorage", "auto")
             // テストは 1 アプリ・1 IP に大量リクエストを送るためレート制限を緩和
             // （本番既定は auth 10 / api 100 req/min のまま）
             .WithEnvironment("CistaNas__Auth__AuthRateLimitPerMinute", "100000")
@@ -109,12 +119,27 @@ public class MinIOFixture : IAsyncLifetime
         {
             // 既に存在する場合は無視
         }
+        Assert.Equal(0, (await s3.ListObjectsV2Async(new ListObjectsV2Request
+        {
+            BucketName = Bucket,
+            MaxKeys = 1,
+        })).S3Objects?.Count ?? 0);
     }
 
     public async Task DisposeAsync()
     {
         Http?.Dispose();
-        if (_app is not null) await _app.DisposeAsync();
+        if (_app is not null)
+        {
+            // Dispose alone can leave the started host's container running.
+            // Stop its owned resources before releasing the host services.
+            try { await _app.StopAsync(); }
+            finally
+            {
+                try { await _app.DisposeAsync(); }
+                finally { await RemoveOwnedTestContainersAsync(); }
+            }
+        }
 
         // テスト用データを一括削除
         if (Directory.Exists(_tempDataRoot))
@@ -122,6 +147,44 @@ public class MinIOFixture : IAsyncLifetime
             try { Directory.Delete(_tempDataRoot, true); }
             catch (IOException) { /* ベストエフォート */ }
         }
+    }
+
+    private async Task RemoveOwnedTestContainersAsync()
+    {
+        // Aspire may leave session containers after host disposal. Select only
+        // this fixture's randomly labelled containers; never prune shared data.
+        string output = await RunDockerAsync("ps", "--all", "--filter", "label=" + _containerLabel,
+            "--format", "{{.ID}}");
+        foreach (string id in output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (id.Length is < 12 or > 64 || !id.All(Uri.IsHexDigit))
+                throw new IOException("Docker returned an invalid test container ID.");
+            await RunDockerAsync("rm", "--force", "--volumes", id);
+        }
+    }
+
+    private static async Task<string> RunDockerAsync(params string[] arguments)
+    {
+        var start = new ProcessStartInfo("docker")
+        {
+            UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+        };
+        foreach (string argument in arguments) start.ArgumentList.Add(argument);
+        using var process = Process.Start(start) ?? throw new IOException("Unable to start Docker cleanup.");
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        Task<string> output = process.StandardOutput.ReadToEndAsync(timeout.Token);
+        Task<string> error = process.StandardError.ReadToEndAsync(timeout.Token);
+        try { await process.WaitForExitAsync(timeout.Token); }
+        catch (OperationCanceledException)
+        {
+            if (!process.HasExited) process.Kill(entireProcessTree: true);
+            throw;
+        }
+        string text = await output;
+        string diagnostics = await error;
+        if (process.ExitCode != 0) throw new IOException("Docker test cleanup failed: " + diagnostics);
+        return text;
     }
 }
 
