@@ -104,6 +104,13 @@ dotnet run --project CistaNAS.AppHost
 
 環境変数 `ENABLE_MINIO=true` で Aspire が MinIO コンテナを起動し、webfrontend を S3 バックエンドに自動切替します。デフォルト（未設定）は local ストレージで本番影響なし。
 
+Dockerが必要です。初回は `deploy/minio/Dockerfile` に固定した公式MinIOリリースのコミットから
+開発・テスト用イメージをビルドするため、数分かかる場合があります。[コミュニティ版はソース配布](https://github.com/minio/minio)
+に移行しており、`minio/minio:latest` は使用しません。コンテナテストの前にビルドする場合は
+`docker build -t cistanas-minio:integration-test deploy/minio` を実行し、テストプロセスに
+`MINIO_IMAGE=cistanas-minio:integration-test` を設定します（PowerShellでは
+`$env:MINIO_IMAGE = 'cistanas-minio:integration-test'`）。CIでも先にビルドします。
+
 ```bash
 # 環境変数で指定
 ENABLE_MINIO=true dotnet run --project CistaNAS.AppHost
@@ -112,7 +119,7 @@ ENABLE_MINIO=true dotnet run --project CistaNAS.AppHost
 dotnet run --project CistaNAS.AppHost -- --ENABLE_MINIO true
 ```
 
-MinIO コンソール: `http://localhost:9001`（認証: `minioadmin` / `minioadmin`）
+MinIOコンソールはAspireダッシュボードに表示されるエンドポイントから開きます（認証: `minioadmin` / `minioadmin`）。
 
 ### 個別起動（Aspire なし）
 

@@ -50,7 +50,11 @@ public class MinIOFixture : IAsyncLifetime
             .WithEnvironment("CistaNas__Auth__ApiRateLimitPerMinute", "100000");
 
         _app = await builder.BuildAsync();
-        using var startup = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        // A cold source build takes longer than starting CI's prebuilt image.
+        var startupTimeout = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MINIO_IMAGE"))
+            ? TimeSpan.FromMinutes(10)
+            : TimeSpan.FromMinutes(2);
+        using var startup = new CancellationTokenSource(startupTimeout);
         await _app.StartAsync(startup.Token);
         await _app.Services.GetRequiredService<ResourceNotificationService>()
             .WaitForResourceHealthyAsync("minio", startup.Token);

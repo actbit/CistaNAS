@@ -65,6 +65,8 @@ jobs:
   object-storage-and-postgres:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      MINIO_IMAGE: cistanas-minio:integration-test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -73,9 +75,9 @@ jobs:
         with:
           global-json-file: global.json
       - run: docker info
-      - name: Pull integration test images
+      - name: Build MinIO from pinned official source and pull PostgreSQL
         run: |
-          docker pull minio/minio:latest
+          docker build --tag "$MINIO_IMAGE" deploy/minio
           docker pull postgres:17-alpine
       - run: >-
           dotnet test CistaNAS.StorageTests/CistaNAS.StorageTests.csproj

@@ -104,6 +104,13 @@ On first launch you will be redirected to `/setup` to create the admin user.
 
 Setting the `ENABLE_MINIO=true` environment variable makes Aspire start a MinIO container and automatically switch the webfrontend to the S3 backend. The default (unset) uses local storage with no production impact.
 
+Docker is required. The first launch builds the development/test image from the fixed official
+MinIO release commit in `deploy/minio/Dockerfile` and can take several minutes. The [community
+distribution is source-only](https://github.com/minio/minio); `minio/minio:latest` is no longer used.
+To build before running container tests, run `docker build -t cistanas-minio:integration-test deploy/minio`
+and set `MINIO_IMAGE=cistanas-minio:integration-test` for the test process (PowerShell:
+`$env:MINIO_IMAGE = 'cistanas-minio:integration-test'`). CI performs this build explicitly.
+
 ```bash
 # Via environment variable
 ENABLE_MINIO=true dotnet run --project CistaNAS.AppHost
@@ -112,7 +119,7 @@ ENABLE_MINIO=true dotnet run --project CistaNAS.AppHost
 dotnet run --project CistaNAS.AppHost -- --ENABLE_MINIO true
 ```
 
-MinIO console: `http://localhost:9001` (credentials: `minioadmin` / `minioadmin`)
+Open the MinIO console endpoint shown in the Aspire dashboard (credentials: `minioadmin` / `minioadmin`).
 
 ### Standalone launch (without Aspire)
 
