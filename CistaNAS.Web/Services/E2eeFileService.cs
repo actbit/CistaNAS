@@ -267,12 +267,26 @@ public sealed class E2eeFileService
                     System.Security.Cryptography.SHA256.HashData(chunkData));
 
                 string? newChunkObjectId = null;
+                string? supersededPendingId = replace && entry.PendingChunks is not null
+                    && entry.PendingChunks.TryGetValue(chunkIndex, out var previousPending)
+                    ? previousPending.ObjectId : null;
 
                 if (_volumeService.IsChunkMode(volumeName))
                 {
                     newChunkObjectId = $"{fileId}/versions/{Guid.NewGuid():N}";
                     using var chunkStream = new MemoryStream(chunkData, writable: false);
-                    await _chunkStore.WriteChunkAsync(volumeName, newChunkObjectId, chunkIndex, chunkStream, ct);
+                    try
+                    {
+                        await _chunkStore.WriteChunkAsync(volumeName, newChunkObjectId, chunkIndex, chunkStream, ct);
+                    }
+                    catch
+                    {
+                        // A failed response can follow an accepted PUT. This generation
+                        // has never been published, so attempt cleanup independently of ct.
+                        try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, newChunkObjectId, CancellationToken.None); }
+                        catch { }
+                        throw;
+                    }
                 }
                 else
                 {
@@ -377,6 +391,16 @@ public sealed class E2eeFileService
                         catch { }
                     }
                     throw;
+                }
+                // Only retire the earlier pending generation after its replacement
+                // is durable. Readers still own the visible generation until finalize.
+                if (newChunkObjectId is not null && supersededPendingId is not null
+                    && supersededPendingId.StartsWith(fileId + "/versions/", StringComparison.Ordinal)
+                    && !entry.ChunkObjectIds.Contains(supersededPendingId, StringComparer.Ordinal)
+                    && !entry.PendingChunks!.Values.Any(p => p.ObjectId == supersededPendingId))
+                {
+                    try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, supersededPendingId, CancellationToken.None); }
+                    catch { }
                 }
             }
         }
@@ -567,7 +591,7 @@ public sealed class E2eeFileService
 
                 foreach (string objectId in removedObjectIds.Distinct(StringComparer.Ordinal))
                 {
-                    try { await _chunkStore.DeleteChunksAsync(volumeName, objectId, ct); }
+                    try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, objectId, CancellationToken.None); }
                     catch { /* 切り詰めは公開済み。旧世代の削除はベストエフォート。 */ }
                 }
             }

@@ -16,7 +16,7 @@ namespace CistaNAS.Tests;
 /// S3 バックエンドでのボリューム・ファイル・E2EE・ストリーミングを検証する。
 /// </summary>
 [Collection("MinIO")]
-public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output)
+public partial class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output)
 {
     private HttpClient Http => fixture.Http;
     private CistaNasApiClient Api => fixture.Api;
@@ -291,6 +291,13 @@ public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output
     public async Task S3_08_Object_Persisted_In_S3()
     {
         // ボリュームメタデータが実際に S3 に保存されていることを確認（バックエンドの検証）
+        string volume = "s3-persisted-" + Guid.NewGuid().ToString("N");
+        using var auth = CreateAuthClient();
+        using var created = await auth.PostAsJsonAsync("/api/v1/volumes/", new
+        {
+            name = volume, username = MinIOFixture.Username, password = "f", encrypted = false,
+        });
+        created.EnsureSuccessStatusCode();
         using var s3 = new AmazonS3Client("minioadmin", "minioadmin", new AmazonS3Config
         {
             RegionEndpoint = Amazon.RegionEndpoint.USEast1,
@@ -302,11 +309,12 @@ public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output
         var listResp = await s3.ListObjectsV2Async(new ListObjectsV2Request
         {
             BucketName = MinIOFixture.Bucket,
+            Prefix = volume + "/",
             MaxKeys = 10,
         });
 
-        // 何らかのオブジェクトが保存されていること（他のテストの成果物含む）
-        Assert.NotNull(listResp.S3Objects);
-        output.WriteLine($"S3 バケット内オブジェクト数: {listResp.S3Objects.Count}");
+        // Other tests and previous runs must not supply this test's evidence.
+        Assert.Contains(listResp.S3Objects ?? [], obj => obj.Key == volume + "/volume.json");
+        output.WriteLine($"S3 バケット内オブジェクト数: {listResp.S3Objects?.Count ?? 0}");
     }
 }

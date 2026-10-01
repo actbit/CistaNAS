@@ -121,6 +121,10 @@ dotnet run --project CistaNAS.AppHost -- --ENABLE_MINIO true
 
 Open the MinIO console endpoint shown in the Aspire dashboard (credentials: `minioadmin` / `minioadmin`).
 
+Normal AppHost launches retain the `minio-data` Docker volume. Integration tests remove this mount
+and use a disposable container layer, checking that their bucket starts empty. Historical test data
+already in `minio-data` is retained; upgrading does not delete that volume or its objects.
+
 ### Standalone launch (without Aspire)
 
 ```bash
@@ -566,6 +570,11 @@ clearing remain proportional to full file size, so a one-byte PATCH has full-fil
 `FileServiceIntegrityTests.LargeLocalPartialUpdates_ReportCost_AndKeepStorageBounded` records elapsed
 time and physical size for repeated 16 MiB updates without imposing hardware-dependent timing limits.
 General online compaction and proportional-I/O local patches are not implemented.
+
+In object-storage mode, replacing a pending E2EE chunk removes its superseded generation only
+after the new catalog is saved. Published updates retry old-generation deletion independently of
+request cancellation. Persistent deletion failures or a process crash can still leave orphan objects;
+automatic background collection of historical orphans is not implemented.
 
 ## Tests
 

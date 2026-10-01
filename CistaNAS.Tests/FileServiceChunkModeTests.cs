@@ -376,6 +376,47 @@ public class FileServiceChunkModeTests : IAsyncDisposable
         Assert.Equal(content, actual);
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task PublishedUpdate_RetriesOldChunkDeletion(bool partialUpdate, bool cancelAfterSave)
+    {
+        string volume = await MountEncryptedVol("old-chunk-retry");
+        var storage = _sp.GetRequiredService<IStorageProvider>();
+        var chunks = new E2eeFileTests.TransientCleanupStore(_sp.GetRequiredService<IChunkStore>());
+        using var cancellation = new CancellationTokenSource();
+        var guardedStorage = new E2eeFileTests.CancelAfterCatalogStorage(storage, cancellation);
+        using var scope = _sp.CreateAsyncScope();
+        var service = new FileService(_vs, scope.ServiceProvider.GetRequiredService<JournalService>(), guardedStorage, chunks);
+        using (var original = new MemoryStream(new byte[128]))
+            await service.UploadAsync(volume, "test.bin", original, 128);
+        chunks.FailNextDelete = true;
+        guardedStorage.CancelAfterSave = cancelAfterSave;
+        byte[] replacement = Enumerable.Repeat((byte)42, partialUpdate ? 1 : 128).ToArray();
+        using (var content = new MemoryStream(replacement))
+        {
+            Task update = partialUpdate
+                ? service.PatchRangeAsync(volume, "test.bin", 5, content, 1, cancellation.Token)
+                : service.UploadAsync(volume, "test.bin", content, 128, cancellation.Token);
+            if (cancelAfterSave) await Assert.ThrowsAnyAsync<OperationCanceledException>(() => update);
+            else await update;
+        }
+        Assert.Single(await storage.ListAsync($"{volume}/chunks/"));
+        Assert.Equal(2, chunks.DeleteAttempts);
+        if (cancelAfterSave) await service.RecoverJournalAsync(volume);
+        var download = await service.DownloadAsync(volume, "test.bin");
+        using (download.Stream)
+        {
+            byte[] actual = new byte[128];
+            await download.Stream.ReadExactlyAsync(actual);
+            byte[] expected = partialUpdate ? new byte[128] : replacement;
+            if (partialUpdate) expected[5] = 42;
+            Assert.Equal(expected, actual);
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         foreach (var v in await _vs.ListAllAsync())

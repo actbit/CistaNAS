@@ -35,6 +35,12 @@ public class MinIOFixture : IAsyncLifetime
         // ENABLE_MINIO=true を渡して AppHost を起動 → AppHost 側で MinIO コンテナが立ち上がる
         var builder = await DistributedApplicationTestingBuilder
             .CreateAsync<Projects.CistaNAS_AppHost>(args: ["--ENABLE_MINIO", "true"]);
+        // Development keeps minio-data across launches. Integration tests must
+        // use the disposable container layer instead of sharing that volume.
+        var minio = builder.Resources.OfType<ContainerResource>().Single(r => r.Name == "minio");
+        foreach (var mount in minio.Annotations.OfType<ContainerMountAnnotation>()
+            .Where(m => m.Target == "/data").ToArray())
+            minio.Annotations.Remove(mount);
         builder.Services.AddLogging(logging => logging.AddConsole().SetMinimumLevel(LogLevel.Information));
 
         // webfrontend の DataRoot とバケット名をテスト用に上書き
@@ -44,6 +50,7 @@ public class MinIOFixture : IAsyncLifetime
         builder.CreateResourceBuilder(proj)
             .WithEnvironment("CistaNas__DataRoot", _tempDataRoot)
             .WithEnvironment("CistaNas__Storage__BucketOrContainer", Bucket)
+            .WithEnvironment("CistaNas__Volume__ChunkStorage", "auto")
             // テストは 1 アプリ・1 IP に大量リクエストを送るためレート制限を緩和
             // （本番既定は auth 10 / api 100 req/min のまま）
             .WithEnvironment("CistaNas__Auth__AuthRateLimitPerMinute", "100000")
@@ -109,6 +116,11 @@ public class MinIOFixture : IAsyncLifetime
         {
             // 既に存在する場合は無視
         }
+        Assert.Equal(0, (await s3.ListObjectsV2Async(new ListObjectsV2Request
+        {
+            BucketName = Bucket,
+            MaxKeys = 1,
+        })).S3Objects?.Count ?? 0);
     }
 
     public async Task DisposeAsync()
