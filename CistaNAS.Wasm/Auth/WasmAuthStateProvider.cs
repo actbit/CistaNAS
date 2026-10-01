@@ -15,6 +15,8 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
     private string? _token;
     private DateTimeOffset? _expiresAt;
     private long _authenticationVersion;
+    private readonly SemaphoreSlim _storageGate = new(1, 1);
+    private bool _disposed;
 
     public event Action? StateChanged;
     /// <summary>Await を挟む前に、前の認証に属する鍵・表示内容を破棄する。</summary>
@@ -52,53 +54,50 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
     /// <summary>ログイン成功時に呼ぶ。JWT を解析して ClaimsPrincipal を構築。</summary>
     public async Task SetTokenAsync(string token, DateTimeOffset expiresAt)
     {
-        _authenticationVersion++;
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        long version = ++_authenticationVersion;
         _token = token;
         _expiresAt = expiresAt;
 
         // JWT の payload をデコードして ClaimsPrincipal を構築
         _user = ParseJwtClaims(token);
         SessionInvalidated?.Invoke();
+        NotifyIfCurrent(version);
 
-        // sessionStorage に保存
-        try
-        {
-            await _js.InvokeVoidAsync("sessionStorage.setItem", "cista_jwt", token);
-            await _js.InvokeVoidAsync("sessionStorage.setItem", "cista_jwt_expires", expiresAt.ToString("O"));
-        }
-        catch { /* JS 未初期化時は無視 */ }
-
-        NotifyAuthenticationStateChanged(GetAuthenticationStateAsync());
-        StateChanged?.Invoke();
+        await PersistAsync(version, token, expiresAt);
     }
 
     /// <summary>ログアウト。</summary>
     public async Task LogoutAsync()
     {
-        _authenticationVersion++;
+        if (_disposed) return;
+        long version = ++_authenticationVersion;
         _user = null;
         _token = null;
         _expiresAt = null;
         SessionInvalidated?.Invoke();
+        NotifyIfCurrent(version);
 
-        try
-        {
-            await _js.InvokeVoidAsync("sessionStorage.removeItem", "cista_jwt");
-            await _js.InvokeVoidAsync("sessionStorage.removeItem", "cista_jwt_expires");
-        }
-        catch { /* JS 未初期化時は無視 */ }
-
-        NotifyAuthenticationStateChanged(GetAuthenticationStateAsync());
-        StateChanged?.Invoke();
+        await PersistAsync(version, null, null);
     }
 
     /// <summary>起動時に sessionStorage からトークンを復元。</summary>
     public async Task TryRestoreAsync()
     {
+        long version = _authenticationVersion;
         try
         {
-            var token = await _js.InvokeAsync<string?>("sessionStorage.getItem", "cista_jwt");
-            var expiresStr = await _js.InvokeAsync<string?>("sessionStorage.getItem", "cista_jwt_expires");
+            string? token, expiresStr;
+            await _storageGate.WaitAsync();
+            try
+            {
+                if (!IsCurrent(version)) return;
+                token = await _js.InvokeAsync<string?>("sessionStorage.getItem", "cista_jwt");
+                if (!IsCurrent(version)) return;
+                expiresStr = await _js.InvokeAsync<string?>("sessionStorage.getItem", "cista_jwt_expires");
+            }
+            finally { _storageGate.Release(); }
+            if (!IsCurrent(version)) return;
 
             if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(expiresStr)) return;
 
@@ -109,16 +108,47 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
                 return;
             }
 
-            _authenticationVersion++;
+            version = ++_authenticationVersion;
             _token = token;
             _expiresAt = expires;
             _user = ParseJwtClaims(token);
             SessionInvalidated?.Invoke();
 
-            NotifyAuthenticationStateChanged(GetAuthenticationStateAsync());
-            StateChanged?.Invoke();
+            NotifyIfCurrent(version);
         }
         catch { /* 初期化失敗は無視 */ }
+    }
+
+    private bool IsCurrent(long version) => !_disposed && version == _authenticationVersion;
+
+    private void NotifyIfCurrent(long version)
+    {
+        if (!IsCurrent(version)) return;
+        NotifyAuthenticationStateChanged(GetAuthenticationStateAsync());
+        StateChanged?.Invoke();
+    }
+
+    private async Task PersistAsync(long version, string? token, DateTimeOffset? expires)
+    {
+        // Keep the token/expiration pair ordered. RAM invalidation still happens
+        // immediately, before waiting for an older JS write or removal.
+        await _storageGate.WaitAsync();
+        try
+        {
+            if (!IsCurrent(version)) return;
+            if (token is null)
+            {
+                await _js.InvokeVoidAsync("sessionStorage.removeItem", "cista_jwt");
+                if (IsCurrent(version)) await _js.InvokeVoidAsync("sessionStorage.removeItem", "cista_jwt_expires");
+            }
+            else
+            {
+                await _js.InvokeVoidAsync("sessionStorage.setItem", "cista_jwt", token);
+                if (IsCurrent(version)) await _js.InvokeVoidAsync("sessionStorage.setItem", "cista_jwt_expires", expires!.Value.ToString("O"));
+            }
+        }
+        catch { /* JS 未初期化時は RAM 上の認証状態を維持する。 */ }
+        finally { _storageGate.Release(); }
     }
 
     /// <summary>JWT の payload をデコードして ClaimsPrincipal を構築。</summary>
@@ -181,5 +211,14 @@ public sealed class WasmAuthStateProvider : AuthenticationStateProvider, IDispos
         }
     }
 
-    public void Dispose() { StateChanged = null; SessionInvalidated = null; }
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _authenticationVersion++;
+        _user = null; _token = null; _expiresAt = null;
+        SessionInvalidated?.Invoke();
+        StateChanged = null; SessionInvalidated = null;
+        // In-flight JS calls may still release the managed semaphore.
+    }
 }

@@ -7,6 +7,7 @@ public abstract class SessionViewModelBase : BusyViewModelBase, IDisposable
 {
     private CancellationTokenSource _navigation = new();
     private bool _disposed;
+    private long _busyVersion;
 
     public override void OnNavigatedTo()
     {
@@ -18,16 +19,28 @@ public abstract class SessionViewModelBase : BusyViewModelBase, IDisposable
         }
     }
 
-    public override void OnNavigatedFrom() { if (!_disposed) _navigation.Cancel(); }
+    public override void OnNavigatedFrom()
+    {
+        if (_disposed) return;
+        _navigation.Cancel();
+        _busyVersion++;
+        IsBusy = false;
+    }
 
     private protected ClientSessionOperation BeginOperation(AppServices app, CancellationToken ct)
         => app.BeginOperation(ct, _navigation.Token);
 
-    protected Task RunSessionBusyAsync(Func<Task> action) => RunBusyAsync(async () =>
+    protected async Task RunSessionBusyAsync(Func<Task> action)
     {
+        if (_disposed || _navigation.IsCancellationRequested || IsBusy) return;
+        long version = ++_busyVersion;
+        Error = null;
+        IsBusy = true;
         try { await action(); }
         catch (OperationCanceledException) { }
-    });
+        catch (Exception ex) { if (version == _busyVersion) Error = FriendlyError(ex); }
+        finally { if (version == _busyVersion) IsBusy = false; }
+    }
 
     public void Dispose()
     {

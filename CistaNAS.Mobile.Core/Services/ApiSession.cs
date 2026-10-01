@@ -14,7 +14,8 @@ public sealed class ApiSession : IDisposable
     // reads could send a new server's token to the old destination during a switch.
     private sealed record AuthorizationState(Uri? Server, string? Token, long Version);
     private AuthorizationState _authorization = new(null, null, 0);
-    private readonly AsyncLocal<long?> _requestVersion = new();
+    private sealed record RequestOperation(long Version, CancellationToken Cancellation);
+    private readonly AsyncLocal<RequestOperation?> _requestOperation = new();
 
     public ApiSession(HttpMessageHandler? httpHandler = null)
     {
@@ -23,7 +24,12 @@ public sealed class ApiSession : IDisposable
             {
                 var state = Volatile.Read(ref _authorization);
                 return (state.Server, state.Token, state.Version);
-            }, () => _requestVersion.Value);
+            }, () =>
+            {
+                var operation = _requestOperation.Value;
+                operation?.Cancellation.ThrowIfCancellationRequested();
+                return operation?.Version;
+            });
         // リダイレクト先へログイン情報やアップロード本文を転送しない。
         _authHandler.InnerHandler = httpHandler ?? new HttpClientHandler { AllowAutoRedirect = false };
         // 接続失敗後もサーバーを変更できるよう、送信時に接続先を解決する。
@@ -72,11 +78,11 @@ public sealed class ApiSession : IDisposable
         return ReferenceEquals(Interlocked.CompareExchange(ref _authorization, next, previous), previous);
     }
 
-    internal IDisposable BindRequests(long version)
+    internal IDisposable BindRequests(long version, CancellationToken cancellation)
     {
-        long? previous = _requestVersion.Value;
-        _requestVersion.Value = version;
-        return new RequestBinding(() => _requestVersion.Value = previous);
+        var previous = _requestOperation.Value;
+        _requestOperation.Value = new(version, cancellation);
+        return new RequestBinding(() => _requestOperation.Value = previous);
     }
 
     private sealed class RequestBinding(Action release) : IDisposable

@@ -9,12 +9,12 @@ public static class CistaNasApiClientFiles
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
     /// <summary>ボリューム内のファイル一覧を取得する。</summary>
-    public static async Task<List<FileMetadata>> ListFilesAsync(this CistaNasApiClient client, string volumeName)
+    public static async Task<List<FileMetadata>> ListFilesAsync(this CistaNasApiClient client, string volumeName, CancellationToken ct = default)
     {
         var http = client._http;
-        var res = await http.GetAsync($"/api/v1/files/{Uri.EscapeDataString(volumeName)}/");
+        using var res = await http.GetAsync($"/api/v1/files/{Uri.EscapeDataString(volumeName)}/", ct);
         res.EnsureSuccessStatusCode();
-        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>(ct);
         var files = json.GetProperty("files");
         var result = new List<FileMetadata>();
         foreach (var f in files.EnumerateArray())

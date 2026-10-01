@@ -18,12 +18,12 @@ public sealed class VolumeApiClient
     }
 
     /// <summary>ボリューム作成。</summary>
-    public async Task<VolumeInfo> CreateAsync(string name, string username, string? password, bool encrypted)
+    public async Task<VolumeInfo> CreateAsync(string name, string username, string? password, bool encrypted, CancellationToken ct = default)
     {
-        var response = await _http.PostAsJsonAsync("/api/v1/volumes",
-            new CreateVolumeRequest(name, username, password, encrypted));
+        using var response = await _http.PostAsJsonAsync("/api/v1/volumes",
+            new CreateVolumeRequest(name, username, password, encrypted), ct);
         response.EnsureSuccessStatusCode();
-        return (await response.Content.ReadFromJsonAsync<VolumeInfo>())!;
+        return (await response.Content.ReadFromJsonAsync<VolumeInfo>(ct))!;
     }
 
     /// <summary>E2EE ボリューム作成。</summary>

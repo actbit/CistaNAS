@@ -9,12 +9,12 @@ public static class CistaNasApiClientSettings
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
     /// <summary>暗号化設定を取得する。</summary>
-    public static async Task<EncryptionSettingsInfo> GetEncryptionSettingsAsync(this CistaNasApiClient client)
+    public static async Task<EncryptionSettingsInfo> GetEncryptionSettingsAsync(this CistaNasApiClient client, CancellationToken ct = default)
     {
         var http = client._http;
-        var res = await http.GetAsync("/api/v1/settings/encryption");
+        using var res = await http.GetAsync("/api/v1/settings/encryption", ct);
         res.EnsureSuccessStatusCode();
-        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>(ct);
         return new EncryptionSettingsInfo
         {
             DefaultEncryptionMode = json.GetProperty("defaultEncryptionMode").GetString() ?? "server",

@@ -24,7 +24,7 @@ public sealed class FileItem
 /// server モード: 全ファイル一覧から FileTreeBuilder でフォルダツリーを構築。
 /// e2ee モード: フラットな一覧を masterKey で名前復号して表示 (サーバーにディレクトリ概念なし)。
 /// </summary>
-public sealed partial class FileBrowserViewModel(AppServices app, VolumeListItem volume) : BusyViewModelBase
+public sealed partial class FileBrowserViewModel(AppServices app, VolumeListItem volume) : SessionViewModelBase
 {
     private List<FileMetadata>? _serverFiles;
     private List<(string Name, E2eeFileEntry Entry)>? _e2eeFiles;
@@ -45,32 +45,48 @@ public sealed partial class FileBrowserViewModel(AppServices app, VolumeListItem
 
     public override string Title => volume.Name;
 
-    public override async void OnNavigatedTo() => await LoadAsync();
+    public override async void OnNavigatedTo()
+    {
+        base.OnNavigatedTo();
+        await RunSessionBusyAsync(() => LoadCoreAsync(CancellationToken.None));
+    }
+
+    public override void OnNavigatedFrom()
+    {
+        base.OnNavigatedFrom();
+        _serverFiles = null;
+        _e2eeFiles?.Clear();
+        _e2eeFiles = null;
+        Items.Clear();
+    }
 
     [RelayCommand]
-    private Task RefreshAsync(CancellationToken ct) => RunBusyAsync(LoadCoreAsync);
+    private Task RefreshAsync(CancellationToken ct) => RunSessionBusyAsync(() => LoadCoreAsync(ct));
 
-    private Task LoadAsync() => RunBusyAsync(LoadCoreAsync);
-
-    private async Task LoadCoreAsync()
+    private async Task LoadCoreAsync(CancellationToken ct)
     {
+        using var operation = BeginOperation(app, ct);
         if (IsE2ee)
         {
-            await LoadE2eeAsync();
+            var entries = await app.Session.Api.ListFilesAsync(volume.Name, operation.Cancellation);
+            operation.Commit(() =>
+            {
+                _e2eeFiles = BuildE2eeFiles(entries);
+                RefreshChildren();
+            });
         }
         else
         {
             // インスタンス側 ListFilesAsync (E2EE 用) と同名のため拡張メソッドを明示呼び出し
-            _serverFiles = await CistaNasApiClientFiles.ListFilesAsync(app.Session.Api, volume.Name);
+            var files = await CistaNasApiClientFiles.ListFilesAsync(app.Session.Api, volume.Name, operation.Cancellation);
+            operation.Commit(() => { _serverFiles = files; RefreshChildren(); });
         }
-        RefreshChildren();
     }
 
     /// <summary>E2EE: 一覧を取得して名前を復号する。復号できないエントリは (他ユーザーの鍵のため) スキップ表示。</summary>
-    private async Task LoadE2eeAsync()
+    private List<(string Name, E2eeFileEntry Entry)> BuildE2eeFiles(List<E2eeFileEntry> entries)
     {
-        List<E2eeFileEntry> entries = await app.Session.Api.ListFilesAsync(volume.Name);
-        _e2eeFiles = [];
+        List<(string Name, E2eeFileEntry Entry)> files = [];
         bool hasV2 = app.E2ee.TryGetV2State(volume.Name, out E2eeV2VolumeState? v2);
         byte[]? masterKey = app.E2ee.HasKey(volume.Name) ? app.E2ee.GetMasterKey(volume.Name) : null;
 
@@ -91,9 +107,10 @@ public sealed partial class FileBrowserViewModel(AppServices app, VolumeListItem
                 name = null;
             }
             if (name is null) continue;
-            _e2eeFiles.Add((name, e));
+            files.Add((name, e));
         }
-        _e2eeFiles.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+        files.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+        return files;
     }
 
     /// <summary>

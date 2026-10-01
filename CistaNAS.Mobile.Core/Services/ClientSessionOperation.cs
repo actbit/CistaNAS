@@ -14,7 +14,7 @@ internal sealed class ClientSessionOperation : IDisposable
     {
         _app = app; _session = session; _version = version;
         _cancellation = CancellationTokenSource.CreateLinkedTokenSource(session, command, navigation);
-        _requestBinding = app.Session.BindRequests(version);
+        _requestBinding = app.Session.BindRequests(version, _cancellation.Token);
     }
 
     public CancellationToken Cancellation => _cancellation.Token;

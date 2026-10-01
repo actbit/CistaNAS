@@ -1,7 +1,8 @@
 @page "/setup"
 @using CistaNAS.Wasm.Services
+@implements IDisposable
 @inject AuthApiClient AuthApi
-@inject VolumeApiClient VolumeApi
+@inject BrowserAuthenticationService Authentication
 @inject NavigationManager Nav
 
 <PageTitle>初回セットアップ - CistaNAS</PageTitle>
@@ -62,6 +63,7 @@ else
     private SetupModel _model = new();
     private string? _error;
     private bool _loading;
+    private readonly CancellationTokenSource _lifetime = new();
 
     private sealed class SetupModel
     {
@@ -74,7 +76,8 @@ else
 
     protected override async Task OnInitializedAsync()
     {
-        _hasUsers = await AuthApi.HasAnyUsersAsync();
+        try { _hasUsers = await AuthApi.HasAnyUsersAsync(_lifetime.Token); }
+        catch (OperationCanceledException) { }
     }
 
     private async Task HandleSetup()
@@ -96,27 +99,14 @@ else
                 return;
             }
 
-            var ok = await AuthApi.SetupAsync(_model.Username, _model.Password);
-            if (!ok)
-            {
-                _error = "既にセットアップ済みです。";
-                return;
-            }
-
-            if (_model.CreateVolume && !string.IsNullOrWhiteSpace(_model.VolumeName))
-            {
-                try
-                {
-                    await VolumeApi.CreateAsync(_model.VolumeName, _model.Username, _model.Password, encrypted: true);
-                }
-                catch
-                {
-                    // ボリューム作成失敗は警告のみ
-                }
-            }
-
-            Nav.NavigateTo("/login", forceLoad: false);
+            long version = Authentication.Version;
+            string username = _model.Username, password = _model.Password;
+            string? volume = _model.CreateVolume ? _model.VolumeName : null;
+            await Authentication.SetupAsync(username, password, volume, version, _lifetime.Token);
+            Authentication.EnsureCurrent(version + 1, _lifetime.Token);
+            Nav.NavigateTo("/volumes", forceLoad: false);
         }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
             _error = ex.Message;
@@ -125,5 +115,11 @@ else
         {
             _loading = false;
         }
+    }
+
+    public void Dispose()
+    {
+        _lifetime.Cancel();
+        _model.Password = _model.ConfirmPassword = "";
     }
 }

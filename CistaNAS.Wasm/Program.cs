@@ -32,6 +32,7 @@ builder.Services.AddScoped(sp =>
 builder.Services.AddScoped<VolumeApiClient>();
 builder.Services.AddScoped<FileApiClient>();
 builder.Services.AddScoped<AuthApiClient>();
+builder.Services.AddScoped<BrowserAuthenticationService>();
 builder.Services.AddScoped<AccountApiClient>();
 builder.Services.AddScoped<E2eeApiClient>();
 builder.Services.AddScoped<E2eeFileTransferService>();
