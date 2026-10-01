@@ -16,6 +16,7 @@
     <ProjectReference Include="..\CistaNAS.AppHost\CistaNAS.AppHost.csproj" />
     <ProjectReference Include="..\CistaNAS.Web\CistaNAS.Web.csproj" />
     <Compile Include="..\CistaNAS.Tests\MinIOFixture.cs" Link="MinIOFixture.cs" />
+    <Compile Include="..\CistaNAS.Tests\LocalTestHttpClient.cs" Link="LocalTestHttpClient.cs" />
     <Compile Include="..\CistaNAS.Tests\MinIOStorageE2ETests.cs" Link="MinIOStorageE2ETests.cs" />
     <Compile Include="..\CistaNAS.Tests\PostgreSqlMigrationTests.cs" Link="PostgreSqlMigrationTests.cs" />
     <Using Include="System.Net" />

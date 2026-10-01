@@ -24,7 +24,7 @@ public class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelper output
 
     private HttpClient CreateAuthClient()
     {
-        var client = new HttpClient { BaseAddress = Http.BaseAddress };
+        var client = CistaNAS.Testing.LocalTestHttpClient.Create(Http.BaseAddress!);
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", Token);
         return client;
     }
