@@ -388,9 +388,8 @@ app.Use(async (ctx, next) =>
     headers.XFrameOptions = "SAMEORIGIN";
     headers["Referrer-Policy"] = "strict-origin-when-cross-origin";
     headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()";
-    if (!ctx.Request.Headers.ContainsKey("Content-Security-Policy"))
+    ctx.Response.OnStarting(() =>
     {
-        // 開発環境ではCSPを緩和
         // 'unsafe-inline' は .NET 10 Blazor WASM が生成する <script type="importmap">（インライン）に必須。
         // ハッシュ/nonce は fingerprint でビルド毎に変わるため使えず、インライン許可が現実解。
         // 'unsafe-eval' は使わず 'wasm-unsafe-eval'（WASM ランタイム内のみ評価）で任意 JS eval を遮断。
@@ -405,7 +404,8 @@ app.Use(async (ctx, next) =>
                   "frame-ancestors 'self'; " +
                   "upgrade-insecure-requests";
         headers["Content-Security-Policy"] = csp;
-    }
+        return Task.CompletedTask;
+    });
     await next();
 });
 

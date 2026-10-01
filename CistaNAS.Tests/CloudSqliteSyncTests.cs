@@ -128,14 +128,17 @@ public class CloudSqliteSyncTests
                 new StorageOptions { VolumeDataPath = localDir },
                 new DatabaseOptions { BlobKey = "test.db" });
 
-            await File.WriteAllBytesAsync(sync.LocalDbPath, "NEW-DATA"u8.ToArray());
+            CloudSqliteRecoveryTests.WriteValue(sync.LocalDbPath, "NEW-DATA");
             sync.MarkDirty();
 
             await sync.StopAsync(CancellationToken.None);
 
             var cloudData = await storage.ReadAsync("test.db");
             Assert.NotNull(cloudData);
-            Assert.Equal("NEW-DATA"u8.ToArray(), cloudData);
+            string restored = Path.Combine(localDir, "restored.db");
+            await File.WriteAllBytesAsync(restored, cloudData);
+            using var db = CloudSqliteRecoveryTests.Open(restored);
+            Assert.Equal("NEW-DATA", CloudSqliteRecoveryTests.ReadValue(db));
         }
         finally
         {
@@ -155,15 +158,17 @@ public class CloudSqliteSyncTests
             var sync = new CloudSqliteSync(storage,
                 new StorageOptions { VolumeDataPath = localDir },
                 new DatabaseOptions { BlobKey = "test.db" });
-            byte[] expected = "RETRY-ME"u8.ToArray();
-            await File.WriteAllBytesAsync(sync.LocalDbPath, expected);
+            CloudSqliteRecoveryTests.WriteValue(sync.LocalDbPath, "RETRY-ME");
             sync.MarkDirty();
 
             await Assert.ThrowsAsync<IOException>(() => sync.UploadIfDirtyAsync());
             await sync.UploadIfDirtyAsync();
 
             Assert.Equal(2, storage.WriteAttempts);
-            Assert.Equal(expected, await storage.ReadAsync("test.db"));
+            string restored = Path.Combine(localDir, "restored.db");
+            await File.WriteAllBytesAsync(restored, (await storage.ReadAsync("test.db"))!);
+            using var db = CloudSqliteRecoveryTests.Open(restored);
+            Assert.Equal("RETRY-ME", CloudSqliteRecoveryTests.ReadValue(db));
         }
         finally
         {
@@ -184,8 +189,8 @@ public class CloudSqliteSyncTests
                 new StorageOptions { VolumeDataPath = localDir },
                 new DatabaseOptions { BlobKey = "test.db" });
 
-            byte[] precious = "PRECIOUS-UNSAVED-CHANGE"u8.ToArray();
-            await File.WriteAllBytesAsync(sync.LocalDbPath, precious);
+            CloudSqliteRecoveryTests.WriteValue(sync.LocalDbPath, "PRECIOUS-UNSAVED-CHANGE");
+            byte[] precious = await File.ReadAllBytesAsync(sync.LocalDbPath);
             sync.MarkDirty();
 
             // アップロード全失敗。早期キャンセルでリトライ遅延を短縮（失敗時の挙動検証が目的）

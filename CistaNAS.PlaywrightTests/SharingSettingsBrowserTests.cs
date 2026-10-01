@@ -19,6 +19,23 @@ public class SharingSettingsBrowserTests(PlaywrightWebAppFixture fixture)
 {
     private const int WasmLoadTimeout = 60000;
 
+    [Fact]
+    public async Task E2eeSharingDialog_ExplainsCachedFileKeyLimit()
+    {
+        await SetGlobalSharingAsync(true);
+        await SetUserSharingAsync(PlaywrightWebAppFixture.Username, true);
+        string volume = await CreateE2eeVolumeAsync();
+        await using var context = await fixture.CreateAuthenticatedContextAsync();
+        var page = await context.NewPageAsync();
+        await page.GotoAsync(fixture.BaseUrl + "/volumes");
+        var row = page.Locator("tr").Filter(new LocatorFilterOptions { HasText = volume });
+        await row.GetByRole(AriaRole.Button, new LocatorGetByRoleOptions { Name = "共有", Exact = true }).ClickAsync();
+        var notice = page.GetByTestId("e2ee-revocation-limit");
+        await Assertions.Expect(notice).ToBeVisibleAsync();
+        await Assertions.Expect(notice).ToContainTextAsync("保存済みのファイル鍵");
+        await Assertions.Expect(notice).ToContainTextAsync("新規ファイルとしてアップロード");
+    }
+
     private HttpClient AdminHttp()
     {
         var c = new HttpClient

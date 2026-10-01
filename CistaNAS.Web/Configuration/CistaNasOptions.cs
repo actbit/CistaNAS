@@ -56,6 +56,10 @@ public sealed class DatabaseOptions
 
     /// <summary>オブジェクトストレージ内の DB ファイルパス（デフォルト "cista.db"）。</summary>
     public string? BlobKey { get; set; }
+
+    /// <summary>クラウド SQLite の定期同期間隔（秒）。失敗時も次の周期で再試行。</summary>
+    [Range(1, 3600)]
+    public int SyncIntervalSeconds { get; set; } = 30;
 }
 
 /// <summary>メタデータ保存先のプロバイダ設定。</summary>

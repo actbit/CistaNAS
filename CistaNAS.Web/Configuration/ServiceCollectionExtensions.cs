@@ -83,11 +83,12 @@ public static class ServiceCollectionExtensions
             case "azureblob":
             case "gcs":
             {
-                var sync = new CloudSqliteSync(storage, cista.Storage, db);
-                services.AddSingleton(sync);
+                services.AddSingleton(sp => new CloudSqliteSync(storage, cista.Storage, db,
+                    sp.GetRequiredService<ILogger<CloudSqliteSync>>()));
                 services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<CloudSqliteSync>());
-                services.AddDbContext<AppDbContext>(o =>
+                services.AddDbContext<AppDbContext>((sp, o) =>
                 {
+                    var sync = sp.GetRequiredService<CloudSqliteSync>();
                     o.UseSqlite($"Data Source={sync.LocalDbPath};Mode=ReadWriteCreate;Cache=Shared",
                         b => b.MigrationsAssembly(SqliteMigrationsAssembly));
                     o.AddInterceptors(new CloudSqliteSaveChangesInterceptor(sync));
