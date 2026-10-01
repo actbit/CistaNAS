@@ -306,21 +306,42 @@ public class DokanFileSystemTests
     public void FileCache_TryGetFileKey_ThreadSafe()
     {
         var cache = new CistaNasFileSystem.FileCache();
-        byte[] key = { 1, 2, 3, 4 };
-
-        // 複数スレッドから同時に TryGetFileKey を呼び出す
-        var results = new ConcurrentBag<bool>();
-        Parallel.For(0, 100, i =>
+        byte[] firstKey = Enumerable.Repeat((byte)1, 32).ToArray();
+        byte[] secondKey = Enumerable.Repeat((byte)2, 32).ToArray();
+        byte[] firstSalt = Enumerable.Repeat((byte)3, 16).ToArray();
+        byte[] secondSalt = Enumerable.Repeat((byte)4, 16).ToArray();
+        try
         {
-            if (i == 50)
-                cache.SetFileKey(key, new byte[16]);
-            bool hasKey = cache.TryGetFileKey(out _, out _);
-            results.Add(hasKey);
-        });
+            // 書き込み前の結果は実行順に依存させず検証する。
+            Parallel.For(0, 100, _ =>
+            {
+                Assert.False(cache.TryGetFileKey(out var key, out var salt));
+                Assert.Null(key);
+                Assert.Null(salt);
+            });
 
-        // SetFileKey 前は false、後は true が混在しているはず
-        Assert.Contains(true, results);
-        Assert.Contains(false, results);
+            cache.SetFileKey(firstKey, firstSalt);
+            // 更新中の読み取りは、必ず同じ世代の鍵・ソルトの組を返す。
+            Parallel.For(0, 1000, i =>
+            {
+                if (i % 3 == 0)
+                    cache.SetFileKey(i % 2 == 0 ? firstKey : secondKey,
+                        i % 2 == 0 ? firstSalt : secondSalt);
+                Assert.True(cache.TryGetFileKey(out var key, out var salt));
+                try
+                {
+                    bool isFirst = key!.SequenceEqual(firstKey);
+                    Assert.True(isFirst || key.SequenceEqual(secondKey));
+                    Assert.Equal(isFirst ? firstSalt : secondSalt, salt);
+                }
+                finally
+                {
+                    Array.Clear(key!);
+                    Array.Clear(salt!);
+                }
+            });
+        }
+        finally { cache.Dispose(); }
     }
 
     [Fact]

@@ -271,6 +271,21 @@ else
                     </div>
                     <div class="modal-body">
                         <h6>アクセス権のあるユーザー</h6>
+                        @if (_shareIsE2ee)
+                        {
+                            <p class="alert alert-warning small" data-testid="e2ee-revocation-limit">
+                                共有解除後も、相手が保存済みのファイル鍵で既存ファイルの更新内容を復号できる場合があります。
+                                @if (_shareKeyEpoch == 0)
+                                {
+                                    <span>旧形式では新規アップロードも保存済みの共有鍵で読めます。更新内容を保護するには、共有v2へ移行したうえで新規ファイルとしてアップロードしてください。</span>
+                                }
+                                else
+                                {
+                                    <span>更新内容を保護するには、共有解除後に新規ファイルとしてアップロードしてください。</span>
+                                }
+                                内容を確認してから元ファイルを削除してください。
+                            </p>
+                        }
                         <ul class="list-group mb-3">
                             @foreach (var u in _shareUsers)
                             {

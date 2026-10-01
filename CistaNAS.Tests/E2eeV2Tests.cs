@@ -17,6 +17,46 @@ public class E2eeV2Tests
     // ---- TOFU fingerprint ----
 
     [Fact]
+    public void LegacySharedMasterKey_CanDecryptFreshV1UploadEvenWithNewSalt()
+    {
+        byte[] cachedMasterKey = E2eeCrypto.GenerateMasterKey();
+        byte[] newSalt = E2eeCrypto.GenerateFileSalt();
+        byte[] key = E2eeCrypto.DeriveFileKey(cachedMasterKey, newSalt);
+        byte[] updated = "new legacy upload"u8.ToArray();
+        byte[] ciphertext = E2eeCrypto.EncryptChunk(updated, key, 0, newSalt, true);
+        byte[] publicSalt = ciphertext[..E2eeCrypto.SaltSize];
+        byte[] removedMemberKey = E2eeCrypto.DeriveFileKey(cachedMasterKey, publicSalt);
+        Assert.Equal(updated, E2eeCrypto.DecryptChunk(ciphertext, removedMemberKey, 0, publicSalt));
+    }
+
+    [Fact]
+    public void CachedFileKey_CanDecryptUpdatesAfterRewrap_ButCannotDecryptFreshFile()
+    {
+        byte[] oldGroupKey = E2eeV2.GenerateGroupKey();
+        byte[] newGroupKey = E2eeV2.GenerateGroupKey();
+        byte[] fileKey = E2eeV2.GenerateFileKey();
+        string fileId = Guid.NewGuid().ToString("N");
+        var oldWrap = E2eeV2.WrapFileKey(fileKey, oldGroupKey, VolumeId, fileId, 1);
+        byte[] cachedKey = E2eeV2.UnwrapFileKey(oldWrap.Nonce, oldWrap.Ciphertext, oldWrap.Tag,
+            oldGroupKey, VolumeId, fileId, 1);
+        var newWrap = E2eeV2.WrapFileKey(fileKey, newGroupKey, VolumeId, fileId, 2);
+        byte[] remainingMemberKey = E2eeV2.UnwrapFileKey(newWrap.Nonce, newWrap.Ciphertext, newWrap.Tag,
+            newGroupKey, VolumeId, fileId, 2);
+        byte[] updated = "updated after revocation"u8.ToArray();
+        byte[] salt = E2eeV2.GenerateFileSalt();
+        var context = new E2eeChunkContext(VolumeId, fileId, 0, 1, 2);
+        byte[] ciphertext = E2eeV2.EncryptChunk(updated, remainingMemberKey, context, true, salt);
+        Assert.Equal(updated, E2eeV2.DecryptChunk(ciphertext, cachedKey, context, salt));
+
+        byte[] freshKey = E2eeV2.GenerateFileKey();
+        byte[] freshSalt = E2eeV2.GenerateFileSalt();
+        var freshContext = new E2eeChunkContext(VolumeId, Guid.NewGuid().ToString("N"), 0, 0, 2);
+        byte[] freshCiphertext = E2eeV2.EncryptChunk(updated, freshKey, freshContext, true, freshSalt);
+        Assert.Equal(updated, E2eeV2.DecryptChunk(freshCiphertext, freshKey, freshContext, freshSalt));
+        Assert.ThrowsAny<CryptographicException>(() => E2eeV2.DecryptChunk(freshCiphertext, cachedKey, freshContext, freshSalt));
+    }
+
+    [Fact]
     public void ComputeFingerprint_IsUppercaseHexSha256OfRawKey()
     {
         byte[] pub = Convert.FromHexString(

@@ -19,7 +19,7 @@ public class SharingSecurityHardeningTests(AspireFixture fixture)
 {
     private HttpClient AuthClient(string token)
     {
-        var c = new HttpClient { BaseAddress = fixture.Http.BaseAddress };
+        var c = CistaNAS.Testing.LocalTestHttpClient.Create(fixture.Http.BaseAddress!);
         c.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
         return c;
     }
@@ -78,7 +78,7 @@ public class SharingSecurityHardeningTests(AspireFixture fixture)
     [Fact]
     public async Task AnonymousRequests_ToKeyMaterialEndpoints_All401()
     {
-        var anon = new HttpClient { BaseAddress = fixture.Http.BaseAddress };
+        using var anon = CistaNAS.Testing.LocalTestHttpClient.Create(fixture.Http.BaseAddress!);
 
         var setup = await anon.GetAsync("/api/v1/e2ee/identity-setup");
         Assert.Equal(HttpStatusCode.Unauthorized, setup.StatusCode);

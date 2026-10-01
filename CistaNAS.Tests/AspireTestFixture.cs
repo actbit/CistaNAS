@@ -112,7 +112,7 @@ public class AspireHttpTests(AspireFixture fixture)
     [Fact]
     public async Task AuthFlow_VolumesEndpoint_ReturnsOk()
     {
-        using var authClient = new HttpClient { BaseAddress = Http.BaseAddress };
+        using var authClient = CistaNAS.Testing.LocalTestHttpClient.Create(Http.BaseAddress!);
         authClient.DefaultRequestHeaders.Authorization =
             new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", Token);
         var listResp = await authClient.GetAsync("/api/v1/volumes");
@@ -129,7 +129,7 @@ public class AspireHttpTests(AspireFixture fixture)
 
         string volName = $"http-e2ee-{Guid.NewGuid():N}";
 
-        using var authClient = new HttpClient { BaseAddress = Http.BaseAddress };
+        using var authClient = CistaNAS.Testing.LocalTestHttpClient.Create(Http.BaseAddress!);
         authClient.DefaultRequestHeaders.Authorization =
             new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", Token);
 

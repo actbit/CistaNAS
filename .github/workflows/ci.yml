@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
+
+jobs:
+  windows-tests:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          global-json-file: global.json
+      - name: Service and client regressions
+        run: >-
+          dotnet test CistaNAS.Tests/CistaNAS.Tests.csproj
+          --filter "Category!=RequiresDokan&FullyQualifiedName!~MinIOStorageE2ETests&FullyQualifiedName!~PostgreSqlMigrationTests"
+          --logger "trx;LogFileName=windows.trx" --results-directory artifacts/test-results
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: windows-test-results
+          path: artifacts/test-results/*.trx
+          retention-days: 14
+
+  browser-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          global-json-file: global.json
+      - run: dotnet build CistaNAS.PlaywrightTests/CistaNAS.PlaywrightTests.csproj
+      - run: pwsh CistaNAS.PlaywrightTests/bin/Debug/net10.0/playwright.ps1 install --with-deps chromium
+      - run: >-
+          dotnet test CistaNAS.PlaywrightTests/CistaNAS.PlaywrightTests.csproj --no-build
+          --logger "trx;LogFileName=browser.trx" --results-directory artifacts/test-results
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: browser-test-results
+          path: artifacts/test-results/*.trx
+          retention-days: 14
+
+  object-storage-and-postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MINIO_IMAGE: cistanas-minio:integration-test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          global-json-file: global.json
+      - run: docker info
+      - name: Build MinIO from pinned official source and pull PostgreSQL
+        run: |
+          docker build --tag "$MINIO_IMAGE" deploy/minio
+          docker pull postgres:17-alpine
+      - run: >-
+          dotnet test CistaNAS.StorageTests/CistaNAS.StorageTests.csproj
+          --logger "console;verbosity=normal"
+          --logger "trx;LogFileName=storage.trx" --results-directory artifacts/test-results
+      - name: Container diagnostics
+        if: failure()
+        run: docker ps --all
+      - name: Require container tests to execute
+        if: success()
+        shell: pwsh
+        run: |
+          [xml]$results = Get-Content artifacts/test-results/storage.trx
+          if ([int]$results.TestRun.ResultSummary.Counters.notExecuted -gt 0) {
+            throw 'Container tests were skipped; CI must verify the real storage backends.'
+          }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: storage-test-results
+          path: artifacts/test-results/*.trx
+          retention-days: 14
+
+  android-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - configuration: Debug
+            runtime: android-x64
+          - configuration: Release
+            runtime: android-arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
+        with:
+          global-json-file: global.json
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: microsoft
+          java-version: '21'
+      - run: dotnet workload install android --skip-manifest-update
+      - run: >-
+          dotnet build CistaNAS.Mobile/CistaNAS.Mobile.csproj
+          -c ${{ matrix.configuration }} -r ${{ matrix.runtime }}
+          -p:AndroidSdkDirectory="$ANDROID_HOME" -p:JavaSdkDirectory="$JAVA_HOME"
+          -p:AcceptAndroidSdkLicenses=true

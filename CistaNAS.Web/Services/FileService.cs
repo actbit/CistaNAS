@@ -18,7 +18,7 @@ namespace CistaNAS.Web.Services;
 /// <remarks>
 /// <para>ボリューム内のファイル管理方式：</para>
 /// <para>
-/// - volume.dat の暗号化ストリームの末尾にファイルデータを追記
+/// - volume.dat の暗号化ストリーム内の空き領域に新しい世代を保存
 /// - catalog.json（同じディレクトリに平文で保存、アクセス制御で保護）に
 ///   ファイル名→オフセット/長さのマッピングを保持
 /// - ジャーナルで書き込み前後の一貫性を保証
@@ -142,7 +142,7 @@ public sealed class FileService
 
     /// <summary>
     /// 新しい領域に完全な内容を構築し、フラッシュ後にカタログを切り替える。
-    /// 本文不足・キャンセル・保存失敗時にも既存領域は変更しない。
+    /// 空き領域はカタログから判定し、本文不足・キャンセル・保存失敗時にも既存領域は変更しない。
     /// PATCH の拡張が隣接ファイルを上書きしたり、その内容を隙間として公開することも防ぐ。
     /// </summary>
     private async Task<FileMetadata> WriteLocalAsync(string volumeName, string fileName, long offset,
@@ -174,12 +174,15 @@ public sealed class FileService
                 var streamLock = _streamLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
                 await streamLock.WaitAsync(ct);
                 byte[] buffer = new byte[81920];
-                long newOffset = stream.Length;
+                long originalStreamLength = stream.Length;
                 bool publicationStarted = false;
                 try
                 {
                     long oldLength = patch ? existing?.Length ?? 0 : 0;
                     long newLength = contentLength == 0 ? 0 : Math.Max(oldLength, checked(offset + contentLength));
+                    // 現行カタログの全領域（置換対象も含む）を避け、空き領域に新世代を作る。
+                    // 旧世代はカタログ公開まで保持するため、失敗時にも既存データを壊さない。
+                    long newOffset = FindFreeLocalExtent(catalog, newLength);
 
                     // 同一ストリームなので読み取りと書き込みの位置を各回明示する。
                     for (long copied = 0; copied < oldLength;)
@@ -237,6 +240,8 @@ public sealed class FileService
                         }
                         catch (IOException) { /* 新世代は保存済み。旧領域の消去はベストエフォート。 */ }
                     }
+                    try { TrimLocalTail(stream, catalog); stream.Flush(); }
+                    catch (IOException) { /* 保存は確定済み。容量回収は次回更新・削除でも行う。 */ }
                     await _journalService.CommitAsync(volumeName, opId, ct);
                     return meta;
                 }
@@ -246,7 +251,7 @@ public sealed class FileService
                     // カタログ保存を開始した後は公開の成否が不明なため切り詰めない。
                     if (!publicationStarted)
                     {
-                        try { stream.SetLength(newOffset); stream.Flush(); }
+                        try { stream.SetLength(originalStreamLength); stream.Flush(); }
                         catch (IOException) { /* 元の失敗を保持する。旧領域は変更していない。 */ }
                     }
                     throw;
@@ -262,6 +267,27 @@ public sealed class FileService
                 catLock.Release();
             }
         }
+    }
+
+    private static long FindFreeLocalExtent(FileCatalog catalog, long requiredLength)
+    {
+        long candidate = 0;
+        foreach (var file in catalog.Files.Values.Where(f => f.Length > 0).OrderBy(f => f.Offset))
+        {
+            if (file.Offset < 0 || file.Length < 0)
+                throw new FileServiceException("カタログのファイル領域が不正です。");
+            if (file.Offset >= candidate && file.Offset - candidate >= requiredLength)
+                return candidate;
+            candidate = Math.Max(candidate, checked(file.Offset + file.Length));
+        }
+        return candidate;
+    }
+
+    private static void TrimLocalTail(Stream stream, FileCatalog catalog)
+    {
+        long lastUsed = catalog.Files.Values.Where(f => f.Length > 0)
+            .Select(f => checked(f.Offset + f.Length)).DefaultIfEmpty(0).Max();
+        if (lastUsed < stream.Length) stream.SetLength(lastUsed);
     }
 
     private static async Task ClearLocalRangeAsync(Stream stream, long offset, long length, byte[] buffer, CancellationToken ct)
@@ -708,6 +734,17 @@ public sealed class FileService
                     throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
 
                 await SaveCatalogAsync(volumeName, catalog, ct);
+                if (!isChunkMode)
+                {
+                    var (ioGuard, stream, _) = await _volumeService.GetMountedForIoAsync(volumeName, ct);
+                    using (ioGuard)
+                    {
+                        var streamLock = _streamLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+                        await streamLock.WaitAsync(ct);
+                        try { TrimLocalTail(stream, catalog); stream.Flush(); }
+                        finally { streamLock.Release(); }
+                    }
+                }
             }
             finally
             {

@@ -4,6 +4,7 @@ using Amazon.S3;
 using Amazon.S3.Model;
 using Aspire.Hosting.ApplicationModel;
 using CistaNAS.Client.Api;
+using Microsoft.Extensions.Logging;
 
 namespace CistaNAS.Tests;
 
@@ -34,6 +35,7 @@ public class MinIOFixture : IAsyncLifetime
         // ENABLE_MINIO=true を渡して AppHost を起動 → AppHost 側で MinIO コンテナが立ち上がる
         var builder = await DistributedApplicationTestingBuilder
             .CreateAsync<Projects.CistaNAS_AppHost>(args: ["--ENABLE_MINIO", "true"]);
+        builder.Services.AddLogging(logging => logging.AddConsole().SetMinimumLevel(LogLevel.Information));
 
         // webfrontend の DataRoot とバケット名をテスト用に上書き
         var proj = builder.Resources
@@ -48,7 +50,14 @@ public class MinIOFixture : IAsyncLifetime
             .WithEnvironment("CistaNas__Auth__ApiRateLimitPerMinute", "100000");
 
         _app = await builder.BuildAsync();
-        await _app.StartAsync();
+        // A cold source build takes longer than starting CI's prebuilt image.
+        var startupTimeout = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("MINIO_IMAGE"))
+            ? TimeSpan.FromMinutes(10)
+            : TimeSpan.FromMinutes(2);
+        using var startup = new CancellationTokenSource(startupTimeout);
+        await _app.StartAsync(startup.Token);
+        await _app.Services.GetRequiredService<ResourceNotificationService>()
+            .WaitForResourceHealthyAsync("minio", startup.Token);
 
         // MinIO の動的エンドポイントを取得してバケット作成
         MinIOEndpoint = _app.GetEndpoint("minio", "s3").ToString();
@@ -104,7 +113,7 @@ public class MinIOFixture : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        Http.Dispose();
+        Http?.Dispose();
         if (_app is not null) await _app.DisposeAsync();
 
         // テスト用データを一括削除

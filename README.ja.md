@@ -104,6 +104,13 @@ dotnet run --project CistaNAS.AppHost
 
 環境変数 `ENABLE_MINIO=true` で Aspire が MinIO コンテナを起動し、webfrontend を S3 バックエンドに自動切替します。デフォルト（未設定）は local ストレージで本番影響なし。
 
+Dockerが必要です。初回は `deploy/minio/Dockerfile` に固定した公式MinIOリリースのコミットから
+開発・テスト用イメージをビルドするため、数分かかる場合があります。[コミュニティ版はソース配布](https://github.com/minio/minio)
+に移行しており、`minio/minio:latest` は使用しません。コンテナテストの前にビルドする場合は
+`docker build -t cistanas-minio:integration-test deploy/minio` を実行し、テストプロセスに
+`MINIO_IMAGE=cistanas-minio:integration-test` を設定します（PowerShellでは
+`$env:MINIO_IMAGE = 'cistanas-minio:integration-test'`）。CIでも先にビルドします。
+
 ```bash
 # 環境変数で指定
 ENABLE_MINIO=true dotnet run --project CistaNAS.AppHost
@@ -112,7 +119,7 @@ ENABLE_MINIO=true dotnet run --project CistaNAS.AppHost
 dotnet run --project CistaNAS.AppHost -- --ENABLE_MINIO true
 ```
 
-MinIO コンソール: `http://localhost:9001`（認証: `minioadmin` / `minioadmin`）
+MinIOコンソールはAspireダッシュボードに表示されるエンドポイントから開きます（認証: `minioadmin` / `minioadmin`）。
 
 ### 個別起動（Aspire なし）
 
@@ -277,6 +284,20 @@ Download → S3 GET → ChunkedReadStream（Seekable + Range 対応）
 - **サーバー侵害でも安全** — 暗号化済みデータとラップ済み鍵しか漏洩しない
 - **パスワード紛失時は復旧不可能** — クライアント側でのみ鍵を保持
 
+### E2EE共有解除の保証と制限
+
+共有解除後はサーバーへのアクセスを拒否し、共有v2では残るメンバー向けに新しいGroupKeyを発行します。
+**ファイル鍵の再ラップはDEKの交換ではありません。** 既存ファイルのDEKは同じなので、旧メンバーが
+DEK（または旧GroupKeyと旧ラップ）を保存していた場合、別経路で入手した更新後の暗号文も復号できます。
+epochやAADの変更だけでは、このアクセスを防げません。過去に取得した平文・暗号文も取り消せません。
+
+更新後の内容を旧メンバーから暗号学的に分離するには、**新しいファイルID・ランダムなDEK・ソルト**で
+全体を再暗号化し、保存完了と内容確認の後に元ファイルを削除する必要があります。ブラウザー・Androidの
+組み込みアップロードは新しいファイルを作成しますが、Dokanで既存ファイルを編集してもDEKは交換されません。
+旧v1形式では公開ソルトと同じマスターキーからファイル鍵を導出するため、マスターキーを保持する旧メンバーは
+新規アップロードも復号できます。置換ファイルをアップロードする前に共有v2への移行が必要です。
+既存ファイルのDEKを自動かつ原子的に交換する機能は未実装です。APIのrevokeだけではGroupKeyも交換されません。
+
 ## メディアストリーミング
 
 ブラウザでの動画・音声・画像のプレビューに対応。
@@ -421,7 +442,33 @@ kubectl create secret generic cistanas-secrets \
 | `azure` | `managed-premium` (20Gi) | Azure Blob | Application Gateway |
 | `gcp` | `pd-ssd` (20Gi) | GCS | GCE (静的 IP) |
 
+## DB復旧と更新時の容量・I/O
+
+クラウドSQLiteは単一インスタンス専用です。ローカルDBとWALは永続ボリューム上の
+`Storage:VolumeDataPath` に保存してください。SQLiteのbackup APIでWALのコミットを含む整合した
+スナップショットを作り、`Database:SyncIntervalSeconds`（既定30秒）ごとに同期・失敗時の再試行を行います。
+アップロードは直列化し、再起動時に既存ローカルDBを再送します。ダウンロードは原子的に反映し、
+終了・キャンセル・Dispose後もローカル復旧元を保持します。
+
+一時ディレクトリへのフォールバックではコンテナ・ホストの交換に耐えられません。同期成功前にローカル
+ボリュームを失えば最近の変更が失われる可能性があります。オブジェクトストレージは非同期の複製先です。
+重要データには別バックアップを用意し、強い耐久性や複数インスタンスが必要ならPostgreSQLを使用してください。
+同じクラウドSQLiteオブジェクトに複数のプロセスから書き込んではいけません。
+
+ローカル部分更新は、全体を別領域へ保存してからカタログを切り替えます。空き領域の再利用と、更新・削除後の
+不要な末尾の切り詰めにより、同じサイズの繰り返し更新による容量増加を抑えます。更新中は単一ファイルでも
+約2倍の容量が必要になり、空き領域の断片化や他ファイルによってはさらに必要です。コピー・旧領域の消去には
+ファイル全体に比例するI/Oが残ります。16 MiBファイルの反復更新テストで時間と物理容量を記録します。
+汎用的なオンライン圧縮・差分に比例するI/Oへの変更は未実装です。
+
 ## テスト
+
+GitHub ActionsでPR・masterへのpush時に、Windowsのサーバー／クライアントテスト、Chromiumのブラウザー
+テスト、LinuxのMinIO／PostgreSQL統合テスト、Android Debug x64／Release arm64ビルドを実行します。
+TRX結果を成果物として保存します。実DokanドライバテストはドライバのあるWindows環境で実行するため、
+ホスト型CIから除外します。AndroidのネイティブViewerには端末・エミュレーターが必要です
+（`CistaNAS.Mobile/Testing/README.md` を参照）。同一checkoutではWebビルドがWASM出力を共有するため、
+テストプロジェクトのビルドを順番に行います。
 
 ```bash
 dotnet test

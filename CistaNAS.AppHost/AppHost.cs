@@ -10,7 +10,12 @@ var web = builder.AddProject<Projects.CistaNAS_Web>("webfrontend")
 // デフォルトは local ストレージで本番影響なし。テストやローカル S3 検証で有効化。
 if (string.Equals(builder.Configuration["ENABLE_MINIO"], "true", StringComparison.OrdinalIgnoreCase))
 {
-    var minio = builder.AddContainer("minio", "minio/minio:latest")
+    // Official community binaries are no longer distributed. Build pinned source
+    // by default; CI can supply the same prebuilt local image before its startup deadline.
+    var minioImage = builder.Configuration["MINIO_IMAGE"];
+    var minio = (string.IsNullOrWhiteSpace(minioImage)
+        ? builder.AddDockerfile("minio", "../deploy/minio")
+        : builder.AddContainer("minio", minioImage))
         .WithHttpEndpoint(targetPort: 9000, name: "s3")
         .WithHttpEndpoint(targetPort: 9001, name: "console")
         .WithEnvironment("MINIO_ROOT_USER", "minioadmin")

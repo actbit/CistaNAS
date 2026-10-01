@@ -3,11 +3,106 @@ using CistaNAS.Web.Journal;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
+using Xunit.Abstractions;
 
 namespace CistaNAS.Tests;
 
-public sealed class FileServiceIntegrityTests
+public sealed class FileServiceIntegrityTests(ITestOutputHelper output)
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RepeatedLocalPatches_ReuseFreeExtents_AndBoundPhysicalSize(bool encrypted)
+    {
+        await using var fixture = await Fixture.CreateAsync(false, encrypted);
+        byte[] expected = Enumerable.Repeat((byte)0xA5, 512 * 1024).ToArray();
+        await fixture.UploadAsync("large.bin", expected);
+        for (int i = 0; i < 8; i++)
+        {
+            expected[100 + i] = (byte)i;
+            await fixture.Files.PatchRangeAsync(fixture.Volume, "large.bin", 100 + i,
+                new MemoryStream(new[] { (byte)i }), 1);
+            Assert.True(fixture.PhysicalLength <= 2L * expected.Length);
+        }
+        Assert.Equal(expected, await fixture.ReadAsync("large.bin"));
+        await fixture.RemountAsync();
+        Assert.Equal(expected, await fixture.ReadAsync("large.bin"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DeleteLocalFiles_ReclaimsTail_WithoutTruncatingNeighbor(bool encrypted)
+    {
+        await using var fixture = await Fixture.CreateAsync(false, encrypted);
+        await fixture.UploadAsync("first.bin", new byte[4096]);
+        byte[] neighbor = Enumerable.Repeat((byte)0xDA, 8192).ToArray();
+        await fixture.UploadAsync("neighbor.bin", neighbor);
+        await fixture.Files.DeleteAsync(fixture.Volume, "first.bin");
+        Assert.Equal(neighbor, await fixture.ReadAsync("neighbor.bin"));
+        await fixture.Files.DeleteAsync(fixture.Volume, "neighbor.bin");
+        Assert.Equal(0, fixture.PhysicalLength);
+        await fixture.UploadAsync("recreated.bin", neighbor);
+        Assert.Equal(neighbor.Length, fixture.PhysicalLength);
+        Assert.Equal(neighbor, await fixture.ReadAsync("recreated.bin"));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task FailedWriteIntoFreeExtent_DoesNotTruncateLiveFiles(bool encrypted, bool cancel)
+    {
+        await using var fixture = await Fixture.CreateAsync(false, encrypted);
+        await fixture.UploadAsync("hole.bin", new byte[32768]);
+        byte[] neighbor = Enumerable.Repeat((byte)0xDA, 8192).ToArray();
+        await fixture.UploadAsync("neighbor.bin", neighbor);
+        await fixture.Files.DeleteAsync(fixture.Volume, "hole.bin");
+        using var cancellation = new CancellationTokenSource();
+        if (cancel)
+        {
+            using var interrupted = new CancelAfterReadStream(new byte[12000], cancellation);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => fixture.Files.UploadAsync(
+                fixture.Volume, "failed.bin", interrupted, 12000, cancellation.Token));
+        }
+        else
+        {
+            using var interrupted = new InterruptedStream(new byte[12000]);
+            await Assert.ThrowsAsync<IOException>(() => fixture.Files.UploadAsync(
+                fixture.Volume, "failed.bin", interrupted, 12000));
+        }
+        Assert.Equal(neighbor, await fixture.ReadAsync("neighbor.bin"));
+        await fixture.RemountAsync();
+        Assert.Equal(neighbor, await fixture.ReadAsync("neighbor.bin"));
+        await fixture.UploadAsync("replacement.bin", new byte[16000]);
+        Assert.True(fixture.PhysicalLength <= 40960);
+        Assert.Equal(neighbor, await fixture.ReadAsync("neighbor.bin"));
+    }
+
+    [Theory]
+    [Trait("Category", "Performance")]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LargeLocalPartialUpdates_ReportCost_AndKeepStorageBounded(bool encrypted)
+    {
+        await using var fixture = await Fixture.CreateAsync(false, encrypted);
+        byte[] expected = Enumerable.Repeat((byte)0xA5, 16 * 1024 * 1024).ToArray();
+        await fixture.UploadAsync("large.bin", expected);
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < 4; i++)
+        {
+            int offset = i * (expected.Length / 4);
+            expected[offset] = (byte)i;
+            await fixture.Files.PatchRangeAsync(fixture.Volume, "large.bin", offset,
+                new MemoryStream(new[] { (byte)i }), 1);
+        }
+        timer.Stop();
+        output.WriteLine($"Encrypted={encrypted}; FileBytes={expected.Length}; Patches=4; ElapsedMs={timer.ElapsedMilliseconds}; PhysicalBytes={fixture.PhysicalLength}");
+        Assert.True(fixture.PhysicalLength <= 2L * expected.Length);
+        Assert.Equal(expected, await fixture.ReadAsync("large.bin"));
+    }
+
     [Theory]
     [InlineData(false, false)]
     [InlineData(false, true)]
@@ -264,6 +359,7 @@ public sealed class FileServiceIntegrityTests
         public string Volume { get; } = "integrity-" + Guid.NewGuid().ToString("N");
         public FileService Files { get; }
         public FaultStorage Storage { get; }
+        public long PhysicalLength => new FileInfo(Path.Combine(_root, Volume, "volume.dat")).Length;
 
         private Fixture(bool chunked)
         {

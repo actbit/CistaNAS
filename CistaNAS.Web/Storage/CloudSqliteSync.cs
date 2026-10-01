@@ -1,6 +1,9 @@
 using CistaNAS.Web.Configuration;
+using System.Data.Common;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CistaNAS.Web.Storage;
 
@@ -10,20 +13,26 @@ namespace CistaNAS.Web.Storage;
 /// ローカル DB は VolumeDataPath 配下に保存し、コンテナ再起動後も
 /// 次回 DownloadAsync で復旧可能にする。
 /// VolumeDataPath が未設定の場合はテンポラリファイルにフォールバック。
-/// IHostedService を実装し、シャットダウン時に非同期でアップロードする。
+/// SQLite backup API で WAL を含む整合したスナップショットを定期同期する。
+/// ローカル DB は同期成否にかかわらず復旧元として保持する。
 /// </summary>
-public sealed class CloudSqliteSync : IHostedService, IDisposable
+public sealed class CloudSqliteSync : BackgroundService
 {
     private readonly IStorageProvider _storage;
     private readonly string _blobKey;
     private readonly string _localPath;
-    private readonly bool _isTemp;
+    private readonly SemaphoreSlim _syncGate = new(1, 1);
+    private readonly TimeSpan _interval;
+    private readonly ILogger<CloudSqliteSync> _logger;
     private int _dirty; // 0 = clean, 1 = dirty（Interlocked 用）
 
-    public CloudSqliteSync(IStorageProvider storage, StorageOptions storageOpts, DatabaseOptions dbOpts)
+    public CloudSqliteSync(IStorageProvider storage, StorageOptions storageOpts, DatabaseOptions dbOpts,
+        ILogger<CloudSqliteSync>? logger = null)
     {
         _storage = storage;
         _blobKey = dbOpts.BlobKey ?? "cista.db";
+        _interval = TimeSpan.FromSeconds(Math.Max(1, dbOpts.SyncIntervalSeconds));
+        _logger = logger ?? NullLogger<CloudSqliteSync>.Instance;
 
         // VolumeDataPath が設定されていれば永続パスに保存（ボリュームマウント対応）。
         // 未設定時はテンポラリファイルにフォールバック。
@@ -32,7 +41,6 @@ public sealed class CloudSqliteSync : IHostedService, IDisposable
         {
             Directory.CreateDirectory(volDataPath);
             _localPath = Path.Combine(volDataPath, _blobKey);
-            _isTemp = false;
         }
         else
         {
@@ -40,10 +48,11 @@ public sealed class CloudSqliteSync : IHostedService, IDisposable
             // シャットダウン時のアップロード失敗から次回起動で復旧できるよう、
             // 毎回新しい空ファイルを作らずパスごとのファイルを維持する。
             _localPath = Path.Combine(Path.GetTempPath(), _blobKey);
-            _isTemp = true;
         }
 
-        _dirty = 0;
+        Directory.CreateDirectory(Path.GetDirectoryName(_localPath)!);
+        // Dirty のメモリ状態は再起動で失われる。既存のローカル DB は必ず再送する。
+        _dirty = File.Exists(_localPath) ? 1 : 0;
     }
 
     public string LocalDbPath => _localPath;
@@ -56,13 +65,30 @@ public sealed class CloudSqliteSync : IHostedService, IDisposable
     /// </remarks>
     public async Task DownloadAsync(CancellationToken ct = default)
     {
-        if (File.Exists(_localPath)) return;
-
-        byte[]? data = await _storage.ReadAsync(_blobKey, ct);
-        if (data is not null)
-            await File.WriteAllBytesAsync(_localPath, data, ct);
-        else
-            await File.WriteAllBytesAsync(_localPath, [], ct);
+        await _syncGate.WaitAsync(ct);
+        try
+        {
+            if (!File.Exists(_localPath))
+            {
+                byte[]? data = await _storage.ReadAsync(_blobKey, ct);
+                string temporary = _localPath + ".download-" + Guid.NewGuid().ToString("N");
+                try
+                {
+                    await using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                    {
+                        await file.WriteAsync(data ?? [], ct);
+                        await file.FlushAsync(ct);
+                        file.Flush(flushToDisk: true);
+                    }
+                    ct.ThrowIfCancellationRequested();
+                    File.Move(temporary, _localPath);
+                }
+                finally { File.Delete(temporary); }
+            }
+            // マイグレーションによる変更も最初の同期に含める。
+            MarkDirty();
+        }
+        finally { _syncGate.Release(); }
     }
 
     /// <summary>変更をマークする。</summary>
@@ -71,36 +97,66 @@ public sealed class CloudSqliteSync : IHostedService, IDisposable
     /// <summary>変更があればオブジェクトストレージにアップロードする。</summary>
     public async Task UploadIfDirtyAsync(CancellationToken ct = default)
     {
-        // アップロード開始時に dirty を引き取る。処理中に新しい変更が発生した場合は
-        // MarkDirty が再び 1 にするため、次回の同期対象として残る。
-        if (Interlocked.Exchange(ref _dirty, 0) == 0) return;
+        await _syncGate.WaitAsync(ct);
+        string? snapshot = null;
         try
         {
-            await using var fs = File.OpenRead(_localPath);
-            await _storage.WriteAtomicAsync(_blobKey, fs, ct);
+            // 処理中の MarkDirty は次回の同期対象として残る。
+            if (Interlocked.Exchange(ref _dirty, 0) == 0) return;
+            try
+            {
+                snapshot = _localPath + ".snapshot-" + Guid.NewGuid().ToString("N");
+                // DB ファイルを直接コピーすると WAL のコミットを落とし、書き込み中の
+                // ページを混在させる。backup API は整合した単一 DB を生成する。
+                await Task.Run(() => CreateSnapshot(snapshot, ct), ct);
+                await using var fs = File.OpenRead(snapshot);
+                await _storage.WriteAtomicAsync(_blobKey, fs, ct);
+            }
+            catch
+            {
+                Interlocked.Exchange(ref _dirty, 1);
+                throw;
+            }
         }
-        catch
+        finally
         {
-            // 失敗した変更を次のリトライで必ず再送する。
-            Interlocked.Exchange(ref _dirty, 1);
-            throw;
+            try { if (snapshot is not null) File.Delete(snapshot); }
+            finally { _syncGate.Release(); }
         }
     }
 
-    private int _disposed;
-
-    public void Dispose()
+    private void CreateSnapshot(string snapshot, CancellationToken ct)
     {
-        if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
-        // テンポラリパスのみ削除。VolumeDataPath 配下のファイルは永続データとして保持。
-        if (_isTemp)
-            try { File.Delete(_localPath); } catch (IOException) { }
+        ct.ThrowIfCancellationRequested();
+        using var source = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = _localPath, Mode = SqliteOpenMode.ReadWrite, Pooling = false,
+        }.ToString());
+        using var destination = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = snapshot, Pooling = false,
+        }.ToString());
+        source.Open();
+        destination.Open();
+        source.BackupDatabase(destination);
+        ct.ThrowIfCancellationRequested();
     }
 
-    public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
-
-    public async Task StopAsync(CancellationToken ct)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try { await UploadIfDirtyAsync(stoppingToken); }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
+            catch (Exception ex) { _logger.LogError(ex, "SQLite のクラウド同期に失敗しました。ローカル DB を保持し、再試行します。"); }
+            try { await Task.Delay(_interval, stoppingToken); }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
+        }
+    }
+
+    public override async Task StopAsync(CancellationToken ct)
+    {
+        await base.StopAsync(ct);
         // シャットダウン時の DB アップロードを確実化（リトライ付き）。
         // 失敗してもローカルファイルは保持し、次回起動の DownloadAsync で
         // ローカルが優先されることで DB 変更の消失を防ぐ。
@@ -125,12 +181,22 @@ public sealed class CloudSqliteSync : IHostedService, IDisposable
         }
 
         if (lastError is not null)
-            Console.Error.WriteLine($"[Error] Cloud sync upload failed during shutdown: {lastError.Message}");
+            _logger.LogError(lastError, "シャットダウン時の SQLite 同期に失敗しました。次回起動でローカル DB を再送します。");
+        // Dispose / キャンセル後もローカル DB と WAL を削除しない。
+    }
+}
 
-        // アップロード成功時のみテンポラリファイルを削除（クラウドが最新のため）。
-        // 永続ファイルは Dispose で削除されない。失敗時はテンポラリも保持し次回起動で復旧。
-        if (_isTemp && lastError is null)
-            Dispose();
+/// <summary>明示的トランザクションは SaveChanges 後に確定するため、コミット時も再送対象にする。</summary>
+public sealed class CloudSqliteTransactionInterceptor(CloudSqliteSync sync) : DbTransactionInterceptor
+{
+    public override void TransactionCommitted(DbTransaction transaction, TransactionEndEventData eventData)
+        => sync.MarkDirty();
+
+    public override Task TransactionCommittedAsync(DbTransaction transaction, TransactionEndEventData eventData,
+        CancellationToken cancellationToken = default)
+    {
+        sync.MarkDirty();
+        return Task.CompletedTask;
     }
 }
 

@@ -104,6 +104,13 @@ On first launch you will be redirected to `/setup` to create the admin user.
 
 Setting the `ENABLE_MINIO=true` environment variable makes Aspire start a MinIO container and automatically switch the webfrontend to the S3 backend. The default (unset) uses local storage with no production impact.
 
+Docker is required. The first launch builds the development/test image from the fixed official
+MinIO release commit in `deploy/minio/Dockerfile` and can take several minutes. The [community
+distribution is source-only](https://github.com/minio/minio); `minio/minio:latest` is no longer used.
+To build before running container tests, run `docker build -t cistanas-minio:integration-test deploy/minio`
+and set `MINIO_IMAGE=cistanas-minio:integration-test` for the test process (PowerShell:
+`$env:MINIO_IMAGE = 'cistanas-minio:integration-test'`). CI performs this build explicitly.
+
 ```bash
 # Via environment variable
 ENABLE_MINIO=true dotnet run --project CistaNAS.AppHost
@@ -112,7 +119,7 @@ ENABLE_MINIO=true dotnet run --project CistaNAS.AppHost
 dotnet run --project CistaNAS.AppHost -- --ENABLE_MINIO true
 ```
 
-MinIO console: `http://localhost:9001` (credentials: `minioadmin` / `minioadmin`)
+Open the MinIO console endpoint shown in the Aspire dashboard (credentials: `minioadmin` / `minioadmin`).
 
 ### Standalone launch (without Aspire)
 
@@ -341,8 +348,19 @@ GroupKey (32B, one per epoch, generated on the client)
 
 - Revocation is **not retroactive**: a removed member may have already downloaded/decrypted
   data while they had access. CistaNAS cannot undo that
-- After revocation the removed member cannot read **new or migrated** data (new epoch GroupKey
-  was never given to them and their key entries are gone)
+- The server denies the removed member further API access. A fresh file created with a new
+  random DEK under the new GroupKey is cryptographically isolated from the removed member.
+- **Re-wrapping is not file-key rotation.** Existing files keep the same DEK. A removed member
+  who cached that DEK (or the old GroupKey and old file-key wrap) can still decrypt later
+  ciphertext updates to that file if they obtain the ciphertext through another route.
+  Changing the epoch/AAD or wrapping the same DEK again does not prevent this.
+- To isolate later content, remaining members must create a **new file ID, random DEK and salt**,
+  re-encrypt the entire file, and only remove the original after the new file is finalized and
+  verified. Re-upload through the built-in browser/Android upload creates a new file identity;
+  editing an existing file through Dokan does not replace its DEK. Legacy v1 volumes reuse the
+  shared master key to derive file keys from public salts, so a fresh v1 upload is also readable with a cached
+  master key: promote to shared v2 before uploading the replacement. Automatic atomic rekeying
+  of existing files is not implemented. Cached plaintext and older ciphertext cannot be revoked.
 - Remaining members **keep read access to pre-revocation files** (old epochs stay readable);
   this is intentional so a revoke never destroys the owner's history
 - The `revoke` API alone (without rotation) only removes server-side key entries — on v2
@@ -512,7 +530,36 @@ Overlay configuration:
 | `azure` | `managed-premium` (20Gi) | Azure Blob | Application Gateway |
 | `gcp` | `pd-ssd` (20Gi) | GCS | GCE (static IP) |
 
+## Database recovery and update costs
+
+Cloud SQLite is a **single-instance** configuration. Its local DB and WAL must be on a durable
+`Storage:VolumeDataPath` volume. The server uploads a consistent SQLite backup (including committed
+WAL data) every `Database:SyncIntervalSeconds` (default 30), retries failures, serializes uploads,
+and resends an existing local DB after restart even without a further application write.
+Downloaded DBs are installed atomically. Shutdown and disposal retain the local recovery copy.
+The temporary-directory fallback cannot survive container/host replacement: losing the local
+volume before a successful sync can still lose recent changes. Object storage is an asynchronous
+replica, not a transactional database or an independent backup. Use PostgreSQL and separate backups
+when stronger durability or multiple instances are needed; never start multiple writers on one
+cloud SQLite object.
+
+Local partial writes stage a complete file generation before publishing its catalog entry. Free
+extents are reused and unused tails are truncated after successful publication/deletion, limiting
+growth from repeated same-size updates. One unchanged-size file can still need roughly twice its
+size during an update; fragmented free space and concurrent files can require more. Copying and
+clearing remain proportional to full file size, so a one-byte PATCH has full-file I/O cost.
+`FileServiceIntegrityTests.LargeLocalPartialUpdates_ReportCost_AndKeepStorageBounded` records elapsed
+time and physical size for repeated 16 MiB updates without imposing hardware-dependent timing limits.
+General online compaction and proportional-I/O local patches are not implemented.
+
 ## Tests
+
+The GitHub Actions workflow runs on PRs and master pushes: Windows service/client tests, Chromium
+browser tests, Linux MinIO/PostgreSQL integration tests, and Android Debug x64/Release arm64 builds.
+Test results are retained as TRX artifacts. Actual Dokan driver tests require a Windows host with
+the driver installed and are excluded from hosted CI; native Android viewer tests require a device
+or emulator (see `CistaNAS.Mobile/Testing/README.md`). CI builds test projects sequentially within
+each checkout because the Web build publishes WASM into a shared output directory.
 
 ```bash
 dotnet test
