@@ -10,7 +10,7 @@ using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
 
-public class E2eeFileTests : IAsyncDisposable
+public partial class E2eeFileTests : IAsyncDisposable
 {
     private readonly string _dataRoot;
     private readonly IServiceProvider _sp;
@@ -233,6 +233,29 @@ public class E2eeFileTests : IAsyncDisposable
         var e2eeFs = GetE2eeFileService();
         await Assert.ThrowsAsync<FileServiceException>(() =>
             e2eeFs.DeleteFileAsync(vol, "nonexistent-id"));
+    }
+
+    [Fact]
+    public async Task DeletingFile_DoesNotWaitForOtherVolumeWithSameFileId()
+    {
+        string first = await MountE2eeAsync("gate-first");
+        string second = await MountE2eeAsync("gate-second");
+        string sharedId = Guid.NewGuid().ToString("N");
+        var service = GetE2eeFileService();
+        foreach (string vol in new[] { first, second })
+        {
+            await service.CreateFileAsync(vol, new E2eeCreateFileRequest("enc", 100, 1), "testuser", preallocatedFileId: sharedId);
+            await service.UploadChunkAsync(vol, sharedId, 0, new MemoryStream(new byte[100]), 100);
+        }
+        var (held, _, _, _) = await service.DownloadChunkAsync(second, sharedId, 0);
+        using (held)
+        using (var stop = new CancellationTokenSource(TimeSpan.FromSeconds(2)))
+        {
+            await service.DeleteFileAsync(first, sharedId, stop.Token);
+            byte[] bytes = new byte[100];
+            await held.ReadExactlyAsync(bytes);
+            Assert.Single((await service.ListFilesAsync(second)).Files);
+        }
     }
 
     private async Task<string> MountE2eeAsync(string name)

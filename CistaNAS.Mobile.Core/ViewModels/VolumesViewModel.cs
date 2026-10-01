@@ -8,7 +8,7 @@ using CistaNAS.Shared.Crypto;
 namespace CistaNAS.Mobile.Core.ViewModels;
 
 /// <summary>ボリューム一覧 + マウント (server / e2ee 両対応)。</summary>
-public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBase
+public sealed partial class VolumesViewModel(AppServices app) : SessionViewModelBase
 {
     public ObservableCollection<VolumeListItem> Volumes { get; } = [];
 
@@ -27,7 +27,12 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
 
     /// <summary>保留中のマウントが E2EE ボリュームか（E2EE Key Password 入力欄の表示制御）。</summary>
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(MountExplanation))]
     private bool _isE2eeMount;
+
+    public string MountExplanation => IsE2eeMount
+        ? "このパスワードで端末内の鍵を復号します。パスワードはサーバーへ送信されません。"
+        : "サーバー側でボリュームを解除するため、パスワードを接続先サーバーへ送信します。";
 
     public override string Title => "ボリューム";
 
@@ -39,8 +44,17 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
 
     public override async void OnNavigatedTo()
     {
+        base.OnNavigatedTo();
         CheckLegacySecureStoreKey();
-        await RunBusyAsync(() => LoadCoreAsync(CancellationToken.None));
+        await RunSessionBusyAsync(() => LoadCoreAsync(CancellationToken.None));
+    }
+
+    public override void OnNavigatedFrom()
+    {
+        base.OnNavigatedFrom();
+        CancelMount();
+        Volumes.Clear();
+        OnPropertyChanged(nameof(HasVolumes));
     }
 
     /// <summary>旧方式の秘密鍵残留を検出したらユーザーに警告する（無言削除はしない）。</summary>
@@ -64,22 +78,27 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
     }
 
     [RelayCommand]
-    private Task RefreshAsync(CancellationToken ct) => RunBusyAsync(() => LoadCoreAsync(ct));
+    private Task RefreshAsync(CancellationToken ct) => RunSessionBusyAsync(() => LoadCoreAsync(ct));
 
     private async Task LoadCoreAsync(CancellationToken ct)
     {
-        List<VolumeListItem> volumes = await app.Session.Api.ListVolumesAsync();
-        Volumes.Clear();
-        foreach (var v in volumes) Volumes.Add(v);
-        OnPropertyChanged(nameof(HasVolumes));
+        using var operation = BeginOperation(app, ct);
+        List<VolumeListItem> volumes = await app.Session.Api.ListVolumesAsync(operation.Cancellation);
+        operation.Commit(() =>
+        {
+            Volumes.Clear();
+            foreach (var v in volumes) Volumes.Add(v);
+            OnPropertyChanged(nameof(HasVolumes));
+        });
     }
 
     /// <summary>ボリュームをタップ。必要ならパスワード入力を出してからファイル一覧へ遷移する。</summary>
     [RelayCommand]
     private void OpenVolume(VolumeListItem volume)
     {
+        CancelMount();
         bool needsKey = IsE2ee(volume)
-            ? !app.E2ee.HasKey(volume.Name)
+            ? !app.E2ee.HasKey(volume.Name) && !app.E2ee.HasV2State(volume.Name)
             : !volume.IsMounted;
         if (needsKey)
         {
@@ -94,10 +113,16 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
     }
 
     [RelayCommand]
-    private void CancelMount() => _pendingMount = null;
+    private void CancelMount()
+    {
+        ConfirmMountCommand.Cancel();
+        _pendingMount = null;
+        IsMountPromptVisible = false;
+        MountPassword = MountE2eePassword = "";
+    }
 
     [RelayCommand]
-    private Task ConfirmMountAsync(CancellationToken ct) => RunBusyAsync(async () =>
+    private Task ConfirmMountAsync(CancellationToken ct) => RunSessionBusyAsync(async () =>
     {
         var volume = _pendingMount;
         if (volume is null)
@@ -105,18 +130,30 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
             IsMountPromptVisible = false;
             return;
         }
-        if (IsE2ee(volume))
-            await MountE2eeAsync(volume, MountPassword, MountE2eePassword, ct);
-        else
-            await MountServerAsync(volume, MountPassword, ct);
-        IsMountPromptVisible = false;
-        _pendingMount = null;
-        app.Navigation.NavigateTo(new FileBrowserViewModel(app, volume));
+        using var operation = BeginOperation(app, ct);
+        string password = MountPassword, e2eePassword = MountE2eePassword;
+        try
+        {
+            if (IsE2ee(volume)) await MountE2eeAsync(volume, password, e2eePassword, operation);
+            else await MountServerAsync(volume, password, operation.Cancellation);
+            operation.Commit(() =>
+            {
+                IsMountPromptVisible = false;
+                _pendingMount = null;
+                MountPassword = MountE2eePassword = "";
+                app.Navigation.NavigateTo(new FileBrowserViewModel(app, volume));
+            });
+        }
+        catch (OperationCanceledException)
+        {
+            if (ReferenceEquals(_pendingMount, volume)) CancelMount();
+            throw;
+        }
     });
 
     private async Task MountServerAsync(VolumeListItem volume, string password, CancellationToken ct)
     {
-        await app.Session.Api.MountVolumeAsync(volume.Name, password);
+        await app.Session.Api.MountVolumeAsync(volume.Name, password, ct);
     }
 
     /// <summary>
@@ -129,18 +166,25 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
     /// 同型のため masterKey としては扱わない)。
     /// サーバー側は作成時に自動マウント済みのことがあるため、未マウント時のみ解除を依頼する。
     /// </summary>
-    private async Task MountE2eeAsync(VolumeListItem volume, string password, string e2eePassword, CancellationToken ct)
+    private async Task MountE2eeAsync(VolumeListItem volume, string password, string e2eePassword,
+        ClientSessionOperation operation)
     {
         string username = app.Settings.Username ?? throw new InvalidOperationException("未ログインです。");
 
         // 共有 v2: 全 epoch の GroupKey wraps を取得してアンラップ
-        var gki = await app.Session.Api.GetGroupKeyInfoAsync(volume.Name);
+        var ct = operation.Cancellation;
+        var gki = await app.Session.Api.GetGroupKeyInfoAsync(volume.Name, ct);
+        operation.EnsureCurrent();
         if (gki is not null && gki.KeyEpoch >= 1)
         {
+            WrappedKeyInfo wk = await app.Session.Api.GetWrappedKeyAsync(volume.Name, username, ct);
+            operation.EnsureCurrent();
             byte[] privateKey = (await app.EcdhKeys.DeriveVerifiedAsync(app.Session.Api, username, e2eePassword)).PrivateKeySec1;
             var groupKeys = new Dictionary<int, byte[]>();
+            byte[]? masterKey = null;
             try
             {
+                operation.EnsureCurrent();
                 foreach (var wrap in gki.MyGroupKeys)
                 {
                     if (wrap.EphemeralPublicKey is null) continue;
@@ -157,31 +201,32 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
                 if (groupKeys.Count == 0)
                     throw new InvalidOperationException(
                         "共有 v2 の GroupKey を復号できませんでした（この共有から削除された可能性があります）。");
-                app.E2ee.StoreV2State(volume.Name, gki.VolumeId, groupKeys);
+                // Do not publish a partial unlock if owner authentication or
+                // the remote mount fails after group-key recovery.
+                bool passwordWrap = wk.WrapType is null || string.Equals(wk.WrapType, "password", StringComparison.Ordinal);
+                if (passwordWrap && string.Equals(volume.OwnerUser, username, StringComparison.OrdinalIgnoreCase))
+                    masterKey = app.E2ee.UnwrapMasterKey(username, password, wk, null);
+                if (!volume.IsMounted)
+                    await app.Session.Api.MountAsync(volume.Name, ct);
+                operation.Commit(() =>
+                {
+                    ct.ThrowIfCancellationRequested();
+                    app.E2ee.StoreV2State(volume.Name, gki.VolumeId, groupKeys, wk.ChunkSize);
+                    if (masterKey is not null) app.E2ee.StoreKey(volume.Name, masterKey, wk.ChunkSize);
+                });
             }
             finally
             {
+                if (masterKey is not null) Array.Clear(masterKey);
                 foreach (byte[] groupKey in groupKeys.Values) Array.Clear(groupKey);
                 Array.Clear(privateKey);
             }
-
-            // オーナー + password wrap の場合のみ masterKey も復元（残置 v1 ファイルの読み取り用）
-            WrappedKeyInfo wk = await app.Session.Api.GetWrappedKeyAsync(volume.Name, username);
-            bool passwordWrap = wk.WrapType is null || string.Equals(wk.WrapType, "password", StringComparison.Ordinal);
-            if (passwordWrap && string.Equals(volume.OwnerUser, username, StringComparison.OrdinalIgnoreCase))
-            {
-                byte[] masterKey = app.E2ee.UnwrapMasterKey(username, password, wk, null);
-                try { app.E2ee.StoreKey(volume.Name, masterKey, wk.ChunkSize); }
-                finally { Array.Clear(masterKey); }
-            }
-
-            if (!volume.IsMounted)
-                await app.Session.Api.MountAsync(volume.Name);
             return;
         }
 
         // v1 パス (従来方式)
-        WrappedKeyInfo wkV1 = await app.Session.Api.GetWrappedKeyAsync(volume.Name, username);
+        WrappedKeyInfo wkV1 = await app.Session.Api.GetWrappedKeyAsync(volume.Name, username, ct);
+        operation.EnsureCurrent();
 
         byte[] masterKeyV1;
         if (string.Equals(wkV1.WrapType, "ecdh", StringComparison.Ordinal))
@@ -191,6 +236,7 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
             byte[] privateKey = (await app.EcdhKeys.DeriveVerifiedAsync(app.Session.Api, username, e2eePassword)).PrivateKeySec1;
             try
             {
+                operation.EnsureCurrent();
                 masterKeyV1 = app.E2ee.UnwrapMasterKey(username, null, wkV1, privateKey);
             }
             finally
@@ -206,8 +252,12 @@ public sealed partial class VolumesViewModel(AppServices app) : BusyViewModelBas
         try
         {
             if (!volume.IsMounted)
-                await app.Session.Api.MountAsync(volume.Name);
-            app.E2ee.StoreKey(volume.Name, masterKeyV1, wkV1.ChunkSize);
+                await app.Session.Api.MountAsync(volume.Name, ct);
+            operation.Commit(() =>
+            {
+                ct.ThrowIfCancellationRequested();
+                app.E2ee.StoreKey(volume.Name, masterKeyV1, wkV1.ChunkSize);
+            });
         }
         finally { Array.Clear(masterKeyV1); }
     }

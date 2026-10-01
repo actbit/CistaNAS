@@ -13,18 +13,30 @@ internal sealed class AsyncFileGate : IDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     // ライターに「全リーダー完了」を即時通知する TCS
     private TaskCompletionSource<object?>? _readersCompletedTcs;
-    private bool _disposed;
+    private int _disposed;
+    private readonly CancellationTokenSource _closing = new();
+    private readonly CancellationToken _closingToken;
+
+    public AsyncFileGate() => _closingToken = _closing.Token;
 
     /// <summary>読み取りロックを取得。並行読み取り可。戻り値の IDisposable で解放。</summary>
     public async Task<IDisposable> EnterReadAsync(CancellationToken ct)
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _closingToken);
+        ct = linked.Token;
         // ライター待機中は新規リーダーの入場をブロック（スタベーション防止）
         while (true)
         {
             await _gate.WaitAsync(ct);
+            if (ct.IsCancellationRequested)
+            {
+                _gate.Release();
+                ct.ThrowIfCancellationRequested();
+            }
             if (Volatile.Read(ref _writerWaiting) == 0)
             {
-                _readerCount++;
+                Interlocked.Increment(ref _readerCount);
                 _gate.Release();
                 return new ReadReleaser(this);
             }
@@ -36,6 +48,9 @@ internal sealed class AsyncFileGate : IDisposable
     /// <summary>書き込みロックを取得。全読み取りの完了を即時通知で待機。戻り値の IDisposable で解放。</summary>
     public async Task<IDisposable> EnterWriteAsync(CancellationToken ct)
     {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _closingToken);
+        ct = linked.Token;
         // ライターは _gate を取得したまま全リーダーの完了を待つ（ライター間を直列化）。
         // かつて待機前に _gate を Release していたため、複数ライターが同時に待機して
         // _readersCompletedTcs を上書きし、先のライターが永久スタックするハングがあった。
@@ -46,6 +61,7 @@ internal sealed class AsyncFileGate : IDisposable
         {
             await _gate.WaitAsync(ct);
             gateHeld = true;
+            ct.ThrowIfCancellationRequested();
             Volatile.Write(ref _writerWaiting, 1);
             writerWaitingSet = true;
 
@@ -76,6 +92,7 @@ internal sealed class AsyncFileGate : IDisposable
                 }
             }
             _readersCompletedTcs = null;
+            ct.ThrowIfCancellationRequested();
             // _gate の所有権を WriteReleaser に移譲（ExitWrite で解放）
             gateHeld = false;
             return new WriteReleaser(this);
@@ -105,10 +122,12 @@ internal sealed class AsyncFileGate : IDisposable
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        _readersCompletedTcs?.TrySetCanceled();
-        _gate.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        _closing.Cancel();
+        _closing.Dispose();
+        // A held writer must still be able to release the semaphore. Disposing
+        // SemaphoreSlim also leaves queued WaitAsync calls pending indefinitely.
+        // It has no OS handle here and is collected after the final lease exits.
     }
 
     private sealed class ReadReleaser(AsyncFileGate gate) : IDisposable

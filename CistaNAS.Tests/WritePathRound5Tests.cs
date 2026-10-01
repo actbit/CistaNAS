@@ -107,10 +107,12 @@ public class WritePathRound5Tests
                     if (from >= content.Length)
                         return Task.FromResult(new HttpResponseMessage(HttpStatusCode.RequestedRangeNotSatisfiable));
                     int len = (int)Math.Min(content.Length - from, (r.To ?? content.Length - 1) - from + 1);
-                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                    var response = new HttpResponseMessage(HttpStatusCode.PartialContent)
                     {
                         Content = new ByteArrayContent(content[(int)from..((int)from + len)]),
-                    });
+                    };
+                    response.Content.Headers.ContentRange = new System.Net.Http.Headers.ContentRangeHeaderValue(from, from + len - 1, content.Length);
+                    return Task.FromResult(response);
                 }
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(content) });
             }

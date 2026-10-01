@@ -1,273 +1,224 @@
-// CistaNAS — メディアプレビューヘルパー
-// 通常ボリューム: 短命トークン付きURL → ネイティブストリーミング
-// E2EE ボリューム: MediaSource Extensions でプログレッシブ復号再生
+// Media previews own their requests, decoder buffers and object URLs until
+// replaced or closed. Plaintext is never written to a client file cache.
+(() => {
+    const previews = new WeakMap();
+    const active = new Set();
+    const maxFallbackBytes = 64 * 1024 * 1024;
 
-window.cistaMedia = {
-
-    // ---- 共通 ----
-
-    /**
-     * Blob URL を解放する。
-     */
-    revokeBlobUrl(url) {
-        if (url && url.startsWith("blob:")) {
-            URL.revokeObjectURL(url);
+    function abortError() { return new DOMException("Preview cancelled", "AbortError"); }
+    function clearElement(element) {
+        if (element.tagName === "VIDEO" || element.tagName === "AUDIO") element.pause();
+        element.removeAttribute("src");
+        if (element.tagName === "VIDEO" || element.tagName === "AUDIO") element.load();
+    }
+    function stop(operation) {
+        if (!operation || operation.controller.signal.aborted) return;
+        operation.controller.abort();
+        active.delete(operation);
+        if (previews.get(operation.element) === operation) {
+            previews.delete(operation.element);
+            clearElement(operation.element);
         }
-    },
-
-    /**
-     * ストリーミングURLを取得してメディア要素にセットする。
-     * Blazorから呼び出す。
-     */
-    async setStreamUrl(elementId, apiBase, volumeName, fileName, mediaType) {
-        const element = document.getElementById(elementId);
-        if (!element) {
-            console.error("Element not found:", elementId);
-            return;
-        }
-
-        try {
-            // sessionStorageからJWTトークンを取得
-            const jwtToken = sessionStorage.getItem("cista_jwt");
-            if (!jwtToken) {
-                console.error("JWT token not found in sessionStorage");
-                return;
-            }
-
-            // ストリーミングURLを取得
-            const streamUrl = await this.getStreamUrl(apiBase, volumeName, fileName, jwtToken);
-            element.src = streamUrl;
-
-            // video/audio要素の場合はload()を呼ぶ
-            if (element.tagName === "VIDEO" || element.tagName === "AUDIO") {
-                element.load();
-            }
-        } catch (err) {
-            console.error("Failed to set stream URL:", err);
-        }
-    },
-
-    // ---- 通常ボリューム: ストリーミング ----
-
-    /**
-     * ストリーミングトークンを発行し、ストリーミングURLを返す。
-     * <video> / <audio> / <img> の src に直接セットできる。
-     * Range リクエスト対応なのでブラウザが自動でシーク・バッファリングする。
-     */
-    async getStreamUrl(apiBase, volumeName, fileName, jwtToken) {
-        const resp = await fetch(apiBase + "/api/v1/stream/token", {
-            method: "POST",
-            headers: {
-                "Authorization": "Bearer " + jwtToken,
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({ volumeName, fileName })
-        });
-        if (!resp.ok) throw new Error("stream token failed: " + resp.status);
-        const data = await resp.json();
-        const encoded = encodeURIComponent(fileName);
-        return apiBase + "/api/v1/stream/" + encodeURIComponent(volumeName) + "/" + encoded + "?token=" + data.token;
-    },
-
-    // ---- E2EE ボリューム: プログレッシブ復号 → MediaSource ----
-
-    /**
-     * E2EE メディアをプログレッシブに復号・再生する。
-     * Blazor からチャンク取得コールバックを通じて復号済みデータを順次受け取る。
-     *
-     * @param {HTMLVideoElement|HTMLAudioElement} element - メディア要素
-     * @param {string} mimeType - MIMEタイプ (例: "video/mp4", "audio/mpeg")
-     * @param {function} getNextChunk - async () => { base64: string } | null
-     *   呼ばれるたびに次の復号済みチャンク(base64)を返す。nullで終了。
-     * @param {function} onProgress - (loaded, total) => void (省略可)
-     * @returns {Promise} 再生終了またはエラーで解決
-     */
-    async streamE2ee(element, mimeType, getNextChunk, onProgress) {
-        // MediaSource が使えるか確認
-        if (!("MediaSource" in window)) {
-            throw new Error("このブラウザは MediaSource Extensions に対応していません。");
-        }
-
-        // MSE で扱える MIME を判定
-        const codecsMap = {
-            "video/mp4": ['video/mp4; codecs="avc1.42E01E,mp4a.40.2"', 'video/mp4; codecs="avc1.42E01E"', 'video/mp4; codecs="mp4a.40.2"', "video/mp4"],
-            "video/webm": ['video/webm; codecs="vp8,vorbis"', 'video/webm; codecs="vp9,opus"', "video/webm"],
-            "audio/mpeg": ["audio/mpeg"],
-            "audio/mp4": ["audio/mp4"],
-            "audio/ogg": ["audio/ogg"],
-            "audio/wav": ["audio/wav"],
-            "audio/flac": ["audio/flac"],
-            "audio/webm": ["audio/webm; codecs=\"opus\"", "audio/webm"],
+        for (const url of operation.urls) URL.revokeObjectURL(url);
+        operation.urls.clear();
+    }
+    function begin(element) {
+        stop(previews.get(element));
+        const operation = {
+            element, controller: new AbortController(), urls: new Set(),
+            token: sessionStorage.getItem("cista_jwt")
         };
-
-        let mseMime = mimeType;
-        const candidates = codecsMap[mimeType] || [mimeType];
-        for (const c of candidates) {
-            if (MediaSource.isTypeSupported(c)) {
-                mseMime = c;
-                break;
-            }
+        previews.set(element, operation);
+        active.add(operation);
+        return operation;
+    }
+    function ensureCurrent(operation) {
+        if (operation.controller.signal.aborted || !operation.element.isConnected
+            || previews.get(operation.element) !== operation
+            || sessionStorage.getItem("cista_jwt") !== operation.token) {
+            stop(operation);
+            throw abortError();
         }
-
-        // MSE非対応形式なら Blob にフォールバック
-        if (!MediaSource.isTypeSupported(mseMime)) {
-            return await fallbackBlob(element, mimeType, getNextChunk, onProgress);
-        }
-
-        const mediaSource = new MediaSource();
-        element.src = URL.createObjectURL(mediaSource);
-
-        await new Promise((resolve, reject) => {
-            mediaSource.addEventListener("sourceopen", resolve, { once: true });
-            setTimeout(() => reject(new Error("MediaSource sourceopen timeout")), 5000);
+    }
+    function setObjectSource(operation, value) {
+        ensureCurrent(operation);
+        const url = URL.createObjectURL(value);
+        operation.urls.add(url);
+        operation.element.src = url;
+    }
+    function waitForEvent(target, success, failure, signal, start, timeout) {
+        return new Promise((resolve, reject) => {
+            let timer;
+            const cleanup = () => {
+                target.removeEventListener(success, onSuccess);
+                target.removeEventListener(failure, onFailure);
+                signal.removeEventListener("abort", onAbort);
+                clearTimeout(timer);
+            };
+            const onSuccess = () => { cleanup(); resolve(); };
+            const onFailure = () => { cleanup(); reject(new Error("Media decoder failed")); };
+            const onAbort = () => { cleanup(); reject(abortError()); };
+            target.addEventListener(success, onSuccess);
+            target.addEventListener(failure, onFailure);
+            signal.addEventListener("abort", onAbort, { once: true });
+            if (signal.aborted) { onAbort(); return; }
+            if (timeout) timer = setTimeout(() => { cleanup(); reject(new Error("MediaSource sourceopen timeout")); }, timeout);
+            try { if (start) start(); } catch (error) { cleanup(); reject(error); }
         });
-
-        const sourceBuffer = mediaSource.addSourceBuffer(mseMime);
-        sourceBuffer.mode = "segments";
-
+    }
+    function base64ToUint8(base64) {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+    }
+    async function fallbackBlob(operation, mimeType, getNextChunk, onProgress) {
+        const chunks = [];
+        let index = 0, size = 0;
         try {
-            let chunkIndex = 0;
             while (true) {
+                ensureCurrent(operation);
                 const chunk = await getNextChunk();
+                ensureCurrent(operation);
                 if (chunk === null) break;
-
                 const bytes = base64ToUint8(chunk);
-                // SourceBuffer への追加が完了するまで待機
-                await appendToBuffer(sourceBuffer, bytes);
+                chunks.push(bytes);
+                size += bytes.length;
+                if (size > maxFallbackBytes)
+                    throw new Error("この形式のプレビューは64 MiB以下のファイルに対応しています。");
+                if (onProgress) onProgress(++index, -1);
+            }
+            setObjectSource(operation, new Blob(chunks, { type: mimeType }));
+            if (operation.element.tagName === "VIDEO" || operation.element.tagName === "AUDIO") {
+                operation.element.load();
+                // Playback may wait for data/metadata. It must not hold up the
+                // producer or cancellation of this preview.
+                try { operation.element.play().catch(() => {}); } catch { }
+                ensureCurrent(operation);
+            }
+        } finally {
+            for (const bytes of chunks) bytes.fill(0);
+        }
+    }
+    async function stream(operation, mimeType, getNextChunk, onProgress) {
+        try {
+            ensureCurrent(operation);
+            if (!("MediaSource" in window))
+                throw new Error("このブラウザは MediaSource Extensions に対応していません。");
+            const codecsMap = {
+                "video/mp4": ['video/mp4; codecs="avc1.42E01E,mp4a.40.2"', 'video/mp4; codecs="avc1.42E01E"', 'video/mp4; codecs="mp4a.40.2"', "video/mp4"],
+                "video/webm": ['video/webm; codecs="vp8,vorbis"', 'video/webm; codecs="vp9,opus"', "video/webm"],
+                "audio/webm": ['audio/webm; codecs="opus"', "audio/webm"]
+            };
+            const mseMime = (codecsMap[mimeType] || [mimeType]).find(type => MediaSource.isTypeSupported(type));
+            if (!mseMime) return await fallbackBlob(operation, mimeType, getNextChunk, onProgress);
 
-                chunkIndex++;
-                if (onProgress) onProgress(chunkIndex, -1);
-
-                // 最初のチャンクが入ったら自動再生
-                if (chunkIndex === 1 && element.paused) {
-                    try { await element.play(); } catch {}
+            const source = new MediaSource();
+            await waitForEvent(source, "sourceopen", "error", operation.controller.signal,
+                () => setObjectSource(operation, source), 5000);
+            ensureCurrent(operation);
+            const buffer = source.addSourceBuffer(mseMime);
+            buffer.mode = "segments";
+            let index = 0;
+            while (true) {
+                ensureCurrent(operation);
+                const chunk = await getNextChunk();
+                ensureCurrent(operation);
+                if (chunk === null) break;
+                const bytes = base64ToUint8(chunk);
+                try {
+                    if (buffer.updating)
+                        await waitForEvent(buffer, "updateend", "error", operation.controller.signal);
+                    ensureCurrent(operation);
+                    await waitForEvent(buffer, "updateend", "error", operation.controller.signal,
+                        () => buffer.appendBuffer(bytes));
+                    ensureCurrent(operation);
+                } finally { bytes.fill(0); }
+                index++;
+                if (onProgress) onProgress(index, -1);
+                if (index === 1 && operation.element.paused) {
+                    try { operation.element.play().catch(() => {}); } catch { }
+                    ensureCurrent(operation);
                 }
             }
-
-            // 全チャンク追加完了
-            if (mediaSource.readyState === "open") {
-                mediaSource.endOfStream();
-            }
-        } catch (err) {
-            // MSE対応していてもコンテナ形式の問題で失敗することがある
-            // 部分消費済みジェネレータでは Blob 再構築が不可能なため、
-            // エラーを Blazor 側に伝播して全チャンク再ダウンロードさせる
-            console.warn("MSE failed:", err);
-            element.pause();
-            element.removeAttribute("src");
-            element.load();
-            throw err;
+            if (source.readyState === "open") source.endOfStream();
+        } catch (error) {
+            stop(operation);
+            throw error;
         }
-    },
+    }
 
-    // ---- E2EE ボリューム: サーバー直接取得 + JS内復号 + MSE ----
+    // Blazor may remove a player before its pending JS interop call completes.
+    new MutationObserver(() => {
+        for (const operation of active)
+            if (!operation.element.isConnected) stop(operation);
+    }).observe(document.documentElement, { childList: true, subtree: true });
 
-    /**
-     * E2EE メディアを JS 側で完結ストリーミング。
-     * fetch で暗号化チャンクを取得し、Web Crypto で復号、MSE でプログレッシブ再生。
-     *
-     * @param {object} options
-     * @param {string} options.elementId - video/audio 要素の ID
-     * @param {string} options.mimeType
-     * @param {string} options.apiUrl - ベース URL（末尾スラッシュなし）
-     * @param {string} options.jwtToken
-     * @param {string} options.volumeName
-     * @param {string} options.fileId
-     * @param {number} options.chunkCount
-     * @param {string} options.masterKeyHandle - e2ee.js の鍵ハンドル
-     * @param {string} options.fileSaltBase64
-     * @param {object} options.dotNetRef - DotNetObjectReference（OnProgress コールバック用）
-     */
-    async streamE2eeDirect(options) {
-        const element = document.getElementById(options.elementId);
-        if (!element) throw new Error("media element not found: " + options.elementId);
-
-        let idx = 0;
-        const total = options.chunkCount;
-
-        const getNextChunk = async () => {
-            if (idx >= total) return null;
-            const url = options.apiUrl + "/api/v1/e2ee/" + encodeURIComponent(options.volumeName)
-                + "/download-chunk/" + options.fileId + "/" + idx;
-            const jwtToken = options.jwtToken || sessionStorage.getItem("cista_jwt");
-            const resp = await fetch(url, {
-                headers: { "Authorization": "Bearer " + jwtToken }
+    window.cistaMedia = {
+        revokeBlobUrl(url) { if (url?.startsWith("blob:")) URL.revokeObjectURL(url); },
+        stop(elementId) {
+            for (const operation of active)
+                if (operation.element.id === elementId) stop(operation);
+        },
+        stopAll() { for (const operation of active) stop(operation); },
+        async getStreamUrl(apiBase, volumeName, fileName, jwtToken, signal) {
+            const response = await fetch(apiBase + "/api/v1/stream/token", {
+                method: "POST", signal, cache: "no-store",
+                headers: { "Authorization": "Bearer " + jwtToken, "Content-Type": "application/json" },
+                body: JSON.stringify({ volumeName, fileName })
             });
-            if (!resp.ok) throw new Error("chunk download failed: " + resp.status + " idx=" + idx);
-            const encBuf = await resp.arrayBuffer();
-
-            // revision >= 1 のチャンク（Dokan 差分保存で再暗号化済み）は nonce 導出に revision が必須
-            const revision = parseInt(resp.headers.get("X-Chunk-Revision") || "0", 10) || 0;
-
-            // ArrayBuffer → base64
-            const bytes = new Uint8Array(encBuf);
-            let binary = "";
-            for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-            const encB64 = btoa(binary);
-
-            // Web Crypto で復号
-            const plainB64 = await window.cistaE2ee.decryptChunk(
-                encB64, options.masterKeyHandle, idx, options.fileSaltBase64, revision);
-
-            idx++;
-            try { if (options.dotNetRef) options.dotNetRef.invokeMethod("OnProgress", idx); } catch {}
-
-            return plainB64;
-        };
-
-        const onProgress = (loaded, _total) => {
-            // getNextChunk 内で DotNet コールバック済み
-        };
-
-        return await this.streamE2ee(element, options.mimeType, getNextChunk, onProgress);
-    }
-};
-
-// ---- 内部ヘルパー ----
-
-function base64ToUint8(base64) {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-}
-
-function appendToBuffer(sourceBuffer, data) {
-    return new Promise((resolve, reject) => {
-        if (sourceBuffer.updating) {
-            sourceBuffer.addEventListener("updateend", () => {
-                appendToBuffer(sourceBuffer, data).then(resolve).catch(reject);
-            }, { once: true });
-            return;
+            if (!response.ok) throw new Error("stream token failed: " + response.status);
+            const data = await response.json();
+            return apiBase + "/api/v1/stream/" + encodeURIComponent(volumeName) + "/"
+                + encodeURIComponent(fileName) + "?token=" + encodeURIComponent(data.token);
+        },
+        async setStreamUrl(elementId, apiBase, volumeName, fileName) {
+            const element = document.getElementById(elementId);
+            if (!element) throw abortError();
+            const operation = begin(element);
+            try {
+                if (!operation.token) throw new Error("ログインしてください。");
+                const url = await this.getStreamUrl(apiBase, volumeName, fileName,
+                    operation.token, operation.controller.signal);
+                ensureCurrent(operation);
+                element.src = url;
+                if (element.tagName === "VIDEO" || element.tagName === "AUDIO") element.load();
+            } catch (error) { stop(operation); throw error; }
+        },
+        async streamE2ee(element, mimeType, getNextChunk, onProgress) {
+            return await stream(begin(element), mimeType, getNextChunk, onProgress);
+        },
+        async streamE2eeDirect(options) {
+            const element = document.getElementById(options.elementId);
+            if (!element) throw abortError();
+            const operation = begin(element);
+            let index = 0;
+            const getNextChunk = async () => {
+                ensureCurrent(operation);
+                if (options.jwtToken && options.jwtToken !== operation.token) throw abortError();
+                if (!operation.token) throw new Error("ログインしてください。");
+                if (index >= options.chunkCount) return null;
+                const response = await fetch(options.apiUrl + "/api/v1/e2ee/" + encodeURIComponent(options.volumeName)
+                    + "/download-chunk/" + encodeURIComponent(options.fileId) + "/" + index, {
+                    signal: operation.controller.signal, cache: "no-store",
+                    headers: { "Authorization": "Bearer " + operation.token }
+                });
+                ensureCurrent(operation);
+                if (!response.ok) throw new Error("chunk download failed: " + response.status + " idx=" + index);
+                const encrypted = new Uint8Array(await response.arrayBuffer());
+                ensureCurrent(operation);
+                const revision = Number(response.headers.get("X-Chunk-Revision") || "0");
+                if (!Number.isSafeInteger(revision) || revision < 0) throw new Error("Invalid chunk revision");
+                let binary = "";
+                for (const byte of encrypted) binary += String.fromCharCode(byte);
+                const plaintext = await window.cistaE2ee.decryptChunk(btoa(binary), options.masterKeyHandle,
+                    index, options.fileSaltBase64, revision);
+                ensureCurrent(operation);
+                index++;
+                try { options.dotNetRef?.invokeMethod("OnProgress", index); } catch { }
+                return plaintext;
+            };
+            return await stream(operation, options.mimeType, getNextChunk);
         }
-        try {
-            sourceBuffer.addEventListener("updateend", resolve, { once: true });
-            sourceBuffer.addEventListener("error", reject, { once: true });
-            sourceBuffer.appendBuffer(data);
-        } catch (e) {
-            reject(e);
-        }
-    });
-}
-
-async function fallbackBlob(element, mimeType, getNextChunk, onProgress) {
-    const chunks = [];
-    let index = 0;
-
-    while (true) {
-        const chunk = await getNextChunk();
-        if (chunk === null) break;
-        chunks.push(base64ToUint8(chunk));
-        index++;
-        if (onProgress) onProgress(index, -1);
-    }
-
-    const blob = new Blob(chunks, { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    element.src = url;
-    // <img> には load()/play() が無いため video/audio のみ呼ぶ（画像は src 設定だけで表示）
-    if (element.tagName === "VIDEO" || element.tagName === "AUDIO") {
-        element.load();
-        try { await element.play(); } catch {}
-    }
-}
+    };
+})();

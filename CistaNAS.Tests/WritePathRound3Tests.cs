@@ -20,6 +20,119 @@ namespace CistaNAS.Tests;
 /// </summary>
 public class WritePathRound3Tests
 {
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void NewFileFlush_CommitsBeforeCloseAndReportsUploadFailure(bool e2ee, bool fail)
+    {
+        var (encryptedFs, encrypted, _, _, _) = CreateExistingE2eeFile(0);
+        using var plain = new PlainServer { FailNextWrites = fail ? 1 : 0 };
+        using var http = new HttpClient(plain) { BaseAddress = new Uri("http://test/") };
+        using var plainFs = new CistaNasFileSystem(new CistaNasApiClient(http), Volume);
+        using (encryptedFs)
+        {
+            encrypted.FailNextCreateFiles = fail ? 1 : 0;
+            var fs = e2ee ? encryptedFs : plainFs;
+            CistaNasFileSystem.WriteState state = e2ee
+                ? new CistaNasFileSystem.E2eeChunkWriteState(fs, "new.txt", null)
+                : new CistaNasFileSystem.PlainRangeWriteState(fs, "new.txt", null);
+            try
+            {
+                var info = new StubFileInfo(state);
+                Assert.Equal(DokanResult.Success, fs.WriteFile("\\new.txt", [1, 2, 3], out int written, 0, info));
+                Assert.Equal(3, written);
+                var status = fs.FlushFileBuffers("\\new.txt", info);
+                Assert.Equal(fail ? DokanResult.InternalError : DokanResult.Success, status);
+                if (fail)
+                {
+                    Assert.True(state.HasPending);
+                    Assert.Equal(DokanResult.Success, fs.FlushFileBuffers("\\new.txt", info));
+                }
+                Assert.False(state.HasPending);
+                Assert.NotNull(state.ExistingFileId);
+                if (e2ee)
+                {
+                    Assert.Single(encrypted.FinalizeRequests);
+                    var saved = Assert.IsType<CistaNasFileSystem.E2eeChunkWriteState>(state);
+                    var chunk = encrypted.Chunks[0];
+                    byte[] committed = E2eeCrypto.DecryptChunk(chunk.Cipher, saved.ExistingFileKey!, 0,
+                        saved.ExistingFileSalt!, chunk.Revision);
+                    try { Assert.Equal(new byte[] { 1, 2, 3 }, committed); }
+                    finally { CryptographicOperations.ZeroMemory(committed); }
+                }
+                else Assert.Equal(new byte[] { 1, 2, 3 }, plain.Files["new.txt"]);
+            }
+            finally { state.Dispose(); }
+        }
+    }
+
+    [Fact]
+    public async Task E2eeShrinkDuringSave_IsNotLostWhenOlderSnapshotCommits()
+    {
+        var (fs, server, salt, key, plain) = CreateExistingE2eeFile(10000);
+        using (fs)
+        {
+            var state = new CistaNasFileSystem.E2eeChunkWriteState(fs, "plain.txt", FakeE2eeServer.FileId);
+            Task save = Task.CompletedTask;
+            server.UploadRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            try
+            {
+                state.Write([1], 0, 1, 0);
+                save = Task.Run(() => fs.UploadWriteState(state));
+                Assert.True(await Task.Run(() => server.UploadReached.Wait(TimeSpan.FromSeconds(5))));
+                state.Gate.Wait();
+                try
+                {
+                    state.SetDeclaredSize(5000);
+                    state.SetDeclaredSize(9000);
+                    state.Write([7], 0, 1, 7000);
+                }
+                finally { state.Gate.Release(); }
+                server.UploadRelease.TrySetResult();
+                await save.WaitAsync(TimeSpan.FromSeconds(5));
+                Assert.True(state.HasPending);
+                fs.UploadWriteState(state);
+                byte[] expected = new byte[9000];
+                plain.AsSpan(0, 5000).CopyTo(expected);
+                expected[0] = 1; expected[7000] = 7;
+                byte[] actual = server.Chunks.OrderBy(p => p.Key).SelectMany(p =>
+                    E2eeCrypto.DecryptChunk(p.Value.Cipher, key, p.Key, salt, p.Value.Revision)).ToArray();
+                Assert.Equal(expected, actual);
+            }
+            finally
+            {
+                server.UploadRelease.TrySetResult();
+                try { await save.WaitAsync(TimeSpan.FromSeconds(5)); } catch { }
+                state.Dispose();
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void E2eeShrinkThenGrow_DoesNotRestoreTruncatedServerOrDirtyBytes(bool dirty)
+    {
+        var (fs, server, salt, key, plain) = CreateExistingE2eeFile(10000);
+        using (fs)
+        {
+            var state = new CistaNasFileSystem.E2eeChunkWriteState(fs, "plain.txt", FakeE2eeServer.FileId);
+            try
+            {
+                if (dirty) state.Write([7, 7, 7], 0, 3, 8000);
+                state.SetDeclaredSize(5000);
+                state.SetDeclaredSize(9000);
+                fs.UploadWriteState(state);
+                byte[] actual = server.Chunks.OrderBy(p => p.Key).SelectMany(p =>
+                    E2eeCrypto.DecryptChunk(p.Value.Cipher, key, p.Key, salt, p.Value.Revision)).ToArray();
+                Assert.Equal(plain[..5000].Concat(new byte[4000]), actual);
+            }
+            finally { state.Dispose(); }
+        }
+    }
+
     private const int ChunkSize = 4096;
     private const string Volume = "vol";
 
@@ -200,6 +313,7 @@ public class WritePathRound3Tests
         public int PutCount { get; private set; }
         public int PatchCount { get; private set; }
         public int FailNextGets { get; set; }
+        public int FailNextWrites { get; set; }
 
         /// <summary>このリストにあるファイルへの PUT/PATCH を BlockRelease までブロックする。</summary>
         public HashSet<string> BlockNames { get; } = new();
@@ -213,6 +327,12 @@ public class WritePathRound3Tests
             var segments = request.RequestUri!.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
             // /api/v1/files/{vol}/{name}
             string name = segments[^1];
+
+            if ((request.Method == HttpMethod.Post || request.Method == HttpMethod.Patch) && FailNextWrites > 0)
+            {
+                FailNextWrites--;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError));
+            }
 
             if (request.Method == HttpMethod.Post)
             {
@@ -253,6 +373,17 @@ public class WritePathRound3Tests
                     return Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError));
                 }
                 byte[] content = Files.TryGetValue(name, out var existing) ? existing : Array.Empty<byte>();
+                if (request.Headers.Range?.Ranges.SingleOrDefault() is { } range)
+                {
+                    int from = (int)(range.From ?? 0);
+                    if (from >= content.Length)
+                        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.RequestedRangeNotSatisfiable));
+                    int to = (int)Math.Min(range.To ?? content.Length - 1, content.Length - 1);
+                    var response = new HttpResponseMessage(HttpStatusCode.PartialContent)
+                    { Content = new ByteArrayContent(content[from..(to + 1)]) };
+                    response.Content.Headers.ContentRange = new System.Net.Http.Headers.ContentRangeHeaderValue(from, to, content.Length);
+                    return Task.FromResult(response);
+                }
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(content) });
             }
 
@@ -370,10 +501,10 @@ public class WritePathRound3Tests
     // ---- F3: 切り詰め領域チャンクのロールバック ----
 
     [Fact]
-    public void E2EE切り詰めを含む保存の失敗後も切り詰め領域の書き込みが保持される()
+    public void E2EE切り詰め保存失敗後の再拡張でも削除済み領域はゼロになる()
     {
-        // 回帰: TakeDirtyChunksForUpload が切り詰め領域（ci >= chunkCount）のチャンクを
-        // アップロード成功前にゼロ化・除去し、スナップショット外のためロールバックできなかった。
+        // SetEndOfFile は成功済みなので、Flush の失敗は論理的な切り詰めを取り消さない。
+        // 再拡張では削除済みデータを復活させず、残す先頭の書き込みを再試行する。
         var (fs, server, fileSalt, fileKey, plain) = CreateExistingE2eeFile(10000); // 3 チャンク
         byte[] data0 = Pattern(100, seed: 40);
         byte[] data2 = Pattern(100, seed: 41);
@@ -387,15 +518,18 @@ public class WritePathRound3Tests
         server.FailNextUploads = 1;
         Assert.ThrowsAny<Exception>(() => fs.UploadWriteState(ws));
 
-        // 切り詰めを取り消して再 persist: 切り詰め領域の書き込み（9000..9100）が生きていなければならない
+        // 再拡張して再 persist。切り詰めで捨てた末尾はゼロ。
         ws.SetDeclaredSize(10000);
         fs.UploadWriteState(ws);
 
         Assert.Equal(1, server.Chunks[2].Revision); // 再アップロードされている
         byte[] chunk2 = E2eeCrypto.DecryptChunk(server.Chunks[2].Cipher, fileKey, 2, fileSalt, revision: 1);
-        byte[] expected2 = plain[8192..]; // 旧サーバー内容
-        data2.CopyTo(expected2, 9000 - 8192);
-        Assert.Equal(expected2, chunk2);
+        Assert.Equal(new byte[plain.Length - 8192], chunk2);
+        byte[] chunk0 = E2eeCrypto.DecryptChunk(server.Chunks[0].Cipher, fileKey, 0, fileSalt, server.Chunks[0].Revision);
+        byte[] expected0 = new byte[ChunkSize];
+        plain.AsSpan(0, 1000).CopyTo(expected0);
+        data0.CopyTo(expected0, 0);
+        Assert.Equal(expected0, chunk0);
     }
 
     // ---- F4: Cleanup が進行中の persist を待たない ----

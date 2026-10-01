@@ -11,19 +11,19 @@ public sealed class VolumeApiClient
     public VolumeApiClient(HttpClient http) => _http = http;
 
     /// <summary>ユーザーがアクセス可能なボリューム一覧。</summary>
-    public async Task<IReadOnlyList<VolumeInfo>> ListAsync()
+    public async Task<IReadOnlyList<VolumeInfo>> ListAsync(CancellationToken ct = default)
     {
-        var list = await _http.GetFromJsonAsync<List<VolumeInfo>>("/api/v1/volumes");
+        var list = await _http.GetFromJsonAsync<List<VolumeInfo>>("/api/v1/volumes", ct);
         return list ?? [];
     }
 
     /// <summary>ボリューム作成。</summary>
-    public async Task<VolumeInfo> CreateAsync(string name, string username, string? password, bool encrypted)
+    public async Task<VolumeInfo> CreateAsync(string name, string username, string? password, bool encrypted, CancellationToken ct = default)
     {
-        var response = await _http.PostAsJsonAsync("/api/v1/volumes",
-            new CreateVolumeRequest(name, username, password, encrypted));
+        using var response = await _http.PostAsJsonAsync("/api/v1/volumes",
+            new CreateVolumeRequest(name, username, password, encrypted), ct);
         response.EnsureSuccessStatusCode();
-        return (await response.Content.ReadFromJsonAsync<VolumeInfo>())!;
+        return (await response.Content.ReadFromJsonAsync<VolumeInfo>(ct))!;
     }
 
     /// <summary>E2EE ボリューム作成。</summary>
@@ -36,21 +36,21 @@ public sealed class VolumeApiClient
     }
 
     /// <summary>ボリュームマウント。</summary>
-    public async Task<VolumeInfo> MountAsync(string name, string username, string? password)
+    public async Task<VolumeInfo> MountAsync(string name, string username, string? password, CancellationToken ct = default)
     {
-        var response = await _http.PostAsJsonAsync($"/api/v1/volumes/{Uri.EscapeDataString(name)}/mount",
-            new MountRequest(name, username, password));
+        using var response = await _http.PostAsJsonAsync($"/api/v1/volumes/{Uri.EscapeDataString(name)}/mount",
+            new MountRequest(name, username, password), ct);
         response.EnsureSuccessStatusCode();
-        return (await response.Content.ReadFromJsonAsync<VolumeInfo>())!;
+        return (await response.Content.ReadFromJsonAsync<VolumeInfo>(ct))!;
     }
 
     /// <summary>E2EE ボリュームマウント（アクセス権チェックのみ）。</summary>
-    public async Task<VolumeInfo> MountE2eeAsync(string name, string username)
+    public async Task<VolumeInfo> MountE2eeAsync(string name, string username, CancellationToken ct = default)
     {
-        var response = await _http.PostAsJsonAsync($"/api/v1/e2ee/{Uri.EscapeDataString(name)}/mount",
-            new { });
+        using var response = await _http.PostAsJsonAsync($"/api/v1/e2ee/{Uri.EscapeDataString(name)}/mount",
+            new { }, ct);
         response.EnsureSuccessStatusCode();
-        return (await response.Content.ReadFromJsonAsync<VolumeInfo>())!;
+        return (await response.Content.ReadFromJsonAsync<VolumeInfo>(ct))!;
     }
 
     /// <summary>ボリュームロック。</summary>
@@ -100,13 +100,13 @@ public sealed class VolumeApiClient
     }
 
     /// <summary>E2EE ラップ鍵を取得。</summary>
-    public async Task<WrappedKeyResponse?> GetWrappedKeyAsync(string volumeName, string username)
+    public async Task<WrappedKeyResponse?> GetWrappedKeyAsync(string volumeName, string username, CancellationToken ct = default)
     {
-        var response = await _http.GetAsync(
-            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/wrapped-key/{Uri.EscapeDataString(username)}");
+        using var response = await _http.GetAsync(
+            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/wrapped-key/{Uri.EscapeDataString(username)}", ct);
         if (response.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadFromJsonAsync<WrappedKeyResponse>();
+        return await response.Content.ReadFromJsonAsync<WrappedKeyResponse>(ct);
     }
 
     /// <summary>E2EE ラップ鍵を追加。</summary>
@@ -149,13 +149,13 @@ public sealed class VolumeApiClient
     // ---- 共有 E2EE v2: GroupKey epoch / per-file DEK ----
 
     /// <summary>v2: 自分宛ての全 epoch GroupKey wraps とボリューム鍵状態を取得。</summary>
-    public async Task<E2eeGroupKeyInfoResponse?> GetGroupKeyInfoAsync(string volumeName)
+    public async Task<E2eeGroupKeyInfoResponse?> GetGroupKeyInfoAsync(string volumeName, CancellationToken ct = default)
     {
-        var response = await _http.GetAsync(
-            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/group-key-info");
+        using var response = await _http.GetAsync(
+            $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/group-key-info", ct);
         if (response.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadFromJsonAsync<E2eeGroupKeyInfoResponse>();
+        return await response.Content.ReadFromJsonAsync<E2eeGroupKeyInfoResponse>(ct);
     }
 
     /// <summary>v2: GroupKey をローテーションする（revoke 時、owner 限定）。</summary>

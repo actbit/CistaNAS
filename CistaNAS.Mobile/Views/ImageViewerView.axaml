@@ -1,13 +1,11 @@
 <UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:vm="using:CistaNAS.Mobile.Core.ViewModels"
-             xmlns:local="using:CistaNAS.Mobile.Views"
              x:Class="CistaNAS.Mobile.Views.ImageViewerView"
              x:DataType="vm:ImageViewerViewModel">
   <Panel>
     <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
       <Image x:Name="ViewerImage"
-             Source="{Binding ImageData, Converter={x:Static local:ByteArrayToImageConverter.Instance}}"
              Stretch="Uniform" />
     </ScrollViewer>
 

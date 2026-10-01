@@ -23,6 +23,7 @@ public sealed class AppServices : IDisposable
         Session = new ApiSession(httpHandler);
         Transfer = new E2eeFileTransferService(Session.Api, E2ee);
         StreamingFiles = new StreamingFileService(Session.Api, E2ee);
+        BufferedFiles = new BufferedFileService(StreamingFiles);
         Session.Unauthorized += () =>
         {
             ClearSession();
@@ -38,6 +39,7 @@ public sealed class AppServices : IDisposable
     public EcdhKeyManager EcdhKeys { get; }
     public E2eeFileTransferService Transfer { get; }
     public StreamingFileService StreamingFiles { get; }
+    public BufferedFileService BufferedFiles { get; }
     public NavigationService Navigation { get; } = new();
 
     /// <summary>JWT 失効 (401) を検知したときに発火。UI はログイン画面へ戻す。</summary>
@@ -48,6 +50,24 @@ public sealed class AppServices : IDisposable
         get { lock (_sessionLock) return _sessionCancellation.Token; }
     }
 
+    // Install keys only into the session that started the mount. Checking the
+    // token under the same lock as logout also closes the check/publish race.
+    internal void WithCurrentSession(CancellationToken session, Action action)
+    {
+        lock (_sessionLock)
+        {
+            if (session != _sessionCancellation.Token) throw new OperationCanceledException(session);
+            session.ThrowIfCancellationRequested();
+            action();
+        }
+    }
+
+    internal ClientSessionOperation BeginOperation(CancellationToken command, CancellationToken navigation)
+    {
+        lock (_sessionLock)
+            return new(this, _sessionCancellation.Token, Session.AuthenticationVersion, command, navigation);
+    }
+
     /// <summary>転送を中止し、表示画面のRAM上の内容・トークン・鍵を破棄する。</summary>
     public void ClearSession()
     {
@@ -56,12 +76,12 @@ public sealed class AppServices : IDisposable
         {
             previous = _sessionCancellation;
             _sessionCancellation = new CancellationTokenSource();
+            E2ee.ClearKeys();
+            Session.ClearToken();
         }
         previous.Cancel();
         previous.Dispose();
         Viewer.Clear();
-        Session.ClearToken();
-        E2ee.ClearKeys();
     }
 
     public void Dispose()

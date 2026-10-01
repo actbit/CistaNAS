@@ -6,7 +6,7 @@ using CistaNAS.Mobile.Core.Services;
 namespace CistaNAS.Mobile.Core.ViewModels;
 
 /// <summary>初回オンボーディング: 管理者ユーザー作成 → ログイン。</summary>
-public sealed partial class SetupViewModel(AppServices app) : BusyViewModelBase
+public sealed partial class SetupViewModel(AppServices app) : SessionViewModelBase
 {
     [ObservableProperty]
     private string _username = "";
@@ -20,22 +20,23 @@ public sealed partial class SetupViewModel(AppServices app) : BusyViewModelBase
     public override string Title => "初期セットアップ";
 
     [RelayCommand]
-    private Task SetupAsync(CancellationToken ct) => RunBusyAsync(async () =>
+    private Task SetupAsync(CancellationToken ct) => RunSessionBusyAsync(async () =>
     {
         if (string.IsNullOrWhiteSpace(Username)) throw new InvalidOperationException("ユーザー名を入力してください。");
         if (Password.Length < 8) throw new InvalidOperationException("パスワードは 8 文字以上にしてください。");
         if (Password != PasswordConfirm) throw new InvalidOperationException("パスワードが一致しません。");
 
-        await app.Session.Api.RunInitialSetupAsync(Username, Password);
-        await LoginAsync(ct);
+        string username = Username, password = Password;
+        using var operation = BeginOperation(app, ct);
+        await app.Session.Api.RunInitialSetupAsync(username, password, operation.Cancellation);
+        operation.EnsureCurrent();
+        string token = await app.Session.Api.LoginAsync(username, password, operation.Cancellation);
+        operation.CompleteLogin(token, username, () => app.Navigation.NavigateToRoot(new VolumesViewModel(app)));
     });
 
-    private async Task LoginAsync(CancellationToken ct)
+    public override void OnNavigatedFrom()
     {
-        string token = await app.Session.Api.LoginAsync(Username, Password);
-        app.Session.SetToken(token);
-        app.Settings.Username = Username;
-        app.Settings.Save();
-        app.Navigation.NavigateToRoot(new VolumesViewModel(app));
+        base.OnNavigatedFrom();
+        Password = PasswordConfirm = "";
     }
 }

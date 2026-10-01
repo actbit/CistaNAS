@@ -9,24 +9,24 @@ public static class CistaNasApiClientVolumes
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
     /// <summary>通常ボリュームを作成する。</summary>
-    public static async Task<VolumeInfo> CreateVolumeAsync(this CistaNasApiClient client, string name, string username, string? password = null, bool encrypted = true)
+    public static async Task<VolumeInfo> CreateVolumeAsync(this CistaNasApiClient client, string name, string username, string? password = null, bool encrypted = true, CancellationToken ct = default)
     {
         var http = client._http;
         var req = new { name, username, password, encrypted };
-        var res = await http.PostAsJsonAsync("/api/v1/volumes", req, JsonOpts);
+        using var res = await http.PostAsJsonAsync("/api/v1/volumes", req, JsonOpts, ct);
         res.EnsureSuccessStatusCode();
-        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>(ct);
         return ParseVolumeInfo(json);
     }
 
     /// <summary>ボリュームをマウントする。</summary>
-    public static async Task<VolumeInfo> MountVolumeAsync(this CistaNasApiClient client, string name, string password)
+    public static async Task<VolumeInfo> MountVolumeAsync(this CistaNasApiClient client, string name, string password, CancellationToken ct = default)
     {
         var http = client._http;
         var req = new { password };
-        var res = await http.PostAsJsonAsync($"/api/v1/volumes/{Uri.EscapeDataString(name)}/mount", req, JsonOpts);
+        using var res = await http.PostAsJsonAsync($"/api/v1/volumes/{Uri.EscapeDataString(name)}/mount", req, JsonOpts, ct);
         res.EnsureSuccessStatusCode();
-        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>(ct);
         return ParseVolumeInfo(json);
     }
 

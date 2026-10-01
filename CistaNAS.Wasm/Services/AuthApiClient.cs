@@ -16,18 +16,18 @@ public sealed class AuthApiClient
     }
 
     /// <summary>ログイン。成功時は JWT レスポンス、失敗時は null。</summary>
-    public async Task<LoginResponse?> LoginAsync(string username, string password)
+    public async Task<LoginResponse?> LoginAsync(string username, string password, CancellationToken ct = default)
     {
-        var response = await _http.PostAsJsonAsync("/api/v1/auth/login", new LoginRequest(username, password));
+        using var response = await _http.PostAsJsonAsync("/api/v1/auth/login", new LoginRequest(username, password), ct);
         if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized) return null;
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadFromJsonAsync<LoginResponse>();
+        return await response.Content.ReadFromJsonAsync<LoginResponse>(ct);
     }
 
     /// <summary>初期セットアップ。管理者アカウント作成。</summary>
-    public async Task<bool> SetupAsync(string username, string password)
+    public async Task<bool> SetupAsync(string username, string password, CancellationToken ct = default)
     {
-        var response = await _http.PostAsJsonAsync("/api/v1/auth/setup", new SetupRequest(username, password));
+        using var response = await _http.PostAsJsonAsync("/api/v1/auth/setup", new SetupRequest(username, password), ct);
         if (response.StatusCode == System.Net.HttpStatusCode.Conflict) return false;
         response.EnsureSuccessStatusCode();
         return true;
@@ -42,15 +42,16 @@ public sealed class AuthApiClient
     }
 
     /// <summary>初期セットアップ済みか（ユーザーが存在するか）。</summary>
-    public async Task<bool> HasAnyUsersAsync()
+    public async Task<bool> HasAnyUsersAsync(CancellationToken ct = default)
     {
         try
         {
-            var response = await _http.GetAsync("/api/v1/auth/has-users");
+            using var response = await _http.GetAsync("/api/v1/auth/has-users", ct);
             response.EnsureSuccessStatusCode();
-            var result = await response.Content.ReadFromJsonAsync<HasUsersResponse>();
+            var result = await response.Content.ReadFromJsonAsync<HasUsersResponse>(ct);
             return result?.HasUsers ?? true;
         }
+        catch (OperationCanceledException) { throw; }
         catch
         {
             return true; // エラー時はセットアップ済みとみなす

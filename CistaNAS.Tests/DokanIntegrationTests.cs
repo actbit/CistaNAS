@@ -21,18 +21,101 @@ namespace CistaNAS.Tests;
 [Trait("Category", "RequiresDokan")]
 public class DokanIntegrationTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NewFileFlush_PersistsWhileTheHandleIsStillOpenAndCanRetryFailure(bool fail)
+    {
+        using var storage = new InMemoryStorageHandler { FailNextWrites = fail ? 1 : 0 };
+        using var http = new HttpClient(storage) { BaseAddress = new Uri("http://test/") };
+        using var fs = new CistaNasFileSystem(new CistaNasApiClient(http), "vol");
+        string mountPoint = $"{FindFreeDrive()}:\\";
+        var (dokan, instance, loop) = Mount(fs, mountPoint);
+        try
+        {
+            await WaitForMountAsync(mountPoint);
+            using var file = new FileStream(mountPoint + "durable.bin", FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read, 1);
+            file.Write([1, 2, 3]);
+            if (fail)
+            {
+                Assert.Throws<IOException>(() => file.Flush(flushToDisk: true));
+                Assert.False(storage.Files.ContainsKey("durable.bin"));
+            }
+            file.Flush(flushToDisk: true);
+            Assert.Equal(new byte[] { 1, 2, 3 }, storage.Files["durable.bin"]);
+        }
+        finally
+        {
+            dokan.RemoveMountPoint(mountPoint);
+            await loop;
+            instance.Dispose();
+            dokan.Dispose();
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NonE2ee_SameHandleRepeatedFlushAndShrinkGrow_PreserveCommittedPrefix(bool truncateAtOpen)
+    {
+        using var storage = new InMemoryStorageHandler();
+        if (truncateAtOpen) storage.Files["saved.bin"] = Enumerable.Repeat((byte)9, 100).ToArray();
+        using var http = new HttpClient(storage) { BaseAddress = new Uri("http://test/") };
+        using var fs = new CistaNasFileSystem(new CistaNasApiClient(http), "vol");
+        string mountPoint = $"{FindFreeDrive()}:\\";
+        var (dokan, instance, loop) = Mount(fs, mountPoint);
+        try
+        {
+            await WaitForMountAsync(mountPoint);
+            using (var file = new FileStream(mountPoint + "saved.bin",
+                truncateAtOpen ? FileMode.Create : FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read, 1))
+            {
+                file.Write([1, 2, 3]);
+                file.Flush(flushToDisk: true);
+                file.Write([4, 5, 6]);
+                file.Flush(flushToDisk: true);
+                file.Position = 0;
+                byte[] saved = new byte[6];
+                file.ReadExactly(saved);
+                Assert.Equal(new byte[] { 1, 2, 3, 4, 5, 6 }, saved);
+
+                file.SetLength(3);
+                file.SetLength(6);
+                file.Position = 0;
+                file.ReadExactly(saved);
+                Assert.Equal(new byte[] { 1, 2, 3, 0, 0, 0 }, saved);
+                file.Flush(flushToDisk: true);
+            }
+            Assert.Equal(new byte[] { 1, 2, 3, 0, 0, 0 }, File.ReadAllBytes(mountPoint + "saved.bin"));
+            Assert.Equal(new byte[] { 1, 2, 3, 0, 0, 0 }, storage.Files["saved.bin"]);
+        }
+        finally
+        {
+            dokan.RemoveMountPoint(mountPoint);
+            await loop;
+            instance.Dispose();
+            dokan.Dispose();
+        }
+    }
+
     /// <summary>非E2EE サーバーをインメモリで模擬（POST 全体 / GET Range / PATCH 部分書き込み / DELETE / ListFiles）。</summary>
     private sealed class InMemoryStorageHandler : HttpMessageHandler
     {
         public readonly Dictionary<string, byte[]> Files = new(StringComparer.OrdinalIgnoreCase);
         public int PatchCount;
         public int PostCount;
+        public int FailNextWrites;
         public List<(string Method, string Uri)> Requests = new();
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             var uri = request.RequestUri!.ToString();
             var method = request.Method.Method;
+            if ((method == "POST" || method == "PATCH") && FailNextWrites > 0)
+            {
+                FailNextWrites--;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError));
+            }
             Requests.Add((method, uri));
 
             const string prefix = "/api/v1/files/vol/";
@@ -74,6 +157,10 @@ public class DokanIntegrationTests
                     int len = (int)(end - start + 1);
                     result = new byte[len];
                     Array.Copy(data, (int)start, result, 0, len);
+                    var response = new HttpResponseMessage(HttpStatusCode.PartialContent)
+                    { Content = new ByteArrayContent(result) };
+                    response.Content.Headers.ContentRange = new System.Net.Http.Headers.ContentRangeHeaderValue(start, end, data.Length);
+                    return Task.FromResult(response);
                 }
                 else
                 {

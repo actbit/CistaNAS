@@ -14,10 +14,10 @@ namespace CistaNAS.PlaywrightTests;
 /// パスワード ロック解除 → ファイルアップロード（JS 暗号化）→ 一覧表示（JS 復号）を検証。
 /// </summary>
 [Collection("Playwright")]
-public class E2eeBrowserTests(PlaywrightWebAppFixture fixture)
+public partial class E2eeBrowserTests(PlaywrightWebAppFixture fixture)
 {
     /// <summary>API で E2EE ボリュームを作成し、ボリューム名を返す（ロック解除パスワードは管理者パスワードと同一）。</summary>
-    private async Task<string> CreateE2eeVolumeAsync()
+    private async Task<string> CreateE2eeVolumeAsync(int chunkSize = 1048576)
     {
         string volName = $"pw-e2ee-{Guid.NewGuid():N}";
         byte[] masterKey = E2eeCrypto.GenerateMasterKey();
@@ -37,7 +37,7 @@ public class E2eeBrowserTests(PlaywrightWebAppFixture fixture)
                 kdf = new { algorithm = "pbkdf2-sha256", iterations = 1000, salt },
                 wrappedMasterKey = new { algorithm = "aes-256-gcm", nonce, ciphertext = ct, tag },
             },
-            chunkSize = 1048576,
+            chunkSize,
         });
         var resp = await fixture.Http.SendAsync(req);
         Assert.True(resp.IsSuccessStatusCode, $"create-volume failed: {resp.StatusCode}");

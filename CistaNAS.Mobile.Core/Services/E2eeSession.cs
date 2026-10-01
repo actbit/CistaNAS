@@ -12,18 +12,22 @@ public sealed class E2eeV2VolumeState : IDisposable
 {
     private readonly Dictionary<int, SecureBuffer> _groupKeys = new();
 
-    public E2eeV2VolumeState(string volumeId, IReadOnlyDictionary<int, byte[]> groupKeys)
+    public E2eeV2VolumeState(string volumeId, IReadOnlyDictionary<int, byte[]> groupKeys, int chunkSize = 1048576)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(chunkSize);
+        foreach (var (epoch, key) in groupKeys)
+            if (key.Length != E2eeV2.GroupKeySize)
+                throw new ArgumentException($"GroupKey epoch {epoch} のサイズが不正です ({key.Length}B)。");
+        ChunkSize = chunkSize;
         VolumeId = new SecureBuffer(System.Text.Encoding.UTF8.GetBytes(volumeId));
         foreach (var (epoch, key) in groupKeys)
         {
-            if (key.Length != E2eeV2.GroupKeySize)
-                throw new ArgumentException($"GroupKey epoch {epoch} のサイズが不正です ({key.Length}B)。");
             _groupKeys[epoch] = new SecureBuffer(key);
         }
     }
 
     public SecureBuffer VolumeId { get; }
+    public int ChunkSize { get; }
 
     public string VolumeIdString => System.Text.Encoding.UTF8.GetString(VolumeId.Data);
 
@@ -105,9 +109,10 @@ public sealed class E2eeSession : IDisposable
     /// <summary>
     /// 共有 v2 の GroupKey 状態を登録する。masterKey を持たないメンバーはこれだけで読み書きできる。
     /// </summary>
-    public void StoreV2State(string volumeName, string volumeId, IReadOnlyDictionary<int, byte[]> groupKeysByEpoch)
+    public void StoreV2State(string volumeName, string volumeId, IReadOnlyDictionary<int, byte[]> groupKeysByEpoch,
+        int chunkSize = 1048576)
     {
-        var replacement = new E2eeV2VolumeState(volumeId, groupKeysByEpoch);
+        var replacement = new E2eeV2VolumeState(volumeId, groupKeysByEpoch, chunkSize);
         if (_v2States.TryGetValue(volumeName, out var previous)) previous.Dispose();
         _v2States[volumeName] = replacement;
     }
@@ -118,7 +123,8 @@ public sealed class E2eeSession : IDisposable
     public bool HasV2State(string volumeName) => _v2States.ContainsKey(volumeName);
 
     public int GetChunkSize(string volumeName) =>
-        _keys.TryGetValue(volumeName, out var v) ? v.ChunkSize : 1048576;
+        _keys.TryGetValue(volumeName, out var v) ? v.ChunkSize
+            : _v2States.TryGetValue(volumeName, out var v2) ? v2.ChunkSize : 1048576;
 
     /// <summary>masterKey を取得する (返り値の配列は変更しないこと。セッションが所有する)。</summary>
     public byte[] GetMasterKey(string volumeName) =>

@@ -267,6 +267,7 @@ public class MobileAppE2ETests(AspireFixture fixture)
 
         // --- 戻って別フォルダの画像 ---
         Assert.True(app.Navigation.GoBack());
+        await WaitIdleAsync(browser, "戻ったフォルダの自動再ロード");
         Assert.Equal("docs", browser.CurrentPath);
         browser.GoUpCommand.Execute(null);
         Assert.Equal("", browser.CurrentPath);

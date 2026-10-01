@@ -11,23 +11,23 @@ public sealed class FileApiClient
     public FileApiClient(HttpClient http) => _http = http;
 
     /// <summary>ファイル一覧。</summary>
-    public async Task<ListFilesResponse> ListAsync(string volumeName)
+    public async Task<ListFilesResponse> ListAsync(string volumeName, CancellationToken ct = default)
     {
         var result = await _http.GetFromJsonAsync<ListFilesResponse>(
-            $"/api/v1/files/{Uri.EscapeDataString(volumeName)}");
+            $"/api/v1/files/{Uri.EscapeDataString(volumeName)}", ct);
         return result ?? new ListFilesResponse([]);
     }
 
     /// <summary>ファイルアップロード。</summary>
-    public async Task<FileMetadata> UploadAsync(string volumeName, string fileName, Stream content, long contentLength)
+    public async Task<FileMetadata> UploadAsync(string volumeName, string fileName, Stream content, long contentLength, CancellationToken ct = default)
     {
         using var streamContent = new StreamContent(content);
         streamContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
 
-        var response = await _http.PostAsync(
-            $"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(fileName)}", streamContent);
+        using var response = await _http.PostAsync(
+            $"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(fileName)}", streamContent, ct);
         response.EnsureSuccessStatusCode();
-        return (await response.Content.ReadFromJsonAsync<FileMetadata>())!;
+        return (await response.Content.ReadFromJsonAsync<FileMetadata>(ct))!;
     }
 
     /// <summary>ファイルダウンロード URL を取得。</summary>
@@ -37,20 +37,20 @@ public sealed class FileApiClient
     }
 
     /// <summary>ファイル削除。</summary>
-    public async Task DeleteAsync(string volumeName, string fileName)
+    public async Task DeleteAsync(string volumeName, string fileName, CancellationToken ct = default)
     {
-        var response = await _http.DeleteAsync(
-            $"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(fileName)}");
+        using var response = await _http.DeleteAsync(
+            $"/api/v1/files/{Uri.EscapeDataString(volumeName)}/{Uri.EscapeDataString(fileName)}", ct);
         response.EnsureSuccessStatusCode();
     }
 
     /// <summary>ストリーミングトークン発行。</summary>
-    public async Task<string> IssueStreamTokenAsync(string volumeName, string fileName)
+    public async Task<string> IssueStreamTokenAsync(string volumeName, string fileName, CancellationToken ct = default)
     {
-        var response = await _http.PostAsJsonAsync("/api/v1/stream/token",
-            new StreamTokenRequest(volumeName, fileName));
+        using var response = await _http.PostAsJsonAsync("/api/v1/stream/token",
+            new StreamTokenRequest(volumeName, fileName), ct);
         response.EnsureSuccessStatusCode();
-        var result = await response.Content.ReadFromJsonAsync<TokenResponse>();
+        var result = await response.Content.ReadFromJsonAsync<TokenResponse>(ct);
         return result?.Token ?? "";
     }
 

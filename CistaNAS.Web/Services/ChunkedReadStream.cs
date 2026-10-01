@@ -180,7 +180,7 @@ public sealed class ChunkedReadStream : Stream
         byte[] plain = ChunkEncryptor.DecryptChunkWithScopedKey(
             _masterKey, _scopedKey, _cipherAlgorithm, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength);
 
-        _cachedDecrypted = plain;
+        ValidateAndCache(plain, originalLength);
         _cachedChunkIndex = chunkIndex;
         return plain;
     }
@@ -200,12 +200,23 @@ public sealed class ChunkedReadStream : Stream
         byte[] plain = ChunkEncryptor.DecryptChunkWithScopedKey(
             _masterKey, _scopedKey, _cipherAlgorithm, chunkIndex, _sectorSize, _chunkSize, encrypted, originalLength);
 
-        _cachedDecrypted = plain;
+        ValidateAndCache(plain, originalLength);
         _cachedChunkIndex = chunkIndex;
         return plain;
     }
 
     public override void Flush() { }
+
+    private void ValidateAndCache(byte[] plain, int expectedLength)
+    {
+        if (plain.Length != expectedLength)
+        {
+            CryptographicOperations.ZeroMemory(plain);
+            throw new InvalidDataException("復号済みチャンクの長さがカタログと一致しません。");
+        }
+        if (_cachedDecrypted is not null) CryptographicOperations.ZeroMemory(_cachedDecrypted);
+        _cachedDecrypted = plain;
+    }
     public override void SetLength(long value) => throw new NotSupportedException();
     public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 
@@ -214,6 +225,7 @@ public sealed class ChunkedReadStream : Stream
         if (_disposed) return;
         if (disposing)
         {
+            if (_cachedDecrypted is not null) CryptographicOperations.ZeroMemory(_cachedDecrypted);
             _cachedDecrypted = null;
             if (_scopedKey is not null) CryptographicOperations.ZeroMemory(_scopedKey);
             CryptographicOperations.ZeroMemory(_masterKey);

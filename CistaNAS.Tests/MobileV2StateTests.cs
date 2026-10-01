@@ -7,6 +7,19 @@ namespace CistaNAS.Tests;
 public class MobileV2StateTests
 {
     [Fact]
+    public void UnlockedV2Member_ReopeningVolumeDoesNotAskForMasterKey()
+    {
+        using var app = new AppServices(new MemorySecureKeyStore(), new MemoryAppSettings(), new RecordingFileViewer(), new FakeE2eeServer());
+        app.Session.ConfigureServer("http://test/");
+        app.E2ee.StoreV2State("vol", "vol-id", new Dictionary<int, byte[]> { [1] = E2eeV2.GenerateGroupKey() });
+        var volumes = new CistaNAS.Mobile.Core.ViewModels.VolumesViewModel(app);
+        volumes.OpenVolumeCommand.Execute(new CistaNAS.Client.Api.VolumeListItem
+            { Name = "vol", EncryptionMode = "group-e2ee", IsMounted = true });
+        Assert.False(volumes.IsMountPromptVisible);
+        Assert.IsType<CistaNAS.Mobile.Core.ViewModels.FileBrowserViewModel>(app.Navigation.Current);
+    }
+
+    [Fact]
     public void E2eeV2VolumeState_ManagesEpochsAndVolumeId()
     {
         var keys = new Dictionary<int, byte[]>

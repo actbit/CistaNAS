@@ -34,9 +34,8 @@ public sealed class E2eeFileService
     private readonly string _volumeDataPath;
 
     /// <summary>ファイル単位の読み書きゲート。ダウンロード中の上書き・削除を防止。</summary>
-    private static readonly ConcurrentDictionary<string, AsyncFileGate> _fileGates = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<(string Volume, string FileId), AsyncFileGate> _fileGates = new();
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _volumeGates = new(StringComparer.Ordinal);
-    private static readonly ConcurrentDictionary<string, ConcurrentBag<string>> _volumeFileIds = new(StringComparer.Ordinal);
 
     public E2eeFileService(VolumeService volumeService, IStorageProvider storage, IChunkStore chunkStore, IOptions<CistaNasOptions> options)
     {
@@ -66,8 +65,8 @@ public sealed class E2eeFileService
         // crypto format v2: KeyEpoch ≥ 1 は共有 v2 形式。ラップ済み DEK が必須で、
         // epoch はボリュームの現行 epoch と一致する（旧 epoch の GroupKey で新規ファイルを作成させない）。
         // KeyEpoch == 0 は v1 形式（単独 E2EE、masterKey 派生 fileKey）。
-        if (request.KeyEpoch < 0 || request.KeyEpoch > header.KeyEpoch)
-            throw new FileServiceException($"KeyEpoch {request.KeyEpoch} は不正です（0-{header.KeyEpoch}）。");
+        if (request.KeyEpoch != header.KeyEpoch)
+            throw new FileServiceException($"新規ファイルには現行の KeyEpoch {header.KeyEpoch} が必要です。鍵を再取得してください。");
         if (request.KeyEpoch >= 1)
         {
             if (request.WrappedFileKey is null)
@@ -149,8 +148,7 @@ public sealed class E2eeFileService
             catalog.Files[fileId] = entry;
             await SaveCatalogAsync(volumeName, catalog, ct);
 
-            _fileGates.TryAdd(fileId, new AsyncFileGate());
-            _volumeFileIds.GetOrAdd(volumeName, _ => new ConcurrentBag<string>()).Add(fileId);
+            _fileGates.GetOrAdd((volumeName, fileId), _ => new AsyncFileGate());
             return entry;
         }
         finally
@@ -160,7 +158,8 @@ public sealed class E2eeFileService
     }
 
     /// <summary>チャンクをアップロードして volume.dat またはチャンクストアに書き込む。</summary>
-    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, Stream data, long dataLength, bool replace = false, CancellationToken ct = default)
+    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, Stream data, long dataLength,
+        bool replace = false, CancellationToken ct = default, int? encryptionKeyEpoch = null)
     {
         var header = GetE2eeHeader(volumeName);
 
@@ -172,13 +171,20 @@ public sealed class E2eeFileService
         try
         {
             using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
-            var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
+            var gate = _fileGates.GetOrAdd((volumeName, fileId), _ => new AsyncFileGate());
             using (await gate.EnterWriteAsync(ct))
             {
                 var catalog = await LoadCatalogAsync(volumeName, ct);
 
                 if (!catalog.Files.TryGetValue(fileId, out var entry))
                     throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+
+                // Rewrapping changes the DEK's wrap epoch, but an in-flight
+                // ciphertext still binds the epoch used when it was encrypted.
+                int chunkKeyEpoch = encryptionKeyEpoch ?? entry.KeyEpoch;
+                if (entry.KeyEpoch == 0 ? chunkKeyEpoch != 0
+                    : chunkKeyEpoch <= 0 || chunkKeyEpoch > header.KeyEpoch || header.GetGroupEpoch(chunkKeyEpoch) is null)
+                    throw new FileServiceException("チャンクの暗号化 KeyEpoch が不正です。v2 アップロードには X-Chunk-KeyEpoch が必要です。");
 
                 if (chunkIndex < 0)
                     throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です。");
@@ -322,7 +328,7 @@ public sealed class E2eeFileService
                         Size = chunkData.Length,
                         Hash = hashHex,
                         Revision = newRevision,
-                        KeyEpoch = entry.KeyEpoch,
+                        KeyEpoch = chunkKeyEpoch,
                     };
                 }
                 else
@@ -347,7 +353,7 @@ public sealed class E2eeFileService
 
                     while (entry.ChunkKeyEpochs.Count <= chunkIndex)
                         entry.ChunkKeyEpochs.Add(entry.KeyEpoch);
-                    entry.ChunkKeyEpochs[chunkIndex] = entry.KeyEpoch;
+                    entry.ChunkKeyEpochs[chunkIndex] = chunkKeyEpoch;
 
                     if (newChunkObjectId is not null)
                     {
@@ -385,7 +391,7 @@ public sealed class E2eeFileService
     {
         GetE2eeHeader(volumeName);
 
-        var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
+        var gate = _fileGates.GetOrAdd((volumeName, fileId), _ => new AsyncFileGate());
         var readLock = await gate.EnterReadAsync(ct);
 
         try
@@ -485,7 +491,7 @@ public sealed class E2eeFileService
         try
         {
             using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
-            var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
+            var gate = _fileGates.GetOrAdd((volumeName, fileId), _ => new AsyncFileGate());
             using (await gate.EnterWriteAsync(ct))
             {
                 var catalog = await LoadCatalogAsync(volumeName, ct);
@@ -595,6 +601,8 @@ public sealed class E2eeFileService
             {
                 if (!catalog.Files.TryGetValue(rewrap.FileId, out var entry))
                     throw new FileServiceException($"ファイル '{rewrap.FileId}' が見つかりません。");
+                if (entry.KeyEpoch == 0)
+                    throw new FileServiceException("v1 ファイルは鍵の再ラップだけでは v2 形式に変換できません。");
                 // 再ラップ先 epoch は現行 epoch のみ（旧 epoch への巻き戻しを防止）。
                 if (rewrap.KeyEpoch != header.KeyEpoch || header.GetGroupEpoch(rewrap.KeyEpoch) is null)
                     throw new FileServiceException($"KeyEpoch {rewrap.KeyEpoch} は不正です（現行: {header.KeyEpoch}）。");
@@ -602,6 +610,10 @@ public sealed class E2eeFileService
                     throw new FileServiceException($"ファイル '{rewrap.FileId}' の KeyEpoch を巻き戻せません。");
                 ValidateWrappedFileKeyShape(rewrap.WrappedFileKey);
 
+                // Older catalogs infer missing chunk epochs from the file's
+                // wrap epoch. Materialize that value before changing the wrap.
+                while (entry.ChunkKeyEpochs.Count < entry.ChunkCount)
+                    entry.ChunkKeyEpochs.Add(entry.KeyEpoch);
                 entry.KeyEpoch = rewrap.KeyEpoch;
                 entry.WrappedFileKey = rewrap.WrappedFileKey;
             }
@@ -665,24 +677,9 @@ public sealed class E2eeFileService
         GetE2eeHeader(volumeName);
         var catalog = await LoadCatalogAsync(volumeName, ct);
 
-        // ゴミゲート（カタログから消えたファイルのもの）を破棄する。
-        // _fileGates は全ボリュームで共有される static 辞書のため、自ボリュームに
-        // 紐づく fileId（_volumeFileIds）だけを対象にすること。他ボリュームの gate を
-        // 破棄すると、並行動作中のそのボリュームの UploadChunkAsync / DownloadChunkAsync が
-        // 使用中の SemaphoreSlim を破壊され（ObjectDisposedException）、
-        // アップロード中のデータが失われる。
-        if (_volumeFileIds.TryGetValue(volumeName, out var ownFileIds))
-        {
-            foreach (string fileId in ownFileIds)
-            {
-                if (!catalog.Files.ContainsKey(fileId)
-                    && _fileGates.TryRemove(fileId, out var fileGate))
-                {
-                    fileGate.Dispose();
-                }
-            }
-        }
-
+        // Catalog absence does not mean a gate is idle: deletion and queued
+        // downloads may still own it. Retain gates until volume cleanup so a
+        // recreated file ID and older requests continue sharing the same gate.
         return new E2eeListFilesResponse(catalog.Files.Values.OrderBy(f => f.CreatedAt).ToList());
     }
 
@@ -705,41 +702,34 @@ public sealed class E2eeFileService
         try
         {
             using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
-            var gate = _fileGates.GetOrAdd(fileId, _ => new AsyncFileGate());
+            var gate = _fileGates.GetOrAdd((volumeName, fileId), _ => new AsyncFileGate());
             using (await gate.EnterWriteAsync(ct))
             {
                 var catalog = await LoadCatalogAsync(volumeName, ct);
                 if (!catalog.Files.Remove(fileId))
                     throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
                 await SaveCatalogAsync(volumeName, catalog, ct);
+
+                // Prefix deletion includes all chunk generations under this ID.
+                // Keep both locks until it finishes; otherwise a new creation
+                // can upload chunks that this older deletion then removes.
+                if (isChunkMode)
+                    await _chunkStore.DeleteChunksWithRetryAsync(volumeName, fileId, ct);
             }
         }
         finally
         {
             volGate.Release();
         }
-
-        // チャンクモード: S3 からチャンクを削除（リトライ付き）
-        if (isChunkMode)
-        {
-            await _chunkStore.DeleteChunksWithRetryAsync(volumeName, fileId, ct);
-        }
-
-        // ファイル削除後に対応するゲートを破棄
-        if (_fileGates.TryRemove(fileId, out var g))
-            g.Dispose();
     }
 
     /// <summary>ボリューム削除時に対応するゲートを破棄。</summary>
     public void CleanupVolumeGates(string volumeName)
     {
-        if (_volumeFileIds.TryRemove(volumeName, out var fileIds))
+        foreach (var key in _fileGates.Keys.Where(key => key.Volume == volumeName))
         {
-            foreach (var fileId in fileIds)
-            {
-                if (_fileGates.TryRemove(fileId, out var fileGate))
-                    fileGate.Dispose();
-            }
+            if (_fileGates.TryRemove(key, out var fileGate))
+                fileGate.Dispose();
         }
 
         if (_volumeGates.TryRemove(volumeName, out var volGate))

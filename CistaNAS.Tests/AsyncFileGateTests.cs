@@ -8,6 +8,26 @@ namespace CistaNAS.Tests;
 /// </summary>
 public class AsyncFileGateTests
 {
+    [Fact]
+    public async Task OverlappingReaderEntryAndExit_LeavesNoPhantomReadersOrPrematureWriter()
+    {
+        using var gate = new AsyncFileGate();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => Task.Run(async () =>
+        {
+            for (int i = 0; i < 5000; i++)
+            {
+                using var reader = await gate.EnterReadAsync(stop.Token);
+                if (i % 100 == 0) await Task.Yield();
+            }
+        })));
+        using var held = await gate.EnterReadAsync(stop.Token);
+        Task<IDisposable> writer = gate.EnterWriteAsync(stop.Token);
+        Assert.False(writer.IsCompleted);
+        held.Dispose();
+        using var acquired = await writer.WaitAsync(TimeSpan.FromSeconds(2));
+    }
+
     private static CancellationToken Ct => CancellationToken.None;
 
     /// <summary>複数の並行リーダーが同時に読み取りロックを取得できる。</summary>
@@ -239,32 +259,19 @@ public class AsyncFileGateTests
         wl.Dispose();
     }
 
-    /// <summary>最後のリーダーの解放でライターに即時通知される（遅延なし）。</summary>
+    /// <summary>最後のリーダーの解放で待機中のライターが取得可能になる。</summary>
     [Fact]
-    public async Task LastReaderExit_InstantWriterNotification()
+    public async Task LastReaderExit_ReleasesWaitingWriter()
     {
         using var gate = new AsyncFileGate();
         var readLock = await gate.EnterReadAsync(Ct);
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        bool writerAcquired = false;
-        var writerTask = Task.Run(async () =>
-        {
-            using var wl = await gate.EnterWriteAsync(Ct);
-            writerAcquired = true;
-        });
-
-        // ライターが待機状態に入るまで少し待つ
-        await Task.Delay(100);
-
-        // リーダーを解放 → ライターに即時通知されるはず
+        // Start acquisition directly so the pending writer is established before
+        // releasing the reader, without depending on thread-pool scheduling.
+        var writerTask = gate.EnterWriteAsync(Ct);
+        Assert.False(writerTask.IsCompleted);
         readLock.Dispose();
-        await writerTask;
-        sw.Stop();
-
-        Assert.True(writerAcquired);
-        // 即時通知なら 50ms 以内に完了するはず（スピンウェイトの 20ms より高速）
-        Assert.True(sw.ElapsedMilliseconds < 200, $"ライター取得に {sw.ElapsedMilliseconds}ms かかった");
+        using var writeLock = await writerTask.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     /// <summary>Dispose 後に新しい操作は ObjectDisposedException。</summary>

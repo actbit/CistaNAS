@@ -15,6 +15,67 @@ namespace CistaNAS.Tests;
 /// </summary>
 public class E2eeTransferServiceTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UploadReportsTheEncryptionEpochOfEachChunk(bool v2)
+    {
+        var (service, server) = CreateService(1024, v2);
+        using var source = new MemoryStream(new byte[1025]);
+        await service.UploadAsync(Volume, "epoch.bin", source, 1025);
+        Assert.Equal(2, server.UploadEpochHeaders.Count);
+        Assert.All(server.UploadEpochHeaders, value => Assert.Equal(v2 ? "1" : "0", value));
+    }
+    [Theory]
+    [InlineData(false, -1)]
+    [InlineData(false, 1)]
+    [InlineData(true, -1)]
+    [InlineData(true, 1)]
+    public async Task DecryptedDownload_RejectsMismatchWithDeclaredFileLength(bool v2, int difference)
+    {
+        var (service, server) = CreateService(1024, v2);
+        using var input = new MemoryStream(new byte[1500]);
+        await service.UploadAsync(Volume, "changed.bin", input, 1500);
+        server.LastCreated!.EncryptedLength += difference;
+        await Assert.ThrowsAsync<InvalidDataException>(async () =>
+        {
+            using var output = await service.OpenDecryptedAsync(Volume, server.LastCreated);
+        });
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CancellationAfterFinalDownloadChunk_CannotReturnPlaintext(bool v2)
+    {
+        var (service, server) = CreateService(1024, v2);
+        using var input = new MemoryStream(new byte[1500]);
+        await service.UploadAsync(Volume, "cancelled.bin", input, 1500);
+        using var stop = new CancellationTokenSource();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            using var output = await service.OpenDecryptedAsync(Volume, server.LastCreated!, new CancelProgress(stop), stop.Token);
+        });
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CancellationAfterLastChunk_DoesNotFinalizeUpload(bool v2)
+    {
+        var (service, server) = CreateService(1024, v2);
+        using var stop = new CancellationTokenSource();
+        using var input = new MemoryStream(new byte[3]);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => service.UploadAsync(Volume, "file.bin", input, 3,
+            new CancelProgress(stop), stop.Token));
+        Assert.Equal(0, server.FinalizedCount);
+        Assert.Equal(1, server.DeletedCount);
+        Assert.Equal(1, server.ReleasedCount);
+    }
+
+    private sealed class CancelProgress(CancellationTokenSource stop) : IProgress<double>
+    { public void Report(double value) { if (value == 100) stop.Cancel(); } }
+
     private const string Volume = "vol";
     private static readonly byte[] MasterKey = E2eeCrypto.GenerateMasterKey();
 
@@ -193,6 +254,7 @@ public class E2eeTransferServiceTests
 /// <summary>E2EE チャンク転送エンドポイントのインメモリFake。</summary>
 internal sealed class FakeE2eeServer : HttpMessageHandler
 {
+    public List<string?> UploadEpochHeaders { get; } = [];
     private readonly Dictionary<(string FileId, int Index), byte[]> _chunks = new();
     private readonly Dictionary<(string FileId, int Index), int> _revisions = new();
     private readonly Dictionary<(string FileId, int Index), string> _leaseHeaders = new();
@@ -251,6 +313,7 @@ internal sealed class FakeE2eeServer : HttpMessageHandler
 
             if (op == "upload-chunk" && request.Method == HttpMethod.Post)
             {
+                UploadEpochHeaders.Add(request.Headers.TryGetValues("X-Chunk-KeyEpoch", out var epochs) ? epochs.Single() : null);
                 string lease = request.Headers.TryGetValues("X-CistaNAS-Write-Lease", out var vals) ? vals.First() : "";
                 if (string.IsNullOrEmpty(lease))
                     return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest));

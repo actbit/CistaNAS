@@ -49,25 +49,24 @@ public sealed class S3ChunkStore : IChunkStore
         return indices;
     }
 
-    public async Task DeleteChunksAsync(string volumeName, string objectId, CancellationToken ct = default)
-    {
-        string prefix = $"{volumeName}/chunks/{objectId}/";
-        var keys = await _storage.ListAsync(prefix, ct);
-        foreach (var key in keys)
-        {
-            try { await _storage.DeleteAsync(key, ct); }
-            catch (Exception) { /* ベストエフォート */ }
-        }
-    }
+    public Task DeleteChunksAsync(string volumeName, string objectId, CancellationToken ct = default)
+        => DeleteByPrefixAsync($"{volumeName}/chunks/{objectId}/", ct);
 
-    public async Task DeleteVolumeChunksAsync(string volumeName, CancellationToken ct = default)
+    public Task DeleteVolumeChunksAsync(string volumeName, CancellationToken ct = default)
+        => DeleteByPrefixAsync($"{volumeName}/chunks/", ct);
+
+    private async Task DeleteByPrefixAsync(string prefix, CancellationToken ct)
     {
-        string prefix = $"{volumeName}/chunks/";
         var keys = await _storage.ListAsync(prefix, ct);
+        List<Exception> failures = [];
         foreach (var key in keys)
         {
+            ct.ThrowIfCancellationRequested();
             try { await _storage.DeleteAsync(key, ct); }
-            catch (Exception) { /* ベストエフォート */ }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { failures.Add(ex); }
         }
+        if (failures.Count > 0)
+            throw new IOException("一部のチャンクを削除できませんでした。", new AggregateException(failures));
     }
 }

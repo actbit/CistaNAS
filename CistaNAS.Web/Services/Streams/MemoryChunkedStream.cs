@@ -136,6 +136,8 @@ internal sealed class MemoryChunkedStream : Stream
         byte[]? data = _chunkStore.ReadChunk(_volumeName, _objectId, chunkIndex);
         if (data is null)
             throw new InvalidOperationException($"チャンク {chunkIndex} がストレージに見つかりません。");
+        if (data.Length != _chunkSizes[chunkIndex])
+            throw new InvalidDataException("保存済みチャンクの長さがカタログと一致しません。");
 
         _cachedData = data;
         _cachedChunkIndex = chunkIndex;
@@ -150,6 +152,8 @@ internal sealed class MemoryChunkedStream : Stream
         byte[]? data = await _chunkStore.ReadChunkAsync(_volumeName, _objectId, chunkIndex, ct);
         if (data is null)
             throw new InvalidOperationException($"チャンク {chunkIndex} がストレージに見つかりません。");
+        if (data.Length != _chunkSizes[chunkIndex])
+            throw new InvalidDataException("保存済みチャンクの長さがカタログと一致しません。");
 
         _cachedData = data;
         _cachedChunkIndex = chunkIndex;

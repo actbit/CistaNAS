@@ -30,11 +30,11 @@ public sealed class CistaNasApiClient
 
     // ---- 認証 ----
 
-    public async Task<string> LoginAsync(string username, string password)
+    public async Task<string> LoginAsync(string username, string password, CancellationToken ct = default)
     {
-        var res = await _http.PostAsJsonAsync("/api/v1/auth/login", new { username, password }, JsonOpts);
+        using var res = await _http.PostAsJsonAsync("/api/v1/auth/login", new { username, password }, JsonOpts, ct);
         res.EnsureSuccessStatusCode();
-        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>(ct);
         return json.GetProperty("accessToken").GetString()!;
     }
 
@@ -42,14 +42,14 @@ public sealed class CistaNasApiClient
 
     public Task CreateVolumeAsync(string volumeName, string username,
         byte[] wrappedNonce, byte[] wrappedCt, byte[] wrappedTag,
-        byte[] kdfSalt, int kdfIterations, int chunkSize = 1048576)
+        byte[] kdfSalt, int kdfIterations, int chunkSize = 1048576, CancellationToken ct = default)
         => CreateVolumeAsync(volumeName, username, wrappedNonce, wrappedCt, wrappedTag,
-            kdfSalt, KdfInfo.LegacyPbkdf2(kdfIterations), chunkSize);
+            kdfSalt, KdfInfo.LegacyPbkdf2(kdfIterations), chunkSize, ct);
 
     /// <summary>E2EE ボリュームを作成する（KDF スペック指定。新規は <see cref="KdfInfo.DefaultArgon2id"/> を使用）。</summary>
     public async Task CreateVolumeAsync(string volumeName, string username,
         byte[] wrappedNonce, byte[] wrappedCt, byte[] wrappedTag,
-        byte[] kdfSalt, KdfInfo kdf, int chunkSize = 1048576)
+        byte[] kdfSalt, KdfInfo kdf, int chunkSize = 1048576, CancellationToken ct = default)
     {
         var req = new
         {
@@ -76,21 +76,21 @@ public sealed class CistaNasApiClient
             },
             chunkSize
         };
-        var res = await _http.PostAsJsonAsync("/api/v1/e2ee/create-volume", req, JsonOpts);
+        using var res = await _http.PostAsJsonAsync("/api/v1/e2ee/create-volume", req, JsonOpts, ct);
         res.EnsureSuccessStatusCode();
     }
 
-    public async Task MountAsync(string volumeName)
+    public async Task MountAsync(string volumeName, CancellationToken ct = default)
     {
-        var res = await _http.PostAsJsonAsync($"/api/v1/e2ee/{volumeName}/mount", new { });
+        using var res = await _http.PostAsJsonAsync($"/api/v1/e2ee/{volumeName}/mount", new { }, ct);
         res.EnsureSuccessStatusCode();
     }
 
-    public async Task<WrappedKeyInfo> GetWrappedKeyAsync(string volumeName, string username)
+    public async Task<WrappedKeyInfo> GetWrappedKeyAsync(string volumeName, string username, CancellationToken ct = default)
     {
-        var res = await _http.GetAsync($"/api/v1/e2ee/{volumeName}/wrapped-key/{username}");
+        using var res = await _http.GetAsync($"/api/v1/e2ee/{volumeName}/wrapped-key/{username}", ct);
         res.EnsureSuccessStatusCode();
-        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>(ct);
 
         var kdf = json.GetProperty("kdf");
         var wk = json.GetProperty("wrappedMasterKey");
@@ -167,7 +167,8 @@ public sealed class CistaNasApiClient
         res.EnsureSuccessStatusCode();
     }
 
-    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, byte[] data, string writeLeaseToken, bool replace = false)
+    public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, byte[] data, string writeLeaseToken,
+        bool replace = false, int keyEpoch = 0)
     {
         var content = new ByteArrayContent(data);
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
@@ -175,6 +176,7 @@ public sealed class CistaNasApiClient
         using var request = new HttpRequestMessage(HttpMethod.Post,
             $"/api/v1/e2ee/{volumeName}/upload-chunk/{fileId}/{chunkIndex}{query}") { Content = content };
         request.Headers.Add("X-CistaNAS-Write-Lease", writeLeaseToken);
+        request.Headers.Add("X-Chunk-KeyEpoch", keyEpoch.ToString(System.Globalization.CultureInfo.InvariantCulture));
         var res = await _http.SendAsync(request);
         res.EnsureSuccessStatusCode();
     }
@@ -238,11 +240,11 @@ public sealed class CistaNasApiClient
         res.EnsureSuccessStatusCode();
     }
 
-    public async Task<List<E2eeFileEntry>> ListFilesAsync(string volumeName)
+    public async Task<List<E2eeFileEntry>> ListFilesAsync(string volumeName, CancellationToken ct = default)
     {
-        var res = await _http.GetAsync($"/api/v1/e2ee/{volumeName}/files");
+        using var res = await _http.GetAsync($"/api/v1/e2ee/{volumeName}/files", ct);
         res.EnsureSuccessStatusCode();
-        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>(ct);
         var files = json.GetProperty("files");
         var result = new List<E2eeFileEntry>();
         foreach (var f in files.EnumerateArray())
@@ -262,11 +264,11 @@ public sealed class CistaNasApiClient
         return result;
     }
 
-    public async Task<List<VolumeListItem>> ListVolumesAsync()
+    public async Task<List<VolumeListItem>> ListVolumesAsync(CancellationToken ct = default)
     {
-        var res = await _http.GetAsync("/api/v1/volumes");
+        using var res = await _http.GetAsync("/api/v1/volumes", ct);
         res.EnsureSuccessStatusCode();
-        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>(ct);
         var result = new List<VolumeListItem>();
         if (json.ValueKind == JsonValueKind.Array)
         {

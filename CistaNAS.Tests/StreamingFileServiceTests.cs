@@ -8,6 +8,31 @@ namespace CistaNAS.Tests;
 
 public sealed class StreamingFileServiceTests
 {
+    [Fact]
+    public async Task V2MemberWithoutMasterKey_CustomChunkSizeSupportsStreamingAndBufferedPreview()
+    {
+        using var server = new FakeE2eeServer();
+        using var http = new HttpClient(server) { BaseAddress = new Uri("http://test/") };
+        using var session = new E2eeSession();
+        session.StoreV2State("vol", Guid.NewGuid().ToString("N"),
+            new Dictionary<int, byte[]> { [1] = E2eeV2.GenerateGroupKey() }, chunkSize: 4096);
+        var api = new CistaNasApiClient(http);
+        byte[] original = RandomNumberGenerator.GetBytes(4097);
+        using var input = new MemoryStream(original);
+        await new E2eeFileTransferService(api, session).UploadAsync("vol", "photo.png", input, original.Length);
+        Assert.False(session.HasKey("vol"));
+        Assert.Equal(2, server.LastCreated!.ChunkCount);
+        var streaming = new StreamingFileService(api, session);
+        using var content = await streaming.OpenE2eeFileAsync("vol", "photo.png", server.LastCreated);
+        byte[] boundary = new byte[2];
+        Assert.Equal(2, await content.ReadAsync(4095, boundary));
+        Assert.Equal(original.AsSpan(4095).ToArray(), boundary);
+        byte[] preview = await new BufferedFileService(streaming).ReadAsync("vol", "photo.png", "photo.png",
+            true, null, server.LastCreated, BufferedFileService.ImageLimit, default);
+        try { Assert.Equal(original, preview); }
+        finally { CryptographicOperations.ZeroMemory(preview); }
+    }
+
     [Theory]
     [InlineData(200, 0, 2)]
     [InlineData(206, 1, 2)]

@@ -6,7 +6,7 @@ using CistaNAS.Mobile.Core.Services;
 namespace CistaNAS.Mobile.Core.ViewModels;
 
 /// <summary>サーバー URL 入力画面 (オンボーディングの起点)。</summary>
-public sealed partial class ConnectViewModel(AppServices app) : BusyViewModelBase
+public sealed partial class ConnectViewModel(AppServices app) : SessionViewModelBase
 {
     [ObservableProperty]
     private string _serverUrl = app.Settings.ServerUrl ?? "";
@@ -14,14 +14,19 @@ public sealed partial class ConnectViewModel(AppServices app) : BusyViewModelBas
     public override string Title => "サーバーに接続";
 
     [RelayCommand]
-    private Task ConnectAsync(CancellationToken ct) => RunBusyAsync(async () =>
+    private Task ConnectAsync(CancellationToken ct) => RunSessionBusyAsync(async () =>
     {
         app.ClearSession();
-        app.Session.ConfigureServer(ServerUrl);
-        bool hasUsers = await app.Session.Api.HasUsersAsync();
-        app.Settings.ServerUrl = ServerUrl.TrimEnd('/');
-        app.Settings.Save();
-        app.Navigation.NavigateTo(hasUsers ? new LoginViewModel(app) : new SetupViewModel(app));
+        string server = ServerUrl.TrimEnd('/');
+        app.Session.ConfigureServer(server);
+        using var operation = BeginOperation(app, ct);
+        bool hasUsers = await app.Session.Api.HasUsersAsync(operation.Cancellation);
+        operation.Commit(() =>
+        {
+            app.Settings.ServerUrl = server;
+            app.Settings.Save();
+            app.Navigation.NavigateTo(hasUsers ? new LoginViewModel(app) : new SetupViewModel(app));
+        });
     });
 
     protected override string FriendlyError(Exception ex) =>

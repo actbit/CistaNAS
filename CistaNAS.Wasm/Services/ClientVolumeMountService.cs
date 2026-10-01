@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using CistaNAS.Wasm.Auth;
 
 namespace CistaNAS.Wasm.Services;
 
@@ -9,6 +10,27 @@ namespace CistaNAS.Wasm.Services;
 /// </summary>
 public sealed class ClientVolumeMountService : IDisposable
 {
+    private readonly WasmAuthStateProvider _auth;
+    private readonly E2eeInterop _crypto;
+    private bool _disposed;
+
+    public ClientVolumeMountService(WasmAuthStateProvider auth, E2eeInterop crypto)
+    {
+        _auth = auth; _crypto = crypto;
+        _auth.SessionInvalidated += ClearMounts;
+    }
+
+    public long CaptureSession()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_auth.IsLoggedIn) throw new OperationCanceledException("ログイン状態が終了しました。");
+        return _auth.AuthenticationVersion;
+    }
+
+    public void EnsureCurrentSession(long version)
+    {
+        if (CaptureSession() != version) throw new OperationCanceledException("認証状態が変更されました。");
+    }
     /// <summary>マウント済みボリュームの情報。</summary>
     private sealed class MountedVolume
     {
@@ -30,15 +52,16 @@ public sealed class ClientVolumeMountService : IDisposable
     private readonly ConcurrentDictionary<string, MountedVolume> _mounted = new(StringComparer.Ordinal);
 
     /// <summary>ボリュームがマウント済みか。</summary>
-    public bool IsMounted(string volumeName) => _mounted.ContainsKey(volumeName);
+    public bool IsMounted(string volumeName) => CanReadMounts() && _mounted.ContainsKey(volumeName);
 
     /// <summary>マウント済みボリューム一覧。</summary>
-    public IReadOnlyList<string> MountedVolumes => _mounted.Keys.ToList();
+    public IReadOnlyList<string> MountedVolumes => CanReadMounts() ? _mounted.Keys.ToList() : [];
 
     /// <summary>サーバー暗号化ボリュームをマウント（キーを保持）。</summary>
-    public void MountServerEncrypted(string volumeName, byte[] masterKey, string cipherAlgorithm, int sectorSize, int chunkSize)
+    public void MountServerEncrypted(string volumeName, byte[] masterKey, string cipherAlgorithm, int sectorSize, int chunkSize,
+        long? sessionVersion = null)
     {
-        _mounted[volumeName] = new MountedVolume
+        Replace(volumeName, new MountedVolume
         {
             VolumeName = volumeName,
             EncryptionMode = "server",
@@ -46,19 +69,19 @@ public sealed class ClientVolumeMountService : IDisposable
             SectorSize = sectorSize,
             ChunkSize = chunkSize,
             MasterKey = masterKey,
-        };
+        }, sessionVersion);
     }
 
     /// <summary>E2EE ボリュームをマウント（JS interop キーハンドルを保持）。</summary>
-    public void MountE2ee(string volumeName, string masterKeyHandle, int chunkSize, string encryptionMode)
+    public void MountE2ee(string volumeName, string masterKeyHandle, int chunkSize, string encryptionMode, long? sessionVersion = null)
     {
-        _mounted[volumeName] = new MountedVolume
+        Replace(volumeName, new MountedVolume
         {
             VolumeName = volumeName,
             EncryptionMode = encryptionMode,
             ChunkSize = chunkSize,
             E2eeMasterKeyHandle = masterKeyHandle,
-        };
+        }, sessionVersion);
     }
 
     /// <summary>
@@ -66,9 +89,9 @@ public sealed class ClientVolumeMountService : IDisposable
     /// masterKeyHandle は v1 ファイルの読み取り用（masterKey を持たない v2 メンバーでは null）。
     /// </summary>
     public void MountE2ee(string volumeName, string? masterKeyHandle, int chunkSize, string encryptionMode,
-        string? volumeId, IReadOnlyDictionary<int, string> groupKeysByEpoch)
+        string? volumeId, IReadOnlyDictionary<int, string> groupKeysByEpoch, long? sessionVersion = null)
     {
-        _mounted[volumeName] = new MountedVolume
+        Replace(volumeName, new MountedVolume
         {
             VolumeName = volumeName,
             EncryptionMode = encryptionMode,
@@ -76,13 +99,13 @@ public sealed class ClientVolumeMountService : IDisposable
             E2eeMasterKeyHandle = masterKeyHandle,
             VolumeId = volumeId,
             GroupKeysByEpoch = new Dictionary<int, string>(groupKeysByEpoch),
-        };
+        }, sessionVersion);
     }
 
     /// <summary>共有 v2: ボリュームの GroupKey 辞書（epoch → base64）と VolumeId を取得。未マウント時は null。</summary>
     public (string? VolumeId, IReadOnlyDictionary<int, string> GroupKeys)? GetE2eeV2Keys(string volumeName)
     {
-        if (!_mounted.TryGetValue(volumeName, out var mv)) return null;
+        if (!CanReadMounts() || !_mounted.TryGetValue(volumeName, out var mv)) return null;
         return (mv.VolumeId, mv.GroupKeysByEpoch);
     }
 
@@ -91,24 +114,22 @@ public sealed class ClientVolumeMountService : IDisposable
     {
         if (_mounted.TryRemove(volumeName, out var mv))
         {
-            if (mv.MasterKey is not null)
-                System.Security.Cryptography.CryptographicOperations.ZeroMemory(mv.MasterKey);
-            // E2EE キーハンドルは JS 側でクリアする必要があるため呼び出し元で処理
+            Release(mv);
         }
     }
 
     /// <summary>マウント済みボリュームのマスターキーを取得（サーバー暗号化）。</summary>
     public byte[]? GetMasterKey(string volumeName)
-        => _mounted.TryGetValue(volumeName, out var mv) ? mv.MasterKey : null;
+        => CanReadMounts() && _mounted.TryGetValue(volumeName, out var mv) ? mv.MasterKey : null;
 
     /// <summary>マウント済みボリュームの E2EE キーハンドルを取得。</summary>
     public string? GetE2eeKeyHandle(string volumeName)
-        => _mounted.TryGetValue(volumeName, out var mv) ? mv.E2eeMasterKeyHandle : null;
+        => CanReadMounts() && _mounted.TryGetValue(volumeName, out var mv) ? mv.E2eeMasterKeyHandle : null;
 
     /// <summary>マウント済みボリュームの情報を取得。</summary>
     public (string EncryptionMode, string CipherAlgorithm, int SectorSize, int ChunkSize) GetVolumeInfo(string volumeName)
     {
-        if (!_mounted.TryGetValue(volumeName, out var mv))
+        if (!CanReadMounts() || !_mounted.TryGetValue(volumeName, out var mv))
             throw new InvalidOperationException($"ボリューム '{volumeName}' はマウントされていません。");
         return (mv.EncryptionMode, mv.CipherAlgorithm, mv.SectorSize, mv.ChunkSize);
     }
@@ -116,17 +137,53 @@ public sealed class ClientVolumeMountService : IDisposable
     /// <summary>マウント済みかどうかと E2EE かどうかを取得。</summary>
     public (bool mounted, bool isE2ee) GetMountStatus(string volumeName)
     {
-        if (!_mounted.TryGetValue(volumeName, out var mv)) return (false, false);
+        if (!CanReadMounts() || !_mounted.TryGetValue(volumeName, out var mv)) return (false, false);
         return (true, mv.EncryptionMode is "e2ee" or "group-e2ee");
     }
 
     public void Dispose()
     {
-        foreach (var kvp in _mounted)
-        {
-            if (kvp.Value.MasterKey is not null)
-                System.Security.Cryptography.CryptographicOperations.ZeroMemory(kvp.Value.MasterKey);
-        }
-        _mounted.Clear();
+        if (_disposed) return;
+        _disposed = true;
+        _auth.SessionInvalidated -= ClearMounts;
+        ClearMounts();
+    }
+
+    private bool CanReadMounts()
+    {
+        if (!_disposed && _auth.IsLoggedIn) return true;
+        ClearMounts();
+        return false;
+    }
+
+    private void Replace(string name, MountedVolume next, long? version)
+    {
+        EnsureCurrentSession(version ?? CaptureSession());
+        _mounted.TryGetValue(name, out var previous);
+        _mounted[name] = next;
+        if (previous is not null) Release(previous, next);
+    }
+
+    private void ClearMounts()
+    {
+        foreach (string name in _mounted.Keys)
+            if (_mounted.TryRemove(name, out var previous)) Release(previous);
+    }
+
+    private void Release(MountedVolume previous, MountedVolume? retained = null)
+    {
+        if (previous.MasterKey is not null && !ReferenceEquals(previous.MasterKey, retained?.MasterKey))
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(previous.MasterKey);
+        previous.MasterKey = null;
+        previous.GroupKeysByEpoch.Clear();
+        if (previous.E2eeMasterKeyHandle is { } handle && handle != retained?.E2eeMasterKeyHandle)
+            _ = ClearHandleAsync(handle);
+        previous.E2eeMasterKeyHandle = null;
+    }
+
+    private async Task ClearHandleAsync(string handle)
+    {
+        try { await _crypto.ClearKey(handle); }
+        catch { /* ブラウザ終了時は JS ランタイム自体が破棄済みの場合がある。 */ }
     }
 }

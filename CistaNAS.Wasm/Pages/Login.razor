@@ -3,7 +3,7 @@
 @using CistaNAS.Wasm.Services
 @implements IDisposable
 @inject WasmAuthStateProvider Auth
-@inject AuthApiClient AuthApi
+@inject BrowserAuthenticationService Authentication
 @inject NavigationManager Nav
 
 <PageTitle>ログイン - CistaNAS</PageTitle>
@@ -43,6 +43,7 @@ else
     private LoginModel _model = new();
     private bool _loading;
     private string? _error;
+    private readonly CancellationTokenSource _lifetime = new();
 
     private sealed class LoginModel
     {
@@ -54,15 +55,17 @@ else
 
     private async Task HandleLogin()
     {
+        if (_loading) return;
         _loading = true;
         _error = null;
 
         try
         {
-            var result = await AuthApi.LoginAsync(_model.Username, _model.Password);
-            if (result is not null)
+            long version = Authentication.Version;
+            string username = _model.Username, password = _model.Password;
+            if (await Authentication.LoginAsync(username, password, version, _lifetime.Token))
             {
-                await Auth.SetTokenAsync(result.AccessToken, result.ExpiresAt);
+                Authentication.EnsureCurrent(version + 1, _lifetime.Token);
                 Nav.NavigateTo("/volumes", forceLoad: false);
             }
             else
@@ -70,6 +73,7 @@ else
                 _error = "ユーザー名またはパスワードが正しくありません。";
             }
         }
+        catch (OperationCanceledException) { }
         catch
         {
             _error = "ログイン中にエラーが発生しました。";
@@ -81,5 +85,10 @@ else
     }
 
     private void StateChanged() => StateHasChanged();
-    public void Dispose() => Auth.StateChanged -= StateChanged;
+    public void Dispose()
+    {
+        _lifetime.Cancel();
+        _model.Password = "";
+        Auth.StateChanged -= StateChanged;
+    }
 }

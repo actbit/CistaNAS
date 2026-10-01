@@ -233,13 +233,13 @@ public static class CistaNasApiClientE2eeV2Extensions
     /// crypto format v2: 自分宛ての全 epoch GroupKey wraps とボリューム鍵状態を取得する。
     /// 共有 v2 未移行ボリュームでは KeyEpoch == 0 / MyGroupKeys 空。
     /// </summary>
-    public static async Task<E2eeGroupKeyInfo?> GetGroupKeyInfoAsync(this CistaNasApiClient client, string volumeName)
+    public static async Task<E2eeGroupKeyInfo?> GetGroupKeyInfoAsync(this CistaNasApiClient client, string volumeName, CancellationToken ct = default)
     {
         var http = client._http;
-        var res = await http.GetAsync($"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/group-key-info");
+        using var res = await http.GetAsync($"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/group-key-info", ct);
         if (res.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
         res.EnsureSuccessStatusCode();
-        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>(ct);
 
         var myKeys = new List<GroupKeyWrapInfo>();
         if (json.TryGetProperty("myGroupKeys", out var keys) && keys.ValueKind == JsonValueKind.Array)

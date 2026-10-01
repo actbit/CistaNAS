@@ -69,8 +69,7 @@ public sealed partial class FilePreviewViewModel(IMountedFilePreviewService file
             {
                 if (MountedFilePreviewService.IsImage(item.Name))
                 {
-                    using var stream = new MemoryStream(bytes.Buffer, writable: false);
-                    image = Bitmap.DecodeToWidth(stream, 1600);
+                    image = ImagePreviewDecoder.Decode(bytes.Buffer);
                 }
                 else
                 {

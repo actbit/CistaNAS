@@ -3,6 +3,10 @@ using CistaNAS.Web.Storage;
 
 namespace CistaNAS.Tests;
 
+[CollectionDefinition("Write lease timing", DisableParallelization = true)]
+public sealed class WriteLeaseTimingCollection;
+
+[Collection("Write lease timing")]
 public sealed class E2eeWriteLeaseServiceTests
 {
     private const int LockedStatusCode = 423;

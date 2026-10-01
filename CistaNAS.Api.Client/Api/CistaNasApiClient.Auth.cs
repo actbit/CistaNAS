@@ -9,19 +9,19 @@ public static class CistaNasApiClientAuth
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
     /// <summary>初期ユーザーが存在するか確認する。</summary>
-    public static async Task<bool> HasUsersAsync(this CistaNasApiClient client)
+    public static async Task<bool> HasUsersAsync(this CistaNasApiClient client, CancellationToken ct = default)
     {
-        var res = await client._http.GetAsync("/api/v1/auth/has-users");
+        using var res = await client._http.GetAsync("/api/v1/auth/has-users", ct);
         res.EnsureSuccessStatusCode();
-        var json = await res.Content.ReadFromJsonAsync<JsonElement>();
+        var json = await res.Content.ReadFromJsonAsync<JsonElement>(ct);
         return json.GetProperty("hasUsers").GetBoolean();
     }
 
     /// <summary>初期管理者を作成する（初回セットアップ）。成功後は LoginAsync でログインする。</summary>
-    public static async Task RunInitialSetupAsync(this CistaNasApiClient client, string username, string password)
+    public static async Task RunInitialSetupAsync(this CistaNasApiClient client, string username, string password, CancellationToken ct = default)
     {
         var req = new { username, password };
-        var res = await client._http.PostAsJsonAsync("/api/v1/auth/setup", req, JsonOpts);
+        using var res = await client._http.PostAsJsonAsync("/api/v1/auth/setup", req, JsonOpts, ct);
         res.EnsureSuccessStatusCode();
     }
 
