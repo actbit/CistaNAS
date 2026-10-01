@@ -14,6 +14,7 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
     private readonly IAmazonS3 _client;
     private readonly string _bucket;
     private readonly string _prefix;
+    public string RecoveryIdentity { get; }
     private static readonly TimeSpan LockLease = TimeSpan.FromMinutes(5);
 
     public S3StorageProvider(string bucket, string region, string? endpointOverride, string? pathPrefix)
@@ -30,6 +31,12 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
         };
         if (!string.IsNullOrEmpty(endpointOverride))
             config.ServiceURL = endpointOverride;
+
+        string destination = string.IsNullOrEmpty(endpointOverride)
+            ? "aws:" + config.RegionEndpoint.SystemName
+            : new Uri(endpointOverride).GetComponents(UriComponents.SchemeAndServer | UriComponents.Path,
+                UriFormat.UriEscaped).TrimEnd('/');
+        RecoveryIdentity = System.Text.Json.JsonSerializer.Serialize(new[] { "s3", destination, _bucket, _prefix });
 
         _client = new AmazonS3Client(config);
     }

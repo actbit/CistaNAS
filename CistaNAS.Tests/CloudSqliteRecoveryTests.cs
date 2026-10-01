@@ -87,6 +87,7 @@ public sealed class CloudSqliteRecoveryTests
         {
             sync.Dispose();
             File.Delete(sync.LocalDbPath);
+            Directory.Delete(Path.GetDirectoryName(sync.LocalDbPath)!);
         }
     }
 
@@ -102,7 +103,7 @@ public sealed class CloudSqliteRecoveryTests
         sync.MarkDirty();
         await sync.UploadIfDirtyAsync();
         Assert.Equal("committed-in-wal", await fixture.CloudValueAsync());
-        Assert.Empty(Directory.GetFiles(fixture.Local, "*.snapshot-*"));
+        Assert.Empty(Directory.GetFiles(Path.GetDirectoryName(sync.LocalDbPath)!, "*.snapshot-*"));
     }
 
     [Fact]
@@ -214,6 +215,7 @@ public sealed class CloudSqliteRecoveryTests
     private sealed class ControlledStorage(string root) : IStorageProvider
     {
         private readonly LocalStorageProvider _inner = new(root);
+        public string RecoveryIdentity => _inner.RecoveryIdentity;
         private int _writes;
         public int FailWrites;
         public bool BlockFirstWrite;

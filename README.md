@@ -537,6 +537,20 @@ Cloud SQLite is a **single-instance** configuration. Its local DB and WAL must b
 WAL data) every `Database:SyncIntervalSeconds` (default 30), retries failures, serializes uploads,
 and resends an existing local DB after restart even without a further application write.
 Downloaded DBs are installed atomically. Shutdown and disposal retain the local recovery copy.
+
+Recovery files live at `<VolumeDataPath>/.cistanas-sqlite/<SHA-256 of destination and BlobKey>/database.sqlite`.
+The temporary fallback uses the same isolation scheme. The actual provider, endpoint, bucket/container,
+and prefix identify the destination; credentials are excluded, so rotating Azure keys or SAS credentials
+alone does not change its recovery location. Cloud object names are not interpreted as local paths.
+
+An existing legacy `<VolumeDataPath>/<BlobKey>` or DB/WAL/SHM directly under the temporary directory
+has no destination binding. Startup stops with both old and new paths and retains the original files.
+Before migration, stop the server, make a backup, and confirm that the old DB belongs to the current
+destination. Move the DB and any `-wal`/`-shm` files to the indicated `database.sqlite`,
+`database.sqlite-wal`, and `database.sqlite-shm` paths. Copying only a running DB can lose uncheckpointed
+changes. Restart and verify the content and synchronization. Retain and check the previous recovery
+copy when changing a destination or BlobKey as well.
+
 The temporary-directory fallback cannot survive container/host replacement: losing the local
 volume before a successful sync can still lose recent changes. Object storage is an asynchronous
 replica, not a transactional database or an independent backup. Use PostgreSQL and separate backups

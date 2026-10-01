@@ -11,6 +11,11 @@ public sealed class LocalStorageProvider : IStorageProvider
         .Select(_ => new SemaphoreSlim(1, 1)).ToArray();
     private readonly string _basePath;
 
+    public string RecoveryIdentity => System.Text.Json.JsonSerializer.Serialize(new[]
+    {
+        "local", OperatingSystem.IsWindows() ? _basePath.ToUpperInvariant() : _basePath,
+    });
+
     private static SemaphoreSlim GetBlobGate(string fullPath)
     {
         var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
@@ -19,7 +24,7 @@ public sealed class LocalStorageProvider : IStorageProvider
 
     public LocalStorageProvider(string basePath)
     {
-        _basePath = basePath;
+        _basePath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(basePath));
         Directory.CreateDirectory(_basePath);
     }
 

@@ -16,6 +16,7 @@ public class CloudSqliteSyncTests
         private int _writes;
         public FailOnceStorageProvider(string path) => _inner = new LocalStorageProvider(path);
         public int WriteAttempts => Volatile.Read(ref _writes);
+        public string RecoveryIdentity => _inner.RecoveryIdentity;
         public Task<byte[]?> ReadAsync(string blobPath, CancellationToken ct = default) => _inner.ReadAsync(blobPath, ct);
         public Task WriteAsync(string blobPath, Stream content, CancellationToken ct = default) => _inner.WriteAsync(blobPath, content, ct);
         public Task WriteAtomicAsync(string blobPath, Stream content, CancellationToken ct = default)
@@ -34,6 +35,7 @@ public class CloudSqliteSyncTests
     /// <summary>全操作が失敗するストレージ（シャットダウンアップロード失敗をシミュレート）。</summary>
     private sealed class FaultyStorageProvider : IStorageProvider
     {
+        public string RecoveryIdentity => "test:unavailable";
         public Task<byte[]?> ReadAsync(string blobPath, CancellationToken ct = default)
             => Task.FromResult<byte[]?>(null);
         public Task WriteAsync(string blobPath, Stream content, CancellationToken ct = default)
@@ -68,14 +70,15 @@ public class CloudSqliteSyncTests
         try
         {
             // ローカルに「最新」、クラウドに「古い」データ
-            string localPath = Path.Combine(localDir, "test.db");
-            await File.WriteAllBytesAsync(localPath, "LOCAL-LATEST"u8.ToArray());
             var storage = new LocalStorageProvider(cloudDir);
             await storage.WriteAsync("test.db", new MemoryStream("CLOUD-STALE"u8.ToArray()));
 
             var sync = new CloudSqliteSync(storage,
                 new StorageOptions { VolumeDataPath = localDir },
                 new DatabaseOptions { BlobKey = "test.db" });
+
+            string localPath = sync.LocalDbPath;
+            await File.WriteAllBytesAsync(localPath, "LOCAL-LATEST"u8.ToArray());
 
             await sync.DownloadAsync();
 
@@ -106,7 +109,7 @@ public class CloudSqliteSyncTests
 
             await sync.DownloadAsync();
 
-            var localContent = await File.ReadAllBytesAsync(Path.Combine(localDir, "test.db"));
+            var localContent = await File.ReadAllBytesAsync(sync.LocalDbPath);
             Assert.Equal("CLOUD-DATA"u8.ToArray(), localContent);
         }
         finally

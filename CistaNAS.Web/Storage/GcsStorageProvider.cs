@@ -14,13 +14,17 @@ public sealed class GcsStorageProvider : IStorageProvider, IAsyncDisposable
     private readonly StorageClient _client;
     private readonly string _bucket;
     private readonly string _prefix;
+    public string RecoveryIdentity => System.Text.Json.JsonSerializer.Serialize(new[] { "gcs", _bucket, _prefix });
     private static readonly TimeSpan LockLease = TimeSpan.FromMinutes(5);
 
     public GcsStorageProvider(string bucketName, string? pathPrefix)
+        : this(StorageClient.Create(), bucketName, pathPrefix) { }
+
+    internal GcsStorageProvider(StorageClient client, string bucketName, string? pathPrefix)
     {
         _bucket = bucketName;
         _prefix = NormalizePrefix(pathPrefix);
-        _client = StorageClient.Create();
+        _client = client;
     }
 
     private string FullPath(string blobPath) => _prefix + blobPath;
@@ -84,9 +88,10 @@ public sealed class GcsStorageProvider : IStorageProvider, IAsyncDisposable
 
     public async Task<IReadOnlyList<string>> ListAsync(string? prefix = null, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         var result = new List<string>();
-        string? blobPrefix = string.IsNullOrEmpty(prefix) ? null : FullPath(prefix);
-        await foreach (var obj in _client.ListObjectsAsync(_bucket, blobPrefix))
+        string blobPrefix = string.IsNullOrEmpty(prefix) ? _prefix : FullPath(prefix);
+        await foreach (var obj in _client.ListObjectsAsync(_bucket, blobPrefix).WithCancellation(ct))
         {
             string name = obj.Name;
             if (name.StartsWith(_prefix))
