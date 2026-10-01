@@ -124,6 +124,8 @@ Open the MinIO console endpoint shown in the Aspire dashboard (credentials: `min
 Normal AppHost launches retain the `minio-data` Docker volume. Integration tests remove this mount
 and use a disposable container layer, checking that their bucket starts empty. Historical test data
 already in `minio-data` is retained; upgrading does not delete that volume or its objects.
+Each fixture labels its own containers with a random identifier and removes those containers and
+their anonymous volumes on teardown, including when Aspire leaves a session container running.
 
 ### Standalone launch (without Aspire)
 

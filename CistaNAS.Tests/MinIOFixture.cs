@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Diagnostics;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Aspire.Hosting.ApplicationModel;
@@ -17,6 +18,7 @@ public class MinIOFixture : IAsyncLifetime
 {
     private DistributedApplication? _app;
     private string _tempDataRoot = "";
+    private readonly string _containerLabel = "cistanas.test-fixture=" + Guid.NewGuid().ToString("N");
 
     public HttpClient Http { get; private set; } = null!;
     public CistaNasApiClient Api { get; private set; } = null!;
@@ -41,6 +43,7 @@ public class MinIOFixture : IAsyncLifetime
         foreach (var mount in minio.Annotations.OfType<ContainerMountAnnotation>()
             .Where(m => m.Target == "/data").ToArray())
             minio.Annotations.Remove(mount);
+        builder.CreateResourceBuilder(minio).WithContainerRuntimeArgs("--label", _containerLabel);
         builder.Services.AddLogging(logging => logging.AddConsole().SetMinimumLevel(LogLevel.Information));
 
         // webfrontend の DataRoot とバケット名をテスト用に上書き
@@ -126,7 +129,17 @@ public class MinIOFixture : IAsyncLifetime
     public async Task DisposeAsync()
     {
         Http?.Dispose();
-        if (_app is not null) await _app.DisposeAsync();
+        if (_app is not null)
+        {
+            // Dispose alone can leave the started host's container running.
+            // Stop its owned resources before releasing the host services.
+            try { await _app.StopAsync(); }
+            finally
+            {
+                try { await _app.DisposeAsync(); }
+                finally { await RemoveOwnedTestContainersAsync(); }
+            }
+        }
 
         // テスト用データを一括削除
         if (Directory.Exists(_tempDataRoot))
@@ -134,6 +147,44 @@ public class MinIOFixture : IAsyncLifetime
             try { Directory.Delete(_tempDataRoot, true); }
             catch (IOException) { /* ベストエフォート */ }
         }
+    }
+
+    private async Task RemoveOwnedTestContainersAsync()
+    {
+        // Aspire may leave session containers after host disposal. Select only
+        // this fixture's randomly labelled containers; never prune shared data.
+        string output = await RunDockerAsync("ps", "--all", "--filter", "label=" + _containerLabel,
+            "--format", "{{.ID}}");
+        foreach (string id in output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (id.Length is < 12 or > 64 || !id.All(Uri.IsHexDigit))
+                throw new IOException("Docker returned an invalid test container ID.");
+            await RunDockerAsync("rm", "--force", "--volumes", id);
+        }
+    }
+
+    private static async Task<string> RunDockerAsync(params string[] arguments)
+    {
+        var start = new ProcessStartInfo("docker")
+        {
+            UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+        };
+        foreach (string argument in arguments) start.ArgumentList.Add(argument);
+        using var process = Process.Start(start) ?? throw new IOException("Unable to start Docker cleanup.");
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        Task<string> output = process.StandardOutput.ReadToEndAsync(timeout.Token);
+        Task<string> error = process.StandardError.ReadToEndAsync(timeout.Token);
+        try { await process.WaitForExitAsync(timeout.Token); }
+        catch (OperationCanceledException)
+        {
+            if (!process.HasExited) process.Kill(entireProcessTree: true);
+            throw;
+        }
+        string text = await output;
+        string diagnostics = await error;
+        if (process.ExitCode != 0) throw new IOException("Docker test cleanup failed: " + diagnostics);
+        return text;
     }
 }
 
