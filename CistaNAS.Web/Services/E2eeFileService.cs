@@ -36,7 +36,6 @@ public sealed class E2eeFileService
     /// <summary>ファイル単位の読み書きゲート。ダウンロード中の上書き・削除を防止。</summary>
     private static readonly ConcurrentDictionary<(string Volume, string FileId), AsyncFileGate> _fileGates = new();
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> _volumeGates = new(StringComparer.Ordinal);
-    private static readonly ConcurrentDictionary<string, ConcurrentBag<string>> _volumeFileIds = new(StringComparer.Ordinal);
 
     public E2eeFileService(VolumeService volumeService, IStorageProvider storage, IChunkStore chunkStore, IOptions<CistaNasOptions> options)
     {
@@ -150,7 +149,6 @@ public sealed class E2eeFileService
             await SaveCatalogAsync(volumeName, catalog, ct);
 
             _fileGates.GetOrAdd((volumeName, fileId), _ => new AsyncFileGate());
-            _volumeFileIds.GetOrAdd(volumeName, _ => new ConcurrentBag<string>()).Add(fileId);
             return entry;
         }
         finally
@@ -665,24 +663,9 @@ public sealed class E2eeFileService
         GetE2eeHeader(volumeName);
         var catalog = await LoadCatalogAsync(volumeName, ct);
 
-        // ゴミゲート（カタログから消えたファイルのもの）を破棄する。
-        // _fileGates は全ボリュームで共有される static 辞書のため、自ボリュームに
-        // 紐づく fileId（_volumeFileIds）だけを対象にすること。他ボリュームの gate を
-        // 破棄すると、並行動作中のそのボリュームの UploadChunkAsync / DownloadChunkAsync が
-        // 使用中の SemaphoreSlim を破壊され（ObjectDisposedException）、
-        // アップロード中のデータが失われる。
-        if (_volumeFileIds.TryGetValue(volumeName, out var ownFileIds))
-        {
-            foreach (string fileId in ownFileIds)
-            {
-                if (!catalog.Files.ContainsKey(fileId)
-                    && _fileGates.TryRemove((volumeName, fileId), out var fileGate))
-                {
-                    fileGate.Dispose();
-                }
-            }
-        }
-
+        // Catalog absence does not mean a gate is idle: deletion and queued
+        // downloads may still own it. Retain gates until volume cleanup so a
+        // recreated file ID and older requests continue sharing the same gate.
         return new E2eeListFilesResponse(catalog.Files.Values.OrderBy(f => f.CreatedAt).ToList());
     }
 
@@ -712,34 +695,27 @@ public sealed class E2eeFileService
                 if (!catalog.Files.Remove(fileId))
                     throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
                 await SaveCatalogAsync(volumeName, catalog, ct);
+
+                // Prefix deletion includes all chunk generations under this ID.
+                // Keep both locks until it finishes; otherwise a new creation
+                // can upload chunks that this older deletion then removes.
+                if (isChunkMode)
+                    await _chunkStore.DeleteChunksWithRetryAsync(volumeName, fileId, ct);
             }
         }
         finally
         {
             volGate.Release();
         }
-
-        // チャンクモード: S3 からチャンクを削除（リトライ付き）
-        if (isChunkMode)
-        {
-            await _chunkStore.DeleteChunksWithRetryAsync(volumeName, fileId, ct);
-        }
-
-        // ファイル削除後に対応するゲートを破棄
-        if (_fileGates.TryRemove((volumeName, fileId), out var g))
-            g.Dispose();
     }
 
     /// <summary>ボリューム削除時に対応するゲートを破棄。</summary>
     public void CleanupVolumeGates(string volumeName)
     {
-        if (_volumeFileIds.TryRemove(volumeName, out var fileIds))
+        foreach (var key in _fileGates.Keys.Where(key => key.Volume == volumeName))
         {
-            foreach (var fileId in fileIds)
-            {
-                if (_fileGates.TryRemove((volumeName, fileId), out var fileGate))
-                    fileGate.Dispose();
-            }
+            if (_fileGates.TryRemove(key, out var fileGate))
+                fileGate.Dispose();
         }
 
         if (_volumeGates.TryRemove(volumeName, out var volGate))

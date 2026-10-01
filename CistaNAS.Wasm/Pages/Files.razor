@@ -236,6 +236,9 @@ else
     // メディアプレビュー
     private string? _selectedFile;
     private string _previewElementId = "";
+    private long _previewGeneration;
+    private bool _previewSetupPending;
+    private Task _previewStop = Task.CompletedTask;
     private bool _disposed;
 
     protected override async Task OnInitializedAsync()
@@ -528,86 +531,101 @@ else
 
     private async Task PreviewMedia(string fileName)
     {
+        long version = Auth.AuthenticationVersion;
+        Task closing = ClosePreview();
+        long generation = _previewGeneration;
+        await closing;
+        if (_disposed || !Auth.IsLoggedIn || version != Auth.AuthenticationVersion
+            || generation != _previewGeneration) return;
         _selectedFile = fileName;
-        _previewElementId = $"media-{fileName.Replace(".", "-").Replace("/", "-").Replace("\\", "-")}";
-        StateHasChanged();
-
-        await Task.Delay(50);
-
-        if (_isE2ee)
-        {
-            await SetupE2eePlayer(fileName);
-        }
-        else
-        {
-            await SetupStreamingPlayer(fileName);
-        }
+        _previewElementId = $"media-{Guid.NewGuid():N}";
+        _previewSetupPending = true;
     }
 
-    private async Task SetupStreamingPlayer(string fileName)
+    protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        var mediaType = MediaHelper.GetMediaType(fileName);
-        var apiBase = Http.BaseAddress!.AbsoluteUri.TrimEnd('/');
-        await JS.InvokeVoidAsync("cistaMedia.setStreamUrl", _previewElementId, apiBase, VolumeName, fileName, mediaType.ToString());
+        if (!_previewSetupPending || _selectedFile is null) return;
+        _previewSetupPending = false;
+        string fileName = _selectedFile, elementId = _previewElementId, volume = VolumeName;
+        long version = Auth.AuthenticationVersion;
+        try
+        {
+            EnsureActivePreview(elementId, version);
+            if (_isE2ee) await SetupE2eePlayer(fileName, volume, elementId, version);
+            else
+            {
+                var apiBase = Http.BaseAddress!.AbsoluteUri.TrimEnd('/');
+                await JS.InvokeVoidAsync("cistaMedia.setStreamUrl", elementId, apiBase, volume, fileName);
+            }
+        }
+        catch (Exception ex)
+        {
+            if (!_disposed && elementId == _previewElementId && version == Auth.AuthenticationVersion)
+            {
+                _operationError = $"プレビューエラー: {ex.Message}";
+                await ClosePreview();
+                StateHasChanged();
+            }
+        }
     }
 
-    private async Task SetupE2eePlayer(string fileName)
+    private async Task SetupE2eePlayer(string fileName, string volume, string elementId, long version)
     {
         var mimeType = MediaHelper.GetMimeType(fileName);
-        var masterKeyHandle = _masterKeyHandle ?? VolumeMountService.GetE2eeKeyHandle(VolumeName);
-
-        if (string.IsNullOrEmpty(masterKeyHandle))
-        {
-            await SetupStreamingPlayer(fileName);
-            return;
-        }
-
-        // E2EE ファイル ID を検索
         var e2eeItem = _e2eeFiles.FirstOrDefault(f => f.PlainName == fileName);
         if (e2eeItem is null)
-        {
-            await SetupStreamingPlayer(fileName);
-            return;
-        }
+            throw new InvalidOperationException("ファイル情報が見つかりません。");
 
         // 共有 v2 のチャンクは per-file DEK + v2 AAD のため、masterKey ストリーミングでは再生できない
         if (e2eeItem.Entry.KeyEpoch >= 1)
         {
-            _operationError = "共有 v2 のファイルはブラウザ内プレビューに対応していません。ダウンロードしてご利用ください。";
-            _selectedFile = null;
-            StateHasChanged();
-            return;
+            throw new NotSupportedException("共有 v2 のファイルはブラウザ内プレビューに対応していません。");
         }
 
-        try
+        var masterKeyHandle = _masterKeyHandle ?? VolumeMountService.GetE2eeKeyHandle(volume);
+        if (string.IsNullOrEmpty(masterKeyHandle))
+            throw new InvalidOperationException("ボリュームをロック解除してください。");
+        var (chunk0Data, _, _) = await E2eeApi.DownloadChunkAsync(volume, e2eeItem.Entry.FileId, 0);
+        EnsureActivePreview(elementId, version);
+        if (chunk0Data.Length < 16) throw new InvalidDataException("ファイルの暗号化情報が不完全です。");
+        var fileSaltBase64 = Convert.ToBase64String(chunk0Data, 0, 16);
+        var apiBase = Http.BaseAddress!.AbsoluteUri.TrimEnd('/');
+        await JS.InvokeVoidAsync("cistaMedia.streamE2eeDirect", new
         {
-            var (chunk0Data, _, _) = await E2eeApi.DownloadChunkAsync(VolumeName, e2eeItem.Entry.FileId, 0);
-            if (chunk0Data.Length < 16) { await SetupStreamingPlayer(fileName); return; }
-
-            var salt = new byte[16];
-            Buffer.BlockCopy(chunk0Data, 0, salt, 0, 16);
-            var fileSaltBase64 = Convert.ToBase64String(salt);
-            var apiBase = Http.BaseAddress!.AbsoluteUri.TrimEnd('/');
-
-            await JS.InvokeVoidAsync("cistaMedia.streamE2eeDirect", new
-            {
-                elementId = _previewElementId,
-                mimeType,
-                apiUrl = apiBase,
-                jwtToken = "",
-                volumeName = VolumeName,
-                fileId = e2eeItem.Entry.FileId,
-                chunkCount = e2eeItem.Entry.ChunkCount,
-                masterKeyHandle,
-                fileSaltBase64,
-            });
-        }
-        catch { await SetupStreamingPlayer(fileName); }
+            elementId,
+            mimeType,
+            apiUrl = apiBase,
+            jwtToken = "",
+            volumeName = volume,
+            fileId = e2eeItem.Entry.FileId,
+            chunkCount = e2eeItem.Entry.ChunkCount,
+            masterKeyHandle,
+            fileSaltBase64,
+        });
     }
 
-    private void ClosePreview()
+    private void EnsureActivePreview(string elementId, long version)
     {
+        EnsureActiveSession(version);
+        if (elementId != _previewElementId || _selectedFile is null) throw new OperationCanceledException();
+    }
+
+    private Task ClosePreview()
+    {
+        _previewGeneration++;
+        string elementId = _previewElementId;
+        _previewElementId = "";
         _selectedFile = null;
+        _previewSetupPending = false;
+        if (elementId.Length > 0) _previewStop = StopPreviewAsync(elementId);
+        return _previewStop;
+    }
+
+    private async Task StopPreviewAsync(string elementId)
+    {
+        try { await JS.InvokeVoidAsync("cistaMedia.stop", elementId); }
+        catch (JSException) { }
+        catch (OperationCanceledException) { }
     }
 
     // ---- ヘルパー ----
@@ -643,13 +661,13 @@ else
         _masterKeyHandle = _volumeId = null;
         _e2eePassword = "";
         _e2eeUnlocked = _e2eeUnlocking = false;
-        _selectedFile = null;
+        _ = ClosePreview();
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
         Dispose();
-        return ValueTask.CompletedTask;
+        await _previewStop;
     }
 
     public void Dispose()

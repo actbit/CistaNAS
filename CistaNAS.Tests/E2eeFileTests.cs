@@ -10,7 +10,7 @@ using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
 
-public class E2eeFileTests : IAsyncDisposable
+public partial class E2eeFileTests : IAsyncDisposable
 {
     private readonly string _dataRoot;
     private readonly IServiceProvider _sp;

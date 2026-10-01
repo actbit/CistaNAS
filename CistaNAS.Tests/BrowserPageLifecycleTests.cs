@@ -8,6 +8,37 @@ namespace CistaNAS.Tests;
 
 public sealed class BrowserPageLifecycleTests
 {
+    [Theory]
+    [InlineData("close")]
+    [InlineData("replace")]
+    [InlineData("login")]
+    public async Task PendingPreviewReplacement_CannotReopenAnAbandonedSelection(string change)
+    {
+        var js = new PausedMediaJs();
+        using var auth = new WasmAuthStateProvider(js);
+        await auth.SetTokenAsync("header.eyJzdWIiOiJhbGljZSJ9.signature", DateTimeOffset.UtcNow.AddMinutes(5));
+        var page = new CistaNAS.Wasm.Pages.Files();
+        Inject(page, "Auth", auth);
+        Inject(page, "JS", js);
+        SetField(page, "_previewElementId", "previous-media");
+        SetField(page, "_selectedFile", "previous.png");
+        Task obsolete = InvokeTask(page, "PreviewMedia", "obsolete.png");
+        await js.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Task? replacement = null;
+        if (change == "close") _ = InvokeTask(page, "ClosePreview");
+        if (change == "replace") replacement = InvokeTask(page, "PreviewMedia", "current.png");
+        if (change == "login")
+        {
+            await auth.LogoutAsync();
+            await auth.SetTokenAsync("header.eyJzdWIiOiJib2IifQ.signature", DateTimeOffset.UtcNow.AddMinutes(5));
+        }
+        js.Release.TrySetResult();
+        await obsolete.WaitAsync(TimeSpan.FromSeconds(5));
+        if (replacement is not null) await replacement.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(change == "replace" ? "current.png" : null, GetField(page, "_selectedFile"));
+        await page.DisposeAsync();
+    }
+
     [Fact]
     public async Task LeavingFilesWhileLoading_DoesNotFetchOrPublishFilesFromTheAbandonedPage()
     {
@@ -41,6 +72,12 @@ public sealed class BrowserPageLifecycleTests
 
     private static void Inject(object page, string name, object value) => page.GetType()
         .GetProperty(name, BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(page, value);
+    private static void SetField(object page, string name, object value) => page.GetType()
+        .GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(page, value);
+    private static object? GetField(object page, string name) => page.GetType()
+        .GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(page);
+    private static Task InvokeTask(object page, string name, params object[] args) => (Task)page.GetType()
+        .GetMethod(name, BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(page, args)!;
     private static HttpResponseMessage Json(object value) => new(HttpStatusCode.OK) { Content = JsonContent.Create(value) };
     private sealed class Handler(Func<HttpRequestMessage, Task<HttpResponseMessage>> send) : HttpMessageHandler
     {
@@ -49,6 +86,19 @@ public sealed class BrowserPageLifecycleTests
     private sealed class NoopJs : IJSRuntime
     {
         public ValueTask<T> InvokeAsync<T>(string identifier, object?[]? args) => ValueTask.FromResult(default(T)!);
+        public ValueTask<T> InvokeAsync<T>(string identifier, CancellationToken ct, object?[]? args) => InvokeAsync<T>(identifier, args);
+    }
+
+    private sealed class PausedMediaJs : IJSRuntime
+    {
+        public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public async ValueTask<T> InvokeAsync<T>(string identifier, object?[]? args)
+        {
+            if (identifier == "cistaMedia.stop")
+            { Entered.TrySetResult(); await Release.Task; }
+            return default!;
+        }
         public ValueTask<T> InvokeAsync<T>(string identifier, CancellationToken ct, object?[]? args) => InvokeAsync<T>(identifier, args);
     }
 }
