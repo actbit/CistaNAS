@@ -61,11 +61,9 @@ public sealed class CloudSqliteSync : BackgroundService
     {
         try
         {
-            if (Path.IsPathRooted(key)) return null;
-            string full = Path.GetFullPath(Path.Combine(root, key));
-            string boundary = root.EndsWith(Path.DirectorySeparatorChar) ? root : root + Path.DirectorySeparatorChar;
-            return full.StartsWith(boundary, OperatingSystem.IsWindows()
-                ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal) ? full : null;
+            // Match the old path calculation, including rooted or parent-relative keys.
+            // This is read-only detection; new recovery files always use the scoped path.
+            return Path.GetFullPath(Path.Combine(root, key));
         }
         catch (ArgumentException) { return null; }
         catch (NotSupportedException) { return null; }

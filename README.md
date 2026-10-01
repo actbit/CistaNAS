@@ -544,7 +544,8 @@ and prefix identify the destination; credentials are excluded, so rotating Azure
 alone does not change its recovery location. Cloud object names are not interpreted as local paths.
 
 An existing legacy `<VolumeDataPath>/<BlobKey>` or DB/WAL/SHM directly under the temporary directory
-has no destination binding. Startup stops with both old and new paths and retains the original files.
+has no destination binding. Legacy absolute or parent-relative BlobKey paths are also checked without
+modifying their files. Startup stops with both old and new paths and retains the original files.
 Before migration, stop the server, make a backup, and confirm that the old DB belongs to the current
 destination. Move the DB and any `-wal`/`-shm` files to the indicated `database.sqlite`,
 `database.sqlite-wal`, and `database.sqlite-shm` paths. Copying only a running DB can lose uncheckpointed

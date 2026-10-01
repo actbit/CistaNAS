@@ -12,6 +12,22 @@ public sealed class CloudSqliteIsolationTests
         Assert.Equal(Path.Combine(root, "cista.db"), CloudSqliteSync.GetLegacyPath(root, "cista.db"));
     }
 
+    [Fact]
+    public void LegacyDatabaseOutsideConfiguredRoot_IsPreservedInsteadOfIgnored()
+    {
+        using var fixture = new Fixture(false);
+        var storage = new LocalStorageProvider(Path.Combine(fixture.Root, "cloud"));
+        var options = new StorageOptions { VolumeDataPath = fixture.Local };
+        var database = new DatabaseOptions { BlobKey = "../legacy.db" };
+        using var probe = new CloudSqliteSync(storage, options, database);
+        string legacy = Path.Combine(fixture.Root, "legacy.db");
+        File.WriteAllText(legacy, "unsynced-legacy-data");
+        var error = Assert.Throws<InvalidOperationException>(() => new CloudSqliteSync(storage, options, database));
+        Assert.Contains(legacy, error.Message);
+        Assert.Equal("unsynced-legacy-data", File.ReadAllText(legacy));
+        Assert.False(File.Exists(probe.LocalDbPath));
+    }
+
     [Theory]
     [InlineData("../metadata.db")]
     [InlineData("nested/metadata.db")]
