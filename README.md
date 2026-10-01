@@ -350,7 +350,9 @@ GroupKey (32B, one per epoch, generated on the client)
 - To isolate later content, remaining members must create a **new file ID, random DEK and salt**,
   re-encrypt the entire file, and only remove the original after the new file is finalized and
   verified. Re-upload through the built-in browser/Android upload creates a new file identity;
-  editing an existing file through Dokan does not replace its DEK. Automatic atomic rekeying
+  editing an existing file through Dokan does not replace its DEK. Legacy v1 volumes reuse the
+  shared master key to derive file keys from public salts, so a fresh v1 upload is also readable with a cached
+  master key: promote to shared v2 before uploading the replacement. Automatic atomic rekeying
   of existing files is not implemented. Cached plaintext and older ciphertext cannot be revoked.
 - Remaining members **keep read access to pre-revocation files** (old epochs stay readable);
   this is intentional so a revoke never destroys the owner's history

@@ -17,6 +17,19 @@ public class E2eeV2Tests
     // ---- TOFU fingerprint ----
 
     [Fact]
+    public void LegacySharedMasterKey_CanDecryptFreshV1UploadEvenWithNewSalt()
+    {
+        byte[] cachedMasterKey = E2eeCrypto.GenerateMasterKey();
+        byte[] newSalt = E2eeCrypto.GenerateFileSalt();
+        byte[] key = E2eeCrypto.DeriveFileKey(cachedMasterKey, newSalt);
+        byte[] updated = "new legacy upload"u8.ToArray();
+        byte[] ciphertext = E2eeCrypto.EncryptChunk(updated, key, 0, newSalt, true);
+        byte[] publicSalt = ciphertext[..E2eeCrypto.SaltSize];
+        byte[] removedMemberKey = E2eeCrypto.DeriveFileKey(cachedMasterKey, publicSalt);
+        Assert.Equal(updated, E2eeCrypto.DecryptChunk(ciphertext, removedMemberKey, 0, publicSalt));
+    }
+
+    [Fact]
     public void CachedFileKey_CanDecryptUpdatesAfterRewrap_ButCannotDecryptFreshFile()
     {
         byte[] oldGroupKey = E2eeV2.GenerateGroupKey();

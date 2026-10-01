@@ -73,9 +73,17 @@ jobs:
         with:
           global-json-file: global.json
       - run: docker info
+      - name: Pull integration test images
+        run: |
+          docker pull minio/minio:latest
+          docker pull postgres:17-alpine
       - run: >-
           dotnet test CistaNAS.StorageTests/CistaNAS.StorageTests.csproj
+          --logger "console;verbosity=normal"
           --logger "trx;LogFileName=storage.trx" --results-directory artifacts/test-results
+      - name: Container diagnostics
+        if: failure()
+        run: docker ps --all
       - name: Require container tests to execute
         if: success()
         shell: pwsh

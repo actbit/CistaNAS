@@ -34,6 +34,7 @@ public class SharingSettingsBrowserTests(PlaywrightWebAppFixture fixture)
         await Assertions.Expect(notice).ToBeVisibleAsync();
         await Assertions.Expect(notice).ToContainTextAsync("保存済みのファイル鍵");
         await Assertions.Expect(notice).ToContainTextAsync("新規ファイルとしてアップロード");
+        await Assertions.Expect(notice).ToContainTextAsync("共有v2へ移行");
     }
 
     private HttpClient AdminHttp()
