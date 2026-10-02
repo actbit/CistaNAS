@@ -32,7 +32,27 @@ public sealed class JournalFile
     public const string Suffix = ".journal";
 
     public string VolumeName { get; set; } = "";
+    [System.Text.Json.Serialization.JsonRequired]
     public List<JournalEntry> Pending { get; set; } = [];
+
+    internal static JournalFile Deserialize(ReadOnlySpan<byte> data)
+    {
+        try { return Validate(JsonSerializer.Deserialize<JournalFile>(data, JsonOptions)); }
+        catch (JsonException ex) { throw new InvalidDataException("ジャーナルの保存内容が不正です。復旧元を確認してください。", ex); }
+    }
+
+    private static JournalFile Deserialize(Stream data)
+    {
+        try { return Validate(JsonSerializer.Deserialize<JournalFile>(data, JsonOptions)); }
+        catch (JsonException ex) { throw new InvalidDataException("ジャーナルの保存内容が不正です。復旧元を確認してください。", ex); }
+    }
+
+    private static JournalFile Validate(JournalFile? journal)
+    {
+        if (journal?.Pending is null || journal.Pending.Any(entry => entry is null || !Enum.IsDefined(entry.Operation)))
+            throw new InvalidDataException("ジャーナルの保存内容が不正です。復旧元を確認してください。");
+        return journal;
+    }
 
     /// <summary>ジャーナルの追記。完了後に <see cref="Flush"/> を呼ぶこと。</summary>
     public static void Append(string journalPath, JournalEntry entry)
@@ -49,7 +69,7 @@ public sealed class JournalFile
         if (File.Exists(journalPath))
         {
             using var fs = File.OpenRead(journalPath);
-            journal = JsonSerializer.Deserialize<JournalFile>(fs, JsonOptions) ?? new JournalFile();
+            journal = Deserialize(fs);
         }
         else
         {
@@ -80,7 +100,7 @@ public sealed class JournalFile
         List<JournalEntry> entries;
         using (var fs = File.OpenRead(journalPath))
         {
-            var journal = JsonSerializer.Deserialize<JournalFile>(fs, JsonOptions) ?? new JournalFile();
+            var journal = Deserialize(fs);
             entries = journal.Pending;
         }
 
@@ -99,6 +119,6 @@ public sealed class JournalFile
     {
         if (!File.Exists(journalPath)) return [];
         using var fs = File.OpenRead(journalPath);
-        return JsonSerializer.Deserialize<JournalFile>(fs, JsonOptions)?.Pending ?? [];
+        return Deserialize(fs).Pending;
     }
 }
