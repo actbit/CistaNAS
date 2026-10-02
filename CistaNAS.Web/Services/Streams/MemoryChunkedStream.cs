@@ -58,6 +58,7 @@ internal sealed class MemoryChunkedStream : Stream
     public override int Read(byte[] buffer, int offset, int count)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        ValidateBufferArguments(buffer, offset, count);
         if (_position >= _totalLength) return 0;
         count = (int)Math.Min(count, _totalLength - _position);
         int totalRead = 0;

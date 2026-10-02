@@ -43,6 +43,7 @@ internal sealed class FileSubStream(Stream baseStream, long offset, long length,
     public override int Read(byte[] buffer, int bufOffset, int count)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        ValidateBufferArguments(buffer, bufOffset, count);
         if (_position >= length) return 0;
         int toRead = (int)Math.Min(count, length - _position);
         if (toRead == 0) return 0;

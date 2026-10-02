@@ -23,6 +23,7 @@ internal sealed class SubStream(Stream baseStream, long length) : Stream
     public override int Read(byte[] buffer, int offset, int count)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        ValidateBufferArguments(buffer, offset, count);
         if (_remaining <= 0) return 0;
         int toRead = (int)Math.Min(count, _remaining);
         if (toRead == 0) return 0;

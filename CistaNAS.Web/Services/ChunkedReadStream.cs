@@ -81,7 +81,7 @@ public sealed class ChunkedReadStream : Stream
 
     public override int Read(byte[] buffer, int offset, int count)
     {
-        ArgumentNullException.ThrowIfNull(buffer);
+        ValidateBufferArguments(buffer, offset, count);
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_position >= _totalLength) return 0;
 
