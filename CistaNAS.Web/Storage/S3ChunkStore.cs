@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace CistaNAS.Web.Storage;
 
 /// <summary>
@@ -15,7 +17,7 @@ public sealed class S3ChunkStore : IChunkStore
     }
 
     private static string ChunkKey(string volumeName, string objectId, int chunkIndex)
-        => $"{volumeName}/chunks/{objectId}/{chunkIndex:D5}";
+        => $"{volumeName}/chunks/{objectId}/{chunkIndex.ToString("D5", CultureInfo.InvariantCulture)}";
 
     public Task WriteChunkAsync(string volumeName, string objectId, int chunkIndex, Stream data, CancellationToken ct = default)
         => _storage.WriteAsync(ChunkKey(volumeName, objectId, chunkIndex), data, ct);
@@ -38,11 +40,12 @@ public sealed class S3ChunkStore : IChunkStore
         var indices = new List<int>(keys.Count);
         foreach (var key in keys)
         {
-            // キー末尾の5桁インデックスを抽出
-            int slash = key.LastIndexOf('/');
-            if (slash < 0 || slash == key.Length - 1) continue;
-            string idxStr = key[(slash + 1)..];
-            if (int.TryParse(idxStr, out int idx))
+            // ReadChunk が実際に参照する直下のキーだけを数える。
+            // 子オブジェクトや versions 配下のチャンクを本体の存在証拠にしない。
+            if (!key.StartsWith(prefix, StringComparison.Ordinal)) continue;
+            string idxStr = key[prefix.Length..];
+            if (int.TryParse(idxStr, NumberStyles.None, CultureInfo.InvariantCulture, out int idx)
+                && idxStr == idx.ToString("D5", CultureInfo.InvariantCulture))
                 indices.Add(idx);
         }
         indices.Sort();

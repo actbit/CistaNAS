@@ -8,6 +8,13 @@ namespace CistaNAS.Tests;
 
 public partial class MinIOStorageE2ETests
 {
+    [Fact]
+    public async Task S3_12_ChunkListing_ExcludesOtherGenerationsAndNonCanonicalKeys()
+    {
+        await using var storage = CreateStorage("chunk-listing/" + Guid.NewGuid().ToString("N"));
+        await ChunkListingRegressionTests.VerifyListingAsync(storage);
+    }
+
     private S3StorageProvider CreateStorage(string? prefix = null) => new(
         MinIOFixture.Bucket, "us-east-1", fixture.MinIOEndpoint, prefix,
         new AmazonS3Client("minioadmin", "minioadmin", new AmazonS3Config
