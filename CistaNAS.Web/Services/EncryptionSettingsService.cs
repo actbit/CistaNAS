@@ -20,6 +20,8 @@ public sealed class EncryptionSettingsService
 {
     private readonly CistaNasOptions _options;
     private readonly ILogger<EncryptionSettingsService> _logger;
+    // Singleton 内で、読み取り→変更→原子的置換→メモリ反映を一括して保護する。
+    private readonly object _settingsGate = new();
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     public EncryptionSettingsService(IOptions<CistaNasOptions> options, ILogger<EncryptionSettingsService> logger)
@@ -46,6 +48,11 @@ public sealed class EncryptionSettingsService
     /// </summary>
     public void SaveSharingOptions(bool enabled)
     {
+        lock (_settingsGate) SaveSharingOptionsCore(enabled);
+    }
+
+    private void SaveSharingOptionsCore(bool enabled)
+    {
         try
         {
             Directory.CreateDirectory(_options.DataRoot);
@@ -66,6 +73,11 @@ public sealed class EncryptionSettingsService
     /// CistaNasOptions.Volume を更新する。ファイルが無ければ何もしない。
     /// </summary>
     public void LoadFromDiskIfExists()
+    {
+        lock (_settingsGate) LoadFromDiskIfExistsCore();
+    }
+
+    private void LoadFromDiskIfExistsCore()
     {
         if (!File.Exists(SettingsPath)) return;
         try
@@ -111,6 +123,11 @@ public sealed class EncryptionSettingsService
     /// <summary>VolumeOptions を cista-settings.json に保存する。</summary>
     public void SaveVolumeOptions(VolumeOptions volume)
     {
+        lock (_settingsGate) SaveVolumeOptionsCore(volume);
+    }
+
+    private void SaveVolumeOptionsCore(VolumeOptions volume)
+    {
         try
         {
             Directory.CreateDirectory(_options.DataRoot);
@@ -143,6 +160,11 @@ public sealed class EncryptionSettingsService
     /// <summary>UpdateEncryptionSettingsRequest から VolumeOptions を構築して保存（ChunkStorage/ServerChunkSize は現状維持）。</summary>
     public void UpdateVolumeOptions(UpdateEncryptionSettingsRequest body)
     {
+        lock (_settingsGate) UpdateVolumeOptionsCore(body);
+    }
+
+    private void UpdateVolumeOptionsCore(UpdateEncryptionSettingsRequest body)
+    {
         Validate(body);
         var current = CurrentVolumeOptions();
         var updated = new VolumeOptions
@@ -159,7 +181,7 @@ public sealed class EncryptionSettingsService
             ServerChunkSize = current.ServerChunkSize,
             MaxFileSizeBytes = current.MaxFileSizeBytes,
         };
-        SaveVolumeOptions(updated);
+        SaveVolumeOptionsCore(updated);
     }
 
     private static void Validate(UpdateEncryptionSettingsRequest body)
@@ -190,6 +212,11 @@ public sealed class EncryptionSettingsService
 
     /// <summary>AuthOptions を cista-settings.json に保存する。</summary>
     public void SaveAuthOptions(AuthOptions auth)
+    {
+        lock (_settingsGate) SaveAuthOptionsCore(auth);
+    }
+
+    private void SaveAuthOptionsCore(AuthOptions auth)
     {
         try
         {
