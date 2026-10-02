@@ -20,7 +20,9 @@ internal sealed class SubStream(Stream baseStream, long length) : Stream
     {
         if (_remaining <= 0) return 0;
         int toRead = (int)Math.Min(count, _remaining);
+        if (toRead == 0) return 0;
         int read = baseStream.Read(buffer, offset, toRead);
+        if (read == 0) throw new EndOfStreamException("保存済みチャンクがカタログの長さより短くなっています。");
         _remaining -= read;
         return read;
     }
@@ -29,7 +31,9 @@ internal sealed class SubStream(Stream baseStream, long length) : Stream
     {
         if (_remaining <= 0) return 0;
         int toRead = (int)Math.Min(buffer.Length, _remaining);
+        if (toRead == 0) return 0;
         int read = await baseStream.ReadAsync(buffer[..toRead], cancellationToken);
+        if (read == 0) throw new EndOfStreamException("保存済みチャンクがカタログの長さより短くなっています。");
         _remaining -= read;
         return read;
     }

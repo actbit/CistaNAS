@@ -41,6 +41,7 @@ internal sealed class FileSubStream(Stream baseStream, long offset, long length,
     {
         if (_position >= length) return 0;
         int toRead = (int)Math.Min(count, length - _position);
+        if (toRead == 0) return 0;
         // 同期パスだが Dokan コールバック等の制約上 GetAwaiter().GetResult() を使用。
         // streamLock はボリューム単位で共有されるが、通常は短時間で解放されるためデッドロックリスクは低い。
         streamLock.WaitAsync(CancellationToken.None).GetAwaiter().GetResult();
@@ -48,6 +49,7 @@ internal sealed class FileSubStream(Stream baseStream, long offset, long length,
         {
             baseStream.Position = offset + _position;
             int read = baseStream.Read(buffer, bufOffset, toRead);
+            if (read == 0) throw new EndOfStreamException("保存済みファイルがカタログの長さより短くなっています。");
             _position += read;
             return read;
         }
@@ -61,11 +63,13 @@ internal sealed class FileSubStream(Stream baseStream, long offset, long length,
     {
         if (_position >= length) return 0;
         int toRead = (int)Math.Min(buffer.Length, length - _position);
+        if (toRead == 0) return 0;
         await streamLock.WaitAsync(cancellationToken);
         try
         {
             baseStream.Position = offset + _position;
             int read = await baseStream.ReadAsync(buffer[..toRead], cancellationToken);
+            if (read == 0) throw new EndOfStreamException("保存済みファイルがカタログの長さより短くなっています。");
             _position += read;
             return read;
         }
