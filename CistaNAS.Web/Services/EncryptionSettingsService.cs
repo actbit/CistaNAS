@@ -74,6 +74,12 @@ public sealed class EncryptionSettingsService
             var persisted = JsonSerializer.Deserialize<PersistedSettings>(json, JsonOptions);
             if (persisted?.Volume is not null)
             {
+                if (persisted.Volume.MaxFileSizeBytes is long limit)
+                {
+                    if (limit <= 0 || limit > (1L << 50))
+                        throw new InvalidDataException("保存されたファイルサイズ上限が不正です。");
+                    _options.Volume.MaxFileSizeBytes = limit;
+                }
                 _options.Volume.SectorSize = persisted.Volume.SectorSize;
                 _options.Volume.KdfAlgorithm = persisted.Volume.KdfAlgorithm;
                 _options.Volume.KdfIterations = persisted.Volume.KdfIterations;
@@ -121,6 +127,7 @@ public sealed class EncryptionSettingsService
                 E2eeChunkSize = volume.E2eeChunkSize,
                 ChunkStorage = volume.ChunkStorage,
                 ServerChunkSize = volume.ServerChunkSize,
+                MaxFileSizeBytes = volume.MaxFileSizeBytes,
             };
             WriteAtomicSettings(SettingsPath, JsonSerializer.Serialize(persisted, JsonOptions));
             // メモリ上も更新
@@ -150,6 +157,7 @@ public sealed class EncryptionSettingsService
             E2eeChunkSize = body.E2eeChunkSize,
             ChunkStorage = current.ChunkStorage,
             ServerChunkSize = current.ServerChunkSize,
+            MaxFileSizeBytes = current.MaxFileSizeBytes,
         };
         SaveVolumeOptions(updated);
     }
@@ -255,6 +263,8 @@ public sealed class EncryptionSettingsService
         public int E2eeChunkSize { get; set; }
         public string ChunkStorage { get; set; } = "local";
         public int ServerChunkSize { get; set; }
+        // 未指定の旧設定では appsettings 等の設定値を保持する。
+        public long? MaxFileSizeBytes { get; set; }
     }
 
     private sealed class PersistedAuth
