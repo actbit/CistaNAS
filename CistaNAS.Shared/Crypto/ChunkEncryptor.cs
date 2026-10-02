@@ -161,6 +161,16 @@ public static class ChunkEncryptor
         ReadOnlySpan<byte> ciphertext,
         int originalLength)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(originalLength);
+        // 長さを検査してから復号する。切り捨てによって過大な保存データを隠さない。
+        // long で計算し、カタログ由来の長さが int の上限付近でもオーバーフローさせない。
+        bool isChaCha20V2 = algorithm == CipherAlgorithm.ChaCha20 && IsChaCha20V2(ciphertext);
+        long expectedLength = ((long)originalLength + 15) / 16 * 16;
+        if (isChaCha20V2)
+            expectedLength += ChaCha20V2Magic.Length + ChaCha20NonceSize + ChaCha20TagSize;
+        if (ciphertext.Length != expectedLength)
+            throw new InvalidDataException("保存済み暗号化チャンクの長さがカタログと一致しません。");
+
         // セクタサイズが未設定（E2EE 等）の場合はブロックサイズ（16）を使用
         if (sectorSize <= 0) sectorSize = 16;
 
@@ -180,7 +190,7 @@ public static class ChunkEncryptor
                 break;
 
             case CipherAlgorithm.ChaCha20:
-                if (IsChaCha20V2(ciphertext))
+                if (isChaCha20V2)
                     padded = DecryptChaCha20V2(key, ciphertext);
                 else
                     ChaCha20Decrypt(key, firstSector, padded, sectorSize);
