@@ -20,6 +20,8 @@ public sealed class EncryptionSettingsService
 {
     private readonly CistaNasOptions _options;
     private readonly ILogger<EncryptionSettingsService> _logger;
+    // Singleton 内で、読み取り→変更→原子的置換→メモリ反映を一括して保護する。
+    private readonly object _settingsGate = new();
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     public EncryptionSettingsService(IOptions<CistaNasOptions> options, ILogger<EncryptionSettingsService> logger)
@@ -46,6 +48,11 @@ public sealed class EncryptionSettingsService
     /// </summary>
     public void SaveSharingOptions(bool enabled)
     {
+        lock (_settingsGate) SaveSharingOptionsCore(enabled);
+    }
+
+    private void SaveSharingOptionsCore(bool enabled)
+    {
         try
         {
             Directory.CreateDirectory(_options.DataRoot);
@@ -67,6 +74,11 @@ public sealed class EncryptionSettingsService
     /// </summary>
     public void LoadFromDiskIfExists()
     {
+        lock (_settingsGate) LoadFromDiskIfExistsCore();
+    }
+
+    private void LoadFromDiskIfExistsCore()
+    {
         if (!File.Exists(SettingsPath)) return;
         try
         {
@@ -74,6 +86,12 @@ public sealed class EncryptionSettingsService
             var persisted = JsonSerializer.Deserialize<PersistedSettings>(json, JsonOptions);
             if (persisted?.Volume is not null)
             {
+                if (persisted.Volume.MaxFileSizeBytes is long limit)
+                {
+                    if (limit <= 0 || limit > (1L << 50))
+                        throw new InvalidDataException("保存されたファイルサイズ上限が不正です。");
+                    _options.Volume.MaxFileSizeBytes = limit;
+                }
                 _options.Volume.SectorSize = persisted.Volume.SectorSize;
                 _options.Volume.KdfAlgorithm = persisted.Volume.KdfAlgorithm;
                 _options.Volume.KdfIterations = persisted.Volume.KdfIterations;
@@ -105,6 +123,11 @@ public sealed class EncryptionSettingsService
     /// <summary>VolumeOptions を cista-settings.json に保存する。</summary>
     public void SaveVolumeOptions(VolumeOptions volume)
     {
+        lock (_settingsGate) SaveVolumeOptionsCore(volume);
+    }
+
+    private void SaveVolumeOptionsCore(VolumeOptions volume)
+    {
         try
         {
             Directory.CreateDirectory(_options.DataRoot);
@@ -121,6 +144,7 @@ public sealed class EncryptionSettingsService
                 E2eeChunkSize = volume.E2eeChunkSize,
                 ChunkStorage = volume.ChunkStorage,
                 ServerChunkSize = volume.ServerChunkSize,
+                MaxFileSizeBytes = volume.MaxFileSizeBytes,
             };
             WriteAtomicSettings(SettingsPath, JsonSerializer.Serialize(persisted, JsonOptions));
             // メモリ上も更新
@@ -136,6 +160,11 @@ public sealed class EncryptionSettingsService
     /// <summary>UpdateEncryptionSettingsRequest から VolumeOptions を構築して保存（ChunkStorage/ServerChunkSize は現状維持）。</summary>
     public void UpdateVolumeOptions(UpdateEncryptionSettingsRequest body)
     {
+        lock (_settingsGate) UpdateVolumeOptionsCore(body);
+    }
+
+    private void UpdateVolumeOptionsCore(UpdateEncryptionSettingsRequest body)
+    {
         Validate(body);
         var current = CurrentVolumeOptions();
         var updated = new VolumeOptions
@@ -150,8 +179,9 @@ public sealed class EncryptionSettingsService
             E2eeChunkSize = body.E2eeChunkSize,
             ChunkStorage = current.ChunkStorage,
             ServerChunkSize = current.ServerChunkSize,
+            MaxFileSizeBytes = current.MaxFileSizeBytes,
         };
-        SaveVolumeOptions(updated);
+        SaveVolumeOptionsCore(updated);
     }
 
     private static void Validate(UpdateEncryptionSettingsRequest body)
@@ -182,6 +212,11 @@ public sealed class EncryptionSettingsService
 
     /// <summary>AuthOptions を cista-settings.json に保存する。</summary>
     public void SaveAuthOptions(AuthOptions auth)
+    {
+        lock (_settingsGate) SaveAuthOptionsCore(auth);
+    }
+
+    private void SaveAuthOptionsCore(AuthOptions auth)
     {
         try
         {
@@ -255,6 +290,8 @@ public sealed class EncryptionSettingsService
         public int E2eeChunkSize { get; set; }
         public string ChunkStorage { get; set; } = "local";
         public int ServerChunkSize { get; set; }
+        // 未指定の旧設定では appsettings 等の設定値を保持する。
+        public long? MaxFileSizeBytes { get; set; }
     }
 
     private sealed class PersistedAuth

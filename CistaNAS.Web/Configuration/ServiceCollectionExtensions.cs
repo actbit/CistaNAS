@@ -37,6 +37,7 @@ public static class ServiceCollectionExtensions
         services.AddScoped<GroupService>();
         // BackgroundService は Singleton 登録でホストが自動起動
         services.AddSingleton<InvitationService>();
+        services.AddHostedService<InvitationService>(sp => sp.GetRequiredService<InvitationService>());
 
         // ボリューム
         services.AddSingleton<VolumeMetadataStore>();
@@ -53,6 +54,7 @@ public static class ServiceCollectionExtensions
 
         // メディアストリーミング（BackgroundService）
         services.AddSingleton<StreamingTokenService>();
+        services.AddHostedService<StreamingTokenService>(sp => sp.GetRequiredService<StreamingTokenService>());
 
         // 暗号化設定の永続化（appsettings.json 直書きを廃止し DB ファイルへ）(H-6)
         services.AddSingleton<EncryptionSettingsService>();

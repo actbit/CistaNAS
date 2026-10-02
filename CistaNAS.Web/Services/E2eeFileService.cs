@@ -802,7 +802,17 @@ public sealed class E2eeFileService
     {
         byte[]? data = await _storage.ReadAsync($"{volumeName}/catalog-e2ee.json", ct);
         if (data is null) return new E2eeCatalog();
-        return JsonSerializer.Deserialize<E2eeCatalog>(data, JsonOptions) ?? new E2eeCatalog();
+        try
+        {
+            var catalog = JsonSerializer.Deserialize<E2eeCatalog>(data, JsonOptions);
+            if (catalog?.Files is null || catalog.Files.Values.Any(file => file is null))
+                throw new InvalidDataException("E2EE ファイルカタログが不正です。保存データを確認してください。");
+            return catalog;
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException("E2EE ファイルカタログが不正です。保存データを確認してください。", ex);
+        }
     }
 
     private async Task SaveCatalogAsync(string volumeName, E2eeCatalog catalog, CancellationToken ct)
