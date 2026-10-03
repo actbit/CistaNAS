@@ -239,6 +239,26 @@ public sealed class AccountService(
     /// </summary>
     public async Task UpdatePublicKeyAsync(string username, string publicKeyBase64, bool allowRotation = false)
     {
+        ArgumentException.ThrowIfNullOrEmpty(publicKeyBase64);
+        if (publicKeyBase64.Length > 256)
+            throw new InvalidOperationException("公開鍵が長すぎます。");
+
+        byte[] publicKey;
+        try
+        {
+            publicKey = Convert.FromBase64String(publicKeyBase64);
+        }
+        catch (FormatException ex)
+        {
+            throw new InvalidOperationException("公開鍵の形式が不正です。", ex);
+        }
+
+        // E2eeCrypto の公開鍵表現は raw P-256 point (65 bytes) で固定。
+        // 点の妥当性は実際の ECDH 利用時にも検証されるが、保存時に巨大・異形の
+        // 値を受け付けると Identity DB と各種レスポンスを不必要に膨らませられる。
+        if (publicKey.Length != 65)
+            throw new InvalidOperationException("公開鍵は Base64 化された 65 バイト値である必要があります。");
+
         var user = await userManager.FindByNameAsync(username)
             ?? throw new InvalidOperationException($"ユーザー '{username}' が見つかりません。");
         if (user.PublicKey is not null && !allowRotation)

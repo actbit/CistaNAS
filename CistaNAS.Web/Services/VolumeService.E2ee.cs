@@ -221,12 +221,16 @@ public sealed partial class VolumeService
             var header = await LoadHeaderOrThrowAsync(volumeName);
             if (header.OwnerUser != requesterUsername)
                 throw new VolumeException("オーナーのみが鍵を追加できます。");
+            if (wrappedKeys.Count > 1024)
+                throw new VolumeException("一度に追加できる鍵の数が多すぎます。");
 
             await using var scope = _scopeFactory.CreateAsyncScope();
             var sharingPolicy = scope.ServiceProvider.GetRequiredService<ISharingPolicy>();
 
             foreach (var (username, wrappedKey) in wrappedKeys)
             {
+                if (string.IsNullOrWhiteSpace(username) || username.Length > 128)
+                    throw new VolumeException("ユーザー名が不正です。");
                 // 共有無効ユーザー（ユーザー単位 or global 無効）宛ての新規付与は禁止
                 // （revoke は別経路で常に可能）
                 if (!await sharingPolicy.IsAllowedAsync(SharingAction.Receive, username))
@@ -275,6 +279,8 @@ public sealed partial class VolumeService
                 throw new VolumeException($"NewEpoch は {header.KeyEpoch + 1} である必要があります（現在: {header.KeyEpoch}）。");
             if (request.WrappedGroupKeys.Count == 0)
                 throw new VolumeException("WrappedGroupKeys が空です（remaining members 宛ての wrap が必要です）。");
+            if (request.WrappedGroupKeys.Count > 1024)
+                throw new VolumeException("一度にローテーションできる鍵の数が多すぎます。");
 
             // 剥奪対象に新しい GroupKey をラップしてはならない（revoke の基本要件）
             if (request.RemovedUsername is not null

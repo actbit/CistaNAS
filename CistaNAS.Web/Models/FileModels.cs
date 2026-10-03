@@ -128,7 +128,7 @@ public sealed class E2eePendingChunk
 }
 
 public sealed record E2eeCreateFileRequest(
-    [Required] string EncryptedName,
+    [Required] [StringLength(4096, MinimumLength = 1)] string EncryptedName,
     [Range(0, long.MaxValue)] long EncryptedLength,
     [Range(1, 100000)] int ChunkCount,
     /// <summary>この新規ファイルの鍵 epoch（0 = v1）。ボリュームの現行 epoch と一致すること。</summary>
@@ -144,18 +144,18 @@ public sealed record E2eeCreateFileRequest(
 
 /// <summary>crypto format v2: ファイル鍵の再ラップ（GroupKey ローテーション / epoch migration）。</summary>
 public sealed record E2eeRewrapFileKeyEntry(
-    [Required] string FileId,
+    [Required] [StringLength(64, MinimumLength = 1)] string FileId,
     [Range(1, int.MaxValue)] int KeyEpoch,
     [Required] VolumeHeader.WrappedKey WrappedFileKey);
 
 public sealed record E2eeRewrapFileKeysRequest(
-    [Required] IReadOnlyList<E2eeRewrapFileKeyEntry> Rewraps);
+    [Required] [MaxLength(1024)] IReadOnlyList<E2eeRewrapFileKeyEntry> Rewraps);
 
 /// <summary>crypto format v2: GroupKey ローテーション（revoke によるメンバー縮小）。</summary>
 public sealed record E2eeRotateGroupKeyRequest(
     [Range(1, int.MaxValue)] int NewEpoch,
     /// <summary>remaining members 宛てのラップ済み GroupKey（削除されたメンバーを含めてはならない）。</summary>
-    [Required] Dictionary<string, VolumeHeader.UserWrappedKey> WrappedGroupKeys,
+    [Required] [MaxLength(1024)] Dictionary<string, VolumeHeader.UserWrappedKey> WrappedGroupKeys,
     /// <summary>このローテーションで剥奪するユーザー（全 epoch の wraps と UserKeys から削除）。null 可（revoke 無しの再ラップ）。</summary>
     string? RemovedUsername = null);
 
@@ -209,28 +209,29 @@ public sealed class E2eeCatalog
 
 // ---- ECDH 鍵交換・招待関連 DTO ----
 
-public sealed record SetPublicKeyRequest([Required] string PublicKey);
+public sealed record SetPublicKeyRequest(
+    [Required] [StringLength(256, MinimumLength = 1)] string PublicKey);
 public sealed record CreateGroupE2eeVolumeRequest(
     [Required] [StringLength(64, MinimumLength = 1)] string GroupName,
     [Required] VolumeHeader.UserWrappedKey OwnerWrappedKey,
     [Range(4096, 67108864)] int ChunkSize = 1048576);
 public sealed record AddE2eeWrappedKeysBatchRequest(
-    [Required] Dictionary<string, VolumeHeader.UserWrappedKey> WrappedKeys);
+    [Required] [MaxLength(1024)] Dictionary<string, VolumeHeader.UserWrappedKey> WrappedKeys);
 public sealed record CreateInvitationRequest([Required] [StringLength(128)] string TargetUsername);
 public sealed record AcceptInvitationRequest(
-    [Required] string EncryptedPublicKey,
-    [Required] string Nonce);
+    [Required] [StringLength(512, MinimumLength = 1)] string EncryptedPublicKey,
+    [Required] [StringLength(512, MinimumLength = 1)] string Nonce);
 public sealed record InvitationResponse(string InvitationId, string InviterUsername, DateTimeOffset CreatedAt);
 
 /// <summary>メディアストリーミングトークン発行リクエスト。</summary>
 public sealed record StreamTokenRequest(
-    [Required] string VolumeName,
-    [Required] string FileName);
+    [Required] [StringLength(64, MinimumLength = 1)] string VolumeName,
+    [Required] [StringLength(4096, MinimumLength = 1)] string FileName);
 
 /// <summary>ユーザー作成リクエスト (WASM 用)。</summary>
 public sealed record CreateUserRequest(
-    [Required] string Username,
-    [Required] string Password,
+    [Required] [StringLength(128, MinimumLength = 1)] string Username,
+    [Required] [StringLength(256, MinimumLength = 8)] string Password,
     string? Role = "user");
 
 /// <summary>ユーザー単位の共有有効フラグ変更リクエスト (admin 用)。</summary>

@@ -39,6 +39,76 @@ public sealed class SecurityHardeningTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task E2eeCreate_RejectsOversizedEncryptedNameBeforeCatalogWrite()
+    {
+        await _volumes.CreateE2eeAsync(
+            "name-limit", "alice", new VolumeHeader.UserWrappedKey());
+        using var scope = _services.CreateScope();
+        var files = scope.ServiceProvider.GetRequiredService<E2eeFileService>();
+
+        await Assert.ThrowsAsync<FileServiceException>(() => files.CreateFileAsync(
+            "name-limit",
+            new E2eeCreateFileRequest(new string('A', 4097), E2eeFileService.SaltSize + E2eeFileService.TagSize, 1),
+            "alice"));
+
+        var catalog = _services.GetRequiredService<IStorageProvider>();
+        Assert.False(await catalog.ExistsAsync("name-limit/catalog-e2ee.json"));
+    }
+
+    [Fact]
+    public async Task LegacyE2ee_RejectsVariableLengthReplacementWithoutChangingBytes()
+    {
+        const string volumeName = "legacy-shape";
+        await _volumes.CreateE2eeAsync(volumeName, "alice", new VolumeHeader.UserWrappedKey());
+        await _volumes.LockAsync(volumeName, "alice");
+
+        var metadata = _services.GetRequiredService<VolumeMetadataStore>();
+        var header = await metadata.LoadAsync(volumeName);
+        Assert.NotNull(header);
+        header!.StorageMode = "local";
+        await metadata.SaveAsync(volumeName, header);
+        File.Create(Path.Combine(_dataRoot, volumeName, "volume.dat")).Dispose();
+        await _volumes.MountE2eeAsync(volumeName, "alice");
+
+        using var scope = _services.CreateScope();
+        var files = scope.ServiceProvider.GetRequiredService<E2eeFileService>();
+        var entry = await files.CreateFileAsync(
+            volumeName, new E2eeCreateFileRequest("legacy", 32, 1), "alice");
+        using (var original = new MemoryStream(new byte[32]))
+            await files.UploadChunkAsync(volumeName, entry.FileId, 0, original, 32);
+
+        using var replacement = new MemoryStream(new byte[33]);
+        await Assert.ThrowsAsync<FileServiceException>(() => files.UploadChunkAsync(
+            volumeName, entry.FileId, 0, replacement, 33, replace: true));
+
+        var current = Assert.Single((await files.ListFilesAsync(volumeName)).Files);
+        Assert.Equal(32, current.ChunkSizes[0]);
+    }
+
+    [Fact]
+    public async Task PublicKeyUpdate_RejectsMalformedOrOversizedValues()
+    {
+        using var scope = _services.CreateScope();
+        var account = scope.ServiceProvider.GetRequiredService<AccountService>();
+        await account.CreateUserAsync("key-bound", "password1234", "user");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            account.UpdatePublicKeyAsync("key-bound", new string('A', 257)));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            account.UpdatePublicKeyAsync("key-bound", Convert.ToBase64String(new byte[32])));
+    }
+
+    [Fact]
+    public void InvitationAcceptedData_RejectsOversizedPayloads()
+    {
+        var invitations = new InvitationService();
+        var invitation = invitations.Create("alice", "bob");
+
+        Assert.Throws<InvalidOperationException>(() => invitations.SetAcceptedData(
+            invitation.InvitationId, new string('A', 513), "nonce"));
+    }
+
+    [Fact]
     public async Task GroupCreate_RejectsPathSeparators()
     {
         using var scope = _services.CreateScope();

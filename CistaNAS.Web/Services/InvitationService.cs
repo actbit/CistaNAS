@@ -11,6 +11,8 @@ namespace CistaNAS.Web.Services;
 /// </summary>
 public sealed class InvitationService : BackgroundService
 {
+    private const int MaxUsernameLength = 128;
+    private const int MaxAcceptedDataLength = 512;
     private readonly ConcurrentDictionary<string, InvitationRecord> _invitations = new();
 
     /// <summary>招待の有効期限。デフォルト 24 時間。</summary>
@@ -24,6 +26,8 @@ public sealed class InvitationService : BackgroundService
     {
         ArgumentException.ThrowIfNullOrEmpty(inviterUsername);
         ArgumentException.ThrowIfNullOrEmpty(targetUsername);
+        if (inviterUsername.Length > MaxUsernameLength || targetUsername.Length > MaxUsernameLength)
+            throw new InvalidOperationException("招待先または招待元のユーザー名が長すぎます。");
         if (string.Equals(inviterUsername, targetUsername, StringComparison.Ordinal))
             throw new InvalidOperationException("自分自身を招待することはできません。");
 
@@ -52,6 +56,9 @@ public sealed class InvitationService : BackgroundService
         ArgumentException.ThrowIfNullOrEmpty(invitationId);
         ArgumentException.ThrowIfNullOrEmpty(encryptedPublicKey);
         ArgumentException.ThrowIfNullOrEmpty(nonce);
+        if (encryptedPublicKey.Length > MaxAcceptedDataLength
+            || nonce.Length > MaxAcceptedDataLength)
+            throw new InvalidOperationException("招待の受諾データが大きすぎます。");
         if (!_invitations.TryGetValue(invitationId.ToLowerInvariant(), out var record))
             throw new InvalidOperationException("招待が見つかりません。");
         lock (record)
