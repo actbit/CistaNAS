@@ -227,6 +227,23 @@ public sealed partial class VolumeService : IAsyncDisposable
             throw new VolumeException("ボリューム名に使用できない文字が含まれています。");
     }
 
+    /// <summary>
+    /// ボリューム名をローカルデータパスへ解決する前の防御的検証。
+    /// 既存の home__/group__ ボリュームも扱えるよう予約プレフィックスは
+    /// 許可するが、区切り文字と親参照は常に拒否する。
+    /// </summary>
+    private static void ValidateStorageName(string name)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        if (Path.IsPathRooted(name)
+            || name.Contains('/', StringComparison.Ordinal)
+            || name.Contains('\\', StringComparison.Ordinal)
+            || name is "." or ".."
+            || name.Any(char.IsControl)
+            || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            throw new VolumeException("ボリューム名に使用できない文字が含まれています。");
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;

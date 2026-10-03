@@ -13,6 +13,18 @@ public sealed class GroupService(
     ILogger<GroupService> logger,
     IServiceScopeFactory scopeFactory)
 {
+    public static void ValidateGroupName(string groupName)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(groupName);
+        if (groupName.Length > 64
+            || groupName is "." or ".."
+            || groupName.Contains('/', StringComparison.Ordinal)
+            || groupName.Contains('\\', StringComparison.Ordinal)
+            || groupName.Any(char.IsControl)
+            || groupName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            throw new InvalidOperationException("グループ名に使用できない文字が含まれています。");
+    }
+
     public async Task<IReadOnlyList<GroupEntity>> ListGroupsAsync()
         => await db.Groups.AsNoTracking().ToListAsync();
 
@@ -40,7 +52,7 @@ public sealed class GroupService(
 
     public async Task CreateGroupAsync(string groupName, string ownerUser)
     {
-        ArgumentException.ThrowIfNullOrEmpty(groupName);
+        ValidateGroupName(groupName);
         ArgumentException.ThrowIfNullOrEmpty(ownerUser);
 
         if (await db.Groups.AnyAsync(g => g.GroupName == groupName))

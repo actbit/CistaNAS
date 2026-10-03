@@ -17,7 +17,8 @@ namespace CistaNAS.Tests;
 public static class TestHelper
 {
     public static (IServiceProvider sp, string dataRoot) BuildTestServices(
-        VolumeOptions? volOpts = null, StorageOptions? storageOpts = null)
+        VolumeOptions? volOpts = null, StorageOptions? storageOpts = null,
+        Func<string, IStorageProvider>? storageFactory = null)
     {
         var dataRoot = Path.Combine(Path.GetTempPath(), "cista-test-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dataRoot);
@@ -57,7 +58,7 @@ public static class TestHelper
         services.AddSingleton<IStorageProvider>(sp =>
         {
             var o = sp.GetRequiredService<IOptions<CistaNasOptions>>().Value;
-            return new LocalStorageProvider(o.DataRoot);
+            return storageFactory?.Invoke(o.DataRoot) ?? new LocalStorageProvider(o.DataRoot);
         });
         services.AddSingleton<IChunkStore>(sp =>
         {
