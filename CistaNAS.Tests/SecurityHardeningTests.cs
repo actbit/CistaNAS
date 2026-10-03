@@ -1,3 +1,4 @@
+using System.Text;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
@@ -52,6 +53,79 @@ public sealed class SecurityHardeningTests : IAsyncDisposable
     {
         await Assert.ThrowsAsync<VolumeException>(() =>
             _volumes.CreateInternalAsync("../outside", "alice", null, encrypted: false));
+    }
+
+    [Fact]
+    public async Task HomeVolume_IsAccessibleOnlyByItsOwner()
+    {
+        const string home = "home__alice";
+        await _volumes.CreateInternalAsync(home, "alice", null, encrypted: false);
+
+        Assert.True(await _volumes.HasAccessAsync(home, "alice"));
+        Assert.False(await _volumes.HasAccessAsync(home, "bob"));
+
+        await _volumes.LockAsync(home, "alice");
+        await Assert.ThrowsAsync<VolumeException>(() => _volumes.MountAsync(home, "bob", null));
+    }
+
+    [Fact]
+    public async Task CreateUser_DoesNotReuseAnExistingHomeVolume()
+    {
+        await _volumes.CreateInternalAsync("home__reused", "old-user", null, encrypted: false);
+
+        using var scope = _services.CreateScope();
+        var account = scope.ServiceProvider.GetRequiredService<AccountService>();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            account.CreateUserAsync("reused", "password1234", "user"));
+
+        Assert.Null(await account.FindAsync("reused"));
+    }
+
+    [Fact]
+    public async Task OwnedVolumeEnumeration_FailsClosedOnCorruptHeader()
+    {
+        await _volumes.CreateInternalAsync("owned-corrupt", "alice", null, encrypted: false);
+        await _volumes.LockAsync("owned-corrupt", "alice");
+
+        var metadata = _services.GetRequiredService<VolumeMetadataStore>();
+        var originalHeader = await metadata.LoadAsync("owned-corrupt");
+        Assert.NotNull(originalHeader);
+
+        var storage = _services.GetRequiredService<IStorageProvider>();
+        await storage.WriteAsync(
+            "owned-corrupt/volume.json",
+            new MemoryStream(Encoding.UTF8.GetBytes("{")));
+
+        try
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                _volumes.GetOwnedVolumeNamesAsync("alice"));
+        }
+        finally
+        {
+            await metadata.SaveAsync("owned-corrupt", originalHeader!);
+        }
+    }
+
+    [Fact]
+    public async Task DeletingAndRecreatingGroup_DoesNotReuseOldVolumeAccess()
+    {
+        const string groupName = "reusable-group";
+        using var scope = _services.CreateScope();
+        var groups = scope.ServiceProvider.GetRequiredService<GroupService>();
+
+        await groups.CreateGroupAsync(groupName, "alice");
+        await groups.AddMemberAsync(groupName, "alice", "bob");
+        await _volumes.CreateAsync("group-access", "alice", "password", encrypted: true);
+        await _volumes.GrantGroupAccessAsync("group-access", "alice", groupName);
+        Assert.True(await _volumes.HasAccessAsync("group-access", "bob"));
+
+        await groups.DeleteGroupAsync(groupName, "alice");
+        await groups.CreateGroupAsync(groupName, "alice");
+        await groups.AddMemberAsync(groupName, "alice", "bob");
+
+        Assert.False(await _volumes.HasAccessAsync("group-access", "bob"));
     }
 
     [Fact]

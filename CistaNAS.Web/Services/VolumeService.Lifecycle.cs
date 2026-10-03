@@ -100,6 +100,9 @@ public sealed partial class VolumeService
                 throw new VolumeException($"ボリューム '{name}' は既にマウントされています。");
 
             var header = await LoadHeaderOrThrowAsync(name);
+            if (!await HasAccessAsync(name, username))
+                throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
+
             byte[]? masterKey = null;
             if (header.Encrypted)
             {

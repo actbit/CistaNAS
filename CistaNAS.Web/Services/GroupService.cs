@@ -10,7 +10,6 @@ namespace CistaNAS.Web.Services;
 /// </summary>
 public sealed class GroupService(
     AppDbContext db,
-    ILogger<GroupService> logger,
     IServiceScopeFactory scopeFactory)
 {
     public static void ValidateGroupName(string groupName)
@@ -77,20 +76,18 @@ public sealed class GroupService(
         if (group.OwnerUser != requester)
             throw new InvalidOperationException("オーナーのみがグループを削除できます。");
 
-        db.Groups.Remove(group);
-        await db.SaveChangesAsync();
-
-        // ボリュームからグループ参照を除去（スコープ外で実行）
-        try
+        // 先に全ボリュームから参照を除去する。DB のグループを先に消して
+        // 参照除去をベストエフォートにすると、同名グループの再作成後に
+        // 新メンバーが旧ボリュームへアクセスできるセキュリティ問題になる。
+        // 途中で失敗した場合はグループを残して再試行可能にする。
+        await using (var scope = scopeFactory.CreateAsyncScope())
         {
-            await using var scope = scopeFactory.CreateAsyncScope();
             var volumeService = scope.ServiceProvider.GetRequiredService<VolumeService>();
             await volumeService.RemoveGroupFromAllVolumesAsync(groupName);
         }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "グループ '{GroupName}' 削除後のボリューム参照除去に失敗しました。", groupName);
-        }
+
+        db.Groups.Remove(group);
+        await db.SaveChangesAsync();
     }
 
     public async Task AddMemberAsync(string groupName, string requester, string username)

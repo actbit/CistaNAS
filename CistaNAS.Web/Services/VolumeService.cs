@@ -50,10 +50,12 @@ public sealed partial class VolumeService : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                // 破損ヘッダ 1 件でアカウント削除が恒久的に不可能になるのを避けるため読み飛ばす
-                // （孤児ボリュームのリスクよりも、削除不能アカウントの残留を避けることを優先）。
-                _logger.LogWarning(ex, "ボリューム '{Volume}' のヘッダ読込に失敗したため所有判定をスキップします。", name);
-                continue;
+                // 所有者を確認できないままユーザーを削除すると、ボリュームだけが
+                // 孤児化してデータへ到達できなくなる。削除不能よりもデータ保全を優先し、
+                // 管理者がヘッダを復旧してから再試行できるよう中止する。
+                throw new InvalidOperationException(
+                    $"ボリューム '{name}' のヘッダを読み込めないため、ユーザー削除を中止しました。復旧後に再試行してください。",
+                    ex);
             }
             if (header is not null && string.Equals(header.OwnerUser, username, StringComparison.Ordinal))
                 result.Add(name);

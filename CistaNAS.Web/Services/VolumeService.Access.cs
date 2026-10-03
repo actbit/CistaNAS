@@ -26,6 +26,11 @@ public sealed partial class VolumeService
 
     private static bool HasAccessInternal(VolumeHeader header, string username, HashSet<string> userGroups)
     {
+        // ホームボリュームは内部作成時に暗号化を無効化しているが、個人領域であり
+        // 「非暗号化かつ UserKeys が空なら公開」という通常ボリュームの規則を適用しない。
+        if (header.Name.StartsWith(VolumeHeader.HomePrefix, StringComparison.Ordinal))
+            return string.Equals(header.OwnerUser, username, StringComparison.Ordinal);
+
         // 非暗号化ボリューム: UserKeys が空なら誰でもアクセス可、そうでなければユーザーまたはグループ
         if (!header.Encrypted && header.UserKeys.Count == 0) return true;
         if (header.HasUserAccess(username)) return true;

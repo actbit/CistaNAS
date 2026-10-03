@@ -69,6 +69,17 @@ public sealed class AccountService(
         ArgumentException.ThrowIfNullOrEmpty(username);
         ArgumentException.ThrowIfNullOrEmpty(password);
 
+        // 以前の削除失敗で同名のホームボリュームが残っている場合、先にユーザーを
+        // 作成すると新しいユーザーが旧ユーザーの home__ ボリュームを引き継げる。
+        // アカウント作成前に残存を検出して、データ所有者名の再利用を止める。
+        string homeName = $"{VolumeHeader.HomePrefix}{username}";
+        await using (var preflightScope = scopeFactory.CreateAsyncScope())
+        {
+            var volumeService = preflightScope.ServiceProvider.GetRequiredService<VolumeService>();
+            if (await volumeService.GetVolumeInfoAsync(homeName) is not null)
+                throw new InvalidOperationException($"ホームボリューム '{homeName}' が既に存在します。管理者による復旧が必要です。");
+        }
+
         await EnsureRoleAsync(role);
 
         var user = new ApplicationUser { UserName = username };
@@ -86,7 +97,6 @@ public sealed class AccountService(
         {
             await using var scope = scopeFactory.CreateAsyncScope();
             var volumeService = scope.ServiceProvider.GetRequiredService<VolumeService>();
-            string homeName = $"{VolumeHeader.HomePrefix}{username}";
             await volumeService.CreateInternalAsync(homeName, username, password: null, encrypted: false);
         }
         catch (Exception ex)
@@ -118,32 +128,29 @@ public sealed class AccountService(
             throw new InvalidOperationException(
                 $"ユーザー '{username}' がオーナーのボリュームが残っています: {string.Join(", ", ownedVolumes)}。削除または移管後に再度実行してください。");
 
-        await userManager.DeleteAsync(user);
+        // グループから除去
+        // ユーザー削除より先にメンバーシップを除去する。削除後のベストエフォート処理に
+        // すると、失敗時に同名ユーザーを再作成した際、旧グループ経由でボリュームへ
+        // アクセスできる状態が残る。
+        await using (var scope = scopeFactory.CreateAsyncScope())
+        {
+            var groupService = scope.ServiceProvider.GetRequiredService<GroupService>();
+            await groupService.RemoveUserFromAllGroupsAsync(username);
+        }
+
+        var deleteResult = await userManager.DeleteAsync(user);
+        if (!deleteResult.Succeeded)
+            throw new InvalidOperationException(string.Join(", ", deleteResult.Errors.Select(e => e.Description)));
 
         // WebDAV Basic 認証の資格情報キャッシュを失効させる
         WebDav.BasicAuthHandler.InvalidateUser(username);
 
-        // グループから除去
-        try
-        {
-            await using var scope = scopeFactory.CreateAsyncScope();
-            var groupService = scope.ServiceProvider.GetRequiredService<GroupService>();
-            await groupService.RemoveUserFromAllGroupsAsync(username);
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "ユーザー '{Username}' のグループからの除去に失敗しました。", username);
-        }
-
         // ホームボリューム削除
-        try
+        // 失敗を握りつぶすと、同名ユーザーの再作成時に残存データを引き継ぐため、
+        // エラーを呼び出し元へ返して管理者が復旧できるようにする。
+        await using (var scope = scopeFactory.CreateAsyncScope())
         {
-            await using var scope = scopeFactory.CreateAsyncScope();
             await volumeService.DeleteVolumeAsync($"{VolumeHeader.HomePrefix}{username}", username: null);
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "ホームボリューム 'home__{Username}' の削除に失敗しました。", username);
         }
     }
 
