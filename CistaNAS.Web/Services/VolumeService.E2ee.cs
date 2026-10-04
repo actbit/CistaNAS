@@ -6,11 +6,22 @@ namespace CistaNAS.Web.Services;
 
 public sealed partial class VolumeService
 {
+    private const int MinE2eeChunkSize = 4096;
+    private const int MaxE2eeChunkSize = 67_108_864;
+
+    private static void ValidateE2eeChunkSize(int chunkSize)
+    {
+        if (chunkSize is < MinE2eeChunkSize or > MaxE2eeChunkSize)
+            throw new VolumeException(
+                $"E2EE チャンクサイズは {MinE2eeChunkSize:N0}〜{MaxE2eeChunkSize:N0} バイトで指定してください。");
+    }
+
     /// <summary>E2EE ボリュームを作成（クライアントから wrappedMasterKey を受け取る）。</summary>
     public Task<VolumeInfo> CreateE2eeAsync(string name, string username, VolumeHeader.UserWrappedKey wrappedKey, int chunkSize = 1048576)
     {
         ValidateName(name);
         ArgumentException.ThrowIfNullOrEmpty(username);
+        ValidateE2eeChunkSize(chunkSize);
 
         return UnderMountGateAsync(async () =>
         {
@@ -22,8 +33,11 @@ public sealed partial class VolumeService
             Directory.CreateDirectory(VolumeDir(name));
             await _metaStore.SaveAsync(name, header);
 
-            bool chunkMode = ShouldUseChunkMode();
-            if (chunkMode)
+            // CreateE2ee は VolumeHeader.CreateE2ee が保存した StorageMode を
+            // 常に使用する。構成が local でも E2EE は opaque chunk storage が
+            // 必須であり、ここだけ構成値を見ると「ヘッダは chunk、実体は
+            // volume.dat」という不整合なマウント状態になる。
+            if (header.StorageMode == "chunk")
                 MountInternalChunked(name, header, masterKey: null);
             else
             {
@@ -38,6 +52,7 @@ public sealed partial class VolumeService
     /// <summary>E2EE ボリュームをマウント（アクセス権チェックのみ、鍵アンラップなし）。</summary>
     public Task<VolumeInfo> MountE2eeAsync(string name, string username)
     {
+        ValidateStorageName(name);
         return UnderMountGateAsync(async () =>
         {
             if (_mounted.ContainsKey(name))
@@ -115,8 +130,9 @@ public sealed partial class VolumeService
     public Task<VolumeInfo> CreateGroupE2eeAsync(string groupName, string ownerUsername,
         VolumeHeader.UserWrappedKey ownerWrappedKey, int chunkSize = 1048576)
     {
-        ArgumentException.ThrowIfNullOrEmpty(groupName);
+        GroupService.ValidateGroupName(groupName);
         ArgumentException.ThrowIfNullOrEmpty(ownerUsername);
+        ValidateE2eeChunkSize(chunkSize);
 
         return UnderMountGateAsync(async () =>
         {
@@ -136,8 +152,7 @@ public sealed partial class VolumeService
             Directory.CreateDirectory(VolumeDir(volName));
             await _metaStore.SaveAsync(volName, header);
 
-            bool chunkMode = ShouldUseChunkMode();
-            if (chunkMode)
+            if (header.StorageMode == "chunk")
                 MountInternalChunked(volName, header, masterKey: null);
             else
             {
@@ -206,12 +221,16 @@ public sealed partial class VolumeService
             var header = await LoadHeaderOrThrowAsync(volumeName);
             if (header.OwnerUser != requesterUsername)
                 throw new VolumeException("オーナーのみが鍵を追加できます。");
+            if (wrappedKeys.Count > 1024)
+                throw new VolumeException("一度に追加できる鍵の数が多すぎます。");
 
             await using var scope = _scopeFactory.CreateAsyncScope();
             var sharingPolicy = scope.ServiceProvider.GetRequiredService<ISharingPolicy>();
 
             foreach (var (username, wrappedKey) in wrappedKeys)
             {
+                if (string.IsNullOrWhiteSpace(username) || username.Length > 128)
+                    throw new VolumeException("ユーザー名が不正です。");
                 // 共有無効ユーザー（ユーザー単位 or global 無効）宛ての新規付与は禁止
                 // （revoke は別経路で常に可能）
                 if (!await sharingPolicy.IsAllowedAsync(SharingAction.Receive, username))
@@ -260,6 +279,8 @@ public sealed partial class VolumeService
                 throw new VolumeException($"NewEpoch は {header.KeyEpoch + 1} である必要があります（現在: {header.KeyEpoch}）。");
             if (request.WrappedGroupKeys.Count == 0)
                 throw new VolumeException("WrappedGroupKeys が空です（remaining members 宛ての wrap が必要です）。");
+            if (request.WrappedGroupKeys.Count > 1024)
+                throw new VolumeException("一度にローテーションできる鍵の数が多すぎます。");
 
             // 剥奪対象に新しい GroupKey をラップしてはならない（revoke の基本要件）
             if (request.RemovedUsername is not null

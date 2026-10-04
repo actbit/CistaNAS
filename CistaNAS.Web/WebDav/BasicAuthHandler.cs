@@ -100,8 +100,9 @@ public sealed class BasicAuthHandler : AuthenticationHandler<AuthenticationSchem
             var loginResponse = await _authService.AuthenticateAsync(username, password);
             if (loginResponse is null)
             {
-                // ユーザーが存在しない場合もダミー計算を実行してタイミングを均一化
-                Argon2Hasher.RunDummy();
+                // AuthService が存在しないユーザーにはダミー計算を、存在するユーザーの
+                // 誤パスワードには実ハッシュ検証を既に実行している。ここで再度ダミー計算を
+                // 追加すると失敗リクエストごとにArgon2idを二重実行し、DoS負荷が増える。
                 RecordAuthFailure(remoteIp);
                 return AuthenticateResult.Fail("Invalid credentials.");
             }

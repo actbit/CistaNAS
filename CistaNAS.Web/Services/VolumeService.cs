@@ -50,10 +50,12 @@ public sealed partial class VolumeService : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                // 破損ヘッダ 1 件でアカウント削除が恒久的に不可能になるのを避けるため読み飛ばす
-                // （孤児ボリュームのリスクよりも、削除不能アカウントの残留を避けることを優先）。
-                _logger.LogWarning(ex, "ボリューム '{Volume}' のヘッダ読込に失敗したため所有判定をスキップします。", name);
-                continue;
+                // 所有者を確認できないままユーザーを削除すると、ボリュームだけが
+                // 孤児化してデータへ到達できなくなる。削除不能よりもデータ保全を優先し、
+                // 管理者がヘッダを復旧してから再試行できるよう中止する。
+                throw new InvalidOperationException(
+                    $"ボリューム '{name}' のヘッダを読み込めないため、ユーザー削除を中止しました。復旧後に再試行してください。",
+                    ex);
             }
             if (header is not null && string.Equals(header.OwnerUser, username, StringComparison.Ordinal))
                 result.Add(name);
@@ -242,6 +244,23 @@ public sealed partial class VolumeService : IAsyncDisposable
                 throw new VolumeException("ボリューム名に使用できない文字が含まれています。");
         }
         if (name == "." || name == "..")
+            throw new VolumeException("ボリューム名に使用できない文字が含まれています。");
+    }
+
+    /// <summary>
+    /// ボリューム名をローカルデータパスへ解決する前の防御的検証。
+    /// 既存の home__/group__ ボリュームも扱えるよう予約プレフィックスは
+    /// 許可するが、区切り文字と親参照は常に拒否する。
+    /// </summary>
+    private static void ValidateStorageName(string name)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        if (Path.IsPathRooted(name)
+            || name.Contains('/', StringComparison.Ordinal)
+            || name.Contains('\\', StringComparison.Ordinal)
+            || name is "." or ".."
+            || name.Any(char.IsControl)
+            || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
             throw new VolumeException("ボリューム名に使用できない文字が含まれています。");
     }
 

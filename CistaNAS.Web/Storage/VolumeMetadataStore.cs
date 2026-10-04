@@ -51,7 +51,12 @@ public sealed class VolumeMetadataStore(IStorageProvider storage)
     public async Task DeleteAllAsync(string volumeName, CancellationToken ct = default)
     {
         var blobs = await storage.ListAsync($"{volumeName}/", ct);
-        foreach (var blob in blobs)
+        // volume.json は最後に削除する。途中でストレージ障害が起きても
+        // ヘッダが残っていれば所有者/管理者が再試行でき、データが消えたか
+        // 分からない状態でアクセス不能な孤児ボリュームになるのを防げる。
+        foreach (var blob in blobs
+            .Where(blob => !string.Equals(blob, $"{volumeName}/{VolumeHeader.FileName}", StringComparison.Ordinal))
+            .Append($"{volumeName}/{VolumeHeader.FileName}"))
             await storage.DeleteAsync(blob, ct);
     }
 }

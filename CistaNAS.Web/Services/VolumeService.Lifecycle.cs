@@ -30,6 +30,7 @@ public sealed partial class VolumeService
     /// <summary>ホームボリューム等、内部用途の作成（home__ プレフィックスを許可）。</summary>
     public Task<VolumeInfo> CreateInternalAsync(string name, string? username, string? password, bool encrypted = true)
     {
+        ValidateStorageName(name);
         // 内部呼び出し（CreateUserAsync 等）では ValidateName をスキップ。
         // home__ / group__ プレフィックスや長さ制限を許可する。
         // CreateAsync 経由の場合は事前に ValidateName が呼ばれている。
@@ -92,12 +93,16 @@ public sealed partial class VolumeService
 
     public Task<VolumeInfo> MountAsync(string name, string username, string? password)
     {
+        ValidateStorageName(name);
         return UnderMountGateAsync(async () =>
         {
             if (_mounted.ContainsKey(name))
                 throw new VolumeException($"ボリューム '{name}' は既にマウントされています。");
 
             var header = await LoadHeaderOrThrowAsync(name);
+            if (!await HasAccessAsync(name, username))
+                throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
+
             byte[]? masterKey = null;
             if (header.Encrypted)
             {
@@ -134,6 +139,7 @@ public sealed partial class VolumeService
     /// <summary>ボリュームをロック（アンマウント）する。オーナーのみ実行可能。</summary>
     public Task LockAsync(string name, string username)
     {
+        ValidateStorageName(name);
         ArgumentException.ThrowIfNullOrEmpty(username);
         return UnderMountGateAsync(async () =>
         {
@@ -202,14 +208,22 @@ public sealed partial class VolumeService
     /// <summary>ボリュームを削除する。username が非 null の場合はオーナーまたは admin のみ実行可能。</summary>
     public Task DeleteVolumeAsync(string name, string? username = null, bool isAdmin = false)
     {
+        ValidateStorageName(name);
         return UnderMountGateAsync(async () =>
         {
+            VolumeHeader? existingHeader = null;
             // 認可: username が指定されている場合はオーナーまたは admin に限定
             if (username is not null && !isAdmin)
             {
-                var header = await LoadHeaderOrThrowAsync(name);
-                if (header.OwnerUser != username)
+                existingHeader = await LoadHeaderOrThrowAsync(name);
+                if (existingHeader.OwnerUser != username)
                     throw new VolumeException("オーナーのみがボリュームを削除できます。");
+            }
+            else
+            {
+                // アンマウント済みボリュームでも StorageMode を確認し、
+                // チャンクストアの残存データを取りこぼさない。
+                existingHeader = await LoadHeaderIfExistsAsync(name);
             }
             // 新規 I/O の受付を停止してから TryRemove（レースによる use-after-dispose 防止）
             if (_mounted.TryGetValue(name, out var closing))
@@ -222,16 +236,11 @@ public sealed partial class VolumeService
                 if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
             }
 
-            // メタデータとローカルファイルの削除をマウントゲート内で実行
-            // （アンマウントと削除の間に別リクエストが介入するのを防止）
-
-            // メタデータをストレージプロバイダ経由で削除
-            try { await _metaStore.DeleteAllAsync(name); }
-            catch (Exception ex) { _logger.LogWarning(ex, "ボリューム '{Volume}' のメタデータ削除に失敗しました。", name); }
-
-            // ロックを解除（ボリューム削除後は不要）
-            try { _metaStore.Storage.RemoveLock(name); }
-            catch (Exception ex) { _logger.LogWarning(ex, "ボリューム '{Volume}' のロック解除に失敗しました。", name); }
+            // メタデータと実データの削除をマウントゲート内で実行
+            // （アンマウントと削除の間に別リクエストが介入するのを防止）。
+            // 先に実データを削除し、最後に volume.json を削除する。
+            // 途中で失敗した場合でもヘッダを残して再試行可能にし、
+            // 「削除成功」を返したのにデータが残る状態を避ける。
 
             // ローカルの volume.dat を削除
             string dataPath = GetDataPath(name);
@@ -239,8 +248,19 @@ public sealed partial class VolumeService
                 File.Delete(dataPath);
 
             // チャンクモード: S3 からボリューム配下の全チャンクを削除
-            try { await _chunkStore.DeleteVolumeChunksAsync(name); }
-            catch (Exception ex) { _logger.LogWarning(ex, "ボリューム '{Volume}' のチャンク削除に失敗しました。", name); }
+            // ヘッダが既に欠損した孤児ボリュームでは、残存チャンクを
+            // 回収できるよう削除を試みる（通常の local ボリュームでは
+            // chunk プレフィックスは空なので副作用はない）。
+            if (existingHeader is null || (closing?.Header ?? existingHeader)?.StorageMode == "chunk")
+                await _chunkStore.DeleteVolumeChunksAsync(name);
+
+            // メタデータを最後に削除。VolumeMetadataStore は volume.json を
+            // 列挙結果の末尾で削除するため、障害時の再試行に必要なヘッダを保つ。
+            await _metaStore.DeleteAllAsync(name);
+
+            // ロックを解除（ボリューム削除後は不要）
+            try { _metaStore.Storage.RemoveLock(name); }
+            catch (Exception ex) { _logger.LogWarning(ex, "ボリューム '{Volume}' のロック解除に失敗しました。", name); }
 
             // 空になったローカルディレクトリを掃除
             string dir = VolumeDir(name);

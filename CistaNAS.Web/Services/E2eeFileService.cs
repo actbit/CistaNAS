@@ -59,6 +59,8 @@ public sealed class E2eeFileService
         string ownerUsername, CancellationToken ct = default, string? preallocatedFileId = null)
     {
         var header = GetE2eeHeader(volumeName);
+        if (string.IsNullOrWhiteSpace(request.EncryptedName) || request.EncryptedName.Length > 4096)
+            throw new FileServiceException("暗号化ファイル名が不正です。");
         if (request.EncryptedLength < 0 || request.ChunkCount is <= 0 or > 100_000)
             throw new FileServiceException("ファイルサイズまたはチャンク数が不正です。");
 
@@ -293,6 +295,16 @@ public sealed class E2eeFileService
                     long chunkOffset = entry.Offset;
                     for (int i = 0; i < chunkIndex; i++)
                         chunkOffset += i < entry.ChunkSizes.Count ? entry.ChunkSizes[i] : 0;
+
+                    // Legacy E2EE volumes store all chunks in one contiguous file. An in-place
+                    // replacement with a different size would shift the logical offsets of every
+                    // following chunk while leaving their bytes in the old positions, silently
+                    // corrupting the file. New E2EE volumes use chunk storage; keep legacy data
+                    // safe by rejecting this unsupported shape instead of recording bad metadata.
+                    if (chunkIndex < entry.ChunkSizes.Count
+                        && entry.ChunkSizes[chunkIndex] != dataLength)
+                        throw new FileServiceException(
+                            "レガシー E2EE ボリュームでは既存チャンクのサイズを変更できません。");
 
                     string dataPath = GetDataPath(volumeName);
                     using var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
@@ -609,6 +621,8 @@ public sealed class E2eeFileService
     /// </summary>
     public async Task RewrapFileKeysAsync(string volumeName, E2eeRewrapFileKeysRequest request, string requesterUsername, CancellationToken ct = default)
     {
+        if (request.Rewraps.Count > 1024)
+            throw new FileServiceException("一度に再ラップできるファイル数が多すぎます。");
         var header = GetE2eeHeader(volumeName);
         if (string.IsNullOrEmpty(header.VolumeId))
             throw new FileServiceException("このボリュームは共有 v2 形式に移行されていません。");
