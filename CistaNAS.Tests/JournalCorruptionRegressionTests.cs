@@ -120,7 +120,9 @@ public sealed class JournalCorruptionRegressionTests : IDisposable
             Assert.False(volumes.IsMounted(name));
             Assert.Equal(invalid, await storage.ReadAsync(name + "/volume.journal"));
             // Failed recovery must release even the exclusive server-side stream.
-            using (File.Open(Path.Combine(dataRoot, name, "volume.dat"), FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+            // E2EE volumes use chunk storage and intentionally do not create volume.dat.
+            if (mode != "e2ee")
+                using (File.Open(Path.Combine(dataRoot, name, "volume.dat"), FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
 
             await storage.WriteAtomicAsync(name + "/volume.journal", new MemoryStream("{\"Pending\":[]}"u8.ToArray()));
             await mount();
