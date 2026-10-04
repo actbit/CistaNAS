@@ -46,9 +46,18 @@ public sealed class InvitationService : BackgroundService
 
     public InvitationRecord? Find(string invitationId)
     {
-        _invitations.TryGetValue(invitationId.ToLowerInvariant(), out var record);
+        string id = invitationId.ToLowerInvariant();
+        _invitations.TryGetValue(id, out var record);
+        if (record is not null && IsExpired(record))
+        {
+            _invitations.TryRemove(id, out _);
+            return null;
+        }
         return record;
     }
+
+    private static bool IsExpired(InvitationRecord record)
+        => record.CreatedAt <= DateTimeOffset.UtcNow - MaxAge;
 
     /// <summary>招待の受諾データを保存（1 回限り）。再利用を防止。</summary>
     public void SetAcceptedData(string invitationId, string encryptedPublicKey, string nonce)
@@ -63,6 +72,12 @@ public sealed class InvitationService : BackgroundService
             throw new InvalidOperationException("招待が見つかりません。");
         lock (record)
         {
+            // Find と受諾の間に期限を迎えても、期限切れ招待は使用させない。
+            if (IsExpired(record))
+            {
+                _invitations.TryRemove(invitationId.ToLowerInvariant(), out _);
+                throw new InvalidOperationException("招待の有効期限が切れています。");
+            }
             if (record.AcceptedAt.HasValue)
                 throw new InvalidOperationException("この招待は既に使用されています。");
             record.EncryptedPublicKey = encryptedPublicKey;

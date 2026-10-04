@@ -850,6 +850,7 @@ public sealed class FileService
 
     private sealed class FileCatalog
     {
+        [System.Text.Json.Serialization.JsonRequired]
         public Dictionary<string, FileMetadata> Files { get; set; } = new(StringComparer.Ordinal);
     }
 
@@ -857,7 +858,17 @@ public sealed class FileService
     {
         byte[]? data = await _storage.ReadAsync($"{volumeName}/catalog.json", ct);
         if (data is null) return new FileCatalog();
-        return JsonSerializer.Deserialize<FileCatalog>(data, JsonOptions) ?? new FileCatalog();
+        try
+        {
+            var catalog = JsonSerializer.Deserialize<FileCatalog>(data, JsonOptions);
+            if (catalog?.Files is null || catalog.Files.Values.Any(file => file is null))
+                throw new InvalidDataException("ファイルカタログが不正です。保存データを確認してください。");
+            return catalog;
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException("ファイルカタログが不正です。保存データを確認してください。", ex);
+        }
     }
 
     private async Task SaveCatalogAsync(string volumeName, FileCatalog catalog, CancellationToken ct)

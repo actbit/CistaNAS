@@ -36,7 +36,7 @@ public sealed class JournalService
         {
             byte[]? existing = await _storage.ReadAsync(journalPath, ct);
             var journal = existing is not null
-                ? JsonSerializer.Deserialize<JournalFile>(existing, JsonOptions) ?? new JournalFile()
+                ? JournalFile.Deserialize(existing)
                 : new JournalFile();
             journal.Pending.Add(entry);
 
@@ -61,7 +61,7 @@ public sealed class JournalService
         {
             byte[]? existing = await _storage.ReadAsync(journalPath, ct);
             var journal = existing is not null
-                ? JsonSerializer.Deserialize<JournalFile>(existing, JsonOptions) ?? new JournalFile()
+                ? JournalFile.Deserialize(existing)
                 : new JournalFile();
             int removed = journal.Pending.RemoveAll(e => e.OperationId == operationId);
 
@@ -84,6 +84,10 @@ public sealed class JournalService
 
         using (await _storage.AcquireLockAsync(lockPath, ct))
         {
+            byte[]? existing = await _storage.ReadAsync(journalPath, ct);
+            if (existing is null) return;
+            // 不正なジャーナルを復旧済みとして消去しない。
+            _ = JournalFile.Deserialize(existing);
             var empty = new JournalFile { Pending = [] };
             using var ms = new MemoryStream();
             JsonSerializer.Serialize(ms, empty, JsonOptions);
@@ -101,7 +105,7 @@ public sealed class JournalService
         string journalPath = $"{volumeName}/volume{JournalFile.Suffix}";
         byte[]? data = await _storage.ReadAsync(journalPath, ct);
         if (data is null) return [];
-        return JsonSerializer.Deserialize<JournalFile>(data, JsonOptions)?.Pending ?? [];
+        return JournalFile.Deserialize(data).Pending;
     }
 
     /// <summary>ジャーナルが存在するか（未コミットのエントリがあるか）。</summary>
@@ -111,6 +115,6 @@ public sealed class JournalService
         if (!await _storage.ExistsAsync(journalPath, ct)) return false;
         byte[]? data = await _storage.ReadAsync(journalPath, ct);
         if (data is null) return false;
-        return (JsonSerializer.Deserialize<JournalFile>(data, JsonOptions)?.Pending.Count ?? 0) > 0;
+        return JournalFile.Deserialize(data).Pending.Count > 0;
     }
 }

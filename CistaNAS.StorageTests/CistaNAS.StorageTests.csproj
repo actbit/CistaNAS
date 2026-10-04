@@ -19,6 +19,7 @@
     <Compile Include="..\CistaNAS.Tests\LocalTestHttpClient.cs" Link="LocalTestHttpClient.cs" />
     <Compile Include="..\CistaNAS.Tests\MinIOStorageE2ETests.cs" Link="MinIOStorageE2ETests.cs" />
     <Compile Include="..\CistaNAS.Tests\MinIOCleanupE2ETests.cs" Link="MinIOCleanupE2ETests.cs" />
+    <Compile Include="..\CistaNAS.Tests\ChunkListingRegressionTests.cs" Link="ChunkListingRegressionTests.cs" />
     <Compile Include="..\CistaNAS.Tests\PostgreSqlMigrationTests.cs" Link="PostgreSqlMigrationTests.cs" />
     <Compile Include="..\CistaNAS.Tests\CloudSqliteRecoveryTests.cs" Link="CloudSqliteRecoveryTests.cs" />
     <Compile Include="..\CistaNAS.Tests\CloudSqliteSyncTests.cs" Link="CloudSqliteSyncTests.cs" />

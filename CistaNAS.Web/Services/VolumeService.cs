@@ -162,7 +162,8 @@ public sealed partial class VolumeService : IAsyncDisposable
 
     /// <summary>
     /// マウント直後に未コミットジャーナルがあればカタログを修復し、ジャーナルをクリアする。
-    /// FileService（Scoped）をスコープ経由で取得する。復旧失敗はログに記録し、マウント自体は継続。
+    /// FileService（Scoped）をスコープ経由で取得する。不正な復旧データはマウントを取り消す。
+    /// その他の復旧失敗はログに記録する。
     /// </summary>
     private async Task RecoverMountedVolumeAsync(string name)
     {
@@ -171,6 +172,23 @@ public sealed partial class VolumeService : IAsyncDisposable
             await using var scope = _scopeFactory.CreateAsyncScope();
             var fileService = scope.ServiceProvider.GetRequiredService<FileService>();
             await fileService.RecoverAsync(name);
+        }
+        catch (InvalidDataException ex)
+        {
+            _logger.LogWarning(ex, "ボリューム '{Volume}' の復旧データが不正なため、マウントを中止します。", name);
+            // 呼び出し元が _mountGate を保持しているため LockAsync は再入できない。
+            if (_mounted.TryGetValue(name, out var mv))
+            {
+                mv.IoTracker.Close();
+                _mounted.TryRemove(name, out _);
+                await mv.IoTracker.WaitForZeroAsync();
+                try { mv.Stream.Dispose(); }
+                finally
+                {
+                    if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
+                }
+            }
+            throw new VolumeException($"ボリューム '{name}' の復旧データが不正です。保存内容を確認してください。");
         }
         catch (Exception ex)
         {

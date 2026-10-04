@@ -204,6 +204,7 @@ public sealed record E2eeAddWrappedKeyRequest(
 /// <summary>E2EE カタログ（永続化用）。</summary>
 public sealed class E2eeCatalog
 {
+    [JsonRequired]
     public Dictionary<string, E2eeFileEntry> Files { get; set; } = new(StringComparer.Ordinal);
 }
 

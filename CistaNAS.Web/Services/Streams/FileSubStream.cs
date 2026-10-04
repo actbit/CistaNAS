@@ -8,16 +8,18 @@ namespace CistaNAS.Web.Services.Streams;
 internal sealed class FileSubStream(Stream baseStream, long offset, long length, SemaphoreSlim streamLock) : Stream
 {
     private long _position;
+    private volatile bool _disposed;
 
-    public override bool CanRead => true;
-    public override bool CanSeek => true;
+    public override bool CanRead => !_disposed;
+    public override bool CanSeek => !_disposed;
     public override bool CanWrite => false;
-    public override long Length => length;
+    public override long Length { get { ObjectDisposedException.ThrowIf(_disposed, this); return length; } }
     public override long Position
     {
-        get => _position;
+        get { ObjectDisposedException.ThrowIf(_disposed, this); return _position; }
         set
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (value < 0 || value > length) throw new ArgumentOutOfRangeException(nameof(value));
             _position = value;
         }
@@ -25,6 +27,7 @@ internal sealed class FileSubStream(Stream baseStream, long offset, long length,
 
     public override long Seek(long seekOffset, SeekOrigin origin)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         long newPos = origin switch
         {
             SeekOrigin.Begin => seekOffset,
@@ -39,15 +42,20 @@ internal sealed class FileSubStream(Stream baseStream, long offset, long length,
 
     public override int Read(byte[] buffer, int bufOffset, int count)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ValidateBufferArguments(buffer, bufOffset, count);
         if (_position >= length) return 0;
         int toRead = (int)Math.Min(count, length - _position);
+        if (toRead == 0) return 0;
         // 同期パスだが Dokan コールバック等の制約上 GetAwaiter().GetResult() を使用。
         // streamLock はボリューム単位で共有されるが、通常は短時間で解放されるためデッドロックリスクは低い。
         streamLock.WaitAsync(CancellationToken.None).GetAwaiter().GetResult();
         try
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             baseStream.Position = offset + _position;
             int read = baseStream.Read(buffer, bufOffset, toRead);
+            if (read == 0) throw new EndOfStreamException("保存済みファイルがカタログの長さより短くなっています。");
             _position += read;
             return read;
         }
@@ -59,13 +67,17 @@ internal sealed class FileSubStream(Stream baseStream, long offset, long length,
 
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (_position >= length) return 0;
         int toRead = (int)Math.Min(buffer.Length, length - _position);
+        if (toRead == 0) return 0;
         await streamLock.WaitAsync(cancellationToken);
         try
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             baseStream.Position = offset + _position;
             int read = await baseStream.ReadAsync(buffer[..toRead], cancellationToken);
+            if (read == 0) throw new EndOfStreamException("保存済みファイルがカタログの長さより短くなっています。");
             _position += read;
             return read;
         }
@@ -75,7 +87,13 @@ internal sealed class FileSubStream(Stream baseStream, long offset, long length,
         }
     }
 
-    public override void Flush() { }
+    public override void Flush() => ObjectDisposedException.ThrowIf(_disposed, this);
+
+    protected override void Dispose(bool disposing)
+    {
+        _disposed = true;
+        base.Dispose(disposing);
+    }
 
     public override void SetLength(long value) => throw new NotSupportedException();
     public override void Write(byte[] buffer, int writeOffset, int count) => throw new NotSupportedException();
