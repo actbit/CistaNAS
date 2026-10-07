@@ -30,11 +30,11 @@ public sealed class VolumeHeader
     public bool Encrypted { get; set; } = true;
     public int SectorSize { get; set; }
 
-    /// <summary>"server" (サーバー側 AES-XTS) or "e2ee" (クライアント側暗号化)。</summary>
+    /// <summary>"server" (サーバー側暗号化) or "e2ee" (クライアント側暗号化)。</summary>
     public string EncryptionMode { get; set; } = "server";
 
-    /// <summary>暗号化アルゴリズム ("aes-256-xts", "aes-256-gcm", "chacha20-poly1305")</summary>
-    public string CipherAlgorithm { get; set; } = "aes-256-xts";
+    /// <summary>暗号化アルゴリズム。新規サーバー暗号化は認証付き chacha20。</summary>
+    public string CipherAlgorithm { get; set; } = "chacha20";
 
     /// <summary>鍵長（ビット）</summary>
     public int KeySize { get; set; } = 256;
@@ -63,6 +63,12 @@ public sealed class VolumeHeader
     /// ≥ 1 = 共有 v2 モード（GroupKey + per-file DEK）。
     /// </summary>
     public int KeyEpoch { get; set; }
+
+    /// <summary>
+    /// 最後にメンバーを剥奪した GroupKey epoch。これより前に作られたファイルは、
+    /// 剥奪済みユーザーが保持した鍵で更新できるため、同じ FileId の更新を禁止する。
+    /// </summary>
+    public int RevocationEpoch { get; set; }
 
     /// <summary>
     /// epoch ごとの GroupKey（remaining members の公開鍵で ECDH ラップ済み）。
@@ -238,7 +244,7 @@ public sealed class VolumeHeader
 
     public bool IsE2ee => EncryptionMode == "e2ee";
 
-    /// <summary>CipherAlgorithm 文字列をパースした実効値。未設定時は AES-256-XTS。</summary>
+    /// <summary>CipherAlgorithm 文字列をパースした実効値。旧未設定ヘッダは AES-256-XTS。</summary>
     public CistaNAS.Shared.Crypto.CipherAlgorithm EffectiveCipherAlgorithm =>
         string.IsNullOrEmpty(CipherAlgorithm)
             ? CistaNAS.Shared.Crypto.CipherAlgorithm.Aes256Xts
@@ -284,7 +290,7 @@ public sealed class VolumeHeader
 
     /// <summary>新しいボリュームの header＋マスター鍵を生成する。</summary>
     public static (VolumeHeader Header, byte[]? MasterKey) Create(
-        string name, string? username, string? password, int sectorSize, KdfSpec kdf, bool encrypted = true, string cipherAlgorithm = "aes-256-xts")
+        string name, string? username, string? password, int sectorSize, KdfSpec kdf, bool encrypted = true, string cipherAlgorithm = "chacha20")
     {
         if (!encrypted)
         {
@@ -323,8 +329,7 @@ public sealed class VolumeHeader
     {
         "aes-256-xts" => 256,
         "aes-256-gcm" => 256,
-        "chacha20-xts" => 256,
-        "chacha20-poly1305" => 256,
+        "chacha20" or "chacha20-xts" or "chacha20-poly1305" => 256,
         _ => 256,  // デフォルト
     };
 

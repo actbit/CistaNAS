@@ -166,6 +166,9 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
       "PathPrefix": null,
       "VolumeDataPath": null
     },
+    "Network": {
+      "SchemeMode": "https-redirect"
+    },
     "Jwt": {
       "Issuer": "CistaNAS",
       "Audience": "CistaNAS",
@@ -202,14 +205,16 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
 | `Storage:RegionOrConnectionString` | S3: リージョン、Azure: 接続文字列 |
 | `Storage:EndpointOverride` | S3: エンドポイント上書き（MinIO / LocalStack 用） |
 | `Storage:PathPrefix` | バケット/コンテナ内のパスプレフィックス |
-| `Storage:VolumeDataPath` | volume.dat のローカルパス（K8s では PV マウントパス）。未設定時は `DataRoot` |
+| `Storage:VolumeDataPath` | ローカルデータ / クラウドSQLite復旧DBのパス（K8sではPVマウントパス）。未設定時は `DataRoot` |
+| `Network:SchemeMode` | `https-redirect` / `proxy`（Cloudflare等） / `http`（閉域のみ） |
+| `TrustedProxies` | `X-Forwarded-*` を信頼するプロキシのIP/CIDR。実際のプロキシ範囲だけ指定 |
 | `Jwt:SigningKey` | 未設定時は起動ごとにランダム生成（再起動でトークン失効） |
 | `Jwt:AccessTokenMinutes` | アクセストークンの有効期限（分） |
 | `Auth:Argon2MemoryKiB` | ログインハッシュの Argon2id メモリ量 KiB（デフォルト 65,536 = 64 MiB） |
 | `Auth:Argon2TimeCost` | ログインハッシュの Argon2id パス数（デフォルト 4） |
 | `Auth:Argon2Parallelism` | ログインハッシュの Argon2id 並列度（デフォルト 4） |
 | `Auth:Pbkdf2Iterations` | （レガシー）旧パスワードハッシュの PBKDF2 反復回数。新規ハッシュは Argon2id |
-| `Volume:SectorSize` | AES-XTS のセクタサイズ（16 の倍数） |
+| `Volume:SectorSize` | 旧AES-XTS互換用のセクタサイズ（16 の倍数）。新規サーバー暗号化は認証付きチャンク方式 |
 | `Volume:KdfAlgorithm` | KEK 導出アルゴリズム: `argon2id`（Argon2id+PBKDF2 合成、デフォルト）or `argon2id-raw`（Argon2id 単独、RFC 9106 標準構成） |
 | `Volume:KdfMemoryKiB` | KEK 導出の Argon2id メモリ量 KiB（デフォルト 65,536 = 64 MiB） |
 | `Volume:KdfTimeCost` | KEK 導出の Argon2id パス数（デフォルト 4） |
@@ -217,7 +222,7 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
 | `Volume:KdfIterations` | KEK 導出の後段 PBKDF2 反復回数（デフォルト 600,000。`Volume:KdfAlgorithm` = `argon2id-raw` 時は不使用） |
 | `Volume:DefaultEncryptionMode` | デフォルト暗号化モード（`server` / `e2ee` / `none`） |
 | `Volume:E2eeChunkSize` | E2EE チャンクサイズ（バイト、デフォルト 1 MiB） |
-| `Volume:ChunkStorage` | チャンクストレージモード（`local` = 常に volume.dat / `auto` = S3 使用時に自動チャンク） |
+| `Volume:ChunkStorage` | チャンクストレージモード（暗号化ボリュームは常に認証付きチャンク、`auto` はS3等の平文ボリュームにも適用） |
 | `Volume:ServerChunkSize` | チャンクモード時のサーバー側チャンクサイズ（バイト、デフォルト 4 MiB） |
 
 ## 暗号化の仕組み
@@ -383,6 +388,8 @@ E2EE ボリュームの WebDAV は暗号化済みファイル名と暗号化済�
 - **セキュリティヘッダ** — CSP, HSTS, X-Content-Type-Options, X-Frame-Options 等
 - **JWT 署名鍵** — 本番環境で 32 バイト以上必須（開発環境ではランダム生成）
 - **ストリーミングトークン** — 60 秒有効・短命・URL ベースアクセス用・最大 10,000 個
+- **HTTPS/TLS終端は設定可能** — 既定は本番HTTPをHTTPSへリダイレクトし、ストリーミング応答とトークン発行はキャッシュ禁止
+- **保存データの完全性** — 新規サーバー暗号化は認証付き `chacha20` チャンク方式。旧AES-XTSボリュームはマウントせず、バックアップ後に再作成
 - **エラーメッセージ** — 資格情報の情報漏洩なし（セキュリティログのみ詳細を記録）
 - **Kestrel** — リクエストボディ上限 10 GiB、ヘッダタイムアウト 30 秒
 - **鍵消去** — メモリ内の鍵（マスターキー・KEK）を `CryptographicOperations.ZeroMemory` で消去
@@ -400,6 +407,19 @@ docker compose up
 docker compose --profile s3 -f docker-compose.yml -f docker-compose.s3.yml up
 ```
 
+Compose の HTTP ポートは `127.0.0.1` にのみバインドされます。外部公開する場合は、
+証明書を管理する nginx / Caddy 等を前段に置き、`X-Forwarded-Proto` を正しく設定してください。
+Cloudflareからoriginへ接続する場合は `CISTANAS_BIND_ADDRESS=0.0.0.0 CISTANAS_SCHEME_MODE=proxy`
+などを設定し、origin側のファイアウォールはCloudflareの送信元IPだけに制限してください。
+Kubernetes の各 Ingress も HTTPS listener・証明書・HTTP→HTTPS リダイレクトを構成してから公開し、
+アプリの `CistaNas:TrustedProxies` には実際のプロキシIP/CIDRだけを登録してください（Cloudflareの公開IP範囲を
+登録する場合も、公式の最新範囲だけに限定してください）。
+
+HTTP/TLS の動作は `CistaNas:Network:SchemeMode` で切り替えます。既定値は `https-redirect`（本番の
+HTTPをHTTPSへリダイレクト）、CloudflareなどがTLS終端してoriginへHTTPで接続する場合は `proxy`、
+閉域のHTTP運用だけを許可する場合は `http` を指定します。`proxy` の場合はCloudflare/Ingress側で
+外部HTTP→HTTPSリダイレクトを有効にし、originを直接インターネットへ公開しないでください。
+
 ### 環境変数
 
 | 変数 | 説明 |
@@ -410,11 +430,12 @@ docker compose --profile s3 -f docker-compose.yml -f docker-compose.s3.yml up
 | `CistaNas__Storage__BucketOrContainer` | バケット/コンテナ名 |
 | `CistaNas__Storage__RegionOrConnectionString` | S3: リージョン、Azure: 接続文字列 |
 | `CistaNas__Storage__EndpointOverride` | S3: MinIO 等のエンドポイント URL |
-| `CistaNas__Storage__VolumeDataPath` | volume.dat のローカルパス |
+| `CistaNas__Storage__VolumeDataPath` | volume.dat / クラウドSQLiteの永続ローカルパス（クラウドDBでは必須） |
 | `CistaNas__Volume__ChunkStorage` | `local` または `auto`（S3 使用時に自動チャンク） |
 | `CistaNas__Volume__ServerChunkSize` | サーバー側チャンクサイズ（バイト） |
 | `CistaNas__Jwt__SigningKey` | JWT 署名鍵（Base64） |
 | `CistaNas__Auth__DefaultAdminPassword` | 初期管理者パスワード |
+| `CistaNas__Network__SchemeMode` | `https-redirect` / `proxy` / `http` |
 
 ## Kubernetes
 
@@ -448,6 +469,11 @@ kubectl create secret generic cistanas-secrets \
 | `azure` | `managed-premium` (20Gi) | Azure Blob | Application Gateway |
 | `gcp` | `pd-ssd` (20Gi) | GCS | GCE (静的 IP) |
 
+Ingressを公開する前にTLS証明書を設定してください。AWSはALB IngressへACM証明書ARNを追加し、
+Azureは `cistanas-tls-cert` をApp Gatewayに登録済みの証明書名へ置換、GCPは `cistanas-tls` Secretを
+作成（またはManagedCertificateへ置換）します。Cloudflareを前段に置く場合は、Cloudflare側の
+HTTPS強制とorigin制限も有効にしてください。
+
 ## DB復旧と更新時の容量・I/O
 
 クラウドSQLiteは単一インスタンス専用です。ローカルDBとWALは永続ボリューム上の
@@ -469,8 +495,9 @@ DBと存在する `-wal`／`-shm` を、表示された新パスの `database.sq
 `database.sqlite-shm` として移動します。稼働中のDB本体だけをコピーすると未チェックポイントの変更を失います。
 移行後に起動して内容・同期を確認してください。接続先やBlobKeyを変える場合も、以前の復旧元は保持して確認してください。
 
-一時ディレクトリへのフォールバックではコンテナ・ホストの交換に耐えられません。同期成功前にローカル
-ボリュームを失えば最近の変更が失われる可能性があります。オブジェクトストレージは非同期の複製先です。
+クラウドSQLiteで `Storage:VolumeDataPath` を未設定にすると起動を拒否します。一時ディレクトリへの
+フォールバックではコンテナ・ホストの交換に耐えられず、同期成功前にローカルボリュームを失えば最近の
+変更が失われるためです。オブジェクトストレージは非同期の複製先です。
 重要データには別バックアップを用意し、強い耐久性や複数インスタンスが必要ならPostgreSQLを使用してください。
 同じクラウドSQLiteオブジェクトに複数のプロセスから書き込んではいけません。
 

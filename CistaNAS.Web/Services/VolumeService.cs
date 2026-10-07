@@ -141,6 +141,15 @@ public sealed partial class VolumeService : IAsyncDisposable
 
     private void MountInternal(string name, VolumeHeader header, byte[]? masterKey)
     {
+        if (header.IsE2ee)
+            throw new VolumeException(
+                $"E2EE ボリューム '{name}' はチャンクストレージでのみマウントできます。");
+        if (header.Encrypted && !string.Equals(header.StorageMode, "chunk", StringComparison.Ordinal))
+            throw new VolumeException(
+                $"暗号化ボリューム '{name}' は旧ローカルストレージ形式です。バックアップ後に新しいチャンク形式で再作成してください。");
+        if (header.Encrypted && header.EffectiveCipherAlgorithm == CipherAlgorithm.Aes256Xts)
+            throw new VolumeException(
+                $"ボリューム '{name}' は完全性検証のない旧AES-XTS形式です。バックアップ後に新形式で再作成してください。");
         // E2EEはサーバー側で暗号化しないため、FileStream を排他保持しない
         var share = header.IsE2ee ? FileShare.ReadWrite : FileShare.None;
         var fs = new FileStream(GetDataPath(name), FileMode.Open, FileAccess.ReadWrite, share, 4096, FileOptions.Asynchronous);
@@ -153,6 +162,9 @@ public sealed partial class VolumeService : IAsyncDisposable
     /// <summary>チャンクモード: FileStream を開かずにマウント。データは IChunkStore 経由でアクセス。</summary>
     private void MountInternalChunked(string name, VolumeHeader header, byte[]? masterKey)
     {
+        if (!header.IsE2ee && header.Encrypted && header.EffectiveCipherAlgorithm == CipherAlgorithm.Aes256Xts)
+            throw new VolumeException(
+                $"ボリューム '{name}' は完全性検証のない旧AES-XTS形式です。バックアップ後に新形式で再作成してください。");
         // チャンクモードでは FileStream を持たない。ダミーの空ストリームを設定。
         // GetMounted() はチャンクモードでは呼ばれない前提（GetMountedKeys を使用）。
         _mounted[name] = new MountedVolume(header, masterKey, Stream.Null);
@@ -218,9 +230,16 @@ public sealed partial class VolumeService : IAsyncDisposable
         var wrapTypes = h.UserKeys.Count > 0
             ? h.UserKeys.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.WrapType, StringComparer.Ordinal)
             : null;
+        // E2EE の暗号方式はサーバー側 CipherAlgorithm ではなく、各ユーザーの
+        // wrapped master key に保持される。VolumeInfo では代表値として owner
+        // または先頭の wrapped key の方式を返す。
+        string cipherAlgorithm = h.IsE2ee
+            ? h.UserKeys.Values.Select(x => x.WrappedMasterKey.Algorithm)
+                .FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)) ?? "aes-256-gcm"
+            : h.CipherAlgorithm;
         return new(name, mounted, h.Encrypted, h.OwnerUser, h.CreatedAt,
             h.UserKeys.Keys.ToList(), h.EncryptionMode,
-            h.CipherAlgorithm, h.KeySize,
+            cipherAlgorithm, h.KeySize,
             h.AuthorizedGroups.ToList(),
             name.StartsWith(VolumeHeader.HomePrefix, StringComparison.Ordinal),
             wrapTypes);

@@ -2,13 +2,15 @@ services:
   cistanas:
     build: .
     ports:
-      - "8080:8080"
+      # HTTP はホスト外へ公開しない。外部公開する場合は TLS 終端プロキシを前段に置く。
+      - "${CISTANAS_BIND_ADDRESS:-127.0.0.1}:8080:8080"
     volumes:
       - cista-data:/app/data
     environment:
       - CistaNas__DataRoot=/app/data
       - CistaNas__Jwt__SigningKey=${JWT_SIGNING_KEY:-}
       - CistaNas__Auth__DefaultAdminPassword=${ADMIN_PASSWORD:-}
+      - CistaNas__Network__SchemeMode=${CISTANAS_SCHEME_MODE:-http}
       - ASPNETCORE_ENVIRONMENT=Production
 
   # S3 互換ストレージ（MinIO）。ローカルで S3 プロバイダをテストする場合:

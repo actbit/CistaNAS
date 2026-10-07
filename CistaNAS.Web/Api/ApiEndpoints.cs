@@ -271,9 +271,13 @@ public static class ApiEndpoints
             if (string.IsNullOrEmpty(username)) return Results.Unauthorized();
             if (!await vs.HasAccessAsync(req.VolumeName, username)) return Results.Forbid();
             string token = sts.Issue(username, req.VolumeName, req.FileName);
+            ctx.Response.Headers.CacheControl = "no-store";
+            ctx.Response.Headers.Pragma = "no-cache";
+            ctx.Response.Headers["Referrer-Policy"] = "no-referrer";
             return Results.Ok(new { token });
         })
         .RequireAuthorization()
+        .RequireRateLimiting("api")
         .WithName("IssueStreamToken");
 
         // ストリーミングエンドポイント（短命トークン認証、Range対応）
@@ -295,6 +299,8 @@ public static class ApiEndpoints
                 string fileName = PathSanitizer.SanitizeFileName(filePath);
                 if (!string.Equals(file, fileName, StringComparison.Ordinal)) return Results.Forbid();
                 var dl = await fs.DownloadAsync(volumeName, fileName, ctx.RequestAborted);
+                ctx.Response.Headers.CacheControl = "no-store";
+                ctx.Response.Headers["Referrer-Policy"] = "no-referrer";
                 return Results.Stream(dl.Stream, "application/octet-stream", dl.FileName,
                     enableRangeProcessing: true);
             }

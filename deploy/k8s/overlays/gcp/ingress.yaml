@@ -1,0 +1,24 @@
+# GKE Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cistanas
+  namespace: cistanas
+  annotations:
+    kubernetes.io/ingress.class: gce
+    kubernetes.io/ingress.global-static-ip-name: cistanas-ip
+    kubernetes.io/ingress.allow-http: "false"
+spec:
+  # 事前に cistanas-tls Secret を作成する（または環境のManagedCertificateへ置換）。
+  tls:
+    - secretName: cistanas-tls
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cistanas
+                port:
+                  number: 80

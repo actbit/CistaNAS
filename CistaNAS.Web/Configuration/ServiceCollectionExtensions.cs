@@ -17,6 +17,11 @@ public static class ServiceCollectionExtensions
 {
     public static IServiceCollection AddCistaNasServices(this IServiceCollection services, CistaNasOptions cista)
     {
+        // AccountService からも利用されるため、Program.cs 経由でないテスト/ホストでも
+        // SecurityStamp キャッシュを必ず解決できるよう、サービス登録の責務をここに集約する。
+        services.AddMemoryCache();
+        services.AddSingleton<JwtSecurityStampCache>();
+
         // ストレージプロバイダ（直接インスタンス化。DI ラムダ外で生成するため ServiceProvider 構築不要）
         var storage = CreateStorageProvider(cista);
         services.AddSingleton<IStorageProvider>(storage);
@@ -85,6 +90,12 @@ public static class ServiceCollectionExtensions
             case "azureblob":
             case "gcs":
             {
+                if (string.IsNullOrWhiteSpace(cista.Storage.VolumeDataPath))
+                {
+                    throw new InvalidOperationException(
+                        "クラウドSQLiteを使用する場合は CistaNas:Storage:VolumeDataPath に永続ボリュームを指定してください。"
+                        + "未指定の一時ディレクトリでは再起動時に最新のDB/WALが失われます。");
+                }
                 services.AddSingleton(sp => new CloudSqliteSync(storage, cista.Storage, db,
                     sp.GetRequiredService<ILogger<CloudSqliteSync>>()));
                 services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<CloudSqliteSync>());

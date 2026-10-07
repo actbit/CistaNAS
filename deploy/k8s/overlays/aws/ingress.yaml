@@ -1,0 +1,25 @@
+# AWS ALB Ingress (EKS)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cistanas
+  namespace: cistanas
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    # HTTPS listener と ACM 証明書 ARN は環境ごとに必ず設定する。
+    # 証明書 ARN 未設定のままインターネット公開しないこと。
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cistanas
+                port:
+                  number: 80

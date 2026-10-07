@@ -31,11 +31,16 @@ public sealed class SecurityHardeningTests : IAsyncDisposable
     [Fact]
     public async Task E2eeCreate_UsesChunkStorageWithoutCreatingAStaleVolumeFile()
     {
-        await _volumes.CreateE2eeAsync(
+        var info = await _volumes.CreateE2eeAsync(
             "chunk-e2ee", "alice", new VolumeHeader.UserWrappedKey());
+
+        var metadata = _services.GetRequiredService<VolumeMetadataStore>();
+        var header = await metadata.LoadAsync("chunk-e2ee");
 
         Assert.False(File.Exists(Path.Combine(_dataRoot, "chunk-e2ee", "volume.dat")));
         Assert.True(_volumes.IsChunkMode("chunk-e2ee"));
+        Assert.Equal("e2ee", header!.EncryptionMode);
+        Assert.Equal("aes-256-gcm", info.CipherAlgorithm);
     }
 
     [Fact]
@@ -56,7 +61,7 @@ public sealed class SecurityHardeningTests : IAsyncDisposable
     }
 
     [Fact]
-    public async Task LegacyE2ee_RejectsVariableLengthReplacementWithoutChangingBytes()
+    public async Task LegacyE2eeStorage_IsRejectedForRecreation()
     {
         const string volumeName = "legacy-shape";
         await _volumes.CreateE2eeAsync(volumeName, "alice", new VolumeHeader.UserWrappedKey());
@@ -67,22 +72,7 @@ public sealed class SecurityHardeningTests : IAsyncDisposable
         Assert.NotNull(header);
         header!.StorageMode = "local";
         await metadata.SaveAsync(volumeName, header);
-        File.Create(Path.Combine(_dataRoot, volumeName, "volume.dat")).Dispose();
-        await _volumes.MountE2eeAsync(volumeName, "alice");
-
-        using var scope = _services.CreateScope();
-        var files = scope.ServiceProvider.GetRequiredService<E2eeFileService>();
-        var entry = await files.CreateFileAsync(
-            volumeName, new E2eeCreateFileRequest("legacy", 32, 1), "alice");
-        using (var original = new MemoryStream(new byte[32]))
-            await files.UploadChunkAsync(volumeName, entry.FileId, 0, original, 32);
-
-        using var replacement = new MemoryStream(new byte[33]);
-        await Assert.ThrowsAsync<FileServiceException>(() => files.UploadChunkAsync(
-            volumeName, entry.FileId, 0, replacement, 33, replace: true));
-
-        var current = Assert.Single((await files.ListFilesAsync(volumeName)).Files);
-        Assert.Equal(32, current.ChunkSizes[0]);
+        await Assert.ThrowsAsync<VolumeException>(() => _volumes.MountE2eeAsync(volumeName, "alice"));
     }
 
     [Fact]

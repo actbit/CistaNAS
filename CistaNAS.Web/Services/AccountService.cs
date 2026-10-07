@@ -18,7 +18,8 @@ public sealed class AccountService(
     RoleManager<ApplicationRole> roleManager,
     AppDbContext db,
     ILogger<AccountService> logger,
-    IServiceScopeFactory scopeFactory)
+    IServiceScopeFactory scopeFactory,
+    JwtSecurityStampCache? jwtSecurityStampCache = null)
 {
     public async Task<bool> HasAnyUsersAsync()
         => await userManager.Users.AnyAsync();
@@ -144,6 +145,7 @@ public sealed class AccountService(
 
         // WebDAV Basic 認証の資格情報キャッシュを失効させる
         WebDav.BasicAuthHandler.InvalidateUser(username);
+        jwtSecurityStampCache?.Invalidate(username);
 
         // ホームボリューム削除
         // 失敗を握りつぶすと、同名ユーザーの再作成時に残存データを引き継ぐため、
@@ -172,6 +174,7 @@ public sealed class AccountService(
         // WebDAV Basic の資格情報キャッシュも失効させる。
         await userManager.UpdateSecurityStampAsync(user);
         WebDav.BasicAuthHandler.InvalidateUser(username);
+        jwtSecurityStampCache?.Invalidate(username);
     }
 
     public async Task<bool> IsAdminAsync(string username)
@@ -325,6 +328,7 @@ public sealed class AccountService(
 
         // WebDAV Basic 認証の資格情報キャッシュを失効させる（TTL 残存での旧パスワード利用を防ぐ）
         WebDav.BasicAuthHandler.InvalidateUser(username);
+        jwtSecurityStampCache?.Invalidate(username);
 
         // KEK 再ラップ（二相コミット: 失敗時は処理済みボリュームが旧ラップへ復元されるため、
         // Identity 側のパスワードを旧値へロールバックすれば全ボリュームが旧パスワードで開ける） (H-5)
