@@ -15,11 +15,18 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// HTTP/TLS の責務は設定で切り替える。Cloudflare 等が TLS を終端する場合は
+// CistaNas:Network:SchemeMode=proxy、閉域HTTPのみなら http を指定する。
+string schemeMode = (builder.Configuration["CistaNas:Network:SchemeMode"] ?? "https-redirect")
+    .Trim().ToLowerInvariant();
+if (schemeMode is not ("https-redirect" or "http" or "proxy"))
+    throw new InvalidOperationException(
+        "CistaNas:Network:SchemeMode は https-redirect / http / proxy のいずれかで指定してください。");
 
 // ---- Kestrel リクエストサイズ制限 ----
 builder.WebHost.ConfigureKestrel(kestrel =>
@@ -80,8 +87,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         // 検証結果は Auth:JwtSecurityStampCacheSeconds（既定 300 秒）だけキャッシュする。
         // 毎リクエスト FindByNameAsync（DB 往復）を行うと Dokan / rclone の高頻度アクセスで
         // DB 負荷が比例増加し、一時的な DB 障害で全認証リクエストが一斉に失敗するため。
-        // キャッシュは (username, stamp) をキーとするため、stamp が変われば即座に無効になる
-        // （= 失効遅延は stamp 不変のまま期間切れになる場合のみ、最大でキャッシュ TTL）。
+        // SecurityStamp 更新時は AccountService がキャッシュを明示的に削除する。
         options.Events = new JwtBearerEvents
         {
             OnTokenValidated = async ctx =>
@@ -105,13 +111,11 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                 // 無駄なアロケーションになっていた）。
                 var userManager = ctx.HttpContext.RequestServices
                     .GetRequiredService<UserManager<ApplicationUser>>();
-                var cache = ctx.HttpContext.RequestServices.GetRequiredService<IMemoryCache>();
+                var stampCache = ctx.HttpContext.RequestServices.GetRequiredService<JwtSecurityStampCache>();
                 int cacheSeconds = cista.Auth.JwtSecurityStampCacheSeconds;
 
-                string cacheKey = $"secst:{username}";
                 if (cacheSeconds > 0
-                    && cache.TryGetValue(cacheKey, out string? cachedStamp)
-                    && string.Equals(cachedStamp, stamp, StringComparison.Ordinal))
+                    && stampCache.Matches(username, stamp))
                 {
                     return; // TTL 内かつ stamp 不変 → DB 検証を省略
                 }
@@ -130,10 +134,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                 }
 
                 if (cacheSeconds > 0)
-                {
-                    cache.Set(cacheKey, user.SecurityStamp,
-                        new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(cacheSeconds) });
-                }
+                    stampCache.Set(username, user.SecurityStamp!, TimeSpan.FromSeconds(cacheSeconds));
             },
         };
     })
@@ -236,15 +237,22 @@ builder.Services.Configure<ForwardedHeadersOptions>(forwarded =>
     forwarded.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
     foreach (string proxy in cista.TrustedProxies)
     {
-        if (System.Net.IPAddress.TryParse(proxy, out var ip))
-            forwarded.KnownProxies.Add(ip);
+        if (!proxy.Contains('/'))
+        {
+            if (System.Net.IPAddress.TryParse(proxy, out var ip))
+                forwarded.KnownProxies.Add(ip);
+            continue;
+        }
+
+        if (System.Net.IPNetwork.TryParse(proxy, out var network))
+            forwarded.KnownIPNetworks.Add(network);
     }
 });
 
 // ---- Service 層 DI 登録 ----
 builder.Services.AddCistaNasServices(cista);
 
-// JWT SecurityStamp 検証結果のキャッシュ（OnTokenValidated 参照）
+// JWT SecurityStamp 検証結果のキャッシュ（OnTokenValidated / AccountService 参照）
 builder.Services.AddMemoryCache();
 
 // ---- WebDAV ----
@@ -364,7 +372,8 @@ if (app.Environment.IsDevelopment())
 else
 {
     app.UseExceptionHandler("/Error", createScopeForErrors: true);
-    app.UseHsts();
+    if (schemeMode != "http")
+        app.UseHsts();
 }
 
 // リバースプロキシ（nginx / Caddy / Traefik）背後で正しい IP とスキームを取得
@@ -374,10 +383,10 @@ app.UseForwardedHeaders();
 // レスポンス圧縮（WASM アセットの brotli/gzip 配信）
 app.UseResponseCompression();
 
-// Kestrel が HTTPS でリッスンしている場合のみリダイレクトを有効化
-// （リバースプロキシで TLS 終端する構成では ASPNETCORE_URLS が http になるため無効化）
-var urls = builder.Configuration["ASPNETCORE_URLS"] ?? "";
-if (urls.Contains("https://", StringComparison.OrdinalIgnoreCase))
+// https-redirect: アプリ自身がHTTP→HTTPSへリダイレクト。
+// proxy: Cloudflare等の前段が外部HTTPSを強制し、アプリはorigin HTTPを受け付ける。
+// http: 閉域/開発用途としてHTTPを許可。
+if (!app.Environment.IsDevelopment() && schemeMode == "https-redirect")
     app.UseHttpsRedirection();
 
 // ---- セキュリティヘッダー ----

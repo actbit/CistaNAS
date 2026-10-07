@@ -20,11 +20,13 @@ public sealed class CistaNasOptions
     public VolumeOptions Volume { get; set; } = new();
     public SharingOptions Sharing { get; set; } = new();
 
+    public NetworkOptions Network { get; set; } = new();
+
     /// <summary>CORS で許可するオリジンリスト。空なら CORS ポリシーは適用されない（same-origin のみ）。</summary>
     public List<string> CorsAllowedOrigins { get; set; } = [];
 
     /// <summary>
-    /// 信頼して X-Forwarded-For / X-Forwarded-Proto を受理するリバースプロキシの IP 一覧。
+    /// 信頼して X-Forwarded-For / X-Forwarded-Proto を受理するリバースプロキシの IP/CIDR 一覧。
     /// ループバックは常に信頼される（同一ホスト上の nginx / Caddy は追加設定不要）。
     /// 設定しない場合、プロキシ背後では RemoteIpAddress がプロキシの IP になり、
     /// IP 単位のレート制限が全利用者で共有される。
@@ -34,6 +36,16 @@ public sealed class CistaNasOptions
     /// <summary>ストリーミングトークンの TTL（秒）。デフォルト 30 秒。</summary>
     [Range(1, 3600, ErrorMessage = "StreamingTokenTtlSeconds は 1 〜 3600 の範囲で指定してください。")]
     public int StreamingTokenTtlSeconds { get; set; } = 30;
+}
+
+/// <summary>HTTP/TLS終端の配置。Cloudflare等の前段プロキシ構成を明示する。</summary>
+public sealed class NetworkOptions
+{
+    /// <summary>
+    /// https-redirect（本番HTTPをHTTPSへリダイレクト）、http（HTTPを許可）、
+    /// proxy（TLS終端は前段プロキシが担当し、アプリはリダイレクトしない）。
+    /// </summary>
+    public string SchemeMode { get; set; } = "https-redirect";
 }
 
 /// <summary>ユーザー/グループDBのプロバイダ設定。</summary>
@@ -81,8 +93,8 @@ public sealed class StorageOptions
     public string? PathPrefix { get; set; }
 
     /// <summary>
-    /// volume.dat のローカルパス。null の場合は DataRoot を使用。
-    /// クラウドデプロイでは永続ボリュームマウントパス（例: /app/data）を指定。
+    /// ローカルデータおよびクラウドSQLite復旧DBのローカルパス。null の場合は DataRoot を使用。
+    /// クラウドDBデプロイでは永続ボリュームマウントパス（例: /app/data）を必ず指定。
     /// </summary>
     public string? VolumeDataPath { get; set; }
 }

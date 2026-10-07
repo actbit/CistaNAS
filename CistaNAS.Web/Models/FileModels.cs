@@ -97,6 +97,13 @@ public sealed class E2eeFileEntry
     public int KeyEpoch { get; set; }
 
     /// <summary>
+    /// このファイルの鍵を最初に作成した GroupKey epoch。共有解除でこの値より新しい
+    /// RevocationEpoch が設定された場合、同じ FileId の更新・再ラップを拒否する。
+    /// 旧カタログでは 0 として扱う。
+    /// </summary>
+    public int CreatedKeyEpoch { get; set; }
+
+    /// <summary>
     /// crypto format v2: per-file DEK（32B）を GroupKey[KeyEpoch] で AES-256-GCM ラップしたもの。
     /// AAD に volumeId / fileId / keyEpoch を bind 済み。KeyEpoch == 0 の場合は null。
     /// GroupKey ローテーション時はこの値の再ラップのみで移行する（チャンク本体は不変）。

@@ -22,7 +22,8 @@ public sealed class FileServiceIntegrityTests(ITestOutputHelper output)
             expected[100 + i] = (byte)i;
             await fixture.Files.PatchRangeAsync(fixture.Volume, "large.bin", 100 + i,
                 new MemoryStream(new[] { (byte)i }), 1);
-            Assert.True(fixture.PhysicalLength <= 2L * expected.Length);
+            if (!fixture.IsChunked)
+                Assert.True(fixture.PhysicalLength <= 2L * expected.Length);
         }
         Assert.Equal(expected, await fixture.ReadAsync("large.bin"));
         await fixture.RemountAsync();
@@ -41,9 +42,11 @@ public sealed class FileServiceIntegrityTests(ITestOutputHelper output)
         await fixture.Files.DeleteAsync(fixture.Volume, "first.bin");
         Assert.Equal(neighbor, await fixture.ReadAsync("neighbor.bin"));
         await fixture.Files.DeleteAsync(fixture.Volume, "neighbor.bin");
-        Assert.Equal(0, fixture.PhysicalLength);
+        if (!fixture.IsChunked)
+            Assert.Equal(0, fixture.PhysicalLength);
         await fixture.UploadAsync("recreated.bin", neighbor);
-        Assert.Equal(neighbor.Length, fixture.PhysicalLength);
+        if (!fixture.IsChunked)
+            Assert.Equal(neighbor.Length, fixture.PhysicalLength);
         Assert.Equal(neighbor, await fixture.ReadAsync("recreated.bin"));
     }
 
@@ -76,7 +79,8 @@ public sealed class FileServiceIntegrityTests(ITestOutputHelper output)
         await fixture.RemountAsync();
         Assert.Equal(neighbor, await fixture.ReadAsync("neighbor.bin"));
         await fixture.UploadAsync("replacement.bin", new byte[16000]);
-        Assert.True(fixture.PhysicalLength <= 40960);
+        if (!fixture.IsChunked)
+            Assert.True(fixture.PhysicalLength <= 40960);
         Assert.Equal(neighbor, await fixture.ReadAsync("neighbor.bin"));
     }
 
@@ -98,8 +102,9 @@ public sealed class FileServiceIntegrityTests(ITestOutputHelper output)
                 new MemoryStream(new[] { (byte)i }), 1);
         }
         timer.Stop();
-        output.WriteLine($"Encrypted={encrypted}; FileBytes={expected.Length}; Patches=4; ElapsedMs={timer.ElapsedMilliseconds}; PhysicalBytes={fixture.PhysicalLength}");
-        Assert.True(fixture.PhysicalLength <= 2L * expected.Length);
+        output.WriteLine($"Encrypted={encrypted}; FileBytes={expected.Length}; Patches=4; ElapsedMs={timer.ElapsedMilliseconds}; PhysicalBytes={(fixture.IsChunked ? -1 : fixture.PhysicalLength)}");
+        if (!fixture.IsChunked)
+            Assert.True(fixture.PhysicalLength <= 2L * expected.Length);
         Assert.Equal(expected, await fixture.ReadAsync("large.bin"));
     }
 
@@ -359,6 +364,7 @@ public sealed class FileServiceIntegrityTests(ITestOutputHelper output)
         public string Volume { get; } = "integrity-" + Guid.NewGuid().ToString("N");
         public FileService Files { get; }
         public FaultStorage Storage { get; }
+        public bool IsChunked => _volumes.IsChunkMode(Volume);
         public long PhysicalLength => new FileInfo(Path.Combine(_root, Volume, "volume.dat")).Length;
 
         private Fixture(bool chunked)

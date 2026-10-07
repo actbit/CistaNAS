@@ -37,7 +37,7 @@ public sealed partial class VolumeService
         return UnderMountGateAsync(async () =>
         {
             // ユーザー設定を取得して暗号化モードとアルゴリズムを決定
-            string cipherAlgorithm = "aes-256-xts";  // デフォルト
+            string cipherAlgorithm = "chacha20";  // 認証付き暗号を既定にする
             bool shouldEncrypt = encrypted;
             string? userEncryptionMode = null;
 
@@ -58,6 +58,14 @@ public sealed partial class VolumeService
 
             shouldEncrypt = ResolveServerSideEncryption(encrypted, userEncryptionMode);
 
+            // サーバー側で暗号化する新規ボリュームは、改ざん検知可能な
+            // ChaCha20-Poly1305 のチャンク形式に統一する。AES-XTS は完全性検証を
+            // 持たず、保存データの改ざんを検出できないため新規作成では許可しない。
+            if (shouldEncrypt)
+            {
+                cipherAlgorithm = "chacha20";
+            }
+
             if (shouldEncrypt) { ArgumentException.ThrowIfNullOrEmpty(username); ArgumentException.ThrowIfNullOrEmpty(password); }
 
             if (await _metaStore.ExistsAsync(name))
@@ -66,7 +74,9 @@ public sealed partial class VolumeService
             var (header, masterKey) = VolumeHeader.Create(name, username, password, VolOpts.SectorSize, VolOpts.ToKdfSpec(), shouldEncrypt, cipherAlgorithm);
 
             // チャンクモード判定: "auto" かつ S3 プロバイダ使用時
-            bool chunkMode = ShouldUseChunkMode();
+            // 暗号化ボリュームはローカルストレージでもチャンク形式にする。
+            // これにより S3 だけでなくローカル保存でも認証タグを必ず検証できる。
+            bool chunkMode = shouldEncrypt || ShouldUseChunkMode();
             if (chunkMode)
             {
                 header.StorageMode = "chunk";
@@ -100,6 +110,17 @@ public sealed partial class VolumeService
                 throw new VolumeException($"ボリューム '{name}' は既にマウントされています。");
 
             var header = await LoadHeaderOrThrowAsync(name);
+            if (header.IsE2ee && !string.Equals(header.StorageMode, "chunk", StringComparison.Ordinal))
+                throw new VolumeException(
+                    $"E2EE ボリューム '{name}' は旧ストレージ形式です。新しいチャンク形式で再作成してください。");
+            if (!header.IsE2ee && header.Encrypted
+                && !string.Equals(header.StorageMode, "chunk", StringComparison.Ordinal))
+                throw new VolumeException(
+                    $"暗号化ボリューム '{name}' は旧ローカルストレージ形式です。バックアップ後に新しいチャンク形式で再作成してください。");
+            if (!header.IsE2ee && header.Encrypted
+                && header.EffectiveCipherAlgorithm == CistaNAS.Shared.Crypto.CipherAlgorithm.Aes256Xts)
+                throw new VolumeException(
+                    $"ボリューム '{name}' は完全性検証のない旧AES-XTS形式です。バックアップ後に新形式で再作成してください。");
             if (!await HasAccessAsync(name, username))
                 throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
 

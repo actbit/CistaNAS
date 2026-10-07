@@ -78,6 +78,8 @@ public static class TestHelper
         services.AddScoped<JournalService>();
         services.AddScoped<FileService>();
         services.AddScoped<E2eeFileService>();
+        services.AddMemoryCache();
+        services.AddSingleton<JwtSecurityStampCache>();
         services.AddLogging();
 
         var sp = services.BuildServiceProvider();

@@ -1,0 +1,22 @@
+# Azure AGIC Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cistanas
+  namespace: cistanas
+  annotations:
+    kubernetes.io/ingress.class: azure-application-gateway
+    # App Gateway 側に登録した証明書名へ置換して HTTPS リスナーを有効化する。
+    appgw.ingress.kubernetes.io/ssl-redirect: "true"
+    appgw.ingress.kubernetes.io/appgw-ssl-certificate: cistanas-tls-cert
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cistanas
+                port:
+                  number: 80

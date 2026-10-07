@@ -11,9 +11,9 @@ using Microsoft.Extensions.Options;
 namespace CistaNAS.Web.Services;
 
 /// <summary>
-/// E2EE ボリュームのファイル管理。opaque blob として volume.dat に格納し、
+/// E2EE ボリュームのファイル管理。opaque blob としてチャンクストアに格納し、
 /// catalog-e2ee.json に FileId ベースのメタデータを保持する。
-/// メタデータは IStorageProvider 経由で保存し、volume.dat はローカルファイルシステムに配置。
+/// 旧 volume.dat 形式は読み書きせず、再作成を要求する。
 /// </summary>
 public sealed class E2eeFileService
 {
@@ -31,7 +31,6 @@ public sealed class E2eeFileService
     private readonly VolumeService _volumeService;
     private readonly IStorageProvider _storage;
     private readonly IChunkStore _chunkStore;
-    private readonly string _volumeDataPath;
 
     /// <summary>ファイル単位の読み書きゲート。ダウンロード中の上書き・削除を防止。</summary>
     private static readonly ConcurrentDictionary<(string Volume, string FileId), AsyncFileGate> _fileGates = new();
@@ -42,7 +41,7 @@ public sealed class E2eeFileService
         _volumeService = volumeService;
         _storage = storage;
         _chunkStore = chunkStore;
-        _volumeDataPath = options.Value.Storage.VolumeDataPath ?? options.Value.DataRoot;
+        _ = options;
     }
 
     /// <summary>E2EE ボリュームのヘッダを取得。E2EE でなければ例外。</summary>
@@ -51,6 +50,9 @@ public sealed class E2eeFileService
         var (header, _) = _volumeService.GetMountedKeys(volumeName);
         if (!header.IsE2ee)
             throw new FileServiceException($"ボリューム '{volumeName}' は E2EE ボリュームではありません。");
+        if (!string.Equals(header.StorageMode, "chunk", StringComparison.Ordinal))
+            throw new FileServiceException(
+                $"E2EE ボリューム '{volumeName}' は旧ストレージ形式です。新しいチャンク形式で再作成してください。");
         return header;
     }
 
@@ -106,39 +108,15 @@ public sealed class E2eeFileService
             if (catalog.Files.ContainsKey(fileId))
                 throw new FileServiceException("fileIdが重複しています。");
 
-            // 次のオフセットはカタログから算出する。
-            // 旧実装は new FileInfo(dataPath).Length を使っていたが、
-            // ボリュームゲート解放後は物理ファイルがまだ空のため
-            // 並行 CreateFileAsync で同じ offset が割り当てられて衝突していた。
-            //
-            // E2EE ボリュームでは:
-            //  - ローカルモード (IsChunkMode=false): 各ファイルのチャンクが
-            //    volume.dat の Offset から連続して書き込まれる。
-            //  - チャンクモード (IsChunkMode=true): チャンクは IChunkStore に格納され
-            //    volume.dat は使用されない (Offset 値はメタデータとしてのみ保持)。
-            //
-            // ローカルモードでは作成時点で物理領域を予約する。EncryptedLength は
-            // クライアント申告値であり、実際のチャンク長と異なる可能性があるため、
-            // それをそのまま次のファイルの開始位置に使うとファイル同士が重なる。
-            long offset = 0;
-            if (!_volumeService.IsChunkMode(volumeName))
-            {
-                foreach (var existing in catalog.Files.Values)
-                {
-                    long reserved = GetReservedEncryptedLength(header, existing.ChunkCount, existing.EncryptedLength);
-                    long end = checked(existing.Offset + reserved);
-                    if (end > offset) offset = end;
-                }
-            }
-
             var entry = new E2eeFileEntry
             {
                 FileId = fileId,
                 EncryptedName = request.EncryptedName,
-                Offset = offset,
+                Offset = 0,
                 EncryptedLength = request.EncryptedLength,
                 ChunkCount = request.ChunkCount,
                 KeyEpoch = request.KeyEpoch,
+                CreatedKeyEpoch = request.KeyEpoch,
                 WrappedFileKey = request.KeyEpoch >= 1 ? request.WrappedFileKey : null,
                 CreatedAt = DateTimeOffset.UtcNow,
                 ModifiedAt = DateTimeOffset.UtcNow,
@@ -159,7 +137,7 @@ public sealed class E2eeFileService
         }
     }
 
-    /// <summary>チャンクをアップロードして volume.dat またはチャンクストアに書き込む。</summary>
+    /// <summary>チャンクをアップロードしてチャンクストアに書き込む。</summary>
     public async Task UploadChunkAsync(string volumeName, string fileId, int chunkIndex, Stream data, long dataLength,
         bool replace = false, CancellationToken ct = default, int? encryptionKeyEpoch = null)
     {
@@ -180,6 +158,8 @@ public sealed class E2eeFileService
 
                 if (!catalog.Files.TryGetValue(fileId, out var entry))
                     throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+
+                EnsureFileCanBeUpdated(header, entry);
 
                 // Rewrapping changes the DEK's wrap epoch, but an in-flight
                 // ciphertext still binds the epoch used when it was encrypted.
@@ -268,15 +248,13 @@ public sealed class E2eeFileService
                 string hashHex = Convert.ToHexString(
                     System.Security.Cryptography.SHA256.HashData(chunkData));
 
-                string? newChunkObjectId = null;
+                string newChunkObjectId = $"{fileId}/versions/{Guid.NewGuid():N}";
                 string? supersededPendingId = replace && entry.PendingChunks is not null
                     && entry.PendingChunks.TryGetValue(chunkIndex, out var previousPending)
                     ? previousPending.ObjectId : null;
 
-                if (_volumeService.IsChunkMode(volumeName))
+                using (var chunkStream = new MemoryStream(chunkData, writable: false))
                 {
-                    newChunkObjectId = $"{fileId}/versions/{Guid.NewGuid():N}";
-                    using var chunkStream = new MemoryStream(chunkData, writable: false);
                     try
                     {
                         await _chunkStore.WriteChunkAsync(volumeName, newChunkObjectId, chunkIndex, chunkStream, ct);
@@ -289,28 +267,6 @@ public sealed class E2eeFileService
                         catch { }
                         throw;
                     }
-                }
-                else
-                {
-                    long chunkOffset = entry.Offset;
-                    for (int i = 0; i < chunkIndex; i++)
-                        chunkOffset += i < entry.ChunkSizes.Count ? entry.ChunkSizes[i] : 0;
-
-                    // Legacy E2EE volumes store all chunks in one contiguous file. An in-place
-                    // replacement with a different size would shift the logical offsets of every
-                    // following chunk while leaving their bytes in the old positions, silently
-                    // corrupting the file. New E2EE volumes use chunk storage; keep legacy data
-                    // safe by rejecting this unsupported shape instead of recording bad metadata.
-                    if (chunkIndex < entry.ChunkSizes.Count
-                        && entry.ChunkSizes[chunkIndex] != dataLength)
-                        throw new FileServiceException(
-                            "レガシー E2EE ボリュームでは既存チャンクのサイズを変更できません。");
-
-                    string dataPath = GetDataPath(volumeName);
-                    using var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
-                    fs.Seek(chunkOffset, SeekOrigin.Begin);
-                    await fs.WriteAsync(chunkData, ct);
-                    await fs.FlushAsync(ct);
                 }
 
                 // revision: 「実際にアップロード済みのチャンク」の差分上書きは nonce を一意にする
@@ -336,7 +292,7 @@ public sealed class E2eeFileService
                     newRevision = 0; // 新規 / 末尾追記 / 未アップロード・チャンクへの初回書き込み
                 }
 
-                if (replace && newChunkObjectId is not null)
+                if (replace)
                 {
                     // チャンクモードの差分上書き: ファイル単位の可視化（staged visibility）。
                     // 未確定チャンクとして PendingChunks に退避し、可視カタログ
@@ -359,8 +315,7 @@ public sealed class E2eeFileService
                 }
                 else
                 {
-                    // 非チャンクモード（レガシー・共有 volume.dat への in-place 書き込み）と
-                    // 新規順次アップロードは staging できない / しないため、従来通り即時反映する。
+                    // 新規順次アップロードは staging しないため、従来通り即時反映する。
                     // 書き込みセッション間の排他は E2eeWriteLeaseService のファイル単位リースで
                     // 保証される。crypto format v2: チャンクを暗号化したときの keyEpoch を記録する。
                     if (chunkIndex == entry.ChunkCount)
@@ -381,12 +336,9 @@ public sealed class E2eeFileService
                         entry.ChunkKeyEpochs.Add(entry.KeyEpoch);
                     entry.ChunkKeyEpochs[chunkIndex] = chunkKeyEpoch;
 
-                    if (newChunkObjectId is not null)
-                    {
-                        while (entry.ChunkObjectIds.Count <= chunkIndex)
-                            entry.ChunkObjectIds.Add("");
-                        entry.ChunkObjectIds[chunkIndex] = newChunkObjectId;
-                    }
+                    while (entry.ChunkObjectIds.Count <= chunkIndex)
+                        entry.ChunkObjectIds.Add("");
+                    entry.ChunkObjectIds[chunkIndex] = newChunkObjectId;
                 }
 
                 try
@@ -397,16 +349,13 @@ public sealed class E2eeFileService
                 {
                     // カタログ保存失敗時は未確定チャンクの新オブジェクトを撤去（ゴミを残さない）。
                     // 可視カタログは更新していないため、既存データは無傷のまま。
-                    if (newChunkObjectId is not null)
-                    {
-                        try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, newChunkObjectId, CancellationToken.None); }
-                        catch { }
-                    }
+                    try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, newChunkObjectId, CancellationToken.None); }
+                    catch { }
                     throw;
                 }
                 // Only retire the earlier pending generation after its replacement
                 // is durable. Readers still own the visible generation until finalize.
-                if (newChunkObjectId is not null && supersededPendingId is not null
+                if (supersededPendingId is not null
                     && supersededPendingId.StartsWith(fileId + "/versions/", StringComparison.Ordinal)
                     && !entry.ChunkObjectIds.Contains(supersededPendingId, StringComparer.Ordinal)
                     && !entry.PendingChunks!.Values.Any(p => p.ObjectId == supersededPendingId))
@@ -443,35 +392,11 @@ public sealed class E2eeFileService
             int revision = chunkIndex < entry.ChunkRevisions.Count ? entry.ChunkRevisions[chunkIndex] : 0;
             int keyEpoch = chunkIndex < entry.ChunkKeyEpochs.Count ? entry.ChunkKeyEpochs[chunkIndex] : entry.KeyEpoch;
 
-            long chunkLength = chunkIndex < entry.ChunkSizes.Count
-                ? entry.ChunkSizes[chunkIndex]
-                : 0;
-
-            if (_volumeService.IsChunkMode(volumeName))
-            {
-                string chunkObjectId = GetChunkObjectId(entry, chunkIndex);
-                byte[]? chunkData = await _chunkStore.ReadChunkAsync(volumeName, chunkObjectId, chunkIndex, ct);
-                if (chunkData is null)
-                    throw new FileServiceException($"チャンク {chunkIndex} が見つかりません。");
-                return (new GateReadStream(new MemoryStream(chunkData), readLock), chunkData.Length, revision, keyEpoch);
-            }
-
-            long chunkOffset = entry.Offset;
-            for (int i = 0; i < chunkIndex; i++)
-                chunkOffset += i < entry.ChunkSizes.Count ? entry.ChunkSizes[i] : 0;
-
-            string dataPath = GetDataPath(volumeName);
-            var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            try
-            {
-                fs.Seek(chunkOffset, SeekOrigin.Begin);
-                return (new GateReadStream(new SubStream(fs, chunkLength), readLock), chunkLength, revision, keyEpoch);
-            }
-            catch
-            {
-                fs.Dispose();
-                throw;
-            }
+            string chunkObjectId = GetChunkObjectId(entry, chunkIndex);
+            byte[]? chunkData = await _chunkStore.ReadChunkAsync(volumeName, chunkObjectId, chunkIndex, ct);
+            if (chunkData is null)
+                throw new FileServiceException($"チャンク {chunkIndex} が見つかりません。");
+            return (new GateReadStream(new MemoryStream(chunkData), readLock), chunkData.Length, revision, keyEpoch);
         }
         catch
         {
@@ -520,7 +445,7 @@ public sealed class E2eeFileService
     /// <summary>アップロード完了を確定。</summary>
     public async Task FinalizeFileAsync(string volumeName, string fileId, E2eeFinalizeFileRequest request, CancellationToken ct = default)
     {
-        GetE2eeHeader(volumeName);
+        var header = GetE2eeHeader(volumeName);
         // ボリュームゲートでカタログ R-M-W を直列化 (H-9)
         var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
         await volGate.WaitAsync(ct);
@@ -533,6 +458,8 @@ public sealed class E2eeFileService
                 var catalog = await LoadCatalogAsync(volumeName, ct);
                 if (!catalog.Files.TryGetValue(fileId, out var entry))
                     throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+
+                EnsureFileCanBeUpdated(header, entry);
 
                 // ファイル単位の可視化: 未確定チャンク（replace 分）をここで一括昇格する。
                 // 昇格はカタログ R-M-W 1 回で完了するため、読み手は常に完全な旧版か完全な新版の
@@ -639,6 +566,7 @@ public sealed class E2eeFileService
             {
                 if (!catalog.Files.TryGetValue(rewrap.FileId, out var entry))
                     throw new FileServiceException($"ファイル '{rewrap.FileId}' が見つかりません。");
+                EnsureFileCanBeUpdated(header, entry);
                 if (entry.KeyEpoch == 0)
                     throw new FileServiceException("v1 ファイルは鍵の再ラップだけでは v2 形式に変換できません。");
                 // 再ラップ先 epoch は現行 epoch のみ（旧 epoch への巻き戻しを防止）。
@@ -676,17 +604,17 @@ public sealed class E2eeFileService
             throw new FileServiceException("WrappedFileKey の tag サイズが不正です。");
     }
 
-    private static long GetReservedEncryptedLength(VolumeHeader header, int chunkCount, long declaredLength)
-    {
-        if (chunkCount < 0) throw new FileServiceException("チャンク数が不正です。");
-        long capacity = checked((long)SaltSize + (long)chunkCount * (header.ChunkSize + TagSize));
-        return Math.Max(capacity, declaredLength);
-    }
-
     private static string GetChunkObjectId(E2eeFileEntry entry, int chunkIndex)
         => chunkIndex < entry.ChunkObjectIds.Count && !string.IsNullOrWhiteSpace(entry.ChunkObjectIds[chunkIndex])
             ? entry.ChunkObjectIds[chunkIndex]
             : entry.FileId;
+
+    private static void EnsureFileCanBeUpdated(VolumeHeader header, E2eeFileEntry entry)
+    {
+        if (header.RevocationEpoch > entry.CreatedKeyEpoch)
+            throw new FileServiceException(
+                "共有解除後の既存ファイルは更新できません。新しいファイルIDで再暗号化して再アップロードしてください。");
+    }
 
     private async Task EnsureQuotaAsync(string volumeName, string username, E2eeFileEntry current,
         long encryptedLength, int chunkCount, CancellationToken ct)
@@ -733,7 +661,6 @@ public sealed class E2eeFileService
     public async Task DeleteFileAsync(string volumeName, string fileId, CancellationToken ct = default)
     {
         GetE2eeHeader(volumeName);
-        bool isChunkMode = _volumeService.IsChunkMode(volumeName);
         // ボリュームゲートでカタログ R-M-W を直列化 (H-9)
         var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
         await volGate.WaitAsync(ct);
@@ -751,8 +678,7 @@ public sealed class E2eeFileService
                 // Prefix deletion includes all chunk generations under this ID.
                 // Keep both locks until it finishes; otherwise a new creation
                 // can upload chunks that this older deletion then removes.
-                if (isChunkMode)
-                    await _chunkStore.DeleteChunksWithRetryAsync(volumeName, fileId, ct);
+                await _chunkStore.DeleteChunksWithRetryAsync(volumeName, fileId, ct);
             }
         }
         finally
@@ -840,6 +766,4 @@ public sealed class E2eeFileService
     private Task<IDisposable> AcquireCatalogLockAsync(string volumeName, CancellationToken ct)
         => _storage.AcquireLockAsync($"catalog-e2ee/{Uri.EscapeDataString(volumeName)}", ct);
 
-    private string GetDataPath(string volumeName)
-        => Path.Combine(_volumeDataPath, volumeName, "volume.dat");
 }

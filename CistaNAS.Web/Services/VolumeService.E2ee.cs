@@ -33,17 +33,8 @@ public sealed partial class VolumeService
             Directory.CreateDirectory(VolumeDir(name));
             await _metaStore.SaveAsync(name, header);
 
-            // CreateE2ee は VolumeHeader.CreateE2ee が保存した StorageMode を
-            // 常に使用する。構成が local でも E2EE は opaque chunk storage が
-            // 必須であり、ここだけ構成値を見ると「ヘッダは chunk、実体は
-            // volume.dat」という不整合なマウント状態になる。
-            if (header.StorageMode == "chunk")
-                MountInternalChunked(name, header, masterKey: null);
-            else
-            {
-                File.Create(GetDataPath(name)).Dispose();
-                MountInternal(name, header, masterKey: null);
-            }
+            // E2EE は opaque chunk storage のみをサポートする。
+            MountInternalChunked(name, header, masterKey: null);
 
             return ToInfo(name, header, true);
         });
@@ -61,13 +52,13 @@ public sealed partial class VolumeService
             var header = await LoadHeaderOrThrowAsync(name);
             if (!header.IsE2ee)
                 throw new VolumeException($"ボリューム '{name}' は E2EE ボリュームではありません。");
+            if (!string.Equals(header.StorageMode, "chunk", StringComparison.Ordinal))
+                throw new VolumeException(
+                    $"E2EE ボリューム '{name}' は旧ストレージ形式です。新しいチャンク形式で再作成してください。");
             if (!header.HasUserAccess(username))
                 throw new VolumeException($"ユーザー '{username}' はこのボリュームにアクセス権がありません。");
 
-            if (header.StorageMode == "chunk")
-                MountInternalChunked(name, header, masterKey: null);
-            else
-                MountInternal(name, header, masterKey: null);
+            MountInternalChunked(name, header, masterKey: null);
 
             // クラッシュ復旧: 未コミットジャーナルがあればカタログを修復してクリア
             await RecoverMountedVolumeAsync(name);
@@ -152,13 +143,7 @@ public sealed partial class VolumeService
             Directory.CreateDirectory(VolumeDir(volName));
             await _metaStore.SaveAsync(volName, header);
 
-            if (header.StorageMode == "chunk")
-                MountInternalChunked(volName, header, masterKey: null);
-            else
-            {
-                File.Create(GetDataPath(volName)).Dispose();
-                MountInternal(volName, header, masterKey: null);
-            }
+            MountInternalChunked(volName, header, masterKey: null);
 
             return ToInfo(volName, header, true);
         });
@@ -316,7 +301,12 @@ public sealed partial class VolumeService
             header.AddGroupEpoch(request.NewEpoch, acceptedWraps);
 
             if (request.RemovedUsername is not null)
+            {
+                // 旧ファイルの DEK / GroupKey を剥奪ユーザーが保持している可能性があるため、
+                // その FileId の将来更新を止める。既存ファイルの読み取りは引き続き可能。
+                header.RevocationEpoch = Math.Max(header.RevocationEpoch, request.NewEpoch);
                 header.RemoveUserEverywhere(request.RemovedUsername);
+            }
 
             await _metaStore.SaveAsync(volumeName, header);
             RefreshMountedHeader(volumeName, header);

@@ -25,6 +25,9 @@ spec:
               value: Production
             - name: ASPNETCORE_URLS
               value: http://+:8080
+            # TLSはIngress / Cloudflare側で終端する。外部HTTPS強制は前段で行う。
+            - name: CistaNas__Network__SchemeMode
+              value: proxy
           envFrom:
             - secretRef:
                 name: cistanas-secrets

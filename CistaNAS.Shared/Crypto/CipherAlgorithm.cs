@@ -25,7 +25,7 @@ public static class CipherAlgorithmExtensions
     public static CipherAlgorithm ParseCipherAlgorithm(string value) => value.ToLowerInvariant() switch
     {
         "aes-256-xts" => CipherAlgorithm.Aes256Xts,
-        "chacha20" or "chacha20-xts" => CipherAlgorithm.ChaCha20,
+        "chacha20" or "chacha20-xts" or "chacha20-poly1305" => CipherAlgorithm.ChaCha20,
         _ => throw new ArgumentException($"不明な暗号化アルゴリズム: {value}")
     };
 

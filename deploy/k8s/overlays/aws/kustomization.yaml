@@ -3,6 +3,7 @@ kind: Kustomization
 
 resources:
   - ../../base
+  - ingress.yaml
 
 namespace: cistanas
 
@@ -56,25 +57,3 @@ patches:
                     memory: 1Gi
                   requests:
                     memory: 256Mi
-
-# AWS ALB Ingress (EKS)
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: cistanas
-  namespace: cistanas
-  annotations:
-    kubernetes.io/ingress.class: alb
-    alb.ingress.kubernetes.io/scheme: internet-facing
-    alb.ingress.kubernetes.io/target-type: ip
-spec:
-  rules:
-    - http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: cistanas
-                port:
-                  number: 80
