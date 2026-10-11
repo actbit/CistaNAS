@@ -333,6 +333,8 @@ public sealed class FileService
                 using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
                 var catalog = await LoadCatalogAsync(volumeName, ct);
                 catalog.Files.TryGetValue(fileName, out var existing);
+                if (existing?.NeedsRepair == true)
+                    throw new FileServiceException($"ファイル '{fileName}' は要修復状態です。自動上書きを拒否しました。");
 
                 if (contentLength == 0)
                 {
@@ -495,10 +497,14 @@ public sealed class FileService
             }
             catch
             {
+                // WriteAtomicAsync は、オブジェクトを公開した後に応答だけが
+                // 失われても例外を返し得る。未公開と断定して新世代を削除すると、
+                // 参照中のチャンクを消してしまうため、同じロック下でカタログを
+                // 再読込して参照の有無を確認する。再読込自体が失敗した場合も
+                // 安全側（保持）に倒し、後続の監査・GCに委ねる。
                 if (!catalogPublished && newObjectId is not null)
                 {
-                    try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, newObjectId, CancellationToken.None); }
-                    catch { }
+                    await DeleteChunkObjectIfUnreferencedAsync(volumeName, newObjectId);
                 }
                 throw;
             }
@@ -543,6 +549,8 @@ public sealed class FileService
             using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
             var catalog = await LoadCatalogAsync(volumeName, ct);
             catalog.Files.TryGetValue(fileName, out var existing);
+            if (existing?.NeedsRepair == true)
+                throw new FileServiceException($"ファイル '{fileName}' は要修復状態です。自動上書きを拒否しました。");
             // 新規アップロードは別オブジェクトへ書き込み、カタログ切り替えを
             // 最後に行う。既存ファイルの旧オブジェクトは失敗時も保持する。
             objectId = $"{fileName}.upload-{Guid.NewGuid():N}";
@@ -631,12 +639,11 @@ public sealed class FileService
         }
         catch
         {
-            // カタログ切り替え前に失敗した一時オブジェクトは参照元がなく、
-            // ジャーナルからもIDを復元できないため、ここで確実に回収する。
+            // カタログ保存開始後の結果は、応答喪失により不明になり得る。
+            // 参照確認に失敗した場合は孤児を許容してデータを保全する。
             if (!catalogPublished && objectId is not null)
             {
-                try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, objectId, CancellationToken.None); }
-                catch { }
+                await DeleteChunkObjectIfUnreferencedAsync(volumeName, objectId);
             }
             throw;
         }
@@ -661,6 +668,9 @@ public sealed class FileService
                 var catalog = await LoadCatalogAsync(volumeName, ct);
                 if (!catalog.Files.TryGetValue(fileName, out var meta))
                     throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
+
+                if (meta.NeedsRepair)
+                    throw new FileServiceException($"ファイル '{fileName}' は要修復状態です。チャンク整合性を確認してください。");
 
                 if (meta.IsChunked && _volumeService.IsChunkMode(volumeName))
                     return DownloadChunkedResponse(volumeName, fileName, meta, readLock);
@@ -793,23 +803,34 @@ public sealed class FileService
                     catalog.Files.Remove(entry.Path);
             }
 
-            // チャンクモード: WriteFile 未完了のファイルでチャンク欠落がある場合はカタログから削除
+            // チャンクモード: WriteFile 未完了のファイルでチャンク欠落がある場合は、
+            // カタログから削除せず要修復として隔離する。欠損判定は一覧だけに依存
+            // せず、欠けている各チャンクを個別に読み、一覧の一時的不完全さを
+            // 可能な範囲で切り分ける。
             if (_volumeService.IsChunkMode(volumeName))
             {
-                var brokenFiles = new List<string>();
                 foreach (var (fileName, meta) in catalog.Files)
                 {
-                    if (!meta.IsChunked) continue;
+                    if (!meta.IsChunked || meta.NeedsRepair) continue;
                     // 通信障害・キャンセルは欠損の証拠にならない。
                     // 一覧取得に失敗したらカタログ・ジャーナルを保持したまま復旧を中断する。
                     var indices = await _chunkStore.ListChunksAsync(
                         volumeName, meta.ChunkObjectId ?? fileName, ct);
                     var present = indices.ToHashSet();
-                    if (!Enumerable.Range(0, meta.ChunkCount).All(present.Contains))
-                        brokenFiles.Add(fileName);
+                    var missing = Enumerable.Range(0, meta.ChunkCount)
+                        .Where(index => !present.Contains(index))
+                        .ToList();
+                    foreach (int index in missing)
+                    {
+                        byte[]? chunk = await _chunkStore.ReadChunkAsync(
+                            volumeName, meta.ChunkObjectId ?? fileName, index, ct);
+                        if (chunk is not null)
+                            present.Add(index);
+                    }
+
+                    if (missing.Any(index => !present.Contains(index)))
+                        meta.NeedsRepair = true;
                 }
-                foreach (var broken in brokenFiles)
-                    catalog.Files.Remove(broken);
             }
 
             await SaveCatalogAsync(volumeName, catalog, ct);
@@ -877,6 +898,28 @@ public sealed class FileService
         JsonSerializer.Serialize(ms, catalog, JsonOptions);
         ms.Position = 0;
         await _storage.WriteAtomicAsync($"{volumeName}/catalog.json", ms, ct);
+    }
+
+    /// <summary>
+    /// カタログ保存の結果が不明なときだけ使う安全側の一時オブジェクト回収。
+    /// カタログを読めない場合は削除せず、孤児として残して後続の監査・GCに委ねる。
+    /// </summary>
+    private async Task DeleteChunkObjectIfUnreferencedAsync(string volumeName, string objectId)
+    {
+        try
+        {
+            var catalog = await LoadCatalogAsync(volumeName, CancellationToken.None);
+            bool referenced = catalog.Files.Values.Any(file =>
+                string.Equals(file.ChunkObjectId, objectId, StringComparison.Ordinal));
+            if (referenced) return;
+
+            await _chunkStore.DeleteChunksWithRetryAsync(volumeName, objectId, CancellationToken.None);
+        }
+        catch
+        {
+            // 保存結果・参照状態・削除結果のいずれかが不明な場合、データ保全を
+            // 優先して削除しない。孤児は参照検証付きの後続GCで回収する。
+        }
     }
 
     private Task<IDisposable> AcquireCatalogLockAsync(string volumeName, CancellationToken ct)

@@ -174,8 +174,9 @@ public sealed partial class VolumeService : IAsyncDisposable
 
     /// <summary>
     /// マウント直後に未コミットジャーナルがあればカタログを修復し、ジャーナルをクリアする。
-    /// FileService（Scoped）をスコープ経由で取得する。不正な復旧データはマウントを取り消す。
-    /// その他の復旧失敗はログに記録する。
+    /// FileService（Scoped）をスコープ経由で取得する。復旧が完了しない場合は、
+    /// 不正データ・一時 I/O 障害を問わずマウントを取り消し、通常の書き込みを
+    /// 受け付けない。復旧成功を確認してからのみマウント済み状態を返す。
     /// </summary>
     private async Task RecoverMountedVolumeAsync(string name)
     {
@@ -188,23 +189,33 @@ public sealed partial class VolumeService : IAsyncDisposable
         catch (InvalidDataException ex)
         {
             _logger.LogWarning(ex, "ボリューム '{Volume}' の復旧データが不正なため、マウントを中止します。", name);
-            // 呼び出し元が _mountGate を保持しているため LockAsync は再入できない。
-            if (_mounted.TryGetValue(name, out var mv))
-            {
-                mv.IoTracker.Close();
-                _mounted.TryRemove(name, out _);
-                await mv.IoTracker.WaitForZeroAsync();
-                try { mv.Stream.Dispose(); }
-                finally
-                {
-                    if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
-                }
-            }
+            await UnmountAfterRecoveryFailureAsync(name);
             throw new VolumeException($"ボリューム '{name}' の復旧データが不正です。保存内容を確認してください。");
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "ボリューム '{Volume}' のジャーナル復旧に失敗しました。", name);
+            await UnmountAfterRecoveryFailureAsync(name);
+            throw new VolumeException(
+                $"ボリューム '{name}' の復旧が完了しなかったため、マウントを中止しました。保存先を確認して再試行してください。",
+                ex);
+        }
+    }
+
+    /// <summary>
+    /// 復旧失敗時に、マウント済み状態を残さず安全にストリームと鍵を破棄する。
+    /// 呼び出し元は _mountGate を保持しているため LockAsync を経由しない。
+    /// </summary>
+    private async Task UnmountAfterRecoveryFailureAsync(string name)
+    {
+        if (!_mounted.TryRemove(name, out var mv)) return;
+
+        mv.IoTracker.Close();
+        await mv.IoTracker.WaitForZeroAsync();
+        try { mv.Stream.Dispose(); }
+        finally
+        {
+            if (mv.MasterKey is not null) CryptographicOperations.ZeroMemory(mv.MasterKey);
         }
     }
 
