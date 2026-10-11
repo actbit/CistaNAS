@@ -37,7 +37,11 @@ public sealed record VolumeInfo(
     Dictionary<string, string>? UserWrapTypes = null);
 
 /// <summary>ボリューム操作の業務エラー。</summary>
-public sealed class VolumeException(string message) : Exception(message);
+public sealed class VolumeException : Exception
+{
+    public VolumeException(string message) : base(message) { }
+    public VolumeException(string message, Exception innerException) : base(message, innerException) { }
+}
 
 /// <summary>E2EE wrapped key 取得レスポンス（GetWrappedKey API）。</summary>
 public sealed record WrappedKeyResponse(

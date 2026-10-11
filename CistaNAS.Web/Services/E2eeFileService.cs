@@ -347,10 +347,10 @@ public sealed class E2eeFileService
                 }
                 catch
                 {
-                    // カタログ保存失敗時は未確定チャンクの新オブジェクトを撤去（ゴミを残さない）。
-                    // 可視カタログは更新していないため、既存データは無傷のまま。
-                    try { await _chunkStore.DeleteChunksWithRetryAsync(volumeName, newChunkObjectId, CancellationToken.None); }
-                    catch { }
+                    // WriteAtomicAsync は保存後に応答だけが失われても例外を返し得る。
+                    // カタログを再読込して新オブジェクトへの参照がないと確定できた
+                    // 場合だけ回収し、再読込不能時は孤児を許容して暗号文を保全する。
+                    await DeleteChunkObjectIfUnreferencedAsync(volumeName, newChunkObjectId);
                     throw;
                 }
                 // Only retire the earlier pending generation after its replacement
@@ -761,6 +761,30 @@ public sealed class E2eeFileService
         JsonSerializer.Serialize(ms, catalog, JsonOptions);
         ms.Position = 0;
         await _storage.WriteAtomicAsync($"{volumeName}/catalog-e2ee.json", ms, ct);
+    }
+
+    /// <summary>
+    /// E2EE カタログ保存の結果が不明な場合の安全側の回収。
+    /// 可視チャンクだけでなく PendingChunks も参照として扱う。
+    /// </summary>
+    private async Task DeleteChunkObjectIfUnreferencedAsync(string volumeName, string objectId)
+    {
+        try
+        {
+            var catalog = await LoadCatalogAsync(volumeName, CancellationToken.None);
+            bool referenced = catalog.Files.Values.Any(file =>
+                file.ChunkObjectIds.Any(id => string.Equals(id, objectId, StringComparison.Ordinal))
+                || (file.PendingChunks?.Values.Any(p =>
+                    string.Equals(p.ObjectId, objectId, StringComparison.Ordinal)) ?? false));
+            if (referenced) return;
+
+            await _chunkStore.DeleteChunksWithRetryAsync(volumeName, objectId, CancellationToken.None);
+        }
+        catch
+        {
+            // 保存結果または参照状態が不明なときは削除しない。孤児は参照検証付き
+            // の後続GCで回収する。
+        }
     }
 
     private Task<IDisposable> AcquireCatalogLockAsync(string volumeName, CancellationToken ct)

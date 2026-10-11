@@ -171,6 +171,37 @@ public partial class E2eeFileTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task UploadChunk_CatalogResponseLoss_PreservesPublishedGeneration()
+    {
+        string vol = await MountE2eeAsync("test-cow-response-loss");
+        var normalService = GetE2eeFileService();
+        var entry = await normalService.CreateFileAsync(vol,
+            new E2eeCreateFileRequest("enc-response-loss", 100, 1), "testuser");
+        var storage = _sp.GetRequiredService<IStorageProvider>();
+        var chunkStore = _sp.GetRequiredService<IChunkStore>();
+        var failingStorage = new FailCatalogWriteStorage(storage)
+        {
+            ThrowAfterCatalogWrite = true,
+        };
+        var failingService = new E2eeFileService(_volumeService, failingStorage, chunkStore,
+            _sp.GetRequiredService<IOptions<CistaNasOptions>>());
+        byte[] content = RandomNumberGenerator.GetBytes(100);
+
+        await Assert.ThrowsAsync<IOException>(() => failingService.UploadChunkAsync(
+            vol, entry.FileId, 0, new MemoryStream(content), content.Length));
+
+        var published = Assert.Single((await normalService.ListFilesAsync(vol)).Files);
+        Assert.Equal(content.Length, published.ChunkSizes[0]);
+        var (stream, length, _, _) = await normalService.DownloadChunkAsync(vol, entry.FileId, 0);
+        using (stream)
+        {
+            byte[] actual = new byte[length];
+            await stream.ReadExactlyAsync(actual);
+            Assert.Equal(content, actual);
+        }
+    }
+
+    [Fact]
     public async Task ListFiles_ReturnsCreatedFiles()
     {
         string vol = await MountE2eeAsync("test-list");
@@ -282,12 +313,18 @@ public partial class E2eeFileTests : IAsyncDisposable
     private sealed class FailCatalogWriteStorage(IStorageProvider inner) : IStorageProvider
     {
         public bool FailCatalogWrites { get; set; }
+        public bool ThrowAfterCatalogWrite { get; set; }
         public Task<byte[]?> ReadAsync(string path, CancellationToken ct = default) => inner.ReadAsync(path, ct);
         public Task WriteAsync(string path, Stream data, CancellationToken ct = default) => inner.WriteAsync(path, data, ct);
-        public Task WriteAtomicAsync(string path, Stream data, CancellationToken ct = default)
-            => FailCatalogWrites && path.EndsWith("/catalog-e2ee.json", StringComparison.Ordinal)
-                ? Task.FromException(new IOException("simulated catalog write failure"))
-                : inner.WriteAtomicAsync(path, data, ct);
+        public async Task WriteAtomicAsync(string path, Stream data, CancellationToken ct = default)
+        {
+            if (FailCatalogWrites && path.EndsWith("/catalog-e2ee.json", StringComparison.Ordinal))
+                throw new IOException("simulated catalog write failure");
+
+            await inner.WriteAtomicAsync(path, data, ct);
+            if (ThrowAfterCatalogWrite && path.EndsWith("/catalog-e2ee.json", StringComparison.Ordinal))
+                throw new IOException("simulated catalog response loss");
+        }
         public Task DeleteAsync(string path, CancellationToken ct = default) => inner.DeleteAsync(path, ct);
         public Task<bool> ExistsAsync(string path, CancellationToken ct = default) => inner.ExistsAsync(path, ct);
         public Task<IReadOnlyList<string>> ListAsync(string? prefix = null, CancellationToken ct = default) => inner.ListAsync(prefix, ct);

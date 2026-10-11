@@ -58,6 +58,47 @@ public class VolumeTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task Mount_RecoveryFailure_DoesNotLeaveVolumeMounted()
+    {
+        FailingCatalogReadStorage? storage = null;
+        var (services, root) = TestHelper.BuildTestServices(
+            storageFactory: path => storage = new FailingCatalogReadStorage(new LocalStorageProvider(path)));
+        var volumes = services.GetRequiredService<VolumeService>();
+        const string volume = "recovery-failure";
+
+        try
+        {
+            await volumes.CreateAsync(volume, "alice", "pw", encrypted: false);
+            await using (var scope = services.CreateAsyncScope())
+            {
+                await scope.ServiceProvider.GetRequiredService<JournalService>().RecordAsync(
+                    volume, new CistaNAS.Web.Journal.JournalEntry
+                    {
+                        Operation = CistaNAS.Web.Journal.JournalOp.WriteFile,
+                        Path = "unfinished.bin",
+                    });
+            }
+
+            await volumes.LockAsync(volume, "alice");
+            storage!.FailCatalogReads = true;
+            await Assert.ThrowsAsync<VolumeException>(() => volumes.MountAsync(volume, "alice", "pw"));
+            Assert.False(volumes.IsMounted(volume));
+
+            storage.FailCatalogReads = false;
+            Assert.True((await volumes.MountAsync(volume, "alice", "pw")).IsMounted);
+        }
+        finally
+        {
+            if (volumes.IsMounted(volume))
+                await volumes.LockAsync(volume, "alice");
+            if (services is IAsyncDisposable disposable)
+                await disposable.DisposeAsync();
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task Mount_DifferentUser_Fails()
     {
         await _vs.CreateAsync("vol-d", "alice", "shared-pw", encrypted: true);
@@ -196,6 +237,29 @@ public class VolumeTests : IAsyncDisposable
         await _vs.DeleteVolumeAsync("to-delete");
         Assert.False(Directory.Exists(Path.Combine(_dataRoot, "to-delete")));
         Assert.False(_vs.IsMounted("to-delete"));
+    }
+
+    private sealed class FailingCatalogReadStorage(IStorageProvider inner) : IStorageProvider
+    {
+        public bool FailCatalogReads { get; set; }
+
+        public Task<byte[]?> ReadAsync(string path, CancellationToken ct = default)
+            => FailCatalogReads && path.EndsWith("/catalog.json", StringComparison.Ordinal)
+                ? Task.FromException<byte[]?>(new IOException("simulated catalog read failure"))
+                : inner.ReadAsync(path, ct);
+        public Task WriteAsync(string path, Stream content, CancellationToken ct = default)
+            => inner.WriteAsync(path, content, ct);
+        public Task WriteAtomicAsync(string path, Stream content, CancellationToken ct = default)
+            => inner.WriteAtomicAsync(path, content, ct);
+        public Task DeleteAsync(string path, CancellationToken ct = default)
+            => inner.DeleteAsync(path, ct);
+        public Task<bool> ExistsAsync(string path, CancellationToken ct = default)
+            => inner.ExistsAsync(path, ct);
+        public Task<IReadOnlyList<string>> ListAsync(string? prefix = null, CancellationToken ct = default)
+            => inner.ListAsync(prefix, ct);
+        public Task<IDisposable> AcquireLockAsync(string path, CancellationToken ct = default)
+            => inner.AcquireLockAsync(path, ct);
+        public void RemoveLock(string path) => inner.RemoveLock(path);
     }
 
     [Fact]

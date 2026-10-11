@@ -211,6 +211,33 @@ public sealed class FileServiceIntegrityTests(ITestOutputHelper output)
         Assert.Equal(original, await fixture.ReadAsync("keep.bin"));
     }
 
+    [Fact]
+    public async Task CatalogResponseLoss_PreservesPublishedChunkGeneration()
+    {
+        await using var fixture = await Fixture.CreateAsync(true, false);
+        await fixture.UploadAsync("keep.bin", [1, 2, 3]);
+        byte[] replacement = Enumerable.Range(0, 9000).Select(i => (byte)(i % 251)).ToArray();
+
+        // ストレージ側ではカタログの置換を完了したが、呼び出し側には
+        // 応答喪失として例外を返す。
+        fixture.Storage.AfterCatalogWrite = () =>
+            Task.FromException(new IOException("simulated catalog response loss"));
+        try
+        {
+            await Assert.ThrowsAsync<IOException>(() => fixture.Files.UploadAsync(
+                fixture.Volume, "keep.bin", new MemoryStream(replacement), replacement.Length));
+        }
+        finally
+        {
+            fixture.Storage.AfterCatalogWrite = null;
+        }
+
+        // 新カタログを参照中の新世代を回収してはいけない。
+        Assert.Equal(replacement, await fixture.ReadAsync("keep.bin"));
+        await fixture.RemountAsync();
+        Assert.Equal(replacement, await fixture.ReadAsync("keep.bin"));
+    }
+
     [Theory]
     [InlineData(false, false)]
     [InlineData(false, true)]
@@ -265,6 +292,31 @@ public sealed class FileServiceIntegrityTests(ITestOutputHelper output)
         Assert.True(await journal.HasPendingAsync(fixture.Volume));
         await fixture.Files.RecoverAsync(fixture.Volume);
         Assert.Equal(original, await fixture.ReadAsync("keep.bin"));
+        Assert.False(await journal.HasPendingAsync(fixture.Volume));
+    }
+
+    [Fact]
+    public async Task Recovery_MissingChunk_QuarantinesCatalogEntry()
+    {
+        await using var fixture = await Fixture.CreateAsync(true, false);
+        await fixture.UploadAsync("damaged.bin", new byte[9000]);
+        var metadata = Assert.Single((await fixture.Files.ListAsync(fixture.Volume)).Files);
+        string objectId = Assert.IsType<string>(metadata.ChunkObjectId);
+
+        await fixture.Storage.DeleteAsync($"{fixture.Volume}/chunks/{objectId}/00001");
+        var journal = new JournalService(fixture.Storage);
+        await journal.RecordAsync(fixture.Volume, new JournalEntry
+        {
+            Operation = JournalOp.WriteFile,
+            Path = "damaged.bin",
+        });
+
+        await fixture.Files.RecoverAsync(fixture.Volume);
+
+        var recovered = Assert.Single((await fixture.Files.ListAsync(fixture.Volume)).Files);
+        Assert.True(recovered.NeedsRepair);
+        await Assert.ThrowsAsync<FileServiceException>(() =>
+            fixture.Files.DownloadAsync(fixture.Volume, "damaged.bin"));
         Assert.False(await journal.HasPendingAsync(fixture.Volume));
     }
 

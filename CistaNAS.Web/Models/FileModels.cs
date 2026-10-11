@@ -32,6 +32,12 @@ public sealed class FileMetadata
     /// null は旧形式（レガシー: マスターキー直接使用）として復号する。
     /// </summary>
     public string? KeySalt { get; set; }
+
+    /// <summary>
+    /// 復旧時にチャンクの欠損が確認されたファイル。データを失わせないため、
+    /// 復旧処理はこのエントリをカタログから削除せず、要修復として保持する。
+    /// </summary>
+    public bool NeedsRepair { get; set; }
 }
 
 public sealed record ListFilesResponse(IReadOnlyList<FileMetadata> Files);
