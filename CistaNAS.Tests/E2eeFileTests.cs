@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Text.Json.Nodes;
 using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
@@ -6,6 +7,7 @@ using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace CistaNAS.Tests;
@@ -213,6 +215,92 @@ public partial class E2eeFileTests : IAsyncDisposable
         Assert.Equal(2, result.Files.Count);
         Assert.Contains(result.Files, f => f.EncryptedName == "enc-a");
         Assert.Contains(result.Files, f => f.EncryptedName == "enc-b");
+    }
+
+    [Fact]
+    public async Task IntegrityAudit_DetectsCiphertextTampering_AndRepairClearsState()
+    {
+        string vol = await MountE2eeAsync("test-integrity-audit");
+        var e2eeFs = GetE2eeFileService();
+        var entry = await e2eeFs.CreateFileAsync(vol,
+            new E2eeCreateFileRequest("enc", 100, 1), "testuser");
+        byte[] content = RandomNumberGenerator.GetBytes(100);
+        await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0,
+            new MemoryStream(content), content.Length);
+
+        var storedEntry = Assert.Single((await e2eeFs.ListFilesAsync(vol)).Files);
+        string objectId = storedEntry.ChunkObjectIds[0];
+        string path = $"{vol}/chunks/{objectId}/00000";
+        byte[] stored = (await _sp.GetRequiredService<IStorageProvider>().ReadAsync(path))!;
+        stored[0] ^= 0xFF;
+        await _sp.GetRequiredService<IStorageProvider>().WriteAsync(path, new MemoryStream(stored));
+
+        var damaged = await e2eeFs.VerifyIntegrityAsync(vol);
+        Assert.False(damaged.IsHealthy);
+        Assert.Equal(entry.FileId, Assert.Single(damaged.Issues).FileId);
+        Assert.True(Assert.Single((await e2eeFs.ListFilesAsync(vol)).Files).NeedsRepair);
+        await Assert.ThrowsAsync<FileServiceException>(() =>
+            e2eeFs.DownloadChunkAsync(vol, entry.FileId, 0));
+
+        byte[] original = (await _sp.GetRequiredService<IStorageProvider>().ReadAsync(path))!;
+        original[0] ^= 0xFF;
+        await _sp.GetRequiredService<IStorageProvider>().WriteAsync(path, new MemoryStream(original));
+        var repaired = await e2eeFs.RepairAsync(vol, entry.FileId);
+
+        Assert.True(repaired.IsHealthy);
+        Assert.False(Assert.Single((await e2eeFs.ListFilesAsync(vol)).Files).NeedsRepair);
+    }
+
+    [Fact]
+    public async Task IntegrityAudit_BackfillsMissingLegacyCiphertextHashes()
+    {
+        string vol = await MountE2eeAsync("test-integrity-legacy-hash");
+        var e2eeFs = GetE2eeFileService();
+        var entry = await e2eeFs.CreateFileAsync(vol,
+            new E2eeCreateFileRequest("enc", 100, 1), "testuser");
+        byte[] content = RandomNumberGenerator.GetBytes(100);
+        await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0,
+            new MemoryStream(content), content.Length);
+
+        var storage = _sp.GetRequiredService<IStorageProvider>();
+        var catalog = JsonNode.Parse((await storage.ReadAsync($"{vol}/catalog-e2ee.json"))!)!;
+        catalog["Files"]![entry.FileId]!.AsObject().Remove("ChunkHashes");
+        using var rewritten = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(catalog.ToJsonString()));
+        await storage.WriteAtomicAsync($"{vol}/catalog-e2ee.json", rewritten);
+
+        var report = await e2eeFs.VerifyIntegrityAsync(vol);
+        Assert.True(report.IsHealthy);
+        var restored = JsonNode.Parse((await storage.ReadAsync($"{vol}/catalog-e2ee.json"))!)!;
+        Assert.False(string.IsNullOrWhiteSpace(
+            restored["Files"]![entry.FileId]!["ChunkHashes"]![0]!.GetValue<string>()));
+    }
+
+    [Fact]
+    public async Task IntegrityAuditChecksUnmountedE2eeVolume()
+    {
+        string vol = await MountE2eeAsync("test-integrity-unmounted");
+        var e2eeFs = GetE2eeFileService();
+        var entry = await e2eeFs.CreateFileAsync(vol,
+            new E2eeCreateFileRequest("enc", 100, 1), "testuser");
+        byte[] chunk = Enumerable.Range(0, 100).Select(i => (byte)i).ToArray();
+        await e2eeFs.UploadChunkAsync(vol, entry.FileId, 0,
+            new MemoryStream(chunk), chunk.Length);
+
+        var storage = _sp.GetRequiredService<IStorageProvider>();
+        string objectId = Assert.Single((await e2eeFs.ListFilesAsync(vol)).Files).ChunkObjectIds[0];
+        await storage.WriteAsync($"{vol}/chunks/{objectId}/00000",
+            new MemoryStream(Enumerable.Repeat((byte)0xA5, chunk.Length).ToArray()));
+        await _volumeService.LockAsync(vol, "testuser");
+
+        var audit = new VolumeIntegrityAuditService(
+            _volumeService,
+            _sp.GetRequiredService<IServiceScopeFactory>(),
+            _sp.GetRequiredService<IOptions<CistaNasOptions>>(),
+            _sp.GetRequiredService<ILogger<VolumeIntegrityAuditService>>());
+        await audit.RunOnceAsync();
+
+        var catalog = JsonNode.Parse((await storage.ReadAsync($"{vol}/catalog-e2ee.json"))!)!;
+        Assert.True(catalog["Files"]![entry.FileId]!["NeedsRepair"]!.GetValue<bool>());
     }
 
     [Fact]

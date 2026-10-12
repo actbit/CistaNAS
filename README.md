@@ -229,6 +229,14 @@ Configure under the `CistaNas` section of `appsettings.json`.
 | `Volume:E2eeChunkSize` | E2EE chunk size in bytes (default 1 MiB) |
 | `Volume:ChunkStorage` | Chunk storage mode (`local` = always volume.dat / `auto` = auto-chunk on S3) |
 | `Volume:ServerChunkSize` | Server-side chunk size in chunk mode (default 4 MiB) |
+| `Volume:ChunkGcHoldHours` | Hold time before an orphan chunk becomes deletable (default 24 hours) |
+| `Volume:ChunkGcIntervalMinutes` | Automatic orphan-chunk GC interval (default 60 minutes) |
+| `Volume:ChunkGcEnabled` | Enable automatic orphan-chunk GC (default true) |
+| `Volume:IntegrityAuditIntervalMinutes` | Background integrity-audit interval (default 15 minutes) |
+| `Volume:IntegrityAuditBatchSize` | Files checked per background-audit cycle (default 32) |
+| `Database:SyncFailureAlertThreshold` | Consecutive cloud-SQLite failures before a warning log (default 3) |
+| `Database:SyncAlertWebhookUrl` | Optional HTTP(S) endpoint for cloud-SQLite failure/recovery notifications |
+| `Database:SyncAlertWebhookTimeoutSeconds` | Webhook request timeout (default 10 seconds) |
 
 ## How Encryption Works
 
@@ -460,7 +468,9 @@ WebDAV clients access `https://<host>/dav/<volume-name>/`.
 
 Both Basic auth and JWT are supported.
 
-WebDAV for E2EE volumes transfers encrypted filenames and encrypted blobs as-is. It can also be combined with external encryption tools (e.g. rclone crypt).
+E2EE volumes are not available through WebDAV because the server cannot decrypt their
+filenames or content. Use the Web UI, browser client, or native client instead. External
+encryption tools such as rclone crypt can be used with regular server-side encrypted volumes.
 
 ## Security Measures
 
@@ -562,7 +572,14 @@ The temporary-directory fallback cannot survive container/host replacement: losi
 volume before a successful sync can still lose recent changes. Object storage is an asynchronous
 replica, not a transactional database or an independent backup. Use PostgreSQL and separate backups
 when stronger durability or multiple instances are needed; never start multiple writers on one
-cloud SQLite object.
+cloud SQLite object. The last attempt/success/failure timestamps and consecutive-failure count are
+persisted beside the scoped recovery database and are exposed through the admin
+`/api/v1/admin/storage/sqlite-sync` endpoint. A warning is logged after
+`Database:SyncFailureAlertThreshold` consecutive failures. If
+`Database:SyncAlertWebhookUrl` is configured, a threshold failure sends a JSON `failure` event
+and the first successful sync after failures sends a `recovered` event. The payload contains only
+the event, timestamps, failure count, and a generic error message; it does not contain DB contents,
+paths, or credentials. Webhook failures are logged and do not change the sync result.
 
 Local partial writes stage a complete file generation before publishing its catalog entry. Free
 extents are reused and unused tails are truncated after successful publication/deletion, limiting
@@ -575,8 +592,19 @@ General online compaction and proportional-I/O local patches are not implemented
 
 In object-storage mode, replacing a pending E2EE chunk removes its superseded generation only
 after the new catalog is saved. Published updates retry old-generation deletion independently of
-request cancellation. Persistent deletion failures or a process crash can still leave orphan objects;
-automatic background collection of historical orphans is not implemented.
+request cancellation. Persistent deletion failures or a process crash can still leave orphan objects.
+Owners can inspect candidates with `gc?dryRun=true` and collect them with `dryRun=false`; candidates
+are held for `Volume:ChunkGcHoldHours` and are checked against visible catalogs, E2EE pending chunks,
+and journals. `Volume:ChunkGcEnabled=true` runs the same reference-checked collection periodically
+for every stored chunk volume, including volumes that are currently locked/unmounted.
+
+Chunk integrity checks are separated from mount recovery. Mount validates the journal and catalog;
+the background audit reads at most `Volume:IntegrityAuditBatchSize` files per cycle and persists its
+cursor so it resumes after restart. E2EE chunk volumes can be audited even while locked because the
+server checks ciphertext length and SHA-256 only; server-encrypted volumes still require a mount
+because authenticated decryption needs the volume key. Detected damage keeps the file metadata and
+sets `NeedsRepair`; owners can invoke the integrity and repair endpoints for a full scan or explicit
+revalidation.
 
 ## Tests
 

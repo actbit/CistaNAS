@@ -129,7 +129,8 @@ public sealed class CloudSqliteIsolationTests
                 File.Delete(path + "-wal");
                 File.Delete(path + "-shm");
                 if (temporary && Path.GetDirectoryName(path) != Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar))
-                    Directory.Delete(Path.GetDirectoryName(path)!);
+                    // DB本体以外に同期状態ファイルが存在するため、スコープ単位で削除する。
+                    Directory.Delete(Path.GetDirectoryName(path)!, recursive: true);
             }
             if (Legacy is not null) File.Delete(Legacy);
             Directory.Delete(Root, true);

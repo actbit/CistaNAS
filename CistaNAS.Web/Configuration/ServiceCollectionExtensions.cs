@@ -52,6 +52,11 @@ public static class ServiceCollectionExtensions
         services.AddScoped<JournalService>();
         services.AddScoped<FileService>();
         services.AddScoped<E2eeFileService>();
+        services.AddScoped<ChunkGarbageCollector>();
+        services.AddSingleton<VolumeIntegrityAuditService>();
+        services.AddHostedService(sp => sp.GetRequiredService<VolumeIntegrityAuditService>());
+        services.AddSingleton<ChunkGarbageCollectionService>();
+        services.AddHostedService(sp => sp.GetRequiredService<ChunkGarbageCollectionService>());
         services.AddSingleton<E2eeWriteLeaseService>();
 
         // Blazor 認証状態

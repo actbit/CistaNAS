@@ -3,6 +3,8 @@ using CistaNAS.Web.Authorization;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
+using CistaNAS.Web.Storage;
+using Microsoft.Extensions.DependencyInjection;
 using StreamingTokenService = CistaNAS.Web.Services.StreamingTokenService;
 
 namespace CistaNAS.Web.Api;
@@ -46,6 +48,18 @@ public static class ApiEndpoints
 {
     public static IEndpointRouteBuilder MapCistaNasApi(this WebApplication app, IEndpointRouteBuilder api)
     {
+        // クラウドSQLite利用時だけ同期状態を公開する。ローカルSQLiteでは404を返し、
+        // 同期が不要な構成と「同期サービスが停止中」を区別する。
+        api.MapGet("/admin/storage/sqlite-sync", (IServiceProvider services) =>
+        {
+            var sync = services.GetService<CloudSqliteSync>();
+            return sync is null
+                ? Results.NotFound(new { error = "クラウドSQLite同期は有効化されていません。" })
+                : Results.Ok(sync.GetStatus());
+        })
+        .RequireAuthorization(CistaAuthorities.AdminOnly)
+        .WithName("GetCloudSqliteSyncStatus");
+
         // ---- 認証 ----
         api.MapGet("/auth/has-users", async (AccountService accountService) =>
         {
@@ -198,6 +212,45 @@ public static class ApiEndpoints
             catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
         })
         .WithName("ListFiles");
+
+        // 整合性監査は読み取り専用だが、異常を NeedsRepair としてカタログへ記録するため
+        // ボリューム所有者に限定する。全量スキャンは必要時に明示的に実行できる。
+        files.MapGet("/integrity", async (string volumeName, FileService fs, HttpContext ctx) =>
+        {
+            try
+            {
+                return Results.Ok(await fs.VerifyIntegrityAsync(volumeName, ct: ctx.RequestAborted));
+            }
+            catch (FileServiceException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .RequireAuthorization(CistaAuthorities.VolumeOwner)
+        .WithName("VerifyFileIntegrity");
+
+        files.MapPost("/repair/{*filePath}", async (string volumeName, string filePath, FileService fs, HttpContext ctx) =>
+        {
+            try
+            {
+                string fileName = PathSanitizer.SanitizeFileName(filePath);
+                return Results.Ok(await fs.RepairAsync(volumeName, fileName, ctx.RequestAborted));
+            }
+            catch (FileServiceException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .RequireAuthorization(CistaAuthorities.VolumeOwner)
+        .WithName("RepairFile");
+
+        files.MapPost("/gc", async (string volumeName, bool? dryRun, ChunkGarbageCollector gc, HttpContext ctx) =>
+        {
+            try
+            {
+                return Results.Ok(await gc.CollectAsync(volumeName, dryRun ?? true, ctx.RequestAborted));
+            }
+            catch (FileServiceException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        })
+        .RequireAuthorization(CistaAuthorities.VolumeOwner)
+        .WithName("CollectOrphanChunks");
 
         files.MapPost("/{*filePath}", async (string volumeName, string filePath, HttpContext ctx, FileService fs) =>
         {

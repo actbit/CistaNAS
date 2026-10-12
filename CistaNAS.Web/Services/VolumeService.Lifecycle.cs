@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using CistaNAS.Web.Identity;
 using CistaNAS.Web.Models;
+using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.DependencyInjection;
@@ -83,8 +84,14 @@ public sealed partial class VolumeService
                 header.ServerChunkSize = VolOpts.ServerChunkSize;
             }
 
+            // カタログが無い状態を「新規ボリューム」と誤認しないため、作成時に
+            // 空カタログを必ず永続化する。ヘッダのマーカーは先に保存し、途中で
+            // プロセスが停止しても、再マウント時は空として続行せず安全に停止する。
+            header.CatalogInitialized = true;
+
             Directory.CreateDirectory(VolumeDir(name));
             await _metaStore.SaveAsync(name, header);
+            await CatalogStorage.InitializeEmptyAsync(_metaStore.Storage, name, e2ee: false);
 
             if (chunkMode)
             {

@@ -1,5 +1,6 @@
 using CistaNAS.Web.Configuration;
 using System.Data.Common;
+using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -21,21 +22,46 @@ namespace CistaNAS.Web.Storage;
 /// </summary>
 public sealed class CloudSqliteSync : BackgroundService
 {
+    private static readonly HttpClient DefaultAlertHttpClient = new();
     private readonly IStorageProvider _storage;
     private readonly string _blobKey;
     private readonly string _localPath;
+    private readonly string _statusPath;
     private readonly SemaphoreSlim _syncGate = new(1, 1);
     private readonly TimeSpan _interval;
+    private readonly int _failureAlertThreshold;
+    private readonly Uri? _alertWebhookUri;
+    private readonly int _alertWebhookTimeoutSeconds;
+    private readonly HttpClient _alertHttpClient;
     private readonly ILogger<CloudSqliteSync> _logger;
+    private readonly object _statusLock = new();
+    private DateTimeOffset? _lastAttemptAt;
+    private DateTimeOffset? _lastSuccessfulSyncAt;
+    private DateTimeOffset? _lastFailureAt;
+    private string? _lastError;
+    private int _consecutiveFailures;
     private int _dirty; // 0 = clean, 1 = dirty（Interlocked 用）
 
     public CloudSqliteSync(IStorageProvider storage, StorageOptions storageOpts, DatabaseOptions dbOpts,
-        ILogger<CloudSqliteSync>? logger = null)
+        ILogger<CloudSqliteSync>? logger = null, HttpClient? alertHttpClient = null)
     {
         _storage = storage;
         _blobKey = dbOpts.BlobKey ?? "cista.db";
         _interval = TimeSpan.FromSeconds(Math.Max(1, dbOpts.SyncIntervalSeconds));
+        _failureAlertThreshold = Math.Max(1, dbOpts.SyncFailureAlertThreshold);
         _logger = logger ?? NullLogger<CloudSqliteSync>.Instance;
+        _alertWebhookTimeoutSeconds = Math.Clamp(dbOpts.SyncAlertWebhookTimeoutSeconds, 1, 120);
+        _alertHttpClient = alertHttpClient ?? DefaultAlertHttpClient;
+        if (!string.IsNullOrWhiteSpace(dbOpts.SyncAlertWebhookUrl)
+            && Uri.TryCreate(dbOpts.SyncAlertWebhookUrl, UriKind.Absolute, out var webhook)
+            && (webhook.Scheme == Uri.UriSchemeHttp || webhook.Scheme == Uri.UriSchemeHttps))
+        {
+            _alertWebhookUri = webhook;
+        }
+        else if (!string.IsNullOrWhiteSpace(dbOpts.SyncAlertWebhookUrl))
+        {
+            _logger.LogWarning("クラウドSQLite同期通知Webhook URLが不正なため、通知を無効化します。");
+        }
 
         // 同じ DB オブジェクト名でも保存先が異なれば復旧元を共有しない。
         // BlobKey はクラウドの名前であり、ローカルファイルパスとして解釈しない。
@@ -44,6 +70,8 @@ public sealed class CloudSqliteSync : BackgroundService
         string scope = JsonSerializer.Serialize(new[] { storage.RecoveryIdentity, _blobKey });
         string identifier = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(scope))).ToLowerInvariant();
         _localPath = Path.Combine(root, ".cistanas-sqlite", identifier, "database.sqlite");
+        _statusPath = Path.Combine(Path.GetDirectoryName(_localPath)!, "sync-status.json");
+        LoadStatus();
         string? legacy = GetLegacyPath(root, _blobKey);
         if (!File.Exists(_localPath) && legacy is not null &&
             (File.Exists(legacy) || File.Exists(legacy + "-wal") || File.Exists(legacy + "-shm")))
@@ -56,6 +84,30 @@ public sealed class CloudSqliteSync : BackgroundService
     }
 
     public string LocalDbPath => _localPath;
+
+    /// <summary>
+    /// クラウドSQLiteの同期状態。最終成功時刻が無い、dirty、または同期間隔を
+    /// 超過している場合は IsStale=true として運用画面で警告できる。
+    /// </summary>
+    public CloudSqliteSyncStatus GetStatus()
+    {
+        lock (_statusLock)
+        {
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            bool stale = _lastSuccessfulSyncAt is null
+                || Volatile.Read(ref _dirty) != 0
+                || now - _lastSuccessfulSyncAt.Value > _interval;
+            return new CloudSqliteSyncStatus(
+                _lastAttemptAt,
+                _lastSuccessfulSyncAt,
+                _lastFailureAt,
+                _lastError,
+                _consecutiveFailures,
+                Volatile.Read(ref _dirty) != 0,
+                stale,
+                _interval);
+        }
+    }
 
     internal static string? GetLegacyPath(string root, string key)
     {
@@ -115,6 +167,7 @@ public sealed class CloudSqliteSync : BackgroundService
         {
             // 処理中の MarkDirty は次回の同期対象として残る。
             if (Interlocked.Exchange(ref _dirty, 0) == 0) return;
+            SetAttempt(DateTimeOffset.UtcNow);
             try
             {
                 snapshot = _localPath + ".snapshot-" + Guid.NewGuid().ToString("N");
@@ -123,10 +176,12 @@ public sealed class CloudSqliteSync : BackgroundService
                 await Task.Run(() => CreateSnapshot(snapshot, ct), ct);
                 await using var fs = File.OpenRead(snapshot);
                 await _storage.WriteAtomicAsync(_blobKey, fs, ct);
+                await SetSuccessAsync(DateTimeOffset.UtcNow);
             }
             catch
             {
                 Interlocked.Exchange(ref _dirty, 1);
+                await SetFailureAsync(DateTimeOffset.UtcNow);
                 throw;
             }
         }
@@ -134,6 +189,135 @@ public sealed class CloudSqliteSync : BackgroundService
         {
             try { if (snapshot is not null) File.Delete(snapshot); }
             finally { _syncGate.Release(); }
+        }
+    }
+
+    private void SetAttempt(DateTimeOffset timestamp)
+    {
+        lock (_statusLock)
+        {
+            _lastAttemptAt = timestamp;
+            PersistStatusLocked();
+        }
+    }
+
+    private async Task SetSuccessAsync(DateTimeOffset timestamp)
+    {
+        int previousFailures;
+        lock (_statusLock)
+        {
+            previousFailures = _consecutiveFailures;
+            _lastSuccessfulSyncAt = timestamp;
+            _lastError = null;
+            _consecutiveFailures = 0;
+            PersistStatusLocked();
+        }
+
+        if (previousFailures > 0)
+        {
+            _logger.LogInformation("クラウドSQLiteの同期が復旧しました。直前の連続失敗回数: {Count}", previousFailures);
+            await NotifyWebhookAsync(new CloudSqliteSyncAlert(
+                "recovered", timestamp, previousFailures, timestamp, null));
+        }
+    }
+
+    private async Task SetFailureAsync(DateTimeOffset timestamp)
+    {
+        bool shouldWarn;
+        DateTimeOffset? lastSuccess;
+        int consecutiveFailures;
+        lock (_statusLock)
+        {
+            _lastFailureAt = timestamp;
+            _lastError = "クラウドSQLiteの同期に失敗しました。";
+            _consecutiveFailures++;
+            consecutiveFailures = _consecutiveFailures;
+            shouldWarn = consecutiveFailures == _failureAlertThreshold;
+            lastSuccess = _lastSuccessfulSyncAt;
+            PersistStatusLocked();
+        }
+        if (shouldWarn)
+        {
+            _logger.LogWarning(
+                "クラウドSQLiteの同期失敗が {Count} 回連続しています。最終成功時刻: {LastSuccess}",
+                _failureAlertThreshold, lastSuccess);
+            await NotifyWebhookAsync(new CloudSqliteSyncAlert(
+                "failure", timestamp, consecutiveFailures, lastSuccess, "クラウドSQLiteの同期に失敗しました。"));
+        }
+    }
+
+    private async Task NotifyWebhookAsync(CloudSqliteSyncAlert alert)
+    {
+        if (_alertWebhookUri is null) return;
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(
+                TimeSpan.FromSeconds(_alertWebhookTimeoutSeconds));
+            using var response = await _alertHttpClient.PostAsJsonAsync(
+                _alertWebhookUri, alert, timeout.Token);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning(
+                    "クラウドSQLite同期通知WebhookがHTTP {StatusCode}を返しました。",
+                    (int)response.StatusCode);
+            }
+        }
+        catch (Exception ex)
+        {
+            // 通知先の障害でSQLite同期そのものの結果を変えない。
+            _logger.LogWarning(ex, "クラウドSQLite同期通知Webhookへの送信に失敗しました。");
+        }
+    }
+
+    private void LoadStatus()
+    {
+        try
+        {
+            if (!File.Exists(_statusPath)) return;
+            string json = File.ReadAllText(_statusPath);
+            var status = JsonSerializer.Deserialize<PersistedStatus>(json);
+            if (status is null) return;
+            _lastAttemptAt = status.LastAttemptAt;
+            _lastSuccessfulSyncAt = status.LastSuccessfulSyncAt;
+            _lastFailureAt = status.LastFailureAt;
+            _lastError = status.LastError;
+            _consecutiveFailures = Math.Max(0, status.ConsecutiveFailures);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "クラウドSQLiteの同期状態を読み込めません。新しい状態として開始します。");
+        }
+    }
+
+    private void PersistStatusLocked()
+    {
+        try
+        {
+            string? directory = Path.GetDirectoryName(_statusPath);
+            if (directory is not null) Directory.CreateDirectory(directory);
+            string temporary = _statusPath + ".tmp-" + Guid.NewGuid().ToString("N");
+            try
+            {
+                var status = new PersistedStatus(
+                    _lastAttemptAt,
+                    _lastSuccessfulSyncAt,
+                    _lastFailureAt,
+                    _lastError,
+                    _consecutiveFailures);
+                string json = JsonSerializer.Serialize(status);
+                File.WriteAllText(temporary, json);
+                File.Move(temporary, _statusPath, overwrite: true);
+            }
+            finally
+            {
+                try { File.Delete(temporary); } catch { /* best effort */ }
+            }
+        }
+        catch (Exception ex)
+        {
+            // 状態ファイルの保存失敗で本体DBの同期を失敗扱いにしない。
+            _logger.LogWarning(ex, "クラウドSQLiteの同期状態を保存できません。");
         }
     }
 
@@ -197,6 +381,32 @@ public sealed class CloudSqliteSync : BackgroundService
         // Dispose / キャンセル後もローカル DB と WAL を削除しない。
     }
 }
+
+/// <summary>クラウドSQLiteの運用監視用状態。</summary>
+public sealed record CloudSqliteSyncStatus(
+    DateTimeOffset? LastAttemptAt,
+    DateTimeOffset? LastSuccessfulSyncAt,
+    DateTimeOffset? LastFailureAt,
+    string? LastError,
+    int ConsecutiveFailures,
+    bool IsDirty,
+    bool IsStale,
+    TimeSpan SyncInterval);
+
+internal sealed record PersistedStatus(
+    DateTimeOffset? LastAttemptAt,
+    DateTimeOffset? LastSuccessfulSyncAt,
+    DateTimeOffset? LastFailureAt,
+    string? LastError,
+    int ConsecutiveFailures);
+
+/// <summary>クラウドSQLite同期通知の公開ペイロード。秘密情報は含めない。</summary>
+public sealed record CloudSqliteSyncAlert(
+    string Event,
+    DateTimeOffset OccurredAt,
+    int ConsecutiveFailures,
+    DateTimeOffset? LastSuccessfulSyncAt,
+    string? Error);
 
 /// <summary>明示的トランザクションは SaveChanges 後に確定するため、コミット時も再送対象にする。</summary>
 public sealed class CloudSqliteTransactionInterceptor(CloudSqliteSync sync) : DbTransactionInterceptor

@@ -224,6 +224,14 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
 | `Volume:E2eeChunkSize` | E2EE チャンクサイズ（バイト、デフォルト 1 MiB） |
 | `Volume:ChunkStorage` | チャンクストレージモード（暗号化ボリュームは常に認証付きチャンク、`auto` はS3等の平文ボリュームにも適用） |
 | `Volume:ServerChunkSize` | チャンクモード時のサーバー側チャンクサイズ（バイト、デフォルト 4 MiB） |
+| `Volume:ChunkGcHoldHours` | 孤児チャンクを削除候補として保持する時間（デフォルト24時間） |
+| `Volume:ChunkGcIntervalMinutes` | 自動孤児チャンクGCの間隔（分、デフォルト60分） |
+| `Volume:ChunkGcEnabled` | 自動孤児チャンクGC（デフォルト有効）。無効時も所有者APIから手動実行可能 |
+| `Volume:IntegrityAuditIntervalMinutes` | バックグラウンド整合性監査の間隔（分、デフォルト15分） |
+| `Volume:IntegrityAuditBatchSize` | 1周期あたりに検査するファイル数（デフォルト32） |
+| `Database:SyncFailureAlertThreshold` | クラウドSQLite同期の連続失敗を警告する回数（デフォルト3回） |
+| `Database:SyncAlertWebhookUrl` | クラウドSQLiteの失敗・復旧を通知するHTTP(S)エンドポイント（任意） |
+| `Database:SyncAlertWebhookTimeoutSeconds` | 通知Webhookのタイムアウト（秒、デフォルト10秒） |
 
 ## 暗号化の仕組み
 
@@ -344,6 +352,9 @@ POST   /api/v1/volumes/{name}/revoke  アクセス権剥奪
 
 # ファイル
 GET    /api/v1/files/{volume}/                         ファイル一覧
+GET    /api/v1/files/{volume}/integrity                チャンク整合性監査（所有者）
+POST   /api/v1/files/{volume}/repair/{*path}            要修復ファイルの再検証・復旧（所有者）
+POST   /api/v1/files/{volume}/gc?dryRun=true            孤児チャンクGC（既定は確認のみ、所有者）
 POST   /api/v1/files/{volume}/{*path}                  アップロード
 GET    /api/v1/files/{volume}/{*path}                  ダウンロード
 DELETE /api/v1/files/{volume}/{*path}                  削除
@@ -361,7 +372,13 @@ GET    /api/v1/e2ee/{volume}/download-chunk/{fileId}/{index}  チャンクダウ
 PATCH  /api/v1/e2ee/{volume}/finalize-file/{fileId}           アップロード確定
 DELETE /api/v1/e2ee/{volume}/files/{fileId}                   ファイル削除
 GET    /api/v1/e2ee/{volume}/files                           ファイル一覧
+GET    /api/v1/e2ee/{volume}/integrity                         暗号文整合性監査（所有者）
+POST   /api/v1/e2ee/{volume}/repair/{fileId}                  要修復ファイルの再検証・復旧（所有者）
+POST   /api/v1/e2ee/{volume}/gc?dryRun=true                   孤児チャンクGC（既定は確認のみ、所有者）
 POST   /api/v1/e2ee/{volume}/add-wrapped-key                 共有鍵追加
+
+# 管理者
+GET    /api/v1/admin/storage/sqlite-sync                    クラウドSQLite同期状態
 
 # グループ
 GET    /api/v1/groups/                                グループ一覧
@@ -377,7 +394,9 @@ WebDAV クライアントから `https://<host>/dav/<volume-name>/` にアクセ
 
 Basic 認証と JWT の両方に対応。
 
-E2EE ボリュームの WebDAV は暗号化済みファイル名と暗号化済み blob をそのまま転送する。外部暗号化ツール（rclone crypt 等）との併用も可能。
+E2EE ボリュームはサーバーがファイル名・内容を復号できないため、WebDAV には対応していません。
+Web UI、ブラウザクライアント、またはネイティブクライアントを使用してください。外部暗号化ツール
+（rclone crypt 等）は通常のサーバー側暗号化ボリュームと併用できます。
 
 ## セキュリティ対策
 
@@ -501,6 +520,15 @@ DBと存在する `-wal`／`-shm` を、表示された新パスの `database.sq
 重要データには別バックアップを用意し、強い耐久性や複数インスタンスが必要ならPostgreSQLを使用してください。
 同じクラウドSQLiteオブジェクトに複数のプロセスから書き込んではいけません。
 
+クラウドSQLiteの最終同期状態は管理者APIで確認できます。`IsStale=true`、`IsDirty=true`、
+または `ConsecutiveFailures` が増加している場合は、オブジェクトストレージへの同期が完了していません。
+非同期複製のため、最終成功同期以降にローカル永続ボリュームを失うと、その期間のDB更新が失われる可能性があります。
+重要なメタデータにはPostgreSQL、またはDBとオブジェクトストレージを同時点で取得するバックアップを使用してください。
+`Database:SyncAlertWebhookUrl` を設定すると、連続失敗がしきい値に達した時に `failure`、
+失敗後の最初の成功時に `recovered` のJSON通知を送信します。本文はイベント名・時刻・失敗回数・
+一般的なエラーだけで、DB内容・パス・資格情報は含みません。Webhookの失敗はログに記録しますが、
+SQLite同期の成否は変更しません。
+
 ローカル部分更新は、全体を別領域へ保存してからカタログを切り替えます。空き領域の再利用と、更新・削除後の
 不要な末尾の切り詰めにより、同じサイズの繰り返し更新による容量増加を抑えます。更新中は単一ファイルでも
 約2倍の容量が必要になり、空き領域の断片化や他ファイルによってはさらに必要です。コピー・旧領域の消去には
@@ -509,8 +537,29 @@ DBと存在する `-wal`／`-shm` を、表示された新パスの `database.sq
 
 オブジェクトストレージではE2EEの未確定チャンクを再更新した際、新しいカタログの保存後に
 古い未確定世代を削除します。公開済み更新の旧世代削除は、リクエストのキャンセルに依存せず再試行します。
-削除失敗が続く場合やプロセスが停止した場合は孤児オブジェクトが残る可能性があります。
-過去の孤児オブジェクトを自動収集するバックグラウンド処理は未実装です。
+削除失敗が続く場合やプロセスが停止した場合は孤児オブジェクトが残る可能性があります。所有者は
+`gc?dryRun=true` で削除候補を確認し、問題がなければ `dryRun=false` で回収できます。
+候補は `Volume:ChunkGcHoldHours`（既定24時間）保留され、全カタログの可視チャンク、E2EEの
+`PendingChunks`、未完了ジャーナルを確認できない場合は削除しません。
+加えて、`Volume:ChunkGcEnabled=true`（既定）では保存済みの全チャンクボリューム（ロック中・
+未マウントを含む）を `Volume:ChunkGcIntervalMinutes`（既定60分）ごとにバックグラウンドGCします。ストレージ障害や
+参照確認の失敗は削除せず、次周期に再試行します。自動削除を停止する場合は設定をfalseにし、
+所有者APIのdry-run確認後に手動実行してください。
+
+チャンク整合性監査は、マウント時にはジャーナルとカタログの存在・形式だけを確認します。
+E2EEチャンクボリュームは暗号文の長さとSHA-256だけで検査できるため、ロック中・未マウントでも
+バックグラウンド監査の対象になります。サーバー暗号化ボリュームは認証付き復号にボリューム鍵が
+必要なため、マウント済みの場合に監査します。
+全チャンクの読み取り検査は起動後のバックグラウンド処理へ分離し、1周期あたり
+`Volume:IntegrityAuditBatchSize`（既定32）ファイルずつ進めます。監査で異常を検出したファイルは
+`NeedsRepair=true` のまま保持し、ダウンロード・更新を拒否します。所有者の整合性APIを呼ぶと、
+対象ボリュームを明示的に全量監査できます。監査カーソルはローカルデータ領域へ原子的に保存され、
+再起動後も途中位置から再開します。
+
+ファイル削除は、ジャーナルに削除予定を記録した後にカタログから参照を外し、物理チャンクの削除と
+ジャーナルのコミットを行います。プロセス停止後に未コミットの削除ジャーナルが残っている場合は、
+次回マウント時に削除を完遂する仕様です。削除APIが応答を返す前に停止した場合でも、この確定順序により
+再起動後に削除が確定する可能性があります。同じ削除要求の再実行は、対象が無いことを返す冪等な失敗になります。
 
 ## テスト
 
@@ -520,6 +569,10 @@ TRX結果を成果物として保存します。実Dokanドライバテストは
 ホスト型CIから除外します。AndroidのネイティブViewerには端末・エミュレーターが必要です
 （`CistaNAS.Mobile/Testing/README.md` を参照）。同一checkoutではWebビルドがWASM出力を共有するため、
 テストプロジェクトのビルドを順番に行います。
+
+耐久性回帰テストでは、サービスインスタンスを破棄して再生成した後のチャンクデータ復旧、
+起動後の段階的整合性監査、保留期間を経過した孤児チャンクの自動GCを検証します。実ストレージの
+MinIO／PostgreSQL統合テストは `CistaNAS.StorageTests` で別途実行します。
 
 ```bash
 dotnet test

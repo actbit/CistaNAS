@@ -1,3 +1,5 @@
+using System.Net;
+using System.Text.Json;
 using CistaNAS.Web.Configuration;
 using CistaNAS.Web.Storage;
 
@@ -165,13 +167,115 @@ public class CloudSqliteSyncTests
             sync.MarkDirty();
 
             await Assert.ThrowsAsync<IOException>(() => sync.UploadIfDirtyAsync());
+            var failed = sync.GetStatus();
+            Assert.True(failed.IsDirty);
+            Assert.True(failed.IsStale);
+            Assert.Equal(1, failed.ConsecutiveFailures);
+            Assert.NotNull(failed.LastFailureAt);
+
+            // 状態ファイルから、再起動後も連続失敗数を引き継ぐ。
+            var rebooted = new CloudSqliteSync(storage,
+                new StorageOptions { VolumeDataPath = localDir },
+                new DatabaseOptions { BlobKey = "test.db" });
+            var persistedFailure = rebooted.GetStatus();
+            Assert.Equal(1, persistedFailure.ConsecutiveFailures);
+            Assert.NotNull(persistedFailure.LastFailureAt);
+
             await sync.UploadIfDirtyAsync();
+
+            var recovered = sync.GetStatus();
+            Assert.False(recovered.IsDirty);
+            Assert.False(recovered.IsStale);
+            Assert.Equal(0, recovered.ConsecutiveFailures);
+            Assert.NotNull(recovered.LastSuccessfulSyncAt);
 
             Assert.Equal(2, storage.WriteAttempts);
             string restored = Path.Combine(localDir, "restored.db");
             await File.WriteAllBytesAsync(restored, (await storage.ReadAsync("test.db"))!);
             using var db = CloudSqliteRecoveryTests.Open(restored);
             Assert.Equal("RETRY-ME", CloudSqliteRecoveryTests.ReadValue(db));
+        }
+        finally
+        {
+            try { Directory.Delete(localDir, true); } catch { }
+            try { Directory.Delete(cloudDir, true); } catch { }
+        }
+    }
+
+    private sealed class RecordingWebhookHandler : HttpMessageHandler
+    {
+        public List<string> Payloads { get; } = [];
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Payloads.Add(request.Content is null
+                ? ""
+                : await request.Content.ReadAsStringAsync(cancellationToken));
+            return new HttpResponseMessage(HttpStatusCode.NoContent);
+        }
+    }
+
+    [Fact]
+    public async Task SuccessfulSyncStatus_SurvivesRestart()
+    {
+        var localDir = NewTempDir();
+        var cloudDir = NewTempDir();
+        try
+        {
+            var storage = new LocalStorageProvider(cloudDir);
+            var options = new StorageOptions { VolumeDataPath = localDir };
+            var db = new DatabaseOptions { BlobKey = "test.db" };
+            var first = new CloudSqliteSync(storage, options, db);
+            CloudSqliteRecoveryTests.WriteValue(first.LocalDbPath, "PERSISTED-STATUS");
+            first.MarkDirty();
+            await first.UploadIfDirtyAsync();
+            var before = first.GetStatus();
+
+            var second = new CloudSqliteSync(storage, options, db);
+            var after = second.GetStatus();
+            Assert.Equal(before.LastSuccessfulSyncAt, after.LastSuccessfulSyncAt);
+            Assert.Equal(0, after.ConsecutiveFailures);
+            Assert.True(after.IsDirty); // 既存ローカルDBは次回起動でも再送対象
+        }
+        finally
+        {
+            try { Directory.Delete(localDir, true); } catch { }
+            try { Directory.Delete(cloudDir, true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AlertWebhook_ReportsFailureThresholdAndRecovery()
+    {
+        var localDir = NewTempDir();
+        var cloudDir = NewTempDir();
+        try
+        {
+            var storage = new FailOnceStorageProvider(cloudDir);
+            var handler = new RecordingWebhookHandler();
+            using var http = new HttpClient(handler);
+            using var sync = new CloudSqliteSync(storage,
+                new StorageOptions { VolumeDataPath = localDir },
+                new DatabaseOptions
+                {
+                    BlobKey = "test.db",
+                    SyncFailureAlertThreshold = 1,
+                    SyncAlertWebhookUrl = "https://alerts.test/cista",
+                },
+                alertHttpClient: http);
+
+            CloudSqliteRecoveryTests.WriteValue(sync.LocalDbPath, "WEBHOOK-ALERT");
+            sync.MarkDirty();
+            await Assert.ThrowsAsync<IOException>(() => sync.UploadIfDirtyAsync());
+            await sync.UploadIfDirtyAsync();
+
+            Assert.Equal(2, handler.Payloads.Count);
+            using var failure = JsonDocument.Parse(handler.Payloads[0]);
+            using var recovered = JsonDocument.Parse(handler.Payloads[1]);
+            Assert.Equal("failure", failure.RootElement.GetProperty("event").GetString());
+            Assert.Equal("recovered", recovered.RootElement.GetProperty("event").GetString());
+            Assert.DoesNotContain("WEBHOOK-ALERT", handler.Payloads[0]);
         }
         finally
         {
