@@ -87,7 +87,9 @@ public sealed class CloudSqliteRecoveryTests
         {
             sync.Dispose();
             File.Delete(sync.LocalDbPath);
-            Directory.Delete(Path.GetDirectoryName(sync.LocalDbPath)!);
+            // CloudSqliteSync はDB本体と同じスコープディレクトリに
+            // 再起動後の同期状態ファイルも保存する。
+            Directory.Delete(Path.GetDirectoryName(sync.LocalDbPath)!, recursive: true);
         }
     }
 

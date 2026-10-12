@@ -45,6 +45,13 @@ public sealed class VolumeHeader
     /// <summary>チャンクモード時のサーバー側チャンクサイズ（バイト）。EncryptionMode=="server" かつ StorageMode=="chunk" の場合に使用。</summary>
     public int ServerChunkSize { get; set; } = 4194304; // 4 MiB
 
+    /// <summary>
+    /// カタログがボリューム作成時に初期化済みか。旧ヘッダでは false のままでも、
+    /// 既存カタログがある限り後方互換で読み込める。カタログが無い場合は、
+    /// 新規ボリュームとして空カタログを生成せず、安全側でマウント・書き込みを拒否する。
+    /// </summary>
+    public bool CatalogInitialized { get; set; }
+
     /// <summary>E2EE チャンクサイズ（バイト）。EncryptionMode が "e2ee" の場合のみ使用。</summary>
     public int ChunkSize { get; set; } = 1048576;
 

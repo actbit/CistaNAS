@@ -44,6 +44,26 @@ public sealed record ListFilesResponse(IReadOnlyList<FileMetadata> Files);
 public sealed record FileUploadRequest(string VolumeName, string FileName, Stream Content, long ContentLength);
 public sealed record FileDownloadResponse(Stream Stream, string FileName, long Length, string? ContentType = null);
 
+/// <summary>カタログとチャンクの整合性検査で検出した1ファイル分の異常。</summary>
+public sealed record FileIntegrityIssue(
+    string FileId,
+    IReadOnlyList<int> MissingChunks,
+    IReadOnlyList<int> InvalidChunks,
+    string? Error = null);
+
+/// <summary>カタログとチャンクの整合性検査結果。</summary>
+public sealed record FileIntegrityReport(
+    bool IsHealthy,
+    IReadOnlyList<FileIntegrityIssue> Issues);
+
+/// <summary>孤児チャンクGCの実行結果。</summary>
+public sealed record ChunkGcReport(
+    bool DryRun,
+    int CandidateCount,
+    int DeletedCount,
+    IReadOnlyList<string> Candidates,
+    IReadOnlyList<string> Failed);
+
 /// <summary>ファイル操作の業務エラー。</summary>
 public sealed class FileServiceException(string message) : Exception(message);
 
@@ -108,6 +128,12 @@ public sealed class E2eeFileEntry
     /// 旧カタログでは 0 として扱う。
     /// </summary>
     public int CreatedKeyEpoch { get; set; }
+
+    /// <summary>
+    /// チャンク欠損または暗号文のハッシュ不一致が確認されたファイル。
+    /// メタデータは保持し、専用の整合性検査・修復が成功するまで通常アクセスを拒否する。
+    /// </summary>
+    public bool NeedsRepair { get; set; }
 
     /// <summary>
     /// crypto format v2: per-file DEK（32B）を GroupKey[KeyEpoch] で AES-256-GCM ラップしたもの。

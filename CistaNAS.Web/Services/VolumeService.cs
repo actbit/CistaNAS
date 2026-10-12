@@ -137,6 +137,26 @@ public sealed partial class VolumeService : IAsyncDisposable
 
     public bool IsMounted(string name) => _mounted.ContainsKey(name);
 
+    /// <summary>現在マウントされているボリューム名のスナップショットを返す。</summary>
+    public IReadOnlyList<string> GetMountedVolumeNames()
+        => _mounted.Keys.OrderBy(name => name, StringComparer.Ordinal).ToArray();
+
+    /// <summary>
+    /// 保存先に存在するボリューム名のスナップショットを返す。
+    /// バックグラウンド監査・GCは、暗号化ボリュームを勝手にマウントせずに
+    /// 保存済みメタデータを調べる必要があるため、マウント状態とは分離する。
+    /// </summary>
+    public Task<IReadOnlyList<string>> ListStoredVolumeNamesAsync(CancellationToken ct = default)
+        => _metaStore.ListVolumeNamesAsync(ct);
+
+    /// <summary>保存済みVolumeHeaderを取得する。存在しない場合は例外。</summary>
+    public async Task<VolumeHeader> GetStoredHeaderAsync(string name, CancellationToken ct = default)
+    {
+        ValidateStorageName(name);
+        return await _metaStore.LoadAsync(name, ct)
+            ?? throw new VolumeException($"ボリューム '{name}' のヘッダが見つかりません。");
+    }
+
     // ---- マウント内部実装 ----
 
     private void MountInternal(string name, VolumeHeader header, byte[]? masterKey)
@@ -183,8 +203,19 @@ public sealed partial class VolumeService : IAsyncDisposable
         try
         {
             await using var scope = _scopeFactory.CreateAsyncScope();
-            var fileService = scope.ServiceProvider.GetRequiredService<FileService>();
-            await fileService.RecoverAsync(name);
+            var header = _mounted.TryGetValue(name, out var mounted)
+                ? mounted.Header
+                : throw new VolumeException($"ボリューム '{name}' はマウントされていません。");
+            if (header.IsE2ee)
+            {
+                var e2eeFileService = scope.ServiceProvider.GetRequiredService<E2eeFileService>();
+                await e2eeFileService.RecoverJournalAsync(name);
+            }
+            else
+            {
+                var fileService = scope.ServiceProvider.GetRequiredService<FileService>();
+                await fileService.RecoverJournalAsync(name);
+            }
         }
         catch (InvalidDataException ex)
         {

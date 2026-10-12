@@ -18,9 +18,11 @@ public static class TestHelper
 {
     public static (IServiceProvider sp, string dataRoot) BuildTestServices(
         VolumeOptions? volOpts = null, StorageOptions? storageOpts = null,
-        Func<string, IStorageProvider>? storageFactory = null)
+        Func<string, IStorageProvider>? storageFactory = null,
+        string? existingDataRoot = null)
     {
-        var dataRoot = Path.Combine(Path.GetTempPath(), "cista-test-" + Guid.NewGuid().ToString("N"));
+        var dataRoot = existingDataRoot
+            ?? Path.Combine(Path.GetTempPath(), "cista-test-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dataRoot);
         var opt = new CistaNasOptions
         {
@@ -78,6 +80,7 @@ public static class TestHelper
         services.AddScoped<JournalService>();
         services.AddScoped<FileService>();
         services.AddScoped<E2eeFileService>();
+        services.AddScoped<ChunkGarbageCollector>();
         services.AddMemoryCache();
         services.AddSingleton<JwtSecurityStampCache>();
         services.AddLogging();

@@ -72,6 +72,21 @@ public sealed class DatabaseOptions
     /// <summary>クラウド SQLite の定期同期間隔（秒）。失敗時も次の周期で再試行。</summary>
     [Range(1, 3600)]
     public int SyncIntervalSeconds { get; set; } = 30;
+
+    /// <summary>クラウド SQLite 同期失敗を警告ログへ昇格する連続失敗回数。</summary>
+    [Range(1, 1000)]
+    public int SyncFailureAlertThreshold { get; set; } = 3;
+
+    /// <summary>
+    /// 同期失敗・復旧を通知するWebhook URL。未設定ならログと管理APIだけを使用する。
+    /// 通知本文にはDB本体や認証情報を含めない。
+    /// </summary>
+    [Url]
+    public string? SyncAlertWebhookUrl { get; set; }
+
+    /// <summary>同期通知Webhookのタイムアウト秒数。</summary>
+    [Range(1, 120)]
+    public int SyncAlertWebhookTimeoutSeconds { get; set; } = 10;
 }
 
 /// <summary>メタデータ保存先のプロバイダ設定。</summary>
@@ -256,6 +271,28 @@ public sealed class VolumeOptions
     /// <summary>チャンクモード時のサーバー側チャンクサイズ（バイト）。4 MiB デフォルト。</summary>
     [Range(1048576, 67108864)]
     public int ServerChunkSize { get; set; } = 4194304;
+
+    /// <summary>
+    /// 未参照チャンクをGC候補として保持する時間。短時間の応答喪失や再試行中に
+    /// 新世代を回収しないため、既定は24時間。
+    /// </summary>
+    [Range(1, 8760)]
+    public int ChunkGcHoldHours { get; set; } = 24;
+
+    /// <summary>孤児チャンクGCの定期実行間隔（分）。</summary>
+    [Range(1, 10080)]
+    public int ChunkGcIntervalMinutes { get; set; } = 60;
+
+    /// <summary>孤児チャンクGCの自動実行。falseの場合は管理者APIからのみ実行する。</summary>
+    public bool ChunkGcEnabled { get; set; } = true;
+
+    /// <summary>チャンク整合性監査の定期実行間隔（分）。</summary>
+    [Range(1, 10080)]
+    public int IntegrityAuditIntervalMinutes { get; set; } = 15;
+
+    /// <summary>1回のバックグラウンド監査で検査するファイル数。</summary>
+    [Range(1, 10000)]
+    public int IntegrityAuditBatchSize { get; set; } = 32;
 
     /// <summary>
     /// 1 ファイルの最大サイズ（バイト）。UPLOAD（全体 PUT）と PATCH（差分書き込み）の

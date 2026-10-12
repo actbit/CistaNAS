@@ -721,6 +721,100 @@ public sealed class FileService
         return new FileDownloadResponse(new GateReadStream(chunkedStream, readLock), meta.Name, meta.Length);
     }
 
+    /// <summary>
+    /// カタログに記録された全チャンクを検査する。ジャーナルが空でも実行できるため、
+    /// マウント時の検査と管理者による手動監査の両方で使用する。
+    /// </summary>
+    public async Task<FileIntegrityReport> VerifyIntegrityAsync(
+        string volumeName, string? fileName = null, CancellationToken ct = default)
+    {
+        if (!_volumeService.IsChunkMode(volumeName))
+            return new FileIntegrityReport(true, []);
+
+        SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await catLock.WaitAsync(ct);
+        try
+        {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
+            var catalog = await LoadCatalogAsync(volumeName, ct);
+            IEnumerable<KeyValuePair<string, FileMetadata>> entries = catalog.Files;
+            if (fileName is not null)
+            {
+                if (!catalog.Files.TryGetValue(fileName, out var entry))
+                    throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
+                entries = new[] { new KeyValuePair<string, FileMetadata>(fileName, entry) };
+            }
+
+            var issues = await VerifyChunkEntriesAsync(volumeName, entries, ct);
+            bool changed = false;
+            foreach (var issue in issues)
+            {
+                if (catalog.Files.TryGetValue(issue.FileId, out var entry) && !entry.NeedsRepair)
+                {
+                    entry.NeedsRepair = true;
+                    changed = true;
+                }
+            }
+            if (changed)
+                await SaveCatalogAsync(volumeName, catalog, ct);
+
+            return new FileIntegrityReport(issues.Count == 0, issues);
+        }
+        finally
+        {
+            catLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// 要修復ファイルの状態を検査し、全チャンクが正常な場合だけ NeedsRepair を解除する。
+    /// </summary>
+    public async Task<FileIntegrityReport> RepairAsync(
+        string volumeName, string fileName, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(fileName);
+        if (!_volumeService.IsChunkMode(volumeName))
+            throw new FileServiceException("ローカルストレージのファイルはチャンク修復の対象外です。");
+
+        var gate = _fileGates.GetOrAdd((volumeName, fileName), _ => new AsyncFileGate());
+        using (await gate.EnterWriteAsync(ct))
+        {
+            SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+            await catLock.WaitAsync(ct);
+            try
+            {
+                using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
+                var catalog = await LoadCatalogAsync(volumeName, ct);
+                if (!catalog.Files.TryGetValue(fileName, out var entry))
+                    throw new FileServiceException($"ファイル '{fileName}' が見つかりません。");
+
+                var issues = await VerifyChunkEntriesAsync(
+                    volumeName,
+                    new[] { new KeyValuePair<string, FileMetadata>(fileName, entry) },
+                    ct);
+                if (issues.Count == 0)
+                {
+                    if (entry.NeedsRepair)
+                    {
+                        entry.NeedsRepair = false;
+                        await SaveCatalogAsync(volumeName, catalog, ct);
+                    }
+                }
+                else if (!entry.NeedsRepair)
+                {
+                    entry.NeedsRepair = true;
+                    await SaveCatalogAsync(volumeName, catalog, ct);
+                }
+
+                return new FileIntegrityReport(issues.Count == 0, issues);
+            }
+            finally
+            {
+                catLock.Release();
+            }
+        }
+    }
+
     /// <summary>ファイルを削除。</summary>
     public async Task DeleteAsync(string volumeName, string fileName, CancellationToken ct = default)
     {
@@ -780,22 +874,20 @@ public sealed class FileService
         // 再作成側と古いリクエストが別ゲートで動作する。回収はボリューム削除時に行う。
     }
 
-    /// <summary>クラッシュ復旧：未コミットジャーナルからカタログを修復し、ジャーナルをクリアする。</summary>
-    /// <remarks>
-    /// マウント直後（MountAsync / MountE2eeAsync）に呼ばれる。カタログ操作は通常の読み書きと
-    /// 同じボリューム単位のカタログロックで直列化し、進行中の Upload/Delete との競合を防ぐ。
-    /// </remarks>
+    /// <summary>
+    /// クラッシュ復旧とチャンク監査を明示的に実行する。通常のマウント処理では
+    /// 起動をブロックしないため <see cref="RecoverJournalAsync"/> のみを使用する。
+    /// </summary>
     public async Task RecoverAsync(string volumeName, CancellationToken ct = default)
     {
         var pending = await _journalService.RecoverAsync(volumeName, ct);
-        if (pending.Count == 0) return;
+        if (pending.Count == 0 && !_volumeService.IsChunkMode(volumeName)) return;
 
         SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
         await catLock.WaitAsync(ct);
         try
         {
             using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
-            // 削除済みエントリはカタログから取り除く
             var catalog = await LoadCatalogAsync(volumeName, ct);
             foreach (var entry in pending)
             {
@@ -803,38 +895,59 @@ public sealed class FileService
                     catalog.Files.Remove(entry.Path);
             }
 
-            // チャンクモード: WriteFile 未完了のファイルでチャンク欠落がある場合は、
-            // カタログから削除せず要修復として隔離する。欠損判定は一覧だけに依存
-            // せず、欠けている各チャンクを個別に読み、一覧の一時的不完全さを
-            // 可能な範囲で切り分ける。
+            bool catalogChanged = pending.Any(entry => entry.Operation == JournalOp.DeleteFile);
             if (_volumeService.IsChunkMode(volumeName))
             {
-                foreach (var (fileName, meta) in catalog.Files)
+                var issues = await VerifyChunkEntriesAsync(volumeName, catalog.Files, ct);
+                foreach (var issue in issues)
                 {
-                    if (!meta.IsChunked || meta.NeedsRepair) continue;
-                    // 通信障害・キャンセルは欠損の証拠にならない。
-                    // 一覧取得に失敗したらカタログ・ジャーナルを保持したまま復旧を中断する。
-                    var indices = await _chunkStore.ListChunksAsync(
-                        volumeName, meta.ChunkObjectId ?? fileName, ct);
-                    var present = indices.ToHashSet();
-                    var missing = Enumerable.Range(0, meta.ChunkCount)
-                        .Where(index => !present.Contains(index))
-                        .ToList();
-                    foreach (int index in missing)
+                    if (catalog.Files.TryGetValue(issue.FileId, out var meta) && !meta.NeedsRepair)
                     {
-                        byte[]? chunk = await _chunkStore.ReadChunkAsync(
-                            volumeName, meta.ChunkObjectId ?? fileName, index, ct);
-                        if (chunk is not null)
-                            present.Add(index);
-                    }
-
-                    if (missing.Any(index => !present.Contains(index)))
                         meta.NeedsRepair = true;
+                        catalogChanged = true;
+                    }
                 }
             }
 
-            await SaveCatalogAsync(volumeName, catalog, ct);
-            await _journalService.CommitAllAsync(volumeName, ct);
+            if (catalogChanged)
+                await SaveCatalogAsync(volumeName, catalog, ct);
+            if (pending.Count > 0)
+                await _journalService.CommitAllAsync(volumeName, ct);
+        }
+        finally
+        {
+            catLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// マウント時のクラッシュ復旧。ジャーナルとカタログの妥当性だけを確認し、
+    /// 全チャンク監査は行わないため、大容量ボリュームの起動を長時間ブロックしない。
+    /// </summary>
+    public async Task RecoverJournalAsync(string volumeName, CancellationToken ct = default)
+    {
+        var pending = await _journalService.RecoverAsync(volumeName, ct);
+        // チャンクモードではジャーナルが空でもカタログの存在・形式を検証する。
+        if (pending.Count == 0 && !_volumeService.IsChunkMode(volumeName)) return;
+
+        SemaphoreSlim catLock = _catalogLocks.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await catLock.WaitAsync(ct);
+        try
+        {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
+            // 削除済みエントリはカタログから取り除く。チャンク本体の監査は
+            // 後続のバックグラウンド監査へ分離する。
+            var catalog = await LoadCatalogAsync(volumeName, ct);
+            foreach (var entry in pending)
+            {
+                if (entry.Operation == JournalOp.DeleteFile)
+                    catalog.Files.Remove(entry.Path);
+            }
+
+            if (pending.Any(entry => entry.Operation == JournalOp.DeleteFile))
+                await SaveCatalogAsync(volumeName, catalog, ct);
+            if (pending.Count > 0)
+                await _journalService.CommitAllAsync(volumeName, ct);
         }
         finally
         {
@@ -878,7 +991,9 @@ public sealed class FileService
     private async Task<FileCatalog> LoadCatalogAsync(string volumeName, CancellationToken ct)
     {
         byte[]? data = await _storage.ReadAsync($"{volumeName}/catalog.json", ct);
-        if (data is null) return new FileCatalog();
+        if (data is null)
+            throw new InvalidDataException(
+                $"ボリューム '{volumeName}' のカタログが見つかりません。空カタログとして扱わず、バックアップから復元してください。");
         try
         {
             var catalog = JsonSerializer.Deserialize<FileCatalog>(data, JsonOptions);
@@ -898,6 +1013,104 @@ public sealed class FileService
         JsonSerializer.Serialize(ms, catalog, JsonOptions);
         ms.Position = 0;
         await _storage.WriteAtomicAsync($"{volumeName}/catalog.json", ms, ct);
+    }
+
+    private async Task<List<FileIntegrityIssue>> VerifyChunkEntriesAsync(
+        string volumeName,
+        IEnumerable<KeyValuePair<string, FileMetadata>> entries,
+        CancellationToken ct)
+    {
+        var (header, masterKey) = _volumeService.GetMountedKeys(volumeName);
+        var issues = new List<FileIntegrityIssue>();
+
+        foreach (var (fileName, meta) in entries)
+        {
+            if (!meta.IsChunked) continue;
+
+            var missing = new List<int>();
+            var invalid = new List<int>();
+            string? error = null;
+            if (meta.ChunkCount < 0 || meta.ChunkCount > 100_000)
+            {
+                issues.Add(new FileIntegrityIssue(fileName, [], [-1], "カタログのチャンク数が不正です。"));
+                continue;
+            }
+
+            // ListChunks の失敗は一時的なストレージ障害の可能性があるため、
+            // 欠損とは断定せず例外をそのまま上位へ返し、復旧とジャーナル確定を止める。
+            // 一覧取得はストレージ障害を検出するために行う。最終判定は
+            // ReadChunk の結果で行い、一覧結果だけで欠損とは断定しない。
+            _ = await _chunkStore.ListChunksAsync(
+                volumeName, meta.ChunkObjectId ?? fileName, ct);
+            for (int index = 0; index < meta.ChunkCount; index++)
+            {
+                byte[]? chunk = await _chunkStore.ReadChunkAsync(
+                    volumeName, meta.ChunkObjectId ?? fileName, index, ct);
+                if (chunk is null)
+                {
+                    // 一覧に無くても直接読み取りで見つかる実装があるため、
+                    // 最終判定は ReadChunk の結果で行う。
+                    missing.Add(index);
+                    continue;
+                }
+                if (index >= meta.ChunkSizes.Count || meta.ChunkSizes[index] < 0)
+                {
+                    invalid.Add(index);
+                    error ??= "カタログのチャンク長が不足または不正です。";
+                    continue;
+                }
+
+                int expectedPlainLength = meta.ChunkSizes[index];
+                try
+                {
+                    if (header.Encrypted && masterKey is not null)
+                    {
+                        byte[] plain = ChunkEncryptor.DecryptChunk(
+                            masterKey,
+                            header.EffectiveCipherAlgorithm,
+                            index,
+                            header.EffectiveSectorSize,
+                            header.EffectiveServerChunkSize,
+                            chunk,
+                            expectedPlainLength,
+                            DecodeKeySalt(meta.KeySalt) ?? []);
+                        try
+                        {
+                            if (plain.Length != expectedPlainLength)
+                                invalid.Add(index);
+                        }
+                        finally { CryptographicOperations.ZeroMemory(plain); }
+                    }
+                    else if (chunk.Length != expectedPlainLength)
+                    {
+                        invalid.Add(index);
+                        error ??= "保存済みチャンクの長さがカタログと一致しません。";
+                    }
+                }
+                catch (CryptographicException)
+                {
+                    invalid.Add(index);
+                    error ??= "保存済みチャンクの認証に失敗しました。";
+                }
+                catch (InvalidDataException)
+                {
+                    invalid.Add(index);
+                    error ??= "保存済みチャンクの形式または長さが不正です。";
+                }
+                catch (ArgumentException)
+                {
+                    invalid.Add(index);
+                    error ??= "保存済みチャンクの暗号化パラメーターが不正です。";
+                }
+            }
+
+            // ListChunks にはあるが ReadChunk が null の場合も欠損として扱う。
+            // 上の直接読み取り結果を優先し、一覧の一時的不完全さだけでは隔離しない。
+            if (missing.Count > 0 || invalid.Count > 0)
+                issues.Add(new FileIntegrityIssue(fileName, missing, invalid, error));
+        }
+
+        return issues;
     }
 
     /// <summary>

@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text.Json;
 using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Configuration;
+using CistaNAS.Web.Journal;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services.Streams;
 using CistaNAS.Web.Storage;
@@ -388,6 +390,8 @@ public sealed class E2eeFileService
 
             if (chunkIndex < 0 || chunkIndex >= entry.ChunkCount)
                 throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です。");
+            if (entry.NeedsRepair)
+                throw new FileServiceException($"ファイル '{fileId}' は要修復状態です。暗号文の整合性を確認してください。");
 
             int revision = chunkIndex < entry.ChunkRevisions.Count ? entry.ChunkRevisions[chunkIndex] : 0;
             int keyEpoch = chunkIndex < entry.ChunkKeyEpochs.Count ? entry.ChunkKeyEpochs[chunkIndex] : entry.KeyEpoch;
@@ -611,6 +615,9 @@ public sealed class E2eeFileService
 
     private static void EnsureFileCanBeUpdated(VolumeHeader header, E2eeFileEntry entry)
     {
+        if (entry.NeedsRepair)
+            throw new FileServiceException(
+                $"ファイル '{entry.FileId}' は要修復状態です。暗号文の整合性を確認してから更新してください。");
         if (header.RevocationEpoch > entry.CreatedKeyEpoch)
             throw new FileServiceException(
                 "共有解除後の既存ファイルは更新できません。新しいファイルIDで再暗号化して再アップロードしてください。");
@@ -647,6 +654,201 @@ public sealed class E2eeFileService
         // downloads may still own it. Retain gates until volume cleanup so a
         // recreated file ID and older requests continue sharing the same gate.
         return new E2eeListFilesResponse(catalog.Files.Values.OrderBy(f => f.CreatedAt).ToList());
+    }
+
+    /// <summary>
+    /// 未マウントのE2EEチャンクVolumeからファイルIDだけを列挙する。
+    /// サーバーは秘密鍵を必要とせず、暗号化されたカタログの構造だけを扱う。
+    /// </summary>
+    public async Task<IReadOnlyList<string>> ListStoredFileIdsAsync(
+        string volumeName, CancellationToken ct = default)
+    {
+        var header = await _volumeService.GetStoredHeaderAsync(volumeName, ct);
+        EnsureE2eeChunkHeader(volumeName, header);
+        var catalog = await LoadCatalogAsync(volumeName, ct);
+        return catalog.Files.Keys.OrderBy(id => id, StringComparer.Ordinal).ToArray();
+    }
+
+    /// <summary>
+    /// E2EE カタログに記録された全チャンクの存在・長さ・暗号文ハッシュを検査する。
+    /// サーバーは平文を復号できないため、暗号文の完全性を検査し、認証付き復号は
+    /// クライアント側の責務として分離する。
+    /// </summary>
+    public async Task<FileIntegrityReport> VerifyIntegrityAsync(
+        string volumeName, string? fileId = null, CancellationToken ct = default)
+    {
+        GetE2eeHeader(volumeName);
+        return await VerifyIntegrityCoreAsync(volumeName, fileId, ct);
+    }
+
+    /// <summary>
+    /// 未マウントのE2EEチャンクVolumeを暗号文の長さ・SHA-256で検査する。
+    /// E2EEではサーバーが平文鍵を持たないため、マウント不要の監査が可能である。
+    /// </summary>
+    public async Task<FileIntegrityReport> VerifyStoredIntegrityAsync(
+        string volumeName, string? fileId = null, CancellationToken ct = default)
+    {
+        var header = await _volumeService.GetStoredHeaderAsync(volumeName, ct);
+        EnsureE2eeChunkHeader(volumeName, header);
+        return await VerifyIntegrityCoreAsync(volumeName, fileId, ct);
+    }
+
+    private async Task<FileIntegrityReport> VerifyIntegrityCoreAsync(
+        string volumeName, string? fileId, CancellationToken ct)
+    {
+        var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await volGate.WaitAsync(ct);
+        try
+        {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
+            var catalog = await LoadCatalogAsync(volumeName, ct);
+            IEnumerable<KeyValuePair<string, E2eeFileEntry>> entries = catalog.Files;
+            if (fileId is not null)
+            {
+                if (!catalog.Files.TryGetValue(fileId, out var entry))
+                    throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+                entries = new[] { new KeyValuePair<string, E2eeFileEntry>(fileId, entry) };
+            }
+
+            var scan = await VerifyChunkEntriesAsync(volumeName, entries, ct);
+            var issues = scan.Issues;
+            bool changed = false;
+            foreach (var ((legacyFileId, index), hash) in scan.LegacyHashes)
+            {
+                if (!catalog.Files.TryGetValue(legacyFileId, out var entry)) continue;
+                while (entry.ChunkHashes.Count <= index) entry.ChunkHashes.Add("");
+                if (string.IsNullOrWhiteSpace(entry.ChunkHashes[index]))
+                {
+                    entry.ChunkHashes[index] = hash;
+                    changed = true;
+                }
+            }
+            foreach (var issue in issues)
+            {
+                if (catalog.Files.TryGetValue(issue.FileId, out var entry) && !entry.NeedsRepair)
+                {
+                    entry.NeedsRepair = true;
+                    changed = true;
+                }
+            }
+            if (changed)
+                await SaveCatalogAsync(volumeName, catalog, ct);
+
+            return new FileIntegrityReport(issues.Count == 0, issues);
+        }
+        finally
+        {
+            volGate.Release();
+        }
+    }
+
+    private static void EnsureE2eeChunkHeader(string volumeName, VolumeHeader header)
+    {
+        if (!header.IsE2ee)
+            throw new FileServiceException($"ボリューム '{volumeName}' は E2EE ボリュームではありません。");
+        if (!string.Equals(header.StorageMode, "chunk", StringComparison.Ordinal))
+            throw new FileServiceException(
+                $"E2EE ボリューム '{volumeName}' は旧ストレージ形式です。新しいチャンク形式で再作成してください。");
+    }
+
+    /// <summary>
+    /// E2EE ファイルの全暗号文チャンクが検査に合格した場合だけ NeedsRepair を解除する。
+    /// </summary>
+    public async Task<FileIntegrityReport> RepairAsync(
+        string volumeName, string fileId, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(fileId);
+        GetE2eeHeader(volumeName);
+        var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await volGate.WaitAsync(ct);
+        try
+        {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
+            var gate = _fileGates.GetOrAdd((volumeName, fileId), _ => new AsyncFileGate());
+            using (await gate.EnterWriteAsync(ct))
+            {
+                var catalog = await LoadCatalogAsync(volumeName, ct);
+                if (!catalog.Files.TryGetValue(fileId, out var entry))
+                    throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+
+                var scan = await VerifyChunkEntriesAsync(
+                    volumeName,
+                    new[] { new KeyValuePair<string, E2eeFileEntry>(fileId, entry) },
+                    ct);
+                var issues = scan.Issues;
+                bool hashChanged = false;
+                foreach (var ((_, index), hash) in scan.LegacyHashes)
+                {
+                    while (entry.ChunkHashes.Count <= index) entry.ChunkHashes.Add("");
+                    if (string.IsNullOrWhiteSpace(entry.ChunkHashes[index]))
+                    {
+                        entry.ChunkHashes[index] = hash;
+                        hashChanged = true;
+                    }
+                }
+                bool shouldRepair = issues.Count > 0;
+                if (hashChanged || entry.NeedsRepair != shouldRepair)
+                {
+                    entry.NeedsRepair = shouldRepair;
+                    await SaveCatalogAsync(volumeName, catalog, ct);
+                }
+
+                return new FileIntegrityReport(!shouldRepair, issues);
+            }
+        }
+        finally
+        {
+            volGate.Release();
+        }
+    }
+
+    /// <summary>マウント時のE2EE整合性監査。異常時もカタログエントリは保持する。</summary>
+    public async Task RecoverAsync(string volumeName, CancellationToken ct = default)
+    {
+        var pending = await RecoverJournalCoreAsync(volumeName, ct, commitJournal: false);
+        await VerifyIntegrityAsync(volumeName, ct: ct);
+        if (pending.Count > 0)
+            await new JournalService(_storage).CommitAllAsync(volumeName, ct);
+    }
+
+    /// <summary>
+    /// マウント時のE2EEジャーナル復旧。暗号文全量監査はバックグラウンドへ分離し、
+    /// 起動時はジャーナルとカタログの妥当性だけを確認する。
+    /// </summary>
+    public async Task RecoverJournalAsync(string volumeName, CancellationToken ct = default)
+        => await RecoverJournalCoreAsync(volumeName, ct, commitJournal: true);
+
+    private async Task<IReadOnlyList<JournalEntry>> RecoverJournalCoreAsync(
+        string volumeName, CancellationToken ct, bool commitJournal)
+    {
+        // E2EE の通常書き込みは専用カタログを使うが、ボリュームジャーナルが
+        // 壊れている場合は整合性監査より先に失敗させ、未確定状態を隠さない。
+        var journal = new JournalService(_storage);
+        var pending = await journal.RecoverAsync(volumeName, ct);
+
+        var volGate = _volumeGates.GetOrAdd(volumeName, _ => new SemaphoreSlim(1, 1));
+        await volGate.WaitAsync(ct);
+        try
+        {
+            using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
+            var catalog = await LoadCatalogAsync(volumeName, ct);
+            bool changed = false;
+            foreach (var entry in pending)
+            {
+                if (entry.Operation == JournalOp.DeleteFile && catalog.Files.Remove(entry.Path))
+                    changed = true;
+            }
+
+            if (changed)
+                await SaveCatalogAsync(volumeName, catalog, ct);
+            if (commitJournal && pending.Count > 0)
+                await journal.CommitAllAsync(volumeName, ct);
+            return pending;
+        }
+        finally
+        {
+            volGate.Release();
+        }
     }
 
     /// <summary>指定した E2EE ファイルIDが現在のカタログに存在するか確認する。</summary>
@@ -741,7 +943,9 @@ public sealed class E2eeFileService
     private async Task<E2eeCatalog> LoadCatalogAsync(string volumeName, CancellationToken ct)
     {
         byte[]? data = await _storage.ReadAsync($"{volumeName}/catalog-e2ee.json", ct);
-        if (data is null) return new E2eeCatalog();
+        if (data is null)
+            throw new InvalidDataException(
+                $"E2EE ボリューム '{volumeName}' のカタログが見つかりません。空カタログとして扱わず、バックアップから復元してください。");
         try
         {
             var catalog = JsonSerializer.Deserialize<E2eeCatalog>(data, JsonOptions);
@@ -762,6 +966,85 @@ public sealed class E2eeFileService
         ms.Position = 0;
         await _storage.WriteAtomicAsync($"{volumeName}/catalog-e2ee.json", ms, ct);
     }
+
+    private async Task<E2eeIntegrityScan> VerifyChunkEntriesAsync(
+        string volumeName,
+        IEnumerable<KeyValuePair<string, E2eeFileEntry>> entries,
+        CancellationToken ct)
+    {
+        var issues = new List<FileIntegrityIssue>();
+        var legacyHashes = new Dictionary<(string FileId, int Index), string>();
+
+        foreach (var (fileId, entry) in entries)
+        {
+            var missing = new List<int>();
+            var invalid = new List<int>();
+            string? error = null;
+            if (entry.ChunkCount < 0 || entry.ChunkCount > 100_000)
+            {
+                issues.Add(new FileIntegrityIssue(fileId, [], [-1], "カタログのチャンク数が不正です。"));
+                continue;
+            }
+
+            var listedObjects = new Dictionary<string, IReadOnlySet<int>>(StringComparer.Ordinal);
+            for (int index = 0; index < entry.ChunkCount; index++)
+            {
+                string objectId = GetChunkObjectId(entry, index);
+                if (!listedObjects.ContainsKey(objectId))
+                {
+                    // 一時的な一覧取得失敗は欠損と断定せず、監査を中止する。
+                    var listed = await _chunkStore.ListChunksAsync(volumeName, objectId, ct);
+                    listedObjects[objectId] = listed.ToHashSet();
+                }
+
+                byte[]? chunk = await _chunkStore.ReadChunkAsync(volumeName, objectId, index, ct);
+                if (chunk is null)
+                {
+                    missing.Add(index);
+                    continue;
+                }
+
+                if (index >= entry.ChunkSizes.Count || entry.ChunkSizes[index] < 0)
+                {
+                    invalid.Add(index);
+                    error ??= "カタログのチャンク長が不足または不正です。";
+                    continue;
+                }
+                if (chunk.Length != entry.ChunkSizes[index])
+                {
+                    invalid.Add(index);
+                    error ??= "保存済み暗号文チャンクの長さがカタログと一致しません。";
+                }
+
+                if (index < entry.ChunkHashes.Count
+                    && !string.IsNullOrWhiteSpace(entry.ChunkHashes[index]))
+                {
+                    string actualHash = Convert.ToHexString(SHA256.HashData(chunk));
+                    if (!string.Equals(actualHash, entry.ChunkHashes[index], StringComparison.OrdinalIgnoreCase))
+                    {
+                        invalid.Add(index);
+                        error ??= "保存済み暗号文チャンクのSHA-256が一致しません。";
+                    }
+                }
+                else if (chunk.Length == entry.ChunkSizes[index])
+                {
+                    // 旧カタログにはハッシュ列が無い場合がある。存在・長さ検査に
+                    // 合格した暗号文を移行時の基準値として保存し、以後の監査で
+                    // 改変を検出できるようにする。既存ハッシュは必ず照合する。
+                    legacyHashes[(fileId, index)] = Convert.ToHexString(SHA256.HashData(chunk));
+                }
+            }
+
+            if (missing.Count > 0 || invalid.Count > 0)
+                issues.Add(new FileIntegrityIssue(fileId, missing, invalid, error));
+        }
+
+        return new E2eeIntegrityScan(issues, legacyHashes);
+    }
+
+    private sealed record E2eeIntegrityScan(
+        List<FileIntegrityIssue> Issues,
+        Dictionary<(string FileId, int Index), string> LegacyHashes);
 
     /// <summary>
     /// E2EE カタログ保存の結果が不明な場合の安全側の回収。

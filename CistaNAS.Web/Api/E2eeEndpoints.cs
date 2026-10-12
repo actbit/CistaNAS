@@ -2,6 +2,7 @@ using CistaNAS.Shared.Crypto;
 using CistaNAS.Web.Authorization;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
+using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -46,6 +47,12 @@ public static class E2eeEndpoints
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
         e2ee.MapGet("/{volumeName}/files", ListFiles)
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
+        e2ee.MapGet("/{volumeName}/integrity", VerifyIntegrity)
+            .RequireAuthorization(CistaAuthorities.VolumeOwner);
+        e2ee.MapPost("/{volumeName}/repair/{fileId}", RepairFile)
+            .RequireAuthorization(CistaAuthorities.VolumeOwner);
+        e2ee.MapPost("/{volumeName}/gc", CollectOrphanChunks)
+            .RequireAuthorization(CistaAuthorities.VolumeOwner);
         e2ee.MapGet("/{volumeName}/stats", GetStats)
             .RequireAuthorization(CistaAuthorities.VolumeAccess);
 
@@ -430,6 +437,35 @@ public static class E2eeEndpoints
         {
             return Results.BadRequest(new { error = ex.Message });
         }
+    }
+
+    private static async Task<IResult> VerifyIntegrity(string volumeName, HttpContext ctx, E2eeFileService e2eeFs)
+    {
+        try
+        {
+            return Results.Ok(await e2eeFs.VerifyIntegrityAsync(volumeName, ct: ctx.RequestAborted));
+        }
+        catch (FileServiceException ex) { return Results.BadRequest(new { error = ex.Message }); }
+    }
+
+    private static async Task<IResult> RepairFile(string volumeName, string fileId, HttpContext ctx, E2eeFileService e2eeFs)
+    {
+        try
+        {
+            return Results.Ok(await e2eeFs.RepairAsync(volumeName, fileId, ctx.RequestAborted));
+        }
+        catch (FileServiceException ex) { return Results.BadRequest(new { error = ex.Message }); }
+    }
+
+    private static async Task<IResult> CollectOrphanChunks(
+        string volumeName, bool? dryRun, HttpContext ctx, ChunkGarbageCollector gc)
+    {
+        try
+        {
+            return Results.Ok(await gc.CollectAsync(volumeName, dryRun ?? true, ctx.RequestAborted));
+        }
+        catch (FileServiceException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        catch (VolumeException ex) { return Results.BadRequest(new { error = ex.Message }); }
     }
 
     private static async Task<IResult> AddWrappedKey(string volumeName, E2eeAddWrappedKeyRequest req,

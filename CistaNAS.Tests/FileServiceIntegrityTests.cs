@@ -3,6 +3,7 @@ using CistaNAS.Web.Journal;
 using CistaNAS.Web.Models;
 using CistaNAS.Web.Services;
 using CistaNAS.Web.Storage;
+using Microsoft.Extensions.Options;
 using Xunit.Abstractions;
 
 namespace CistaNAS.Tests;
@@ -321,6 +322,80 @@ public sealed class FileServiceIntegrityTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task Recovery_EmptyJournal_QuarantinesMissingChunk()
+    {
+        await using var fixture = await Fixture.CreateAsync(true, false);
+        await fixture.UploadAsync("damaged.bin", new byte[9000]);
+        var metadata = Assert.Single((await fixture.Files.ListAsync(fixture.Volume)).Files);
+        string objectId = Assert.IsType<string>(metadata.ChunkObjectId);
+
+        await fixture.Storage.DeleteAsync($"{fixture.Volume}/chunks/{objectId}/00001");
+
+        // 未コミットジャーナルが無い場合でも、整合性監査は独立して実行される。
+        await fixture.Files.RecoverAsync(fixture.Volume);
+
+        var recovered = Assert.Single((await fixture.Files.ListAsync(fixture.Volume)).Files);
+        Assert.True(recovered.NeedsRepair);
+        await Assert.ThrowsAsync<FileServiceException>(() =>
+            fixture.Files.DownloadAsync(fixture.Volume, "damaged.bin"));
+    }
+
+    [Fact]
+    public async Task Repair_RestoredChunk_ClearsNeedsRepair()
+    {
+        await using var fixture = await Fixture.CreateAsync(true, false);
+        await fixture.UploadAsync("recoverable.bin", new byte[9000]);
+        var metadata = Assert.Single((await fixture.Files.ListAsync(fixture.Volume)).Files);
+        string objectId = Assert.IsType<string>(metadata.ChunkObjectId);
+        string chunkPath = $"{fixture.Volume}/chunks/{objectId}/00001";
+        byte[] originalChunk = (await fixture.Storage.ReadAsync(chunkPath))!;
+
+        await fixture.Storage.DeleteAsync(chunkPath);
+        await fixture.Files.RecoverAsync(fixture.Volume);
+        Assert.True(Assert.Single((await fixture.Files.ListAsync(fixture.Volume)).Files).NeedsRepair);
+
+        await fixture.Storage.WriteAsync(chunkPath, new MemoryStream(originalChunk));
+        var report = await fixture.Files.RepairAsync(fixture.Volume, "recoverable.bin");
+
+        Assert.True(report.IsHealthy);
+        Assert.False(Assert.Single((await fixture.Files.ListAsync(fixture.Volume)).Files).NeedsRepair);
+        Assert.Equal(9000, (await fixture.ReadAsync("recoverable.bin")).Length);
+    }
+
+    [Fact]
+    public async Task MissingCatalog_IsNotTreatedAsEmptyCatalog()
+    {
+        await using var fixture = await Fixture.CreateAsync(true, false);
+        await fixture.UploadAsync("keep.bin", [1, 2, 3]);
+        Assert.NotNull(await fixture.Storage.ReadAsync($"{fixture.Volume}/catalog.json"));
+
+        await fixture.Storage.DeleteAsync($"{fixture.Volume}/catalog.json");
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            fixture.Files.UploadAsync(fixture.Volume, "new.bin", new MemoryStream([4]), 1));
+        await Assert.ThrowsAsync<InvalidDataException>(() => fixture.Files.ListAsync(fixture.Volume));
+        Assert.Null(await fixture.Storage.ReadAsync($"{fixture.Volume}/catalog.json"));
+    }
+
+    [Fact]
+    public async Task OrphanChunkGc_DryRunReportsCandidate_AndHoldPeriodPreservesIt()
+    {
+        await using var fixture = await Fixture.CreateAsync(true, false);
+        await fixture.UploadAsync("keep.bin", [1, 2, 3]);
+        await fixture.Storage.WriteAsync(
+            $"{fixture.Volume}/chunks/orphan-generation/00000", new MemoryStream([9, 9, 9]));
+
+        var dryRun = await fixture.GarbageCollector.CollectAsync(fixture.Volume, dryRun: true);
+        Assert.Contains("orphan-generation", dryRun.Candidates);
+        Assert.Equal(0, dryRun.DeletedCount);
+
+        var scheduled = await fixture.GarbageCollector.CollectAsync(fixture.Volume, dryRun: false);
+        Assert.Equal(0, scheduled.DeletedCount);
+        Assert.NotNull(await fixture.Storage.ReadAsync(
+            $"{fixture.Volume}/chunks/orphan-generation/00000"));
+    }
+
+    [Fact]
     public async Task Delete_WithQueuedDownload_CompletesAndAllowsRecreation()
     {
         await using var fixture = await Fixture.CreateAsync(false, false);
@@ -416,6 +491,10 @@ public sealed class FileServiceIntegrityTests(ITestOutputHelper output)
         public string Volume { get; } = "integrity-" + Guid.NewGuid().ToString("N");
         public FileService Files { get; }
         public FaultStorage Storage { get; }
+        public ChunkGarbageCollector GarbageCollector
+            => new(_volumes, new JournalService(Storage), Storage,
+                new S3ChunkStore(Storage),
+                _services.GetRequiredService<IOptions<CistaNasOptions>>());
         public bool IsChunked => _volumes.IsChunkMode(Volume);
         public long PhysicalLength => new FileInfo(Path.Combine(_root, Volume, "volume.dat")).Length;
 

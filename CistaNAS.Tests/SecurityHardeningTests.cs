@@ -44,7 +44,7 @@ public sealed class SecurityHardeningTests : IAsyncDisposable
     }
 
     [Fact]
-    public async Task E2eeCreate_RejectsOversizedEncryptedNameBeforeCatalogWrite()
+    public async Task E2eeCreate_RejectsOversizedEncryptedNameWithoutChangingCatalog()
     {
         await _volumes.CreateE2eeAsync(
             "name-limit", "alice", new VolumeHeader.UserWrappedKey());
@@ -57,7 +57,10 @@ public sealed class SecurityHardeningTests : IAsyncDisposable
             "alice"));
 
         var catalog = _services.GetRequiredService<IStorageProvider>();
-        Assert.False(await catalog.ExistsAsync("name-limit/catalog-e2ee.json"));
+        Assert.True(await catalog.ExistsAsync("name-limit/catalog-e2ee.json"));
+        byte[]? catalogBytes = await catalog.ReadAsync("name-limit/catalog-e2ee.json");
+        using var catalogJson = System.Text.Json.JsonDocument.Parse(catalogBytes!);
+        Assert.Empty(catalogJson.RootElement.GetProperty("Files").EnumerateObject());
     }
 
     [Fact]

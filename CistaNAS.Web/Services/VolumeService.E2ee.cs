@@ -1,4 +1,5 @@
 using CistaNAS.Web.Models;
+using CistaNAS.Web.Storage;
 using CistaNAS.Web.Volume;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -29,9 +30,11 @@ public sealed partial class VolumeService
                 throw new VolumeException($"ボリューム '{name}' は既に存在します。");
 
             var header = VolumeHeader.CreateE2ee(name, username, wrappedKey, chunkSize);
+            header.CatalogInitialized = true;
 
             Directory.CreateDirectory(VolumeDir(name));
             await _metaStore.SaveAsync(name, header);
+            await CatalogStorage.InitializeEmptyAsync(_metaStore.Storage, name, e2ee: true);
 
             // E2EE は opaque chunk storage のみをサポートする。
             MountInternalChunked(name, header, masterKey: null);
@@ -139,9 +142,11 @@ public sealed partial class VolumeService
                 throw new VolumeException($"グループボリューム '{volName}' は既に存在します。");
 
             var header = VolumeHeader.CreateE2ee(volName, ownerUsername, ownerWrappedKey, chunkSize);
+            header.CatalogInitialized = true;
 
             Directory.CreateDirectory(VolumeDir(volName));
             await _metaStore.SaveAsync(volName, header);
+            await CatalogStorage.InitializeEmptyAsync(_metaStore.Storage, volName, e2ee: true);
 
             MountInternalChunked(volName, header, masterKey: null);
 
