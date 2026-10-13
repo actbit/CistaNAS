@@ -1,6 +1,7 @@
 using System.Threading;
 using Amazon.S3;
 using Amazon.S3.Model;
+using CistaNAS.Web.Configuration;
 using System.Globalization;
 
 namespace CistaNAS.Web.Storage;
@@ -14,17 +15,27 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
     private readonly IAmazonS3 _client;
     private readonly string _bucket;
     private readonly string _prefix;
+    private readonly S3ConditionalRequestOptions _conditionalRequests;
     public string RecoveryIdentity { get; }
     private static readonly TimeSpan LockLease = TimeSpan.FromMinutes(5);
 
     public S3StorageProvider(string bucket, string region, string? endpointOverride, string? pathPrefix)
-        : this(bucket, region, endpointOverride, pathPrefix, null) { }
+        : this(bucket, region, endpointOverride, pathPrefix, null, null) { }
+
+    public S3StorageProvider(string bucket, string region, string? endpointOverride, string? pathPrefix,
+        S3ConditionalRequestOptions? conditionalRequests)
+        : this(bucket, region, endpointOverride, pathPrefix, null, conditionalRequests) { }
 
     internal S3StorageProvider(string bucket, string region, string? endpointOverride, string? pathPrefix,
         IAmazonS3? client)
+        : this(bucket, region, endpointOverride, pathPrefix, client, null) { }
+
+    internal S3StorageProvider(string bucket, string region, string? endpointOverride, string? pathPrefix,
+        IAmazonS3? client, S3ConditionalRequestOptions? conditionalRequests)
     {
         _bucket = bucket;
         _prefix = NormalizePrefix(pathPrefix);
+        _conditionalRequests = conditionalRequests ?? new S3ConditionalRequestOptions();
 
         var config = new AmazonS3Config
         {
@@ -156,9 +167,10 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
                     BucketName = _bucket,
                     Key = key,
                     InputStream = body,
-                    IfNoneMatch = "*",
+                    IfNoneMatch = _conditionalRequests.PutIfNoneMatch ? "*" : null,
                 }, ct);
-                return new S3LockReleaser(_client, _bucket, key, response.ETag);
+                return new S3LockReleaser(_client, _bucket, key, response.ETag,
+                    _conditionalRequests.PutIfMatch, _conditionalRequests.DeleteIfMatch);
             }
             catch (AmazonS3Exception ex) when (ex.StatusCode is System.Net.HttpStatusCode.PreconditionFailed or System.Net.HttpStatusCode.Conflict)
             {
@@ -171,12 +183,13 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
                     if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var expiresAt) &&
                         expiresAt <= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
                     {
-                        await _client.DeleteObjectAsync(new DeleteObjectRequest
+                        var deleteRequest = new DeleteObjectRequest
                         {
                             BucketName = _bucket,
                             Key = key,
-                            IfMatch = metadata.ETag,
-                        }, ct);
+                            IfMatch = _conditionalRequests.DeleteIfMatch ? metadata.ETag : null,
+                        };
+                        await _client.DeleteObjectAsync(deleteRequest, ct);
                         continue;
                     }
                 }
@@ -203,26 +216,31 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
         return default;
     }
 
-    private sealed class S3LockReleaser : IDisposable
+    internal sealed class S3LockReleaser : IDisposable
     {
         private readonly IAmazonS3 _client;
         private readonly string _bucket;
         private readonly string _key;
         private readonly SemaphoreSlim _gate = new(1, 1);
         private readonly Timer _renewal;
+        private readonly bool _putIfMatch;
+        private readonly bool _deleteIfMatch;
         private string? _etag;
         private int _released;
 
-        public S3LockReleaser(IAmazonS3 client, string bucket, string key, string? etag)
+        public S3LockReleaser(IAmazonS3 client, string bucket, string key, string? etag,
+            bool putIfMatch, bool deleteIfMatch)
         {
             _client = client;
             _bucket = bucket;
             _key = key;
             _etag = etag;
+            _putIfMatch = putIfMatch;
+            _deleteIfMatch = deleteIfMatch;
             _renewal = new Timer(_ => _ = RenewAsync(), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
         }
 
-        private async Task RenewAsync()
+        internal async Task RenewAsync()
         {
             try
             {
@@ -233,13 +251,14 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
                     var expiry = DateTimeOffset.UtcNow.Add(LockLease).ToUnixTimeMilliseconds()
                         .ToString(CultureInfo.InvariantCulture);
                     using var body = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(expiry));
-                    var response = await _client.PutObjectAsync(new PutObjectRequest
+                    var request = new PutObjectRequest
                     {
                         BucketName = _bucket,
                         Key = _key,
                         InputStream = body,
-                        IfMatch = _etag,
-                    });
+                        IfMatch = _putIfMatch ? _etag : null,
+                    };
+                    var response = await _client.PutObjectAsync(request);
                     _etag = response.ETag;
                 }
                 finally
@@ -261,12 +280,13 @@ public sealed class S3StorageProvider : IStorageProvider, IAsyncDisposable
             _gate.Wait();
             try
             {
-                _client.DeleteObjectAsync(new DeleteObjectRequest
+                var request = new DeleteObjectRequest
                 {
                     BucketName = _bucket,
                     Key = _key,
-                    IfMatch = _etag,
-                }).GetAwaiter().GetResult();
+                    IfMatch = _deleteIfMatch ? _etag : null,
+                };
+                _client.DeleteObjectAsync(request).GetAwaiter().GetResult();
             }
             catch (AmazonS3Exception ex) when (ex.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.PreconditionFailed or System.Net.HttpStatusCode.Conflict) { }
             finally

@@ -108,10 +108,29 @@ public sealed class StorageOptions
     public string? PathPrefix { get; set; }
 
     /// <summary>
+    /// S3 分散ロックで使用する条件付きリクエスト。S3 以外のプロバイダーでは不使用。
+    /// IDrive e2 など DeleteObject の If-Match 対応が不明なサービスでは、DeleteIfMatch のみ false にできる。
+    /// </summary>
+    public S3ConditionalRequestOptions S3ConditionalRequests { get; set; } = new();
+
+    /// <summary>
     /// ローカルデータおよびクラウドSQLite復旧DBのローカルパス。null の場合は DataRoot を使用。
     /// クラウドDBデプロイでは永続ボリュームマウントパス（例: /app/data）を必ず指定。
     /// </summary>
     public string? VolumeDataPath { get; set; }
+}
+
+/// <summary>S3 分散ロックの条件付きリクエスト設定。</summary>
+public sealed class S3ConditionalRequestOptions
+{
+    /// <summary>ロック新規取得の PUT に If-None-Match: * を付ける。</summary>
+    public bool PutIfNoneMatch { get; set; } = true;
+
+    /// <summary>ロック更新の PUT に現在の ETag を If-Match として付ける。</summary>
+    public bool PutIfMatch { get; set; } = true;
+
+    /// <summary>ロック解放・期限切れ削除の DELETE に現在の ETag を If-Match として付ける。</summary>
+    public bool DeleteIfMatch { get; set; } = true;
 }
 
 public sealed class JwtOptions

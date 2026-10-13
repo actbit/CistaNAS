@@ -175,6 +175,11 @@ Configure under the `CistaNas` section of `appsettings.json`.
       "RegionOrConnectionString": null,
       "EndpointOverride": null,
       "PathPrefix": null,
+      "S3ConditionalRequests": {
+        "PutIfNoneMatch": true,
+        "PutIfMatch": true,
+        "DeleteIfMatch": true
+      },
       "VolumeDataPath": null
     },
     "Jwt": {
@@ -212,6 +217,9 @@ Configure under the `CistaNas` section of `appsettings.json`.
 | `Storage:RegionOrConnectionString` | S3: region, Azure: connection string |
 | `Storage:EndpointOverride` | S3: endpoint override (for MinIO / LocalStack) |
 | `Storage:PathPrefix` | Path prefix within the bucket/container |
+| `Storage:S3ConditionalRequests:PutIfNoneMatch` | `PUT If-None-Match: *` when acquiring an S3 lock. Default `true` |
+| `Storage:S3ConditionalRequests:PutIfMatch` | `PUT If-Match: ETag` when renewing an S3 lock. Default `true` |
+| `Storage:S3ConditionalRequests:DeleteIfMatch` | `DELETE If-Match: ETag` when releasing or removing an expired S3 lock. Default `true`; set to `false` for S3-compatible services with unknown support |
 | `Storage:VolumeDataPath` | Local path for volume.dat (PV mount path on K8s). Defaults to `DataRoot` |
 | `Jwt:SigningKey` | Randomly generated per launch if unset (tokens invalidated on restart) |
 | `Jwt:AccessTokenMinutes` | Access token lifetime in minutes |
