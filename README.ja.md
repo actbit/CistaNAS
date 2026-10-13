@@ -164,6 +164,11 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
       "RegionOrConnectionString": null,
       "EndpointOverride": null,
       "PathPrefix": null,
+      "S3ConditionalRequests": {
+        "PutIfNoneMatch": true,
+        "PutIfMatch": true,
+        "DeleteIfMatch": true
+      },
       "VolumeDataPath": null
     },
     "Network": {
@@ -205,6 +210,9 @@ dotnet run --project CistaNAS.Client -- https://localhost:5001 admin mypassword 
 | `Storage:RegionOrConnectionString` | S3: リージョン、Azure: 接続文字列 |
 | `Storage:EndpointOverride` | S3: エンドポイント上書き（MinIO / LocalStack 用） |
 | `Storage:PathPrefix` | バケット/コンテナ内のパスプレフィックス |
+| `Storage:S3ConditionalRequests:PutIfNoneMatch` | S3 ロック取得時の `PUT If-None-Match: *`。デフォルト `true` |
+| `Storage:S3ConditionalRequests:PutIfMatch` | S3 ロック更新時の `PUT If-Match: ETag`。デフォルト `true` |
+| `Storage:S3ConditionalRequests:DeleteIfMatch` | S3 ロック解放・期限切れ削除時の `DELETE If-Match: ETag`。デフォルト `true`。対応が不明なS3互換サービスでは `false` |
 | `Storage:VolumeDataPath` | ローカルデータ / クラウドSQLite復旧DBのパス（K8sではPVマウントパス）。未設定時は `DataRoot` |
 | `Network:SchemeMode` | `https-redirect` / `proxy`（Cloudflare等） / `http`（閉域のみ） |
 | `TrustedProxies` | `X-Forwarded-*` を信頼するプロキシのIP/CIDR。実際のプロキシ範囲だけ指定 |

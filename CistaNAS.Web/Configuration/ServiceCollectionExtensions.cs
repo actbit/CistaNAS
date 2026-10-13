@@ -172,7 +172,8 @@ public static class ServiceCollectionExtensions
         if (type is null)
             throw new InvalidOperationException(
                 "S3 provider requires AWSSDK.S3 NuGet package. Install: dotnet add package AWSSDK.S3");
-        return (IStorageProvider)Activator.CreateInstance(type, s.BucketOrContainer, s.RegionOrConnectionString, s.EndpointOverride, s.PathPrefix)!;
+        return (IStorageProvider)Activator.CreateInstance(type, s.BucketOrContainer, s.RegionOrConnectionString,
+            s.EndpointOverride, s.PathPrefix, s.S3ConditionalRequests)!;
     }
 
     private static IStorageProvider CreateAzureBlobProvider(StorageOptions s)
