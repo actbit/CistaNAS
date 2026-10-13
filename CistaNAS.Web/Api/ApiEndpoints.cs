@@ -60,6 +60,54 @@ public static class ApiEndpoints
         .RequireAuthorization(CistaAuthorities.AdminOnly)
         .WithName("GetCloudSqliteSyncStatus");
 
+        // ---- アプリケーション更新 ----
+        api.MapGet("/admin/update", (ApplicationUpdateService updateService) =>
+        {
+            return Results.Ok(updateService.GetStatus());
+        })
+        .RequireAuthorization(CistaAuthorities.AdminOnly)
+        .WithName("GetApplicationUpdateStatus");
+
+        api.MapPost("/admin/update/check", (ApplicationUpdateService updateService) =>
+        {
+            try
+            {
+                return Results.Accepted("/api/v1/admin/update", updateService.RequestCheck());
+            }
+            catch (ApplicationUpdateException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (IOException ex)
+            {
+                return Results.Problem(
+                    detail: $"更新確認要求を保存できませんでした: {ex.Message}",
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+        })
+        .RequireAuthorization(CistaAuthorities.AdminOnly)
+        .WithName("RequestApplicationUpdateCheck");
+
+        api.MapPost("/admin/update", (ApplicationUpdateRequest request, ApplicationUpdateService updateService) =>
+        {
+            try
+            {
+                return Results.Accepted("/api/v1/admin/update", updateService.RequestUpdate(request.Version));
+            }
+            catch (ApplicationUpdateException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (IOException ex)
+            {
+                return Results.Problem(
+                    detail: $"更新要求を保存できませんでした: {ex.Message}",
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+        })
+        .RequireAuthorization(CistaAuthorities.AdminOnly)
+        .WithName("RequestApplicationUpdate");
+
         // ---- 認証 ----
         api.MapGet("/auth/has-users", async (AccountService accountService) =>
         {
@@ -609,3 +657,5 @@ public static class ApiEndpoints
         return api;
     }
 }
+
+public sealed record ApplicationUpdateRequest(string? Version);

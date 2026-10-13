@@ -238,6 +238,14 @@ ClientBin/
 *.jfm
 *.pfx
 *.publishsettings
+
+# Debian deployment secrets and local deployment state
+deploy/debian/appsettings.json
+deploy/debian/appsettings.Production.json
+deploy/debian/*.secret.json
+deploy/debian/.deploy.env
+deploy/debian/cloudflare-origin.crt
+deploy/debian/cloudflare-origin.key
 orleans.codegen.cs
 
 # Including strong name files can present a security risk

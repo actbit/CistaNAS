@@ -38,6 +38,7 @@ builder.Services.AddScoped<E2eeApiClient>();
 builder.Services.AddScoped<E2eeFileTransferService>();
 builder.Services.AddScoped<GroupApiClient>();
 builder.Services.AddScoped<EncryptionSettingsClient>();
+builder.Services.AddScoped<ApplicationUpdateApiClient>();
 builder.Services.AddScoped<ClientVolumeMountService>();
 builder.Services.AddScoped<E2eeInterop>();
 builder.Services.AddScoped<E2eeKeyResolverService>();
