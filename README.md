@@ -506,6 +506,69 @@ docker compose up
 docker compose --profile s3 -f docker-compose.yml -f docker-compose.s3.yml up
 ```
 
+### Debian SSH deployment
+
+`deploy/debian/Deploy.ps1` uses the same command for the first deployment and later updates. It builds the
+Debian self-contained .NET distribution locally, transfers it over SSH, and starts it with systemd. The Debian
+bootstrap is idempotent and configures nginx, UFW, and systemd on every run. The application origin is bound only to
+`127.0.0.1:8080`; public ports 80/443 are allowed only from Cloudflare's published IP ranges.
+
+Prepare a Debian user with SSH-key login and passwordless `sudo`, then create the untracked production
+settings file. The settings file is not copied into the distribution: it is installed as the root-owned,
+`cistanas`-group-readable `/etc/cistanas/appsettings.Production.json`. Application data is kept under
+`/var/lib/cistanas/data`.
+
+The tracked `CistaNAS.Web/appsettings.json` remains a shared default configuration. Do not put production
+secrets there; keep them only in the ignored `deploy/debian/appsettings.json` file.
+
+```powershell
+Copy-Item deploy/debian/appsettings.json.example deploy/debian/appsettings.json
+# Edit deploy/debian/appsettings.json and set AllowedHosts,
+# CistaNas:Jwt:SigningKey (at least 32 UTF-8 bytes), and
+# CistaNas:Auth:DefaultAdminPassword.
+# Generate a JWT key with: [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
+
+.\deploy\debian\Deploy.ps1 `
+  -HostName nas.example.com `
+  -UserName deploy `
+  -SshKeyPath "$env:USERPROFILE\.ssh\id_ed25519" `
+  -SettingsFile .\deploy\debian\appsettings.json `
+  -SshAllowFrom "203.0.113.10/32" `
+  -OriginCertificateFile .\deploy\debian\cloudflare-origin.crt `
+  -OriginKeyFile .\deploy\debian\cloudflare-origin.key
+```
+
+Use a Cloudflare Origin CA certificate and `Full (strict)` when possible. Without an origin certificate the
+bootstrap falls back to HTTP between Cloudflare and nginx. SSH is kept separate from Cloudflare and is
+restricted to the deployment source CIDR; the server's provider firewall/security group should apply the
+same 80/443 and SSH restrictions.
+
+### Automatic systemd package publishing from `release`
+
+Merging into the `release` branch runs `.github/workflows/release.yml`, which:
+
+1. Selects the first version as `v0.1.0`, then increments the patch number for later releases.
+2. Builds self-contained `linux-x64` and `linux-arm64` .NET distributions.
+3. Creates the version tag only after both builds succeed.
+4. Attaches tarballs and SHA-256 checksums to the matching GitHub Release.
+
+Re-running the workflow for the same commit reuses its existing version tag. The Debian-side update check runs only
+when an administrator presses “Check for updates” in the CistaNAS admin Settings page; it does not install updates
+automatically. An administrator can then explicitly request an update. A root-owned
+systemd service then verifies the SHA-256 checksum, switches `/opt/cistanas/releases`, restarts systemd, and rolls back
+when the health check fails. Use the existing SSH `Deploy.ps1` for the initial bootstrap and emergency manual deployment.
+
+Public repositories need no additional update configuration. For a private repository, put a read-only GitHub
+token in the root-only `/etc/cistanas/update.env` file:
+
+```bash
+sudoedit /etc/cistanas/update.env
+# CISTANAS_GITHUB_REPOSITORY=actbit/CistaNAS
+# CISTANAS_GITHUB_TOKEN=<read-only GitHub token>
+sudo chmod 600 /etc/cistanas/update.env
+# Version checks are started from the admin Settings page.
+```
+
 ### Environment variables
 
 | Variable | Description |
@@ -616,7 +679,7 @@ revalidation.
 
 ## Tests
 
-The GitHub Actions workflow runs on PRs and master pushes: Windows service/client tests, Chromium
+The GitHub Actions workflow runs on PRs and master/release pushes: Windows service/client tests, Chromium
 browser tests, Linux MinIO/PostgreSQL integration tests, and Android Debug x64/Release arm64 builds.
 Test results are retained as TRX artifacts. Actual Dokan driver tests require a Windows host with
 the driver installed and are excluded from hosted CI; native Android viewer tests require a device

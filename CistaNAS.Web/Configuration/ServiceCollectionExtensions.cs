@@ -69,6 +69,9 @@ public static class ServiceCollectionExtensions
         // 暗号化設定の永続化（appsettings.json 直書きを廃止し DB ファイルへ）(H-6)
         services.AddSingleton<EncryptionSettingsService>();
 
+        // 管理画面からの更新要求。root権限のsystemdサービスへ要求ファイルで委譲する。
+        services.AddSingleton<ApplicationUpdateService>();
+
         return services;
     }
 

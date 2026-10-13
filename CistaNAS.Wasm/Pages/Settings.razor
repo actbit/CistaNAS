@@ -10,6 +10,7 @@
 @inject E2eeInterop E2ee
 @inject E2eeKeyResolverService KeyResolver
 @inject EncryptionSettingsClient EncSettingsApi
+@inject ApplicationUpdateApiClient UpdateApi
 @inject IJSRuntime JS
 @inject NavigationManager Nav
 
@@ -139,6 +140,46 @@ else
                         <button class="btn btn-success" @onclick="HandleAddUser">追加</button>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <!-- アプリケーション更新 (admin) -->
+        <div class="card mb-4">
+            <div class="card-header">アプリケーション更新</div>
+            <div class="card-body">
+                @if (_updateStatus is null)
+                {
+                    <p class="text-muted">更新情報を取得できませんでした。</p>
+                }
+                else
+                {
+                    <dl class="row mb-3">
+                        <dt class="col-sm-4">現在のバージョン</dt>
+                        <dd class="col-sm-8">@(_updateStatus.CurrentVersion ?? "不明")</dd>
+                        <dt class="col-sm-4">Releaseの最新版</dt>
+                        <dd class="col-sm-8">@(_updateStatus.LatestVersion ?? "未確認")</dd>
+                        <dt class="col-sm-4">状態</dt>
+                        <dd class="col-sm-8">@(_updateStatus.Message ?? _updateStatus.State)</dd>
+                    </dl>
+                    @if (_updateError is not null)
+                    {
+                        <div class="alert alert-danger">@_updateError</div>
+                    }
+                    @if (_updateStatus.UpdateAvailable && _updateStatus.LatestVersion is not null)
+                    {
+                        <button class="btn btn-warning" disabled="@_updateLoading" @onclick="HandleRequestUpdate">
+                            @(_updateLoading ? "更新を要求中..." : $"{_updateStatus.LatestVersion}へ更新")
+                        </button>
+                        <p class="form-text mt-2">実行するとサービスが再起動されます。ヘルスチェックに失敗した場合は自動的に直前の版へ戻ります。</p>
+                    }
+                    else
+                    {
+                        <span class="text-muted">適用できる更新はありません。</span>
+                    }
+                    <button class="btn btn-outline-secondary btn-sm ms-2" disabled="@_updateLoading" @onclick="HandleCheckApplicationUpdate">
+                        @(_updateLoading ? "確認中..." : "更新を確認")
+                    </button>
+                }
             </div>
         </div>
 
@@ -435,6 +476,11 @@ else
     private string? _keyError;
     private string? _keySuccess;
 
+    // アプリケーション更新
+    private ApplicationUpdateStatus? _updateStatus;
+    private bool _updateLoading;
+    private string? _updateError;
+
     protected override async Task OnInitializedAsync()
     {
         Auth.StateChanged += OnAuthStateChanged;
@@ -449,6 +495,7 @@ else
         {
             try { _users = await AccountApi.ListWithRolesAsync(); } catch { }
             try { _globalSharingEnabled = await EncSettingsApi.GetSharingEnabledAsync(); } catch { }
+            await LoadApplicationUpdate();
         }
 
         try { _groups = await GroupApi.ListGroupsAsync(); } catch { }
@@ -467,6 +514,62 @@ else
         }
         catch { }
         try { _hasLegacyPrivKey = await KeyResolver.HasLegacyPrivateKeyAsync(Auth.CurrentUsername); } catch { }
+    }
+
+    private async Task LoadApplicationUpdate()
+    {
+        _updateError = null;
+        try
+        {
+            _updateStatus = await UpdateApi.GetStatusAsync();
+        }
+        catch (Exception ex)
+        {
+            _updateError = $"更新情報の取得に失敗しました: {ex.Message}";
+        }
+    }
+
+    private async Task HandleCheckApplicationUpdate()
+    {
+        if (_updateLoading) return;
+
+        _updateLoading = true;
+        _updateError = null;
+        try
+        {
+            _updateStatus = await UpdateApi.CheckForUpdatesAsync();
+            await Task.Delay(750);
+            _updateStatus = await UpdateApi.GetStatusAsync();
+        }
+        catch (Exception ex)
+        {
+            _updateError = $"更新確認に失敗しました: {ex.Message}";
+        }
+        finally
+        {
+            _updateLoading = false;
+        }
+    }
+
+    private async Task HandleRequestUpdate()
+    {
+        if (_updateStatus?.LatestVersion is null || _updateLoading) return;
+        if (!await JS.InvokeAsync<bool>("confirm", $"{_updateStatus.LatestVersion}へ更新しますか？サービスが再起動されます。")) return;
+
+        _updateLoading = true;
+        _updateError = null;
+        try
+        {
+            _updateStatus = await UpdateApi.RequestUpdateAsync(_updateStatus.LatestVersion);
+        }
+        catch (Exception ex)
+        {
+            _updateError = $"更新要求に失敗しました: {ex.Message}";
+        }
+        finally
+        {
+            _updateLoading = false;
+        }
     }
 
     // ---- パスワード変更 ----

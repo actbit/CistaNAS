@@ -447,6 +447,93 @@ HTTPをHTTPSへリダイレクト）、CloudflareなどがTLS終端してorigin�
 閉域のHTTP運用だけを許可する場合は `http` を指定します。`proxy` の場合はCloudflare/Ingress側で
 外部HTTP→HTTPSリダイレクトを有効にし、originを直接インターネットへ公開しないでください。
 
+### DebianへのSSHデプロイ
+
+`deploy/debian/Deploy.ps1` は、初回と更新で同じコマンドを使うためのデプロイスクリプトです。
+ローカルでDebian向けの自己完結.NET配布物を作成し、SSHでDebianへ転送してsystemdで起動します。
+Debian側では初回だけでなく毎回、nginx・UFW・systemdの設定を冪等に確認します。アプリケーション本体のoriginポートは
+`127.0.0.1:8080` のみにバインドされ、外部の80/443はCloudflareの公開IP範囲からだけ許可されます。
+
+Debianには、SSH鍵でログインでき、パスワードなしの `sudo` が可能なユーザーを用意してください。
+SSH自体はCloudflareを経由しないため、初回はデプロイ元のIP/CIDRを `-SshAllowFrom` で指定するか、
+省略して現在のSSH接続元を自動登録します。IPが変わった場合は新しいCIDRを指定して再実行します。
+
+本番の `appsettings.json` は秘密ファイルとしてリポジトリ外で管理します。
+リポジトリ内の `CistaNAS.Web/appsettings.json` は共通の既定値として残し、秘密値はそこへ書き込まず、
+デプロイ用の `deploy/debian/appsettings.json` にだけ記載してください。
+
+```powershell
+Copy-Item deploy/debian/appsettings.json.example deploy/debian/appsettings.json
+# deploy/debian/appsettings.json を編集し、次を設定する
+#   AllowedHosts
+#   CistaNas:Jwt:SigningKey（UTF-8で32バイト以上）
+#   CistaNas:Auth:DefaultAdminPassword
+# JWT鍵の生成例: [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
+
+.\deploy\debian\Deploy.ps1 `
+  -HostName nas.example.com `
+  -UserName deploy `
+  -SshKeyPath "$env:USERPROFILE\.ssh\id_ed25519" `
+  -SettingsFile .\deploy\debian\appsettings.json `
+  -SshAllowFrom "203.0.113.10/32" `
+  -OriginCertificateFile .\deploy\debian\cloudflare-origin.crt `
+  -OriginKeyFile .\deploy\debian\cloudflare-origin.key
+```
+
+SSHユーザー証明書をファイルパスではなく文字列で渡す場合は、`SshPrivateKey` と
+`SshCertificate` を使用できます。秘密値をコマンド履歴へ直接書かず、環境変数やシークレットストアから渡してください。
+
+```powershell
+$sshPrivateKey = $env:CISTANAS_SSH_PRIVATE_KEY
+$sshCertificate = $env:CISTANAS_SSH_CERTIFICATE
+.\deploy\debian\Deploy.ps1 `
+  -HostName ssh-origin.example.com `
+  -UserName debian `
+  -SshPrivateKey $sshPrivateKey `
+  -SshCertificate $sshCertificate `
+  -SettingsFile .\deploy\debian\appsettings.json
+```
+
+文字列の秘密鍵・証明書は実行中だけ一時ファイルへ書き込み、SSH転送終了後に削除します。
+`SshCertificate` はOpenSSHユーザー証明書（通常は `*-cert.pub` の内容）であり、Cloudflare Origin CA証明書とは別物です。
+
+`deploy/debian/appsettings.json` は `.gitignore` 済みで、配布物には含めません。
+デプロイ時にDebianの `/etc/cistanas/appsettings.Production.json` へroot所有・`cistanas` グループ読み取り専用で配置します。
+アプリデータは `/var/lib/cistanas/data` に保存されるため、初回も更新も上記の同じコマンドで実行できます。
+
+Cloudflare Origin CA証明書と鍵を指定した場合は、nginxが443でTLSを終端し、CloudflareのSSL/TLSモードは
+`Full (strict)` にします。証明書を指定しない場合はHTTP originで起動しますが、本番ではOrigin CA証明書を
+設定してから `Full (strict)` に切り替えてください。CloudflareのIP範囲はデプロイ時に公式エンドポイント
+から取得するため、リポジトリ内に固定値を持ちません。サーバー側のクラウドファイアウォールやセキュリティ
+グループも、80/443はCloudflareのIP範囲のみ、SSHは管理用IPのみになるよう同じ制限を設定してください。
+
+### Releaseからsystemd用配布物への自動公開
+
+`release` ブランチへマージすると、`.github/workflows/release.yml` が自動的に次を実行します。
+
+1. 既存のバージョンタグを確認し、最初は `v0.1.0`、以降はパッチ番号を加算したバージョンを決定
+2. `linux-x64` と `linux-arm64` の自己完結.NET配布物をビルド
+3. ビルド成功後にバージョンタグを作成
+4. tar.gzとSHA-256チェックサムをGitHub Releaseへ添付
+
+同じコミットでワークフローを再実行しても、既存のバージョンタグを再利用します。Debian側の
+管理画面の「設定」→「アプリケーション更新」の「更新を確認」ボタンを押したときだけGitHub Releaseを確認します。
+管理者が更新ボタンを押したときだけ、
+root権限のsystemdサービスが配布物のSHA-256を検証して `/opt/cistanas/releases` を切り替え、systemdを再起動します。
+ヘルスチェックに失敗した場合は直前の配布物へ戻します。初回のDebian構築と緊急時の手動デプロイは
+従来どおり `Deploy.ps1` のSSHデプロイを使います。
+
+公開リポジトリなら追加設定は不要です。非公開リポジトリの場合は、Debianのroot専用ファイル
+`/etc/cistanas/update.env` にGitHubの読み取り専用トークンを設定します。
+
+```bash
+sudoedit /etc/cistanas/update.env
+# CISTANAS_GITHUB_REPOSITORY=actbit/CistaNAS
+# CISTANAS_GITHUB_TOKEN=<GitHubの読み取り専用トークン>
+sudo chmod 600 /etc/cistanas/update.env
+# 更新確認は管理画面の「更新を確認」ボタンから実行する
+```
+
 ### 環境変数
 
 | 変数 | 説明 |
@@ -571,7 +658,7 @@ E2EEチャンクボリュームは暗号文の長さとSHA-256だけで検査で
 
 ## テスト
 
-GitHub ActionsでPR・masterへのpush時に、Windowsのサーバー／クライアントテスト、Chromiumのブラウザー
+GitHub ActionsでPR・master・releaseへのpush時に、Windowsのサーバー／クライアントテスト、Chromiumのブラウザー
 テスト、LinuxのMinIO／PostgreSQL統合テスト、Android Debug x64／Release arm64ビルドを実行します。
 TRX結果を成果物として保存します。実DokanドライバテストはドライバのあるWindows環境で実行するため、
 ホスト型CIから除外します。AndroidのネイティブViewerには端末・エミュレーターが必要です

@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for a manual CistaNAS GitHub Release check request
+
+[Path]
+PathChanged=/var/lib/cistanas/update-check-request.json
+Unit=cistanas-update-check.service
+
+[Install]
+WantedBy=multi-user.target

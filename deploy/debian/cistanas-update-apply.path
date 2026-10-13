@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for an approved CistaNAS update request
+
+[Path]
+PathChanged=/var/lib/cistanas/update-request.json
+Unit=cistanas-update.service
+
+[Install]
+WantedBy=multi-user.target

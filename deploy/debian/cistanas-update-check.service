@@ -1,0 +1,8 @@
+[Unit]
+Description=Check for a new CistaNAS GitHub Release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/cistanas-update check
