@@ -144,8 +144,42 @@ public sealed class WasmUploadIntegrityTests
         Assert.Equal(1, server.Released);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LostFinalizeResponse_DoesNotDeleteCommittedUpload(bool v2)
+    {
+        using var server = new UploadServer { LoseFinalizeResponse = true };
+        using var http = new HttpClient(server) { BaseAddress = new Uri("http://test/") };
+        await using var crypto = new E2eeInterop(new FakeCrypto());
+        var transfer = new CistaNAS.Wasm.Services.E2eeFileTransferService(new E2eeApiClient(http), crypto);
+        using var source = new MemoryStream(new byte[3]);
+        await Assert.ThrowsAsync<HttpRequestException>(() => v2
+            ? transfer.UploadV2Async("vol", "file", source, 3, 1024, new E2eeV2KeyContext("volume", 1, Convert.ToBase64String(new byte[32])))
+            : transfer.UploadAsync("vol", "file", source, 3, 1024, "master"));
+        Assert.Equal(1, server.Finalized);
+        Assert.Equal(0, server.Deleted);
+        Assert.Equal(1, server.Released);
+    }
+
+    [Fact]
+    public async Task UnsupportedServer_IsRejectedBeforeUploadingContent()
+    {
+        using var server = new UploadServer { LegacyServer = true };
+        using var http = new HttpClient(server) { BaseAddress = new Uri("http://test/") };
+        await using var crypto = new E2eeInterop(new FakeCrypto());
+        var transfer = new CistaNAS.Wasm.Services.E2eeFileTransferService(new E2eeApiClient(http), crypto);
+        using var source = new MemoryStream(new byte[3]);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transfer.UploadAsync("vol", "file", source, 3, 1024, "master"));
+        Assert.Empty(server.UploadEpochHeaders);
+        Assert.Equal(1, server.Deleted);
+        Assert.Equal(1, server.Released);
+    }
+
     private sealed class UploadServer : HttpMessageHandler
     {
+        public bool LoseFinalizeResponse;
+        public bool LegacyServer;
         public List<string?> UploadEpochHeaders { get; } = [];
         public int Finalized, Deleted, Released;
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
@@ -155,8 +189,12 @@ public sealed class WasmUploadIntegrityTests
                 UploadEpochHeaders.Add(request.Headers.TryGetValues("X-Chunk-KeyEpoch", out var epochs) ? epochs.Single() : null);
             if (path.EndsWith("create-file"))
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Created)
-                { Content = new StringContent("{\"fileId\":\"file\",\"encryptedName\":\"name\",\"writeLeaseToken\":\"lease\"}", System.Text.Encoding.UTF8, "application/json") });
-            if (path.Contains("finalize-file")) Finalized++;
+                { Content = new StringContent(LegacyServer ? "{\"fileId\":\"file\",\"encryptedName\":\"name\",\"writeLeaseToken\":\"lease\"}" : "{\"fileId\":\"file\",\"encryptedName\":\"name\",\"writeLeaseToken\":\"lease\",\"uploadPending\":true}", System.Text.Encoding.UTF8, "application/json") });
+            if (path.Contains("finalize-file"))
+            {
+                Finalized++;
+                if (LoseFinalizeResponse) throw new HttpRequestException("Response lost after commit");
+            }
             if (request.Method == HttpMethod.Delete)
             { if (path.EndsWith("write-lease")) Released++; else Deleted++; }
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));

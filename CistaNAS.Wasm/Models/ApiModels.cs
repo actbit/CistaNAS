@@ -87,13 +87,14 @@ public sealed class WrappedKeyParams
 public sealed record E2eeCreateVolumeRequest(string VolumeName, string? Username, UserWrappedKey WrappedMasterKey, int ChunkSize = 1048576);
 public sealed record E2eeCreateFileRequest(
     string EncryptedName, long EncryptedLength, int ChunkCount,
-    int KeyEpoch = 0, WrappedAeadKeyParams? WrappedFileKey = null, string? FileId = null);
+    int KeyEpoch = 0, WrappedAeadKeyParams? WrappedFileKey = null, string? FileId = null, bool StagedUpload = false);
 public sealed record E2eeFinalizeFileRequest(long ActualEncryptedLength, int? ChunkCount = null);
 public sealed record E2eeListFilesResponse(IReadOnlyList<E2eeFileEntry> Files);
 public sealed record E2eeMountResponse(int ChunkSize, string EncryptionMode);
 
 public sealed class E2eeFileEntry
 {
+    public bool UploadPending { get; set; }
     public required string FileId { get; set; }
     public required string EncryptedName { get; set; }
     public long Offset { get; set; }

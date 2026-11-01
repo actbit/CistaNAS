@@ -2066,6 +2066,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
             string? writeLease = null;
             WrappedAeadKey? localWrappedFileKey = null;
             bool finalized = false;
+            bool finalizeStarted = false;
             try
             {
                 if (isV2)
@@ -2104,16 +2105,17 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 }
                 // FinalizeFile で長さ確定。新規ファイルでも切り詰め宣言（SetEndOfFile）が
                 // ある場合は ChunkCount を渡してサーバー側も確実に論理切り詰めさせる。
+                finalizeStarted = true;
                 _api.FinalizeFileAsync(_volumeName, fileId!, encLength, writeLease, chunkCount).GetAwaiter().GetResult();
                 finalized = true;
             }
             catch
             {
-                // ロールバック: 作成中の fileId を削除し、サーバーに孤児ファイルを残さない（Critical-4）。
+                // 確定要求後は応答だけが失われた可能性があるため削除しない。
                 // バッファ側は RollbackChunkUpload で未永続化に戻す（クローンがデータを保持）。
                 try
                 {
-                    if (fileId is not null && writeLease is not null)
+                    if (!finalizeStarted && fileId is not null && writeLease is not null)
                         _api.DeleteFileAsync(_volumeName, fileId, writeLease).GetAwaiter().GetResult();
                 }
                 catch { /* ベストエフォート */ }

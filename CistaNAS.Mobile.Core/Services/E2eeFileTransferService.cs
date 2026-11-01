@@ -157,6 +157,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
         try
         {
             (string fileId, string lease) = await api.CreateFileAsync(volumeName, encryptedName, encryptedLength, chunkCount);
+            bool finalizeStarted = false;
             try
             {
                 using var secureBuffer = new SecureBuffer(chunkSize);
@@ -176,12 +177,13 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
                     progress?.Report((double)(i + 1) / chunkCount * 100);
                 }
                 ct.ThrowIfCancellationRequested();
+                finalizeStarted = true;
                 await api.FinalizeFileAsync(volumeName, fileId, encryptedLength, lease, chunkCount);
                 return (fileId, chunkCount);
             }
             catch
             {
-                await CleanupFailedUploadAsync(api, volumeName, fileId, lease);
+                if (!finalizeStarted) await CleanupFailedUploadAsync(api, volumeName, fileId, lease);
                 throw;
             }
             finally
@@ -222,6 +224,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
                     Ciphertext = ctBytes,
                     Tag = tag,
                 }, fileId);
+            bool finalizeStarted = false;
             try
             {
                 using var secureBuffer = new SecureBuffer(chunkSize);
@@ -241,12 +244,13 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
                     progress?.Report((double)(i + 1) / chunkCount * 100);
                 }
                 ct.ThrowIfCancellationRequested();
+                finalizeStarted = true;
                 await api.FinalizeFileAsync(volumeName, fileId, encryptedLength, lease, chunkCount);
                 return (fileId, chunkCount);
             }
             catch
             {
-                await CleanupFailedUploadAsync(api, volumeName, fileId, lease);
+                if (!finalizeStarted) await CleanupFailedUploadAsync(api, volumeName, fileId, lease);
                 throw;
             }
             finally
@@ -283,7 +287,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
     private static async Task CleanupFailedUploadAsync(CistaNasApiClient api, string volumeName, string fileId, string lease)
     {
         try { await api.DeleteFileAsync(volumeName, fileId, lease); }
-        catch { /* ロールバック失敗は無視 (finalize 未了の孤立ファイルは finalize 前提のため自然消滅) */ }
+        catch { /* 削除できなかった未確定ファイルは非公開のまま残る。 */ }
     }
 
     private static long ValidatePlainLength(E2eeFileEntry entry)

@@ -117,6 +117,7 @@ public sealed class E2eeFileService
                 Offset = 0,
                 EncryptedLength = request.EncryptedLength,
                 ChunkCount = request.ChunkCount,
+                UploadPending = request.StagedUpload,
                 KeyEpoch = request.KeyEpoch,
                 CreatedKeyEpoch = request.KeyEpoch,
                 WrappedFileKey = request.KeyEpoch >= 1 ? request.WrappedFileKey : null,
@@ -388,6 +389,9 @@ public sealed class E2eeFileService
             if (!catalog.Files.TryGetValue(fileId, out var entry))
                 throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
 
+            if (entry.UploadPending)
+                throw new FileServiceException("アップロードはまだ確定していません。");
+
             if (chunkIndex < 0 || chunkIndex >= entry.ChunkCount)
                 throw new FileServiceException($"チャンクインデックス {chunkIndex} は範囲外です。");
             if (entry.NeedsRepair)
@@ -511,6 +515,7 @@ public sealed class E2eeFileService
                 await EnsureQuotaAsync(volumeName, entry.OwnerUsername, entry,
                     actualStoredLength, requestedChunkCount, ct);
                 entry.EncryptedLength = actualStoredLength;
+                entry.UploadPending = false;
                 entry.ModifiedAt = DateTimeOffset.UtcNow;
 
                 // ファイル長変更（縮小）時のチャンク数調整（論理切り詰め）。
@@ -653,7 +658,7 @@ public sealed class E2eeFileService
         // Catalog absence does not mean a gate is idle: deletion and queued
         // downloads may still own it. Retain gates until volume cleanup so a
         // recreated file ID and older requests continue sharing the same gate.
-        return new E2eeListFilesResponse(catalog.Files.Values.OrderBy(f => f.CreatedAt).ToList());
+        return new E2eeListFilesResponse(catalog.Files.Values.Where(f => !f.UploadPending).OrderBy(f => f.CreatedAt).ToList());
     }
 
     /// <summary>
@@ -702,10 +707,12 @@ public sealed class E2eeFileService
         {
             using var distributedCatalogLock = await AcquireCatalogLockAsync(volumeName, ct);
             var catalog = await LoadCatalogAsync(volumeName, ct);
-            IEnumerable<KeyValuePair<string, E2eeFileEntry>> entries = catalog.Files;
+            // In-progress uploads are intentionally incomplete; auditing them would mark
+            // healthy uploads as damaged and prevent their finalization.
+            IEnumerable<KeyValuePair<string, E2eeFileEntry>> entries = catalog.Files.Where(pair => !pair.Value.UploadPending);
             if (fileId is not null)
             {
-                if (!catalog.Files.TryGetValue(fileId, out var entry))
+                if (!catalog.Files.TryGetValue(fileId, out var entry) || entry.UploadPending)
                     throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
                 entries = new[] { new KeyValuePair<string, E2eeFileEntry>(fileId, entry) };
             }
@@ -770,6 +777,9 @@ public sealed class E2eeFileService
                 var catalog = await LoadCatalogAsync(volumeName, ct);
                 if (!catalog.Files.TryGetValue(fileId, out var entry))
                     throw new FileServiceException($"ファイル '{fileId}' が見つかりません。");
+
+                if (entry.UploadPending)
+                    throw new FileServiceException("アップロードはまだ確定していません。");
 
                 var scan = await VerifyChunkEntriesAsync(
                     volumeName,

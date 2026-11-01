@@ -235,6 +235,9 @@ public class ApiClientTests(AspireFixture fixture)
         Assert.False(string.IsNullOrEmpty(fileId));
 
         await Api.UploadChunkAsync(volName, fileId, 0, encData, writeLease);
+        Assert.Empty(await Api.ListFilesAsync(volName));
+        await Assert.ThrowsAsync<HttpRequestException>(() => Api.DownloadChunkAsync(volName, fileId, 0));
+        await Api.FinalizeFileAsync(volName, fileId, encData.Length, writeLease, 1);
         var (downloaded, _, _) = await Api.DownloadChunkAsync(volName, fileId, 0);
 
         byte[] decrypted = E2eeCrypto.DecryptChunk(downloaded, fileKey, 0, out var extractedSalt);
@@ -281,6 +284,7 @@ public class ApiClientTests(AspireFixture fixture)
 
         var (fileId, writeLease) = await Api.CreateFileAsync(volName, encName, encData.Length, 1);
         await Api.UploadChunkAsync(volName, fileId, 0, encData, writeLease);
+        await Api.FinalizeFileAsync(volName, fileId, encData.Length, writeLease, 1);
 
         var files = await Api.ListFilesAsync(volName);
         Assert.Single(files);
@@ -332,6 +336,7 @@ public class ApiClientTests(AspireFixture fixture)
 
         for (int i = 0; i < 3; i++)
             await Api.UploadChunkAsync(volName, fileId, i, encChunks[i], writeLease);
+        await Api.FinalizeFileAsync(volName, fileId, totalLen, writeLease, 3);
 
         // チャンク0からfileSaltを取得
         var (downloaded0, _, _) = await Api.DownloadChunkAsync(volName, fileId, 0);
