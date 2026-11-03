@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Supply this file as a first-boot/user-data script on a compatible Debian image.
+set -Eeuo pipefail
+
+# Change these non-secret values before creating the VPS.
+export CISTANAS_DOMAIN='nas.example.com'
+export CISTANAS_EMAIL='admin@example.com'
+export CISTANAS_SSH_ALLOW_FROM='203.0.113.10/32'
+# This account must already exist and have your SSH public key installed.
+export CISTANAS_DEPLOY_USER='root'
+export CISTANAS_GITHUB_REPOSITORY='actbit/CistaNAS'
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl
+workdir="$(mktemp -d /root/cistanas-setup.XXXXXX)"
+trap 'rm -rf -- "$workdir"' EXIT
+cd "$workdir"
+base="https://github.com/${CISTANAS_GITHUB_REPOSITORY}/releases/latest/download"
+curl -fLsS --retry 3 -o cistanas-debian-setup.tar.gz "$base/cistanas-debian-setup.tar.gz"
+curl -fLsS --retry 3 -o cistanas-debian-setup.tar.gz.sha256 "$base/cistanas-debian-setup.tar.gz.sha256"
+sha256sum -c cistanas-debian-setup.tar.gz.sha256
+tar -xzf cistanas-debian-setup.tar.gz
+bash ./firstboot.sh

@@ -16,6 +16,8 @@ readonly REQUEST_FILE="/var/lib/cistanas/update-request.json"
 readonly LOCK_FILE="/var/lib/cistanas/update.lock"
 readonly SERVICE_NAME="cistanas"
 readonly HEALTH_URL="http://127.0.0.1:8080/health"
+health_host="$(jq -r '(.AllowedHosts // "localhost") | split(";")[0]' /etc/cistanas/appsettings.Production.json)"
+[[ "$health_host" != '*' && -n "$health_host" ]] || health_host=localhost
 
 if [[ ! -r "${UPDATE_ENV}" ]]; then
     echo "Update configuration is missing: ${UPDATE_ENV}" >&2
@@ -174,6 +176,7 @@ apply_release() {
     chown -R root:root "${stage_dir}"
     find "${stage_dir}" -type d -exec chmod 0755 {} +
     chmod 0755 "${stage_dir}/CistaNAS.Web"
+    ln -sfnT /etc/cistanas/appsettings.Production.json "${stage_dir}/appsettings.Production.json"
     mv "${stage_dir}" "${RELEASE_ROOT}/${latest_version}"
 
     previous_target=""
@@ -186,7 +189,7 @@ apply_release() {
 
     healthy=false
     for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-        if curl --fail --silent --max-time 5 "${HEALTH_URL}" >/dev/null; then
+        if curl --fail --silent --max-time 5 -H "Host: ${health_host}" "${HEALTH_URL}" >/dev/null; then
             healthy=true
             break
         fi

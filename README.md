@@ -523,9 +523,8 @@ secrets there; keep them only in the ignored `deploy/debian/appsettings.json` fi
 
 ```powershell
 Copy-Item deploy/debian/appsettings.json.example deploy/debian/appsettings.json
-# Edit deploy/debian/appsettings.json and set AllowedHosts,
-# CistaNas:Jwt:SigningKey (at least 32 UTF-8 bytes), and
-# CistaNas:Auth:DefaultAdminPassword.
+# Edit deploy/debian/appsettings.json and set AllowedHosts and
+# CistaNas:Jwt:SigningKey (a random value of at least 32 UTF-8 bytes).
 # Generate a JWT key with: [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
 
 .\deploy\debian\Deploy.ps1 `
@@ -583,7 +582,7 @@ sudo chmod 600 /etc/cistanas/update.env
 | `CistaNas__Volume__ChunkStorage` | `local` or `auto` (auto-chunk on S3) |
 | `CistaNas__Volume__ServerChunkSize` | Server-side chunk size (bytes) |
 | `CistaNas__Jwt__SigningKey` | JWT signing key (Base64) |
-| `CistaNas__Auth__DefaultAdminPassword` | Initial admin password |
+| `CistaNas__Auth__DefaultAdminPassword` | Legacy setting; not used to create the initial administrator |
 
 ## Kubernetes
 

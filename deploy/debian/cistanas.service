@@ -9,6 +9,7 @@ User=cistanas
 Group=cistanas
 WorkingDirectory=/opt/cistanas/current
 EnvironmentFile=-/etc/cistanas/cistanas.env
+EnvironmentFile=-/etc/cistanas/aws.env
 ExecStart=/opt/cistanas/current/CistaNAS.Web
 Restart=on-failure
 RestartSec=5s
