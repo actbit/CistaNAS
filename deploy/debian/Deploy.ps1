@@ -73,10 +73,8 @@ if ($SshAllowFrom -and ($SshAllowFrom.Contains("'") -or $SshAllowFrom.Contains('
 try {
     $settings = Get-Content -LiteralPath $SettingsFile -Raw | ConvertFrom-Json
     $signingKey = [string]$settings.CistaNas.Jwt.SigningKey
-    $adminPassword = [string]$settings.CistaNas.Auth.DefaultAdminPassword
     if ($signingKey -like "REPLACE_WITH_*") { throw "CistaNas.Jwt.SigningKey はサンプル値から変更してください。" }
     if ([Text.Encoding]::UTF8.GetByteCount($signingKey) -lt 32) { throw "CistaNas.Jwt.SigningKey はUTF-8で32バイト以上にしてください。" }
-    if ([string]::IsNullOrWhiteSpace($adminPassword) -or $adminPassword -like "REPLACE_WITH_*") { throw "CistaNas.Auth.DefaultAdminPassword を設定してください。" }
 }
 catch { throw "appsettings.json の検査に失敗しました: $($_.Exception.Message)" }
 
@@ -169,11 +167,13 @@ sudo install -d -o root -g root -m 0755 '$RemoteRoot/releases/$version'
 sudo tar -xzf '$remotePackage' -C '$RemoteRoot/releases/$version'
 sudo chown -R root:root '$RemoteRoot/releases/$version'
 sudo chmod 0755 '$RemoteRoot/releases/$version/CistaNAS.Web'
+sudo ln -sfnT /etc/cistanas/appsettings.Production.json '$RemoteRoot/releases/$version/appsettings.Production.json'
 sudo ln -sfnT '$RemoteRoot/releases/$version' '$RemoteRoot/current'
 sudo install -o root -g cistanas -m 0640 '$remoteSettings' /etc/cistanas/appsettings.Production.json
 sudo systemctl daemon-reload
 sudo systemctl restart cistanas.service
-if ! curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused http://127.0.0.1:8080/health >/dev/null; then
+health_host=`$(sudo jq -r '(.AllowedHosts // "localhost") | split(";")[0] | if . == "*" or . == "" then "localhost" else . end' /etc/cistanas/appsettings.Production.json)
+if ! curl --fail --silent --show-error --retry 30 --retry-delay 1 --retry-connrefused -H "Host: `$health_host" http://127.0.0.1:8080/health >/dev/null; then
     sudo systemctl --no-pager --full status cistanas.service || true
     exit 1
 fi

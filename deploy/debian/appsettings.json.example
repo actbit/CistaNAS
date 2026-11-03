@@ -1,5 +1,5 @@
 {
-  "AllowedHosts": "nas.example.com",
+  "AllowedHosts": "nas.example.com;localhost",
   "CistaNas": {
     "DataRoot": "/var/lib/cistanas/data",
     "TrustedProxies": [
@@ -20,8 +20,7 @@
       "SigningKey": "REPLACE_WITH_AT_LEAST_32_RANDOM_BYTES"
     },
     "Auth": {
-      "DefaultAdminUser": "admin",
-      "DefaultAdminPassword": "REPLACE_WITH_A_LONG_RANDOM_PASSWORD"
+      "DefaultAdminUser": "admin"
     }
   }
 }

@@ -18,6 +18,14 @@ readonly UPDATE_SERVICE_SOURCE="${9:?update service source is required}"
 readonly UPDATE_CHECK_SERVICE_SOURCE="${10:?update check service source is required}"
 readonly UPDATE_CHECK_PATH_SOURCE="${11:?update check path source is required}"
 readonly UPDATE_APPLY_PATH_SOURCE="${12:?update apply path source is required}"
+LE_DOMAIN="${13:-}"
+readonly LE_EMAIL="${14:-}"
+if [[ -z "$LE_DOMAIN" && -f /etc/cistanas/letsencrypt-domain && -z "$CERT_SOURCE$KEY_SOURCE" ]]; then
+    LE_DOMAIN="$(< /etc/cistanas/letsencrypt-domain)"
+fi
+if [[ -n "$LE_DOMAIN" && ! "$LE_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+    echo 'Invalid Let’s Encrypt domain.' >&2; exit 1
+fi
 
 if ! id "${DEPLOY_USER}" >/dev/null 2>&1; then
     echo "Deployment user does not exist: ${DEPLOY_USER}" >&2
@@ -32,8 +40,24 @@ for source in "${SERVICE_SOURCE}" "${UPDATE_SCRIPT_SOURCE}" "${UPDATE_SERVICE_SO
 done
 
 export DEBIAN_FRONTEND=noninteractive
+. /etc/os-release
+case "${ID}:${VERSION_ID}" in
+    debian:12) runtime_packages=(libicu72 libssl3) ;;
+    debian:13) runtime_packages=(libicu76 libssl3t64) ;;
+    *) echo "Supported systems: Debian 12 and 13 (detected ${ID}:${VERSION_ID})." >&2; exit 1 ;;
+esac
+if [[ -z "${SSH_ALLOW_FROM}" && -f /etc/cistanas/ssh-allow-from ]]; then
+    SSH_ALLOW_FROM="$(< /etc/cistanas/ssh-allow-from)"
+fi
+if [[ -z "${SSH_ALLOW_FROM}" && -n "${SSH_CONNECTION:-}" ]]; then
+    SSH_ALLOW_FROM="${SSH_CONNECTION%% *}"
+fi
+[[ -n "${SSH_ALLOW_FROM}" ]] || { echo "SSH allow-list is empty." >&2; exit 1; }
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl jq nginx ufw
+apt-get install -y --no-install-recommends ca-certificates curl jq nginx ufw python3 libc6 libgcc-s1 libgssapi-krb5-2 libstdc++6 tzdata zlib1g "${runtime_packages[@]}"
+if [[ -n "$LE_DOMAIN" ]]; then
+    apt-get install -y --no-install-recommends certbot
+fi
 
 if ! getent group cistanas >/dev/null 2>&1; then
     groupadd --system cistanas
@@ -46,7 +70,7 @@ install -d -o root -g root -m 0755 "${INSTALL_ROOT}"
 install -d -o root -g root -m 0755 "${INSTALL_ROOT}/releases"
 install -d -o cistanas -g cistanas -m 0750 /var/lib/cistanas
 install -d -o cistanas -g cistanas -m 0750 /var/lib/cistanas/data
-install -d -o root -g root -m 0750 /etc/cistanas
+install -d -o root -g cistanas -m 0750 /etc/cistanas
 install -d -o root -g root -m 0755 /usr/local/libexec
 
 if [[ ! -f /etc/cistanas/cistanas.env ]]; then
@@ -140,9 +164,18 @@ printf '%s\n' "${SSH_ALLOW_FROM}" > /etc/cistanas/ssh-allow-from
 chmod 0640 /etc/cistanas/ssh-allow-from
 
 cat > /etc/nginx/conf.d/cistanas-map.conf <<'NGINX_MAP'
+geo $cistanas_cloudflare_peer {
+    default 0;
+    include /etc/nginx/cistanas-cloudflare-ips.conf;
+}
 map $http_upgrade $cistanas_connection_upgrade { default upgrade; '' close; }
-map $http_cf_connecting_ip $cistanas_client_ip { default $http_cf_connecting_ip; '' $remote_addr; }
+map "$cistanas_cloudflare_peer:$http_cf_connecting_ip" $cistanas_client_ip {
+    ~^1:(.+)$ $1;
+    default $remote_addr;
+}
 NGINX_MAP
+
+awk '{ print $0 " 1;" }' "${cloudflare_ip_file}" > /etc/nginx/cistanas-cloudflare-ips.conf
 
 cat > /etc/nginx/snippets/cistanas-proxy.conf <<'NGINX_PROXY'
 proxy_pass http://127.0.0.1:8080;
@@ -160,7 +193,60 @@ proxy_read_timeout 3600s;
 proxy_send_timeout 3600s;
 NGINX_PROXY
 
-if [[ -s /etc/cistanas/cloudflare-origin.crt && -s /etc/cistanas/cloudflare-origin.key ]]; then
+# Keep the application closed while an unattended install creates its first admin.
+if [[ "${CISTANAS_INITIALIZE_ADMIN:-}" == 1 ]]; then
+    printf 'return 503;\n' > /etc/nginx/snippets/cistanas-initial-guard.conf
+elif [[ ! -f /etc/nginx/snippets/cistanas-initial-guard.conf ]]; then
+    : > /etc/nginx/snippets/cistanas-initial-guard.conf
+fi
+
+install -d -m 0755 /var/lib/cistanas-acme/.well-known/acme-challenge
+if [[ -n "$LE_DOMAIN" && ! -s "/etc/letsencrypt/live/$LE_DOMAIN/fullchain.pem" ]]; then
+    [[ -n "$LE_EMAIL" ]] || { echo 'An email is required for first-time certificate issuance.' >&2; exit 1; }
+    cat > /etc/nginx/sites-available/cistanas <<'NGINX_ACME'
+server {
+    listen 80 default_server; listen [::]:80 default_server; server_name _;
+    location ^~ /.well-known/acme-challenge/ { root /var/lib/cistanas-acme; }
+    location / { return 503; }
+}
+NGINX_ACME
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sfn /etc/nginx/sites-available/cistanas /etc/nginx/sites-enabled/cistanas
+    nginx -t
+    systemctl enable --now nginx.service
+    systemctl reload nginx.service
+    certbot certonly --webroot -w /var/lib/cistanas-acme --non-interactive --agree-tos \
+        --email "$LE_EMAIL" --cert-name "$LE_DOMAIN" -d "$LE_DOMAIN"
+fi
+
+if [[ -n "$LE_DOMAIN" ]]; then
+    printf '%s\n' "$LE_DOMAIN" > /etc/cistanas/letsencrypt-domain
+    cat > /etc/nginx/sites-available/cistanas <<NGINX_LE
+server {
+    listen 80 default_server; listen [::]:80 default_server; server_name _;
+    location ^~ /.well-known/acme-challenge/ { root /var/lib/cistanas-acme; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+server {
+    listen 443 ssl default_server; listen [::]:443 ssl default_server; server_name _;
+    ssl_certificate /etc/letsencrypt/live/$LE_DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$LE_DOMAIN/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3; client_max_body_size 10g;
+    add_header Strict-Transport-Security "max-age=2592000" always;
+    location ^~ /.well-known/acme-challenge/ { root /var/lib/cistanas-acme; }
+    location / { include /etc/nginx/snippets/cistanas-initial-guard.conf; include /etc/nginx/snippets/cistanas-proxy.conf; }
+}
+NGINX_LE
+    install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+    cat > /etc/letsencrypt/renewal-hooks/deploy/cistanas-nginx <<'HOOK'
+#!/bin/sh
+set -e
+nginx -t
+systemctl reload nginx.service
+HOOK
+    chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/cistanas-nginx
+    systemctl enable --now certbot.timer
+elif [[ -s /etc/cistanas/cloudflare-origin.crt && -s /etc/cistanas/cloudflare-origin.key ]]; then
     cat > /etc/nginx/sites-available/cistanas <<'NGINX_TLS'
 server { listen 80 default_server; listen [::]:80 default_server; server_name _; return 301 https://$host$request_uri; }
 server {
@@ -168,13 +254,14 @@ server {
     ssl_certificate /etc/cistanas/cloudflare-origin.crt;
     ssl_certificate_key /etc/cistanas/cloudflare-origin.key;
     ssl_protocols TLSv1.2 TLSv1.3; client_max_body_size 10g;
-    location / { include /etc/nginx/snippets/cistanas-proxy.conf; }
+    add_header Strict-Transport-Security "max-age=2592000" always;
+    location / { include /etc/nginx/snippets/cistanas-initial-guard.conf; include /etc/nginx/snippets/cistanas-proxy.conf; }
 }
 NGINX_TLS
 else
     echo "No Origin certificate; nginx will use HTTP only." >&2
     cat > /etc/nginx/sites-available/cistanas <<'NGINX_HTTP'
-server { listen 80 default_server; listen [::]:80 default_server; server_name _; client_max_body_size 10g; location / { include /etc/nginx/snippets/cistanas-proxy.conf; } }
+server { listen 80 default_server; listen [::]:80 default_server; server_name _; client_max_body_size 10g; location / { include /etc/nginx/snippets/cistanas-initial-guard.conf; include /etc/nginx/snippets/cistanas-proxy.conf; } }
 NGINX_HTTP
 fi
 

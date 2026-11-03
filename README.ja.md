@@ -449,6 +449,96 @@ HTTPをHTTPSへリダイレクト）、CloudflareなどがTLS終端してorigin�
 
 ### DebianへのSSHデプロイ
 
+#### 短いコマンドで構築
+
+この変更を含むRelease公開後、Debian 12/13上で次を実行すると、ドメイン、証明書用メール、SSH接続元IPを対話形式で確認します。
+このコマンドはインターネットから取得したスクリプトをroot権限で実行するため、内容を確認する場合は先にダウンロードしてください。
+
+```bash
+curl -fsSL https://github.com/actbit/CistaNAS/releases/latest/download/install.sh | sudo bash
+```
+
+既定はSQLite・ローカルストレージで、初期管理者パスワードは自動生成されます。SSH鍵は事前に設定してください。
+初回起動スクリプトなど、端末から入力できない環境では、引数を指定できます（rootで実行する場合は `sudo` 不要）。
+
+```bash
+curl -fsSL https://github.com/actbit/CistaNAS/releases/latest/download/install.sh | sudo bash -s -- \
+  --domain nas.example.com --email admin@example.com --ssh-allow 203.0.113.10/32 --user deploy
+```
+
+DBとS3を指定する例です。示したファイルはあらかじめ安全な方法でサーバーへ配置し、rootのみ読み取り可能にしてください。
+コマンド中のファイルパスはrootから見たパスです。
+
+```bash
+curl -fsSL https://github.com/actbit/CistaNAS/releases/latest/download/install.sh | sudo bash -s -- \
+  --domain nas.example.com --email admin@example.com --ssh-allow 203.0.113.10/32 --user deploy \
+  --db-provider postgresql --db-connection-file /root/cistanas-db-connection \
+  --storage s3 --s3-bucket example-bucket --s3-region us-east-1 \
+  --s3-endpoint https://s3.example.com --s3-prefix cistanas/ --chunk-storage auto \
+  --s3-access-key-file /root/cistanas-s3-access --s3-secret-key-file /root/cistanas-s3-secret \
+  --s3-put-if-none-match true --s3-put-if-match true --s3-delete-if-match false \
+  --admin-password-file /root/cistanas-admin-password
+```
+
+`--db-provider` は `sqlite`、`postgresql`、`s3` を選べます。`s3` のDBを使う場合は `--storage s3` も必要です。
+各条件付きリクエストは省略時 `true` です。`false` はS3互換サービス側の対応を確認して選択してください。
+無効化するとロックや並行操作の安全性に影響します。初回構築には空のDB・専用バケットを使用してください。
+各機密値は直接引数でも指定できますが、シェル履歴やプロセス一覧に残るため `-file` を推奨します。
+VPSのユーザーデータに直接記載すると事業者やOS側に残る可能性があるため、秘密情報は別途安全に配置してください。
+省略したS3認証情報はAWS SDKの既定の認証方法を使用します。全オプションは `install.sh --help` で確認できます。
+
+#### VPSの初回起動時に自動構築
+
+次回以降のReleaseに含まれる `user-data.sh.example` を、VPSの初回起動スクリプトとして使えます。
+先頭のドメイン、メールアドレス、SSH接続元IP、既存SSHユーザー名を編集してください。
+cloud-initのユーザーデータでシェルスクリプトを受け取れる環境でも使えます。netcupの入力方法は
+契約とOSイメージにより異なるため、利用する画面の対応形式を確認してください。
+
+事前にSSH公開鍵の登録と、CloudflareでのDNS設定が必要です。サーバーのIPが確定してDNSへ設定されるまで
+証明書発行は成功しません。Cloudflare側でHTTPの認証パスを通し、初回発行時にはoriginにHTTPで接続できるようにします。
+既存のサーバー設定を変更するため、専用の新規Debian 12/13サーバーで使用してください。
+
+初回起動時に署名鍵とランダムな初期管理者パスワードをサーバー上で生成します。アプリへの外部アクセスは
+管理者作成が成功するまでnginxで503を返します。初期パスワードはSSHまたはサーバーコンソールから
+`sudo cat /root/cistanas-initial-admin.json` で確認し、ログイン後に変更してファイルを削除してください。
+初期化処理のエラーはcloud-init対応環境では `/var/log/cloud-init-output.log` で確認できます。
+失敗時は自動で公開を解除しないため、状態と上記の資格情報ファイルを確認してください。
+一度作成されたサーバーでスクリプトを再実行しても、既存データを上書きしないよう停止します。
+
+#### サーバーで手動実行
+
+Debianサーバー上で初回構築できます。今後作成されるGitHub Releaseには構築用ファイル一式も含まれます。
+以下は公開リポジトリの場合です。リポジトリを取得済みなら `deploy/debian` を使うこともできます。
+`appsettings.json.example` をコピーし、ホスト名と署名キーを設定してから実行します。
+手動実行では管理者は自動作成されません。初回セットアップ画面へのアクセスを制限してから管理者を作成してください。
+SSH鍵でログインできる既存ユーザーと、SSH接続元IPを指定してください。
+
+```bash
+mkdir cistanas-setup && cd cistanas-setup
+curl -fL -O https://github.com/actbit/CistaNAS/releases/latest/download/cistanas-debian-setup.tar.gz
+curl -fL -O https://github.com/actbit/CistaNAS/releases/latest/download/cistanas-debian-setup.tar.gz.sha256
+sha256sum -c cistanas-debian-setup.tar.gz.sha256
+tar -xzf cistanas-debian-setup.tar.gz
+cp appsettings.json.example /tmp/cistanas-settings.json
+chmod 600 /tmp/cistanas-settings.json
+# /tmp/cistanas-settings.json の AllowedHosts と署名キーを編集する
+sudo bash install.sh deploy /tmp/cistanas-settings.json '管理元のIPアドレス' '' '' actbit/CistaNAS nas.example.com admin@example.com
+rm /tmp/cistanas-settings.json
+```
+
+最後の2引数は公開するドメインとLet's Encrypt用メールアドレスです。Cloudflareのプロキシを有効にしたDNSを事前に設定し、
+HTTPの `/.well-known/acme-challenge/` がCloudflareの認証・WAF・HTTPSへの強制転送に遮られないようにしてください。
+初回発行前はCloudflareとorigin間をHTTPで接続できる必要があります。発行後はCloudflareのSSL/TLSモードを
+`Full (strict)` に設定してください。Certbotのタイマーが更新し、更新後にnginxを再読み込みします。
+`sudo certbot renew --dry-run` で更新の疎通を確認できます。自動更新にはCloudflareを通る80番ポートが必要です。
+
+GitHub Releaseの最新版を取得し、整合性を検証してsystemdサービスとして起動します。
+既存のbootstrapと同様、nginxとUFWを設定し、WebアクセスをCloudflareのIPに制限します。
+既存のファイアウォールやnginx設定が変更されるため、専用サーバー向けです。Cloudflare Origin証明書を使う場合は、
+SSH接続元IPに続けて証明書と秘密鍵のパスを指定します。初回構築後の更新は管理画面から行えます。
+Debian 12/13に対応します。既存のUFW許可ルールやクラウド側のファイアウォールも確認してください。
+CloudflareのIP範囲は構築時に取得するため、変更時は再デプロイが必要です。証明書未指定時はorigin区間がHTTPになります。
+
 `deploy/debian/Deploy.ps1` は、初回と更新で同じコマンドを使うためのデプロイスクリプトです。
 ローカルでDebian向けの自己完結.NET配布物を作成し、SSHでDebianへ転送してsystemdで起動します。
 Debian側では初回だけでなく毎回、nginx・UFW・systemdの設定を冪等に確認します。アプリケーション本体のoriginポートは
@@ -467,7 +557,6 @@ Copy-Item deploy/debian/appsettings.json.example deploy/debian/appsettings.json
 # deploy/debian/appsettings.json を編集し、次を設定する
 #   AllowedHosts
 #   CistaNas:Jwt:SigningKey（UTF-8で32バイト以上）
-#   CistaNas:Auth:DefaultAdminPassword
 # JWT鍵の生成例: [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
 
 .\deploy\debian\Deploy.ps1 `
@@ -548,7 +637,7 @@ sudo chmod 600 /etc/cistanas/update.env
 | `CistaNas__Volume__ChunkStorage` | `local` または `auto`（S3 使用時に自動チャンク） |
 | `CistaNas__Volume__ServerChunkSize` | サーバー側チャンクサイズ（バイト） |
 | `CistaNas__Jwt__SigningKey` | JWT 署名鍵（Base64） |
-| `CistaNas__Auth__DefaultAdminPassword` | 初期管理者パスワード |
+| `CistaNas__Auth__DefaultAdminPassword` | 互換用設定。初期管理者の作成には使用されません |
 | `CistaNas__Network__SchemeMode` | `https-redirect` / `proxy` / `http` |
 
 ## Kubernetes

@@ -82,9 +82,14 @@ jobs:
               -p:DebugSymbols=false
 
             tar -czf "$archive" -C "$publish_dir" .
-            sha256sum "$archive" > "$archive.sha256"
+            (cd artifacts && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
             rm -rf "$publish_dir"
           done
+
+          tar -czf artifacts/cistanas-debian-setup.tar.gz -C deploy/debian .
+          (cd artifacts && sha256sum cistanas-debian-setup.tar.gz > cistanas-debian-setup.tar.gz.sha256)
+          cp deploy/debian/quick-install.sh artifacts/install.sh
+          (cd artifacts && sha256sum install.sh > install.sh.sha256)
 
       - name: Publish version tag and GitHub Release
         env:
@@ -108,7 +113,7 @@ jobs:
             git push origin "$VERSION"
           fi
 
-          notes="$(printf 'Debian packages:\n- x86_64: `cistanas-%s-linux-x64.tar.gz`\n- arm64: `cistanas-%s-linux-arm64.tar.gz`\n\nCommit: `%s`\n' "$VERSION" "$VERSION" "$GITHUB_SHA")"
+          notes="$(printf 'Debian packages:\n- Installer: `install.sh`\n- Setup: `cistanas-debian-setup.tar.gz`\n- x86_64: `cistanas-%s-linux-x64.tar.gz`\n- arm64: `cistanas-%s-linux-arm64.tar.gz`\n\nCommit: `%s`\n' "$VERSION" "$VERSION" "$GITHUB_SHA")"
           if gh release view "$VERSION" >/dev/null 2>&1; then
             gh release upload "$VERSION" artifacts/* --clobber
           else
