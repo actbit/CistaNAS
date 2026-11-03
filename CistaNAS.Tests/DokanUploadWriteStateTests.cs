@@ -208,6 +208,7 @@ public class DokanUploadWriteStateTests
         public List<(string Method, string Uri)> Requests { get; } = new();
         public const string CreatedFileId = "newfile123";
         public bool FailFinalize { get; init; }
+        public bool ShowCommitted { get; init; }
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var uri = request.RequestUri!.ToString()!;
@@ -221,6 +222,9 @@ public class DokanUploadWriteStateTests
                     });
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
             }
+            if (ShowCommitted && request.Method == HttpMethod.Get && uri.EndsWith("/files"))
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(
+                    $"{{\"files\":[{{\"fileId\":\"{CreatedFileId}\",\"encryptedName\":\"name\",\"encryptedLength\":35,\"chunkCount\":1,\"createdAt\":\"2026-01-01T00:00:00Z\",\"modifiedAt\":\"2026-01-01T00:00:00Z\"}}]}}", Encoding.UTF8, "application/json") });
             if (uri.Contains("finalize-file") && FailFinalize)
                 throw new HttpRequestException("Response lost after commit");
             if (uri.Contains("upload-chunk") && !FailFinalize)
@@ -279,6 +283,14 @@ public class DokanUploadWriteStateTests
         // 作成中 fileId の DELETE（ロールバック）が呼ばれる
         Assert.Contains(handler.Requests,
             r => r.Method == "DELETE" && r.Uri.Contains(FailUploadChunkHandler.CreatedFileId));
+    }
+
+    [Fact]
+    public async Task FinalizeNewFile_ResponseLost_VisibleFileIsReportedAsSuccess()
+    {
+        var handler = new FailUploadChunkHandler { FailFinalize = true, ShowCommitted = true };
+        var api = new CistaNasApiClient(new HttpClient(handler) { BaseAddress = new Uri("http://test/") });
+        await api.FinalizeNewFileAsync("vol", FailUploadChunkHandler.CreatedFileId, 35, "lease", 1);
     }
 
     [Fact]

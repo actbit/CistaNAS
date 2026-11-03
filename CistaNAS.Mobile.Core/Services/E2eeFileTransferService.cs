@@ -178,7 +178,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
                 }
                 ct.ThrowIfCancellationRequested();
                 finalizeStarted = true;
-                await api.FinalizeFileAsync(volumeName, fileId, encryptedLength, lease, chunkCount);
+                await api.FinalizeNewFileAsync(volumeName, fileId, encryptedLength, lease, chunkCount);
                 return (fileId, chunkCount);
             }
             catch
@@ -245,7 +245,7 @@ public sealed class E2eeFileTransferService(CistaNasApiClient api, E2eeSession e
                 }
                 ct.ThrowIfCancellationRequested();
                 finalizeStarted = true;
-                await api.FinalizeFileAsync(volumeName, fileId, encryptedLength, lease, chunkCount);
+                await api.FinalizeNewFileAsync(volumeName, fileId, encryptedLength, lease, chunkCount);
                 return (fileId, chunkCount);
             }
             catch

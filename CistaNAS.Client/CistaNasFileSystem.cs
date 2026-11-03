@@ -2106,7 +2106,7 @@ public sealed class CistaNasFileSystem : IDokanOperations, IDisposable
                 // FinalizeFile で長さ確定。新規ファイルでも切り詰め宣言（SetEndOfFile）が
                 // ある場合は ChunkCount を渡してサーバー側も確実に論理切り詰めさせる。
                 finalizeStarted = true;
-                _api.FinalizeFileAsync(_volumeName, fileId!, encLength, writeLease, chunkCount).GetAwaiter().GetResult();
+                _api.FinalizeNewFileAsync(_volumeName, fileId!, encLength, writeLease!, chunkCount).GetAwaiter().GetResult();
                 finalized = true;
             }
             catch

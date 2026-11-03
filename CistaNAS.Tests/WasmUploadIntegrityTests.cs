@@ -163,6 +163,16 @@ public sealed class WasmUploadIntegrityTests
     }
 
     [Fact]
+    public async Task LostFinalizeResponse_VisibleFileIsReportedAsSuccess()
+    {
+        using var server = new UploadServer { LoseFinalizeResponse = true, ShowCommitted = true };
+        using var http = new HttpClient(server) { BaseAddress = new Uri("http://test/") };
+        var api = new E2eeApiClient(http);
+        await api.FinalizeNewFileAsync("vol", "file", 35, "lease", 1);
+        Assert.Equal(1, server.Finalized);
+    }
+
+    [Fact]
     public async Task UnsupportedServer_IsRejectedBeforeUploadingContent()
     {
         using var server = new UploadServer { LegacyServer = true };
@@ -180,6 +190,7 @@ public sealed class WasmUploadIntegrityTests
     {
         public bool LoseFinalizeResponse;
         public bool LegacyServer;
+        public bool ShowCommitted;
         public List<string?> UploadEpochHeaders { get; } = [];
         public int Finalized, Deleted, Released;
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
@@ -195,6 +206,9 @@ public sealed class WasmUploadIntegrityTests
                 Finalized++;
                 if (LoseFinalizeResponse) throw new HttpRequestException("Response lost after commit");
             }
+            if (ShowCommitted && request.Method == HttpMethod.Get && path.EndsWith("/files"))
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                { Content = new StringContent("{\"files\":[{\"fileId\":\"file\",\"encryptedName\":\"name\",\"encryptedLength\":35,\"chunkCount\":1}]}", System.Text.Encoding.UTF8, "application/json") });
             if (request.Method == HttpMethod.Delete)
             { if (path.EndsWith("write-lease")) Released++; else Deleted++; }
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));

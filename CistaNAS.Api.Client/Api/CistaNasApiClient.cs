@@ -241,6 +241,23 @@ public sealed class CistaNasApiClient
         res.EnsureSuccessStatusCode();
     }
 
+    // Only for newly staged files: visibility in the listing proves the server committed it.
+    public async Task FinalizeNewFileAsync(string volumeName, string fileId, long actualLength, string writeLeaseToken, int chunkCount)
+    {
+        try { await FinalizeFileAsync(volumeName, fileId, actualLength, writeLeaseToken, chunkCount); }
+        catch (HttpRequestException)
+        {
+            bool committed = false;
+            try
+            {
+                committed = (await ListFilesAsync(volumeName)).Any(f => f.FileId == fileId
+                    && f.EncryptedLength == actualLength && f.ChunkCount == chunkCount);
+            }
+            catch { /* Preserve the original error when the outcome cannot be verified. */ }
+            if (!committed) throw;
+        }
+    }
+
     public async Task DeleteFileAsync(string volumeName, string fileId, string writeLeaseToken)
     {
         using var request = new HttpRequestMessage(HttpMethod.Delete, $"/api/v1/e2ee/{volumeName}/files/{fileId}");

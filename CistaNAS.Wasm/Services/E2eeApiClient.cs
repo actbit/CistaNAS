@@ -114,6 +114,23 @@ public sealed class E2eeApiClient
         response.EnsureSuccessStatusCode();
     }
 
+    // Only for newly staged files: visibility in the listing proves the server committed it.
+    public async Task FinalizeNewFileAsync(string volumeName, string fileId, long length, string lease, int chunkCount, CancellationToken ct = default)
+    {
+        try { await FinalizeFileAsync(volumeName, fileId, length, lease, chunkCount, ct); }
+        catch (HttpRequestException)
+        {
+            bool committed = false;
+            try
+            {
+                committed = (await ListFilesAsync(volumeName, ct)).Files.Any(f => f.FileId == fileId
+                    && f.EncryptedLength == length && f.ChunkCount == chunkCount);
+            }
+            catch { /* Preserve the original error when the outcome cannot be verified. */ }
+            if (!committed) throw;
+        }
+    }
+
     /// <summary>ファイル一覧。</summary>
     public async Task<E2eeListFilesResponse> ListFilesAsync(string volumeName, CancellationToken ct = default)
     {

@@ -60,7 +60,7 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
             // chunkCount も確定させる（Mobile.Core と同じプロトコル。縮小確定に必要）。
             ct.ThrowIfCancellationRequested();
             finalizeStarted = true;
-            await api.FinalizeFileAsync(volumeName, entry.FileId,
+            await api.FinalizeNewFileAsync(volumeName, entry.FileId,
                 E2eeCrypto.ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease, totalChunks, ct);
         }
         catch
@@ -164,7 +164,7 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
             // chunkCount も確定させる（Mobile.Core と同じプロトコル。縮小確定に必要）。
             ct.ThrowIfCancellationRequested();
             finalizeStarted = true;
-            await api.FinalizeFileAsync(volumeName, entry.FileId,
+            await api.FinalizeNewFileAsync(volumeName, entry.FileId,
                 E2eeCrypto.ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease, totalChunks, ct);
             return entry;
         }
