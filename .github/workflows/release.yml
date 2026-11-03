@@ -62,7 +62,7 @@ jobs:
 
       - name: Build Debian packages
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TAG: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -70,7 +70,7 @@ jobs:
 
           for runtime in linux-x64 linux-arm64; do
             publish_dir="publish-$runtime"
-            archive="artifacts/cistanas-$VERSION-$runtime.tar.gz"
+            archive="artifacts/cistanas-$RELEASE_TAG-$runtime.tar.gz"
             rm -rf "$publish_dir"
 
             dotnet publish CistaNAS.Web/CistaNAS.Web.csproj \
@@ -94,31 +94,31 @@ jobs:
       - name: Publish version tag and GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TAG: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
 
           git fetch --tags --force
-          if git show-ref --tags --verify --quiet "refs/tags/$VERSION"; then
-            tag_sha="$(git rev-list -n 1 "$VERSION")"
+          if git show-ref --tags --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
             if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
-              echo "Tag $VERSION already points to $tag_sha, not $GITHUB_SHA" >&2
+              echo "Tag $RELEASE_TAG already points to $tag_sha, not $GITHUB_SHA" >&2
               exit 1
             fi
           else
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git tag --annotate "$VERSION" "$GITHUB_SHA" --message "Release $VERSION"
-            git push origin "$VERSION"
+            git tag --annotate "$RELEASE_TAG" "$GITHUB_SHA" --message "Release $RELEASE_TAG"
+            git push origin "$RELEASE_TAG"
           fi
 
-          notes="$(printf 'Debian packages:\n- Installer: `install.sh`\n- Setup: `cistanas-debian-setup.tar.gz`\n- x86_64: `cistanas-%s-linux-x64.tar.gz`\n- arm64: `cistanas-%s-linux-arm64.tar.gz`\n\nCommit: `%s`\n' "$VERSION" "$VERSION" "$GITHUB_SHA")"
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            gh release upload "$VERSION" artifacts/* --clobber
+          notes="$(printf 'Debian packages:\n- Installer: `install.sh`\n- Setup: `cistanas-debian-setup.tar.gz`\n- x86_64: `cistanas-%s-linux-x64.tar.gz`\n- arm64: `cistanas-%s-linux-arm64.tar.gz`\n\nCommit: `%s`\n' "$RELEASE_TAG" "$RELEASE_TAG" "$GITHUB_SHA")"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" artifacts/* --clobber
           else
-            gh release create "$VERSION" artifacts/* \
+            gh release create "$RELEASE_TAG" artifacts/* \
               --verify-tag \
-              --title "CistaNAS $VERSION" \
+              --title "CistaNAS $RELEASE_TAG" \
               --notes "$notes"
           fi
