@@ -20,7 +20,7 @@ public sealed record E2eeV2KeyContext(string VolumeId, int KeyEpoch, string Grou
 public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
 {
     /// <summary>E2EE ファイルをチャンク暗号化しながらアップロードする。
-    /// 失敗時は作成済みの fileId をロールバック削除し、リースを確実に解放する。</summary>
+    /// 確定前の失敗では作成済みファイルを削除し、リースを解放する。</summary>
     public async Task UploadAsync(string volumeName, string fileName, Stream content,
         long totalSize, int chunkSize, string masterKeyHandle,
         IProgress<double>? progress = null, CancellationToken ct = default)
@@ -36,6 +36,7 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
         var entry = await api.CreateFileAsync(volumeName, encName, estimatedLength, totalChunks, ct);
         string writeLease = entry.WriteLeaseToken
             ?? throw new InvalidDataException("書き込みリースtokenがありません。");
+        bool finalizeStarted = false;
         try
         {
             long bytesRemaining = totalSize;
@@ -58,12 +59,13 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
 
             // chunkCount も確定させる（Mobile.Core と同じプロトコル。縮小確定に必要）。
             ct.ThrowIfCancellationRequested();
-            await api.FinalizeFileAsync(volumeName, entry.FileId,
+            finalizeStarted = true;
+            await api.FinalizeNewFileAsync(volumeName, entry.FileId,
                 E2eeCrypto.ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease, totalChunks, ct);
         }
         catch
         {
-            try { await api.DeleteFileAsync(volumeName, entry.FileId, writeLease); }
+            try { if (!finalizeStarted) await api.DeleteFileAsync(volumeName, entry.FileId, writeLease); }
             catch { }
             throw;
         }
@@ -136,6 +138,7 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
             keyContext.KeyEpoch, wrappedFileKey, fileId, ct);
         string writeLease = entry.WriteLeaseToken
             ?? throw new InvalidDataException("書き込みリースtokenがありません。");
+        bool finalizeStarted = false;
         try
         {
             long bytesRemaining = totalSize;
@@ -160,13 +163,14 @@ public sealed class E2eeFileTransferService(E2eeApiClient api, E2eeInterop e2ee)
 
             // chunkCount も確定させる（Mobile.Core と同じプロトコル。縮小確定に必要）。
             ct.ThrowIfCancellationRequested();
-            await api.FinalizeFileAsync(volumeName, entry.FileId,
+            finalizeStarted = true;
+            await api.FinalizeNewFileAsync(volumeName, entry.FileId,
                 E2eeCrypto.ComputeEncryptedLength(totalSize - bytesRemaining, chunkSize), writeLease, totalChunks, ct);
             return entry;
         }
         catch
         {
-            try { await api.DeleteFileAsync(volumeName, entry.FileId, writeLease); }
+            try { if (!finalizeStarted) await api.DeleteFileAsync(volumeName, entry.FileId, writeLease); }
             catch { }
             throw;
         }

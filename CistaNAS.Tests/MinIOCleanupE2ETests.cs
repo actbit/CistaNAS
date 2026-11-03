@@ -40,6 +40,8 @@ public partial class MinIOStorageE2ETests
         var (fileId, lease) = await Api.CreateFileAsync(volume, "encrypted-name", original.Length, 1);
         await using var storage = CreateStorage();
         await Api.UploadChunkAsync(volume, fileId, 0, original, lease);
+        await Assert.ThrowsAsync<HttpRequestException>(() => Api.DownloadChunkAsync(volume, fileId, 0));
+        await Api.FinalizeFileAsync(volume, fileId, original.Length, lease, 1);
         for (int revision = 1; revision <= 6; revision++)
         {
             byte[] plain = Enumerable.Repeat((byte)revision, 64).ToArray();

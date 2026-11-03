@@ -202,7 +202,7 @@ public class WritePathRound3Tests
                 }
                 CreateFileCount++;
                 return JsonR(HttpStatusCode.OK,
-                    $$"""{"fileId":"new-{{CreateFileCount}}","writeLeaseToken":"new-lease-{{CreateFileCount}}"}""");
+                    $$"""{"fileId":"new-{{CreateFileCount}}","writeLeaseToken":"new-lease-{{CreateFileCount}}","uploadPending":true}""");
             }
 
             if (op == "files" && request.Method == HttpMethod.Get && segments.Length == 5)

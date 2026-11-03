@@ -244,6 +244,10 @@ public partial class MinIOStorageE2ETests(MinIOFixture fixture, ITestOutputHelpe
         for (int i = 0; i < 3; i++)
             await Api.UploadChunkAsync(volName, fileId, i, encChunks[i], writeLease);
 
+        Assert.Empty(await Api.ListFilesAsync(volName));
+        await Assert.ThrowsAsync<HttpRequestException>(() => Api.DownloadChunkAsync(volName, fileId, 0));
+        await Api.FinalizeFileAsync(volName, fileId, totalLen, writeLease, 3);
+
         // 全チャンク復号検証
         for (int i = 0; i < 3; i++)
         {

@@ -22,9 +22,19 @@ public sealed class E2eeApiClient
     {
         using var response = await _http.PostAsJsonAsync(
             $"/api/v1/e2ee/{Uri.EscapeDataString(volumeName)}/create-file",
-            new E2eeCreateFileRequest(encryptedName, encryptedLength, chunkCount, keyEpoch, wrappedFileKey, fileId), ct);
+            new E2eeCreateFileRequest(encryptedName, encryptedLength, chunkCount, keyEpoch, wrappedFileKey, fileId, true), ct);
         response.EnsureSuccessStatusCode();
-        return (await response.Content.ReadFromJsonAsync<E2eeFileEntry>(ct))!;
+        var entry = (await response.Content.ReadFromJsonAsync<E2eeFileEntry>(ct))!;
+        if (!entry.UploadPending)
+        {
+            if (entry.WriteLeaseToken is { } token)
+            {
+                try { await DeleteFileAsync(volumeName, entry.FileId, token); } catch { }
+                try { await ReleaseWriteLeaseAsync(volumeName, entry.FileId, token); } catch { }
+            }
+            throw new InvalidOperationException("Server does not support private staged uploads.");
+        }
+        return entry;
     }
 
     public async Task<string> AcquireWriteLeaseAsync(string volumeName, string fileId, CancellationToken ct = default)
@@ -102,6 +112,23 @@ public sealed class E2eeApiClient
         request.Headers.Add("X-CistaNAS-Write-Lease", writeLeaseToken);
         using var response = await _http.SendAsync(request, ct);
         response.EnsureSuccessStatusCode();
+    }
+
+    // Only for newly staged files: visibility in the listing proves the server committed it.
+    public async Task FinalizeNewFileAsync(string volumeName, string fileId, long length, string lease, int chunkCount, CancellationToken ct = default)
+    {
+        try { await FinalizeFileAsync(volumeName, fileId, length, lease, chunkCount, ct); }
+        catch (HttpRequestException)
+        {
+            bool committed = false;
+            try
+            {
+                committed = (await ListFilesAsync(volumeName, ct)).Files.Any(f => f.FileId == fileId
+                    && f.EncryptedLength == length && f.ChunkCount == chunkCount);
+            }
+            catch { /* Preserve the original error when the outcome cannot be verified. */ }
+            if (!committed) throw;
+        }
     }
 
     /// <summary>ファイル一覧。</summary>

@@ -80,6 +80,7 @@ public sealed record E2eeCreateVolumeRequest(
 /// <summary>E2EE ファイルカタログエントリ。</summary>
 public sealed class E2eeFileEntry
 {
+    public bool UploadPending { get; set; }
     public required string FileId { get; set; }
     public required string EncryptedName { get; set; }
     public long Offset { get; set; }
@@ -179,7 +180,8 @@ public sealed record E2eeCreateFileRequest(
     /// v2 では WrappedFileKey の AAD に fileId が bind されるため、wrap を先に行えるよう
     /// クライアント側で fileId を決めて 1 リクエストで作成できる。未指定時はサーバー生成。
     /// </summary>
-    string? FileId = null);
+    string? FileId = null,
+    bool StagedUpload = false);
 
 /// <summary>crypto format v2: ファイル鍵の再ラップ（GroupKey ローテーション / epoch migration）。</summary>
 public sealed record E2eeRewrapFileKeyEntry(

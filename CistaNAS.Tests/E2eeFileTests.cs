@@ -36,6 +36,29 @@ public partial class E2eeFileTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task StagedUpload_IsHiddenUntilFinalize_AndSurvivesRestartOfService()
+    {
+        string vol = await MountE2eeAsync("staged-upload");
+        var service = GetE2eeFileService();
+        byte[] cipher = RandomNumberGenerator.GetBytes(64);
+        var entry = await service.CreateFileAsync(vol, new E2eeCreateFileRequest("encrypted", cipher.Length, 1, StagedUpload: true), "testuser");
+        Assert.True((await service.VerifyIntegrityAsync(vol)).IsHealthy);
+        await service.UploadChunkAsync(vol, entry.FileId, 0, new MemoryStream(cipher), cipher.Length);
+
+        Assert.Empty((await GetE2eeFileService().ListFilesAsync(vol)).Files);
+        await Assert.ThrowsAsync<FileServiceException>(() => service.DownloadChunkAsync(vol, entry.FileId, 0));
+        await GetE2eeFileService().FinalizeFileAsync(vol, entry.FileId, new E2eeFinalizeFileRequest(cipher.Length, 1));
+        Assert.Single((await service.ListFilesAsync(vol)).Files);
+        var (stream, length, _, _) = await service.DownloadChunkAsync(vol, entry.FileId, 0);
+        using (stream)
+        {
+            byte[] result = new byte[length];
+            await stream.ReadExactlyAsync(result);
+            Assert.Equal(cipher, result);
+        }
+    }
+
+    [Fact]
     public async Task CreateFile_ReturnsEntryWithFileId()
     {
         string vol = await MountE2eeAsync("test-create");

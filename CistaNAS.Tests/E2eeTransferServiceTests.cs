@@ -73,6 +73,20 @@ public class E2eeTransferServiceTests
         Assert.Equal(1, server.ReleasedCount);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LostFinalizeResponse_DoesNotDeleteCommittedUpload(bool v2)
+    {
+        var (service, server) = CreateService(1024, v2);
+        server.LoseFinalizeResponse = true;
+        using var input = new MemoryStream(new byte[3]);
+        await Assert.ThrowsAsync<HttpRequestException>(() => service.UploadAsync(Volume, "file.bin", input, 3));
+        Assert.Equal(1, server.FinalizedCount);
+        Assert.Equal(0, server.DeletedCount);
+        Assert.Equal(1, server.ReleasedCount);
+    }
+
     private sealed class CancelProgress(CancellationTokenSource stop) : IProgress<double>
     { public void Report(double value) { if (value == 100) stop.Cancel(); } }
 
@@ -262,6 +276,7 @@ internal sealed class FakeE2eeServer : HttpMessageHandler
     public E2eeFileEntry? LastCreated { get; private set; }
     public List<int> DownloadRequests { get; } = [];
     public void CorruptChunk(string fileId, int index) => _chunks[(fileId, index)][^1] ^= 1;
+    public bool LoseFinalizeResponse { get; set; }
     public int FinalizedCount { get; private set; }
     public int DeletedCount { get; private set; }
     public int ReleasedCount { get; private set; }
@@ -308,7 +323,7 @@ internal sealed class FakeE2eeServer : HttpMessageHandler
                     WrappedFileKey = root.GetProperty("wrappedFileKey").Deserialize<WrappedAeadKey>(
                         new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true }),
                 };
-                return Task.FromResult(Json(HttpStatusCode.Created, $$"""{"fileId":"{{fileId}}","writeLeaseToken":"lease-1"}"""));
+                return Task.FromResult(Json(HttpStatusCode.Created, $$"""{"fileId":"{{fileId}}","writeLeaseToken":"lease-1","uploadPending":true}"""));
             }
 
             if (op == "upload-chunk" && request.Method == HttpMethod.Post)
@@ -340,6 +355,7 @@ internal sealed class FakeE2eeServer : HttpMessageHandler
             if (op == "finalize-file" && request.Method == HttpMethod.Patch)
             {
                 FinalizedCount++;
+                if (LoseFinalizeResponse) throw new HttpRequestException("Response lost after commit");
                 return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NoContent));
             }
 

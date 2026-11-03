@@ -133,12 +133,21 @@ public sealed class CistaNasApiClient
             wrappedFileKey = wrappedFileKey is null
                 ? null
                 : new { algorithm = wrappedFileKey.Algorithm, nonce = wrappedFileKey.Nonce, ciphertext = wrappedFileKey.Ciphertext, tag = wrappedFileKey.Tag },
-            fileId
+            fileId,
+            stagedUpload = true
         };
         var res = await _http.PostAsJsonAsync($"/api/v1/e2ee/{volumeName}/create-file", req, JsonOpts);
         res.EnsureSuccessStatusCode();
         var json = await res.Content.ReadFromJsonAsync<JsonElement>();
-        return (json.GetProperty("fileId").GetString()!, json.GetProperty("writeLeaseToken").GetString()!);
+        string createdId = json.GetProperty("fileId").GetString()!;
+        string token = json.GetProperty("writeLeaseToken").GetString()!;
+        if (!json.TryGetProperty("uploadPending", out var pending) || pending.ValueKind != JsonValueKind.True)
+        {
+            try { await DeleteFileAsync(volumeName, createdId, token); } catch { }
+            try { await ReleaseWriteLeaseAsync(volumeName, createdId, token); } catch { }
+            throw new InvalidOperationException("Server does not support private staged uploads.");
+        }
+        return (createdId, token);
     }
 
     public async Task<string> AcquireWriteLeaseAsync(string volumeName, string fileId)
@@ -230,6 +239,23 @@ public sealed class CistaNasApiClient
         request.Headers.Add("X-CistaNAS-Write-Lease", writeLeaseToken);
         var res = await _http.SendAsync(request);
         res.EnsureSuccessStatusCode();
+    }
+
+    // Only for newly staged files: visibility in the listing proves the server committed it.
+    public async Task FinalizeNewFileAsync(string volumeName, string fileId, long actualLength, string writeLeaseToken, int chunkCount)
+    {
+        try { await FinalizeFileAsync(volumeName, fileId, actualLength, writeLeaseToken, chunkCount); }
+        catch (HttpRequestException)
+        {
+            bool committed = false;
+            try
+            {
+                committed = (await ListFilesAsync(volumeName)).Any(f => f.FileId == fileId
+                    && f.EncryptedLength == actualLength && f.ChunkCount == chunkCount);
+            }
+            catch { /* Preserve the original error when the outcome cannot be verified. */ }
+            if (!committed) throw;
+        }
     }
 
     public async Task DeleteFileAsync(string volumeName, string fileId, string writeLeaseToken)
